@@ -1,6 +1,6 @@
 mod assets;
 mod fetch;
-pub use assets::{AssetScheduler, AssetStats};
+pub use assets::{AssetScheduler, AssetStats, AssetVfs, CachedAsset};
 
 use crate::backends::navigator::fetch::{Response, ResponseBody};
 use crate::content::PlayingContent;
@@ -28,6 +28,34 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::warn;
 use url::{ParseError, Url};
+
+/// The version binds admission to the cookie state that reqwest actually used,
+/// including cookies set while an HTTP request was awaiting its connection.
+#[derive(Default)]
+pub(super) struct SessionCookies {
+    jar: cookie::Jar,
+    revision: std::sync::RwLock<u64>,
+}
+impl SessionCookies {
+    fn snapshot(&self, url: &Url) -> (bool, u64) {
+        let revision = self.revision.read().expect("cookie version lock");
+        (self.jar.cookies(url).is_none(), *revision)
+    }
+}
+impl CookieStore for SessionCookies {
+    fn set_cookies(&self, headers: &mut dyn Iterator<Item = &header::HeaderValue>, url: &Url) {
+        let mut headers = headers.peekable();
+        if headers.peek().is_none() {
+            return;
+        }
+        let mut version = self.revision.write().expect("cookie version lock");
+        self.jar.set_cookies(&mut headers, url);
+        *version = version.wrapping_add(1);
+    }
+    fn cookies(&self, url: &Url) -> Option<header::HeaderValue> {
+        self.jar.cookies(url)
+    }
+}
 
 pub trait NavigatorInterface: Clone + Send + 'static {
     fn navigate_to_website(&self, url: Url);
@@ -57,7 +85,7 @@ pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterfa
     // Client to use for network requests
     client: Option<Rc<reqwest::Client>>,
 
-    cookies: Arc<cookie::Jar>,
+    cookies: Arc<SessionCookies>,
     assets: Option<AssetScheduler>,
 
     socket_allowed: HashSet<String>,
@@ -93,7 +121,7 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
         content: Rc<PlayingContent>,
         interface: I,
     ) -> Self {
-        let cookies = Arc::new(cookie::Jar::default());
+        let cookies = Arc::new(SessionCookies::default());
         let mut builder = reqwest::ClientBuilder::new()
             .cookie_provider(cookies.clone())
             .user_agent(concat!(
@@ -109,7 +137,7 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
         }
 
         if let Some(cookie) = cookie {
-            cookies.add_cookie_str(&cookie, &base_url);
+            cookies.jar.add_cookie_str(&cookie, &base_url);
         }
 
         if let Some(proxy) = proxy {
@@ -301,17 +329,20 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
     ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
         if let (Some(scheduler), Some(client), Ok(url)) =
             (&self.assets, &self.client, self.resolve_url(request.url()))
-            && request.method() == NavigationMethod::Get
-            && request.body().is_none()
-            && request.headers().is_empty()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && scheduler.allows(&url)
-            && self.cookies.cookies(&url).is_none()
         {
-            return scheduler.fetch(client.as_ref().clone(), self.cookies.clone(), url, reason);
+            let eligible = request.method() == NavigationMethod::Get
+                && request.body().is_none()
+                && request.headers().is_empty()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && scheduler.allows(&url);
+            let cookie = eligible && self.cookies.cookies(&url).is_some();
+            scheduler.observe(eligible, cookie);
+            if eligible && (!cookie || scheduler.cache_enabled()) {
+                return scheduler.fetch(client.as_ref().clone(), self.cookies.clone(), url, reason);
+            }
         }
         self.fetch(request)
     }
