@@ -56,11 +56,16 @@ impl<'gc> CallStack<'gc> {
         }
     }
 
-    pub(crate) fn wall_clock(&self, avm: &super::Avm2<'gc>, classes: &[(&str, &str)]) -> bool {
+    pub(crate) fn wall_clock(
+        &self,
+        avm: &super::Avm2<'gc>,
+        classes: &[(&str, &str)],
+        scope: Option<(usize, bool)>,
+    ) -> bool {
         if classes.is_empty() {
             return false;
         }
-        for method in self.stack.iter().rev() {
+        for method in self.stack[scope.map_or(0, |s| s.0)..].iter().rev() {
             if method
                 .translation_unit()
                 .domain()
@@ -72,7 +77,11 @@ impl<'gc> CallStack<'gc> {
                 return wall_clock_method(class.i_class().unwrap_or(class).name(), classes);
             }
         }
-        false
+        scope.is_some_and(|s| s.1)
+    }
+
+    pub(crate) fn depth(&self) -> usize {
+        self.stack.len()
     }
 
     pub fn is_empty(&self) -> bool {

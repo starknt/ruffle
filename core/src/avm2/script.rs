@@ -119,6 +119,10 @@ impl<'gc> TranslationUnit<'gc> {
             // NOTE: There are subtle differences between how a class is initially exported (here),
             // and how it's exported again when it is encountered in a trait (see `Script::load_traits`).
             // We currently don't handle them and just export it in the domain in both cases.
+            activation
+                .context
+                .playback
+                .check_definition(class.name(), self.movie().data());
             self.domain()
                 .export_class(class.name(), class, activation.gc());
         }
@@ -602,6 +606,12 @@ impl<'gc> Script<'gc> {
 
         for newtrait in &traits {
             if let TraitKind::Class { class, .. } = newtrait.kind() {
+                if newtrait.name() != class.name() {
+                    activation
+                        .context
+                        .playback
+                        .check_definition(newtrait.name(), unit.movie().data());
+                }
                 domain.export_class(newtrait.name(), *class, mc);
             }
         }

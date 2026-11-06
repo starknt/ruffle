@@ -9,34 +9,6 @@ use gc_arena::{DynamicRoot, Gc, Rootable};
 pub struct HostAdapter(DynamicRoot<Rootable![(Domain<'_>, Value<'_>)]>);
 
 impl HostAdapter {
-    /// Inspect the decompressed tag bytes of the movie that actually defined a class.
-    pub fn class_movies(player: &mut Player, class: &str) -> Vec<std::sync::Arc<Vec<u8>>> {
-        player.mutate_with_update_context(|ctx| {
-            let name = QName::from_qualified_name(AvmString::new_utf8(ctx.gc(), class), ctx);
-            let mut owners = Vec::new();
-            for movie in ctx.library.known_movies() {
-                let Some(class) = ctx
-                    .library
-                    .library_for_movie(movie)
-                    .and_then(|lib| lib.try_avm2_domain())
-                    .and_then(|domain| domain.classes().get(name).copied())
-                else {
-                    continue;
-                };
-                if let Some(init) = class.instance_init() {
-                    let bytes = init.owner_movie().shared_data();
-                    if !owners
-                        .iter()
-                        .any(|known| std::sync::Arc::ptr_eq(known, &bytes))
-                    {
-                        owners.push(bytes);
-                    }
-                }
-            }
-            owners
-        })
-    }
-
     /// Locate the domain that declares `anchor` and load trusted ABC into a private child.
     /// Returns `None` while the movie containing the anchor has not loaded.
     pub fn load(

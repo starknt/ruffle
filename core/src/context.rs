@@ -253,11 +253,11 @@ impl<'gc> HasStringContext<'gc> for UpdateContext<'gc> {
 impl<'gc> UpdateContext<'gc> {
     pub(crate) fn in_wall_clock_method(&self) -> bool {
         !self.playback.wall_classes.is_empty()
-            && self
-                .avm2
-                .call_stack()
-                .borrow()
-                .wall_clock(self.avm2, self.playback.wall_classes)
+            && self.avm2.call_stack().borrow().wall_clock(
+                self.avm2,
+                self.playback.wall_classes,
+                self.playback.callback_clock.get(),
+            )
     }
 
     pub fn global_sound_transform(&self) -> &SoundTransform {

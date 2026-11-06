@@ -548,12 +548,24 @@ impl Player {
         FloatDuration::from_millis(self.frame_time(1000.0))
     }
 
+    pub fn install_module_check(
+        &mut self,
+        rules: &'static [crate::playback::ModuleRule],
+        verify: fn(&[u8], &[&str]) -> bool,
+    ) {
+        self.playback.install_module_check(rules, verify);
+    }
+    pub fn unverified_module(&self) -> Option<(&'static crate::playback::ModuleRule, bool)> {
+        self.playback.unverified_module()
+    }
+
     pub fn set_realtime_avm2_classes(&mut self, classes: &'static [(&'static str, &'static str)]) {
         self.playback.wall_classes = classes;
     }
 
-    pub fn has_mixed_protocol_timer(&self) -> bool {
-        self.playback.mixed_timer.get()
+    pub fn has_mixed_protocol_timer(&mut self) -> bool {
+        !self.playback.wall_classes.is_empty()
+            && self.mutate_with_update_context(|ctx| ctx.timers.has_mixed())
     }
 
     pub fn has_active_streams(&mut self) -> bool {
@@ -569,6 +581,11 @@ impl Player {
     }
 
     pub fn set_playback_rate(&mut self, rate: crate::playback::PlaybackRate) {
+        if rate != crate::playback::PlaybackRate::Normal
+            && (self.unverified_module().is_some() || self.has_mixed_protocol_timer())
+        {
+            return;
+        }
         if self.playback.rate == rate {
             return;
         }
@@ -596,9 +613,8 @@ impl Player {
             if let Some(time) = &mut self.playback.elapsed {
                 *time += game_dt.as_millis().max(0.0);
             }
-            self.playback.executing_since = Some(Instant::now());
             self.tick_step(game_dt, Some(dt));
-            self.playback.executing_since = None;
+            self.refresh_wall_deadline();
             return;
         }
         self.update_sockets();
@@ -618,6 +634,10 @@ impl Player {
         } else {
             (self.playback.credit + real * rate).min(100.0 * rate)
         };
+        // Only the last simulated scene needs host mouse hit testing. Give slower real
+        // scenes a share of one display interval while retaining a bounded input latency.
+        self.playback.batching_input = true;
+        let budget = Duration::from_secs_f64((real * 0.8).clamp(8., 32.) / 1000.);
         for _ in 0..16 {
             if self.playback.credit < 0.001 || !self.is_playing() {
                 break;
@@ -628,16 +648,27 @@ impl Player {
                 .min(self.frame_duration().as_millis().clamp(1.0, 32.0));
             self.playback.credit -= step;
             *self.playback.elapsed.as_mut().expect("accelerated clock") += step;
-            self.playback.executing_since = Some(Instant::now());
             self.audio.advance_simulated_output(step);
             self.tick_step(FloatDuration::from_millis(step), None);
-            self.playback.executing_since = None;
-            if begin.elapsed() >= Duration::from_millis(8) {
+            if self.unverified_module().is_some() || self.has_mixed_protocol_timer() {
+                self.set_playback_rate(crate::playback::PlaybackRate::Normal);
+                break;
+            }
+            if begin.elapsed() >= budget {
                 break;
             }
         }
+        self.playback.batching_input = false;
+        self.refresh_wall_deadline();
         self.update(|context| StreamManager::tick(context, dt));
         self.audio.tick();
+    }
+
+    fn refresh_wall_deadline(&mut self) {
+        if !self.playback.wall_classes.is_empty() {
+            self.playback.wall_deadline =
+                self.mutate_with_update_context(|ctx| ctx.timers.wall_deadline());
+        }
     }
 
     fn tick_step(&mut self, dt: FloatDuration, wall_dt: Option<FloatDuration>) {
@@ -736,10 +767,13 @@ impl Player {
             time_til_next = time_til_next.min(FloatDuration::from_millis(time_til_next_timer));
         }
 
-        time_til_next
+        let game = time_til_next
             .max(FloatDuration::ZERO)
             .to_std()
-            .div_f64(self.playback.rate as u8 as f64)
+            .div_f64(self.playback.rate as u8 as f64);
+        self.playback.wall_deadline.map_or(game, |ms| {
+            game.min(Duration::from_secs_f64(ms.max(0.) / 1000.))
+        })
     }
 
     pub fn is_playing(&self) -> bool {
@@ -2414,7 +2448,11 @@ impl Player {
     where
         F: for<'gc> FnOnce(&mut UpdateContext<'gc>) -> R,
     {
-        self.enter_arena_mut(|gc_context, gc_root, this| {
+        let previous = self.playback.executing_since;
+        if previous.is_none() && self.playback.elapsed.is_some() {
+            self.playback.begin_action();
+        }
+        let result = self.enter_arena_mut(|gc_context, gc_root, this| {
             #[allow(unused_variables)]
             let (
                 stage,
@@ -2520,7 +2558,9 @@ impl Player {
                 .and_then(|root| root.as_movie_clip())
                 .map(|clip| clip.current_frame());
             ret
-        })
+        });
+        self.playback.executing_since = previous;
+        result
     }
 
     #[cfg(feature = "egui")]
@@ -2560,6 +2600,9 @@ impl Player {
             rval
         });
 
+        if self.playback.batching_input {
+            return rval;
+        }
         // Update mouse state (check for new hovered button, etc.)
         self.mutate_with_update_context(|context| {
             Self::update_drag(context);
@@ -2697,8 +2740,26 @@ impl Player {
 
     pub fn fetch(
         &self,
+        request: Request,
+        reason: FetchReason,
+    ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        self.fetch_with_buffering(
+            request,
+            reason,
+            matches!(reason, FetchReason::LoadSwf | FetchReason::UrlLoader),
+        )
+    }
+    pub fn fetch_buffered_sound(
+        &self,
+        request: Request,
+    ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        self.fetch_with_buffering(request, FetchReason::Other, true)
+    }
+    fn fetch_with_buffering(
+        &self,
         mut request: Request,
         fetch_reason: FetchReason,
+        buffered: bool,
     ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
         match self.compatibility_rules.block_or_rewrite_swf_url(
             request.url().into(),
@@ -2711,11 +2772,10 @@ impl Player {
         }
 
         let self_reference = self.self_reference.clone();
-        let fetch = match fetch_reason {
-            FetchReason::LoadSwf | FetchReason::UrlLoader => {
-                self.navigator.fetch_buffered(request, fetch_reason)
-            }
-            FetchReason::Other => self.navigator.fetch(request),
+        let fetch = if buffered {
+            self.navigator.fetch_buffered(request, fetch_reason)
+        } else {
+            self.navigator.fetch(request)
         };
         Box::pin(async move {
             let response = fetch.await;

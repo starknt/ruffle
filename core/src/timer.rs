@@ -33,11 +33,14 @@ pub struct Timers<'gc> {
     other_time: u64,
     other_timers: BinaryHeap<Timer<'gc>>,
     updating_wall: bool,
+    mixed: std::collections::HashSet<i32>,
+    reclassify: std::collections::HashMap<i32, bool>,
 }
 
 impl<'gc> Timers<'gc> {
     /// Ticks all timers and runs necessary callbacks.
     pub fn update_timers(context: &mut UpdateContext<'gc>, dt: FloatDuration) -> Option<f64> {
+        context.timers.apply_clock_changes();
         context.timers.cur_time = context
             .timers
             .cur_time
@@ -144,6 +147,10 @@ impl<'gc> Timers<'gc> {
                     }
                 }
                 TimerCallback::Avm2Callback { closure, params } => {
+                    let previous_clock = context.playback.callback_clock.replace(Some((
+                        context.avm2.call_stack().borrow().depth(),
+                        context.timers.updating_wall,
+                    )));
                     let domain = context.avm2.stage_domain();
                     let mut avm2_activation = Avm2Activation::from_domain(context, domain);
 
@@ -161,7 +168,13 @@ impl<'gc> Timers<'gc> {
                         closure.call(&mut avm2_activation, Avm2Value::Null, params)
                     };
 
-                    match run_closure() {
+                    let result = run_closure();
+                    avm2_activation
+                        .context
+                        .playback
+                        .callback_clock
+                        .set(previous_clock);
+                    match result {
                         Ok(v) => v.coerce_to_boolean(),
                         Err(err) => {
                             Avm2::uncaught_error(
@@ -235,6 +248,51 @@ impl<'gc> Timers<'gc> {
         next
     }
 
+    pub fn has_mixed(&self) -> bool {
+        !self.mixed.is_empty()
+    }
+    pub fn classify(&mut self, id: i32, wall: bool, mixed: bool) {
+        if !self.timer_exists(id) {
+            return;
+        }
+        if mixed {
+            self.mixed.insert(id);
+        } else {
+            self.mixed.remove(&id);
+        }
+        self.reclassify.insert(id, wall);
+    }
+    fn apply_clock_changes(&mut self) {
+        for (id, wall) in self.reclassify.drain() {
+            let (from, to, now, dest) = if self.updating_wall == wall {
+                (
+                    &mut self.other_timers,
+                    &mut self.timers,
+                    self.other_time,
+                    self.cur_time,
+                )
+            } else {
+                (
+                    &mut self.timers,
+                    &mut self.other_timers,
+                    self.cur_time,
+                    self.other_time,
+                )
+            };
+            if let Some(mut timer) = from.iter().find(|t| t.id == id).cloned() {
+                from.retain(|t| t.id != id);
+                timer.tick_time = dest.saturating_add(timer.tick_time.saturating_sub(now));
+                to.push(timer);
+            }
+        }
+    }
+    pub fn wall_deadline(&mut self) -> Option<f64> {
+        self.apply_clock_changes();
+        self.other_timers
+            .peek()
+            .map(|t| t.tick_time.saturating_sub(self.other_time) as f64 / Self::TIMER_SCALE)
+    }
+
     /// The minimum interval we allow for timers.
     const MIN_INTERVAL: i32 = 10;
 
@@ -253,6 +311,8 @@ impl<'gc> Timers<'gc> {
             other_time: 0,
             other_timers: Default::default(),
             updating_wall: false,
+            mixed: Default::default(),
+            reclassify: Default::default(),
         }
     }
 
@@ -319,6 +379,8 @@ impl<'gc> Timers<'gc> {
 
     /// Removes a timer.
     pub fn remove(&mut self, id: i32) -> bool {
+        self.mixed.remove(&id);
+        self.reclassify.remove(&id);
         let old = self.num_timers();
         self.timers.retain(|t| t.id != id);
         self.other_timers.retain(|t| t.id != id);
@@ -328,6 +390,8 @@ impl<'gc> Timers<'gc> {
     pub fn remove_all(&mut self) {
         self.timers.clear();
         self.other_timers.clear();
+        self.reclassify.clear();
+        self.mixed.clear();
     }
 
     /// Changes the delay of a timer.
@@ -351,7 +415,7 @@ impl<'gc> Timers<'gc> {
         }
 
         if let Some(mut timer) = timer {
-            self.remove(id);
+            self.timers.retain(|t| t.id != id);
             timer.interval = interval;
             timer.tick_time = self.cur_time + interval;
             self.timers.push(timer);
@@ -369,7 +433,10 @@ impl<'gc> Timers<'gc> {
     }
 
     fn pop(&mut self) -> Option<Timer<'gc>> {
-        self.timers.pop()
+        let t = self.timers.pop()?;
+        self.mixed.remove(&t.id);
+        self.reclassify.remove(&t.id);
+        Some(t)
     }
 }
 

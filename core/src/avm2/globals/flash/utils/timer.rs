@@ -48,20 +48,7 @@ pub fn start<'gc>(
         // Note - we deliberately do *not* check if currentCount is less than repeatCount.
         // Calling 'start' on a timer that has currentCount >= repeatCount will tick exactly
         // once, and then stop immediately. This is handled by Timer.onUpdate
-        let mut wall = activation.context.in_wall_clock_method();
-        if !activation.context.playback.wall_classes.is_empty() {
-            let list = crate::avm2::globals::flash::events::event_dispatcher::dispatch_list(
-                activation, this,
-            )?;
-            let (wall_listener, game_listener) = list
-                .as_dispatch_mut(activation.gc())
-                .expect("event dispatcher")
-                .timer_clocks();
-            wall |= wall_listener;
-            if wall && game_listener {
-                activation.context.playback.mixed_timer.set(true);
-            }
-        }
+        let origin = activation.context.in_wall_clock_method();
         let id = activation.context.timers.add_for_clock(
             TimerCallback::Avm2Callback {
                 closure: Some(on_update),
@@ -69,8 +56,20 @@ pub fn start<'gc>(
             },
             delay,
             false,
-            wall,
+            origin,
         );
+        if !activation.context.playback.wall_classes.is_empty() {
+            let list = crate::avm2::globals::flash::events::event_dispatcher::dispatch_list(
+                activation, this,
+            )?;
+            let mut listeners = list
+                .as_dispatch_mut(activation.gc())
+                .expect("event dispatcher");
+            listeners.bind_timer(id, origin);
+            if let Some((id, wall, mixed)) = listeners.active_timer_clock() {
+                activation.context.timers.classify(id, wall, mixed);
+            }
+        }
         this.set_slot(slots::_TIMER_ID, id.into(), activation)?;
     }
     Ok(Value::Undefined)

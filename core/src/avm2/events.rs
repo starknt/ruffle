@@ -169,12 +169,15 @@ impl<'gc> Event<'gc> {
 /// A set of handlers organized by event type, priority, and order added.
 #[derive(Clone, Collect)]
 #[collect(no_drop)]
-pub struct DispatchList<'gc>(FnvHashMap<AvmString<'gc>, BTreeMap<i32, Vec<EventHandler<'gc>>>>);
+pub struct DispatchList<'gc>(
+    FnvHashMap<AvmString<'gc>, BTreeMap<i32, Vec<EventHandler<'gc>>>>,
+    Option<(i32, bool)>,
+);
 
 impl<'gc> DispatchList<'gc> {
     /// Construct a new dispatch list.
     pub fn new() -> Self {
-        Self(Default::default())
+        Self(Default::default(), None)
     }
 
     /// Get all of the event handlers for a given event type, if such a type
@@ -270,6 +273,14 @@ impl<'gc> DispatchList<'gc> {
     }
 
     /// Timer.onUpdate is shared playerglobal code; inspect the listeners on this exact instance.
+    pub fn bind_timer(&mut self, id: i32, origin: bool) {
+        self.1 = Some((id, origin));
+    }
+    pub fn active_timer_clock(&self) -> Option<(i32, bool, bool)> {
+        let (id, origin) = self.1?;
+        let (wall, game) = self.timer_clocks();
+        Some((id, origin || wall, (origin || wall) && game))
+    }
     pub fn timer_clocks(&self) -> (bool, bool) {
         let mut wall = false;
         let mut game = false;
@@ -440,7 +451,12 @@ fn dispatch_event_to_target<'gc>(
         let global = activation.context.avm2.toplevel_global_object().unwrap();
 
         let args = &[event.into()];
+        let previous = activation.context.playback.callback_clock.replace(Some((
+            activation.context.avm2.call_stack().borrow().depth(),
+            *wall_clock,
+        )));
         let result = handler.call(activation, global.into(), FunctionArgs::from_slice(args));
+        activation.context.playback.callback_clock.set(previous);
         if let Err(err) = result {
             let event_name = event.event().event_type();
 
