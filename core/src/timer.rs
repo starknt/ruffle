@@ -30,6 +30,9 @@ pub struct Timers<'gc> {
 
     /// The current global time.
     cur_time: u64,
+    other_time: u64,
+    other_timers: BinaryHeap<Timer<'gc>>,
+    updating_wall: bool,
 }
 
 impl<'gc> Timers<'gc> {
@@ -183,6 +186,10 @@ impl<'gc> Timers<'gc> {
 
             // We need a mutable reference to the timer for the rest.
             // Just checked that there is still at least one timer active, so unwrap must succeed.
+            let wall_now = context
+                .timers
+                .updating_wall
+                .then_some(context.timers.cur_time);
             let mut timer = context.timers.peek_mut().unwrap();
 
             if timer.id == expected_id {
@@ -193,7 +200,12 @@ impl<'gc> Timers<'gc> {
                     context.timers.pop();
                 } else {
                     // Reset setInterval timers. `peek_mut` re-sorts the timer in the priority queue.
-                    timer.tick_time = timer.tick_time.wrapping_add(timer.interval);
+                    timer.tick_time = if let Some(now) = wall_now {
+                        let missed = now.saturating_sub(timer.tick_time) / timer.interval;
+                        timer.tick_time.wrapping_add((missed + 1) * timer.interval)
+                    } else {
+                        timer.tick_time.wrapping_add(timer.interval)
+                    };
                 }
             } else {
                 drop(timer);
@@ -208,6 +220,19 @@ impl<'gc> Timers<'gc> {
         context.timers.peek().map(|timer| {
             (timer.tick_time.wrapping_sub(context.timers.cur_time)) as f64 / Self::TIMER_SCALE
         })
+    }
+
+    /// While dispatching a callback, both queues remain addressable by their common timer ID.
+    fn swap_clocks(&mut self) {
+        std::mem::swap(&mut self.cur_time, &mut self.other_time);
+        std::mem::swap(&mut self.timers, &mut self.other_timers);
+        self.updating_wall = !self.updating_wall;
+    }
+    pub fn update_wall_timers(context: &mut UpdateContext<'gc>, dt: FloatDuration) -> Option<f64> {
+        context.timers.swap_clocks();
+        let next = Self::update_timers(context, dt);
+        context.timers.swap_clocks();
+        next
     }
 
     /// The minimum interval we allow for timers.
@@ -225,12 +250,15 @@ impl<'gc> Timers<'gc> {
             timers: Default::default(),
             timer_counter: 0,
             cur_time: 0,
+            other_time: 0,
+            other_timers: Default::default(),
+            updating_wall: false,
         }
     }
 
     /// The number of timers currently active.
     pub fn num_timers(&self) -> usize {
-        self.timers.len()
+        self.timers.len() + self.other_timers.len()
     }
 
     /// Whether there are no timers active.
@@ -240,7 +268,10 @@ impl<'gc> Timers<'gc> {
 
     /// Whether a timer with the given ID exists.
     pub fn timer_exists(&self, id: i32) -> bool {
-        self.timers.iter().any(|t| t.id == id)
+        self.timers
+            .iter()
+            .chain(&self.other_timers)
+            .any(|t| t.id == id)
     }
 
     /// Registers a new timer and returns the timer ID.
@@ -249,6 +280,16 @@ impl<'gc> Timers<'gc> {
         callback: TimerCallback<'gc>,
         interval: i32,
         is_timeout: bool,
+    ) -> i32 {
+        self.add_for_clock(callback, interval, is_timeout, false)
+    }
+
+    pub fn add_for_clock(
+        &mut self,
+        callback: TimerCallback<'gc>,
+        interval: i32,
+        is_timeout: bool,
+        wall: bool,
     ) -> i32 {
         // SANITY: Set a minimum interval so we don't spam too much.
         let interval = interval.max(Self::MIN_INTERVAL) as u64 * (Self::TIMER_SCALE as u64);
@@ -260,30 +301,43 @@ impl<'gc> Timers<'gc> {
         let timer = Timer {
             id,
             callback,
-            tick_time: self.cur_time + interval,
+            tick_time: (if wall == self.updating_wall {
+                self.cur_time
+            } else {
+                self.other_time
+            }) + interval,
             interval,
             is_timeout,
         };
-        self.timers.push(timer);
+        if wall == self.updating_wall {
+            self.timers.push(timer);
+        } else {
+            self.other_timers.push(timer);
+        }
         id
     }
 
     /// Removes a timer.
     pub fn remove(&mut self, id: i32) -> bool {
-        let old_len = self.timers.len();
+        let old = self.num_timers();
         self.timers.retain(|t| t.id != id);
-        let len = self.timers.len();
-        // Sanity check: Either we removed a single timer, or none.
-        debug_assert!(len == old_len || len == old_len - 1);
-        len < old_len
+        self.other_timers.retain(|t| t.id != id);
+        old != self.num_timers()
     }
 
     pub fn remove_all(&mut self) {
-        self.timers.clear()
+        self.timers.clear();
+        self.other_timers.clear();
     }
 
     /// Changes the delay of a timer.
     pub fn set_delay(&mut self, id: i32, interval: i32) {
+        if self.other_timers.iter().any(|t| t.id == id) {
+            self.swap_clocks();
+            self.set_delay(id, interval);
+            self.swap_clocks();
+            return;
+        }
         // SANITY: Set a minimum interval so we don't spam too much.
         let interval = interval.max(Self::MIN_INTERVAL) as u64 * (Self::TIMER_SCALE as u64);
 

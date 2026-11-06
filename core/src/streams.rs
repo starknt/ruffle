@@ -94,6 +94,10 @@ impl<'gc> StreamManager<'gc> {
         }
     }
 
+    pub fn is_active(&self) -> bool {
+        !self.active_streams.is_empty()
+    }
+
     /// Activate a `NetStream`.
     ///
     /// This can be called at any time to flag that a `NetStream` has work to

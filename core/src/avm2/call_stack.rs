@@ -56,6 +56,25 @@ impl<'gc> CallStack<'gc> {
         }
     }
 
+    pub(crate) fn wall_clock(&self, avm: &super::Avm2<'gc>, classes: &[(&str, &str)]) -> bool {
+        if classes.is_empty() {
+            return false;
+        }
+        for method in self.stack.iter().rev() {
+            if method
+                .translation_unit()
+                .domain()
+                .is_playerglobals_domain(avm)
+            {
+                continue;
+            }
+            if let Some(class) = method.bound_class() {
+                return wall_clock_method(class.i_class().unwrap_or(class).name(), classes);
+            }
+        }
+        false
+    }
+
     pub fn is_empty(&self) -> bool {
         self.stack.is_empty()
     }
@@ -73,4 +92,13 @@ impl std::fmt::Display for CallStack<'_> {
         self.display(&mut output);
         write!(f, "{output}")
     }
+}
+
+pub(crate) fn wall_clock_method(name: super::QName<'_>, classes: &[(&str, &str)]) -> bool {
+    let Some(uri) = name.namespace().as_uri_opt() else {
+        return false;
+    };
+    classes.iter().any(|(namespace, class)| {
+        name.local_name().as_wstr() == class.as_bytes() && uri.as_wstr() == namespace.as_bytes()
+    })
 }

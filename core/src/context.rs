@@ -184,6 +184,7 @@ pub struct UpdateContext<'gc> {
 
     /// The instant at which the SWF was launched.
     pub start_time: Instant,
+    pub playback: &'gc crate::playback::PlaybackClock,
 
     /// The instant at which the current update started.
     pub update_start: Instant,
@@ -250,6 +251,15 @@ impl<'gc> HasStringContext<'gc> for UpdateContext<'gc> {
 
 /// Convenience methods for controlling audio.
 impl<'gc> UpdateContext<'gc> {
+    pub(crate) fn in_wall_clock_method(&self) -> bool {
+        !self.playback.wall_classes.is_empty()
+            && self
+                .avm2
+                .call_stack()
+                .borrow()
+                .wall_clock(self.avm2, self.playback.wall_classes)
+    }
+
     pub fn global_sound_transform(&self) -> &SoundTransform {
         self.audio_manager.global_sound_transform()
     }

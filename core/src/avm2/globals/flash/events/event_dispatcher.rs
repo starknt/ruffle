@@ -10,7 +10,7 @@ use crate::avm2::value::Value;
 use crate::avm2::{Avm2, Error};
 
 /// Get an object's dispatch list, lazily initializing it if necessary.
-fn dispatch_list<'gc>(
+pub(crate) fn dispatch_list<'gc>(
     activation: &mut Activation<'_, 'gc>,
     this: Object<'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
@@ -38,12 +38,27 @@ pub fn add_event_listener<'gc>(
     let listener = args.get_function(activation, 1, "listener")?;
     let use_capture = args.get_bool(2);
     let priority = args.get_i32(3);
+    let clocked = event_type.as_wstr() == b"enterFrame"
+        || event_type.as_wstr() == b"timer"
+        || event_type.as_wstr() == b"timerComplete";
+    let wall_clock = clocked
+        && (activation.context.in_wall_clock_method()
+            || listener
+                .executable()
+                .as_method()
+                .bound_class()
+                .is_some_and(|class| {
+                    crate::avm2::call_stack::wall_clock_method(
+                        class.i_class().unwrap_or(class).name(),
+                        activation.context.playback.wall_classes,
+                    )
+                }));
 
     //TODO: If we ever get weak GC references, we should respect `useWeakReference`.
     dispatch_list
         .as_dispatch_mut(activation.gc())
         .expect("Internal properties should have what I put in them")
-        .add_event_listener(event_type, priority, listener, use_capture);
+        .add_event_listener(event_type, priority, listener, use_capture, wall_clock);
 
     Avm2::register_broadcast_listener(activation.context, this, event_type);
 

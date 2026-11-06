@@ -8,7 +8,6 @@ use crate::avm2::{Activation, Error, Value};
 use crate::string::AvmString;
 use crate::string::WString;
 use std::fmt::Write;
-use web_time::Instant;
 
 pub mod byte_array;
 pub mod dictionary;
@@ -21,10 +20,15 @@ pub fn get_timer<'gc>(
     _this: Value<'gc>,
     _args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
-    Ok((Instant::now()
-        .duration_since(activation.context.start_time)
-        .as_millis() as u32)
-        .into())
+    let elapsed = if activation.context.in_wall_clock_method() {
+        activation.context.start_time.elapsed().as_secs_f64() * 1000.0
+    } else {
+        activation
+            .context
+            .playback
+            .read(activation.context.start_time)
+    };
+    Ok((elapsed as u64 as u32).into())
 }
 
 /// Implements `flash.utils.setInterval`
@@ -42,10 +46,12 @@ pub fn set_interval<'gc>(
         params: params.to_vec(),
     };
 
-    Ok(Value::Integer(activation.context.timers.add_timer(
+    let wall = activation.context.in_wall_clock_method();
+    Ok(Value::Integer(activation.context.timers.add_for_clock(
         callback,
         interval as i32,
         false,
+        wall,
     )))
 }
 
@@ -75,10 +81,12 @@ pub fn set_timeout<'gc>(
         params: params.to_vec(),
     };
 
-    Ok(Value::Integer(activation.context.timers.add_timer(
+    let wall = activation.context.in_wall_clock_method();
+    Ok(Value::Integer(activation.context.timers.add_for_clock(
         callback,
         interval as i32,
         true,
+        wall,
     )))
 }
 

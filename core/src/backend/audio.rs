@@ -181,6 +181,10 @@ pub trait AudioBackend: Any {
     /// implementing it.
     fn set_frame_rate(&mut self, _frame_rate: f64) {}
 
+    /// A frontend may let the simulation consume samples while fast-forwarding.
+    fn set_simulated_output(&mut self, _enabled: bool) {}
+    fn advance_simulated_output(&mut self, _millis: f64) {}
+
     /// The approximate interval that this backend updates a sound's position value. `None` if the
     /// value is unknown.
     ///

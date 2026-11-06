@@ -220,8 +220,10 @@ impl<'gc> DispatchList<'gc> {
         priority: i32,
         handler: FunctionObject<'gc>,
         use_capture: bool,
+        wall_clock: bool,
     ) {
-        let new_handler = EventHandler::new(handler, use_capture);
+        let mut new_handler = EventHandler::new(handler, use_capture);
+        new_handler.wall_clock = wall_clock;
 
         if let Some(event_sheaf) = self.get_event(event) {
             for other_set in event_sheaf.values() {
@@ -267,6 +269,25 @@ impl<'gc> DispatchList<'gc> {
         false
     }
 
+    /// Timer.onUpdate is shared playerglobal code; inspect the listeners on this exact instance.
+    pub fn timer_clocks(&self) -> (bool, bool) {
+        let mut wall = false;
+        let mut game = false;
+        for (name, levels) in &self.0 {
+            if name.as_wstr() != b"timer" && name.as_wstr() != b"timerComplete" {
+                continue;
+            }
+            for handler in levels.values().flatten() {
+                if handler.wall_clock {
+                    wall = true;
+                } else {
+                    game = true;
+                }
+            }
+        }
+        (wall, game)
+    }
+
     /// Yield the event handlers on this dispatch list for a given event.
     ///
     /// Event handlers will be yielded in the order they are intended to be
@@ -279,13 +300,13 @@ impl<'gc> DispatchList<'gc> {
         &'a mut self,
         event: AvmString<'gc>,
         use_capture: bool,
-    ) -> impl 'a + Iterator<Item = FunctionObject<'gc>> {
+    ) -> impl 'a + Iterator<Item = (FunctionObject<'gc>, bool)> {
         self.get_event_mut(event)
             .iter()
             .rev()
             .flat_map(|(_p, v)| v.iter())
             .filter(move |eh| eh.use_capture == use_capture)
-            .map(|eh| eh.handler)
+            .map(|eh| (eh.handler, eh.wall_clock))
     }
 }
 
@@ -301,6 +322,7 @@ impl Default for DispatchList<'_> {
 struct EventHandler<'gc> {
     /// The event handler to call.
     handler: FunctionObject<'gc>,
+    wall_clock: bool,
 
     /// Indicates if this handler should only be called for capturing events
     /// (when `true`), or if it should only be called for bubbling and
@@ -312,6 +334,7 @@ impl<'gc> EventHandler<'gc> {
     fn new(handler: FunctionObject<'gc>, use_capture: bool) -> Self {
         Self {
             handler,
+            wall_clock: false,
             use_capture,
         }
     }
@@ -383,7 +406,7 @@ fn dispatch_event_to_target<'gc>(
     let name = evtmut.event_type();
     let use_capture = evtmut.phase() == EventPhase::Capturing;
 
-    let handlers: Vec<FunctionObject<'gc>> = dispatch_list
+    let handlers: Vec<_> = dispatch_list
         .as_dispatch_mut(activation.gc())
         .expect("Internal dispatch list is missing during dispatch!")
         .iter_event_handlers(name, use_capture)
@@ -400,7 +423,16 @@ fn dispatch_event_to_target<'gc>(
         return;
     }
 
-    for handler in handlers.iter() {
+    for (handler, wall_clock) in handlers.iter() {
+        let clock = activation.context.playback;
+        if *wall_clock
+            && clock.rate != crate::playback::PlaybackRate::Normal
+            && !clock.wall_frame_due
+            && name.as_wstr() == b"enterFrame"
+        {
+            continue;
+        }
+
         if event.event().is_propagation_stopped_immediately() {
             break;
         }

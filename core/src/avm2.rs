@@ -46,7 +46,7 @@ mod amf;
 pub mod api_version;
 mod array;
 pub mod bytearray;
-mod call_stack;
+pub(crate) mod call_stack;
 mod class;
 mod domain;
 mod dynamic_map;

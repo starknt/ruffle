@@ -390,6 +390,7 @@ pub struct Player {
 
     /// The instant at which the SWF was launched.
     start_time: Instant,
+    playback: crate::playback::PlaybackClock,
 
     /// The maximum amount of time that can be called before a `Error::ExecutionTimeout`
     /// is raised. This defaults to 15 seconds but can be changed.
@@ -547,7 +548,99 @@ impl Player {
         FloatDuration::from_millis(self.frame_time(1000.0))
     }
 
+    pub fn set_realtime_avm2_classes(&mut self, classes: &'static [(&'static str, &'static str)]) {
+        self.playback.wall_classes = classes;
+    }
+
+    pub fn has_mixed_protocol_timer(&self) -> bool {
+        self.playback.mixed_timer.get()
+    }
+
+    pub fn has_active_streams(&mut self) -> bool {
+        self.mutate_with_update_context(|ctx| ctx.stream_manager.is_active())
+    }
+
+    pub fn playback_rate(&self) -> crate::playback::PlaybackRate {
+        self.playback.rate
+    }
+
+    pub fn playback_time_ms(&self) -> f64 {
+        self.playback.read(self.start_time)
+    }
+
+    pub fn set_playback_rate(&mut self, rate: crate::playback::PlaybackRate) {
+        if self.playback.rate == rate {
+            return;
+        }
+        if self.playback.elapsed.is_none() {
+            self.playback.elapsed = Some(self.playback_time_ms());
+        }
+        self.playback.credit = 0.0;
+        self.playback.wall_frame_credit = 0.0;
+        self.playback.wall_frame_due = false;
+        self.playback.rate = rate;
+        self.audio
+            .set_simulated_output(rate != crate::playback::PlaybackRate::Normal);
+    }
+
     pub fn tick(&mut self, dt: FloatDuration) {
+        if !self.is_playing() {
+            return;
+        }
+        if self.playback.rate == crate::playback::PlaybackRate::Normal {
+            let game_dt = if self.playback.elapsed.is_some() && dt.as_millis() > 1000.0 {
+                FloatDuration::ZERO
+            } else {
+                dt
+            };
+            if let Some(time) = &mut self.playback.elapsed {
+                *time += game_dt.as_millis().max(0.0);
+            }
+            self.playback.executing_since = Some(Instant::now());
+            self.tick_step(game_dt, Some(dt));
+            self.playback.executing_since = None;
+            return;
+        }
+        self.update_sockets();
+        self.update_net_connections();
+        self.mutate_with_update_context(|ctx| Timers::update_wall_timers(ctx, dt));
+        let frame_ms = self.frame_duration().as_millis().max(1.0);
+        self.playback.wall_frame_credit += dt.as_millis();
+        if self.playback.wall_frame_credit >= frame_ms {
+            self.playback.wall_frame_due = true;
+            self.playback.wall_frame_credit %= frame_ms;
+        }
+        let begin = Instant::now();
+        let real = dt.as_millis().max(0.0);
+        let rate = self.playback.rate as u8 as f64;
+        self.playback.credit = if real > 1000.0 {
+            0.0
+        } else {
+            (self.playback.credit + real * rate).min(100.0 * rate)
+        };
+        for _ in 0..16 {
+            if self.playback.credit < 0.001 || !self.is_playing() {
+                break;
+            }
+            let step = self
+                .playback
+                .credit
+                .min(self.frame_duration().as_millis().clamp(1.0, 32.0));
+            self.playback.credit -= step;
+            *self.playback.elapsed.as_mut().expect("accelerated clock") += step;
+            self.playback.executing_since = Some(Instant::now());
+            self.audio.advance_simulated_output(step);
+            self.tick_step(FloatDuration::from_millis(step), None);
+            self.playback.executing_since = None;
+            if begin.elapsed() >= Duration::from_millis(8) {
+                break;
+            }
+        }
+        self.update(|context| StreamManager::tick(context, dt));
+        self.audio.tick();
+    }
+
+    fn tick_step(&mut self, dt: FloatDuration, wall_dt: Option<FloatDuration>) {
         if !self.is_playing() {
             return;
         }
@@ -561,6 +654,7 @@ impl Player {
         while frame < max_frames_per_tick && self.frame_accumulator >= frame_duration {
             let timer = Instant::now();
             self.run_frame();
+            self.playback.wall_frame_due = false;
             let elapsed = timer.elapsed().as_millis() as f64;
 
             self.add_frame_timing(elapsed);
@@ -598,21 +692,28 @@ impl Player {
         }
 
         // Adjust playback speed for next frame to stay in sync with timeline audio tracks ("stream" sounds).
-        let cur_frame_offset = self.frame_accumulator.as_millis();
-        let audio_skew = self.mutate_with_update_context(|context| {
-            context
-                .audio_manager
-                .audio_skew_time(context.audio, cur_frame_offset)
-        });
-        self.frame_accumulator += FloatDuration::from_secs(audio_skew);
+        if let Some(wall_dt) = wall_dt {
+            let cur_frame_offset = self.frame_accumulator.as_millis();
+            let audio_skew = self.mutate_with_update_context(|context| {
+                context
+                    .audio_manager
+                    .audio_skew_time(context.audio, cur_frame_offset)
+            });
+            self.frame_accumulator += FloatDuration::from_secs(audio_skew);
 
-        self.update_sockets();
-        self.update_net_connections();
+            self.update_sockets();
+            self.update_net_connections();
+            if !self.playback.wall_classes.is_empty() {
+                self.mutate_with_update_context(|ctx| Timers::update_wall_timers(ctx, wall_dt));
+            }
+        }
         self.update_timers(dt);
-        self.update(|context| {
-            StreamManager::tick(context, dt);
-        });
-        self.audio.tick();
+        if let Some(wall_dt) = wall_dt {
+            self.update(|context| {
+                StreamManager::tick(context, wall_dt);
+            });
+            self.audio.tick();
+        }
     }
 
     pub fn time_til_next_timer(&self) -> Option<f64> {
@@ -635,7 +736,10 @@ impl Player {
             time_til_next = time_til_next.min(FloatDuration::from_millis(time_til_next_timer));
         }
 
-        time_til_next.max(FloatDuration::ZERO).to_std()
+        time_til_next
+            .max(FloatDuration::ZERO)
+            .to_std()
+            .div_f64(self.playback.rate as u8 as f64)
     }
 
     pub fn is_playing(&self) -> bool {
@@ -919,6 +1023,12 @@ impl Player {
     }
 
     fn set_run_state(&mut self, state: RunState) {
+        if state == RunState::Suspended && self.is_playing() {
+            self.playback.elapsed = Some(self.playback_time_ms());
+            self.playback.credit = 0.;
+            self.playback.wall_frame_credit = 0.;
+            self.playback.wall_frame_due = false;
+        }
         let play_audio = match state {
             RunState::Playing => true,
             RunState::Suspended => false,
@@ -2370,6 +2480,7 @@ impl Player {
                 avm2,
                 external_interface,
                 start_time: this.start_time,
+                playback: &this.playback,
                 update_start: Instant::now(),
                 max_execution_duration: this.max_execution_duration,
                 focus_tracker: stage.focus_tracker(),
@@ -3102,6 +3213,7 @@ impl PlayerBuilder {
                 frame_accumulator: FloatDuration::ZERO,
                 recent_run_frame_timings: VecDeque::with_capacity(10),
                 start_time: Instant::now(),
+                playback: Default::default(),
                 time_offset: 0,
                 time_til_next_timer: None,
                 max_execution_duration: self.max_execution_duration,

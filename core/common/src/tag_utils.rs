@@ -313,6 +313,10 @@ impl SwfMovieData {
         self.header.version()
     }
 
+    pub fn shared_data(&self) -> Arc<Vec<u8>> {
+        self.data.clone()
+    }
+
     pub fn data(&self) -> &[u8] {
         &self.data
     }

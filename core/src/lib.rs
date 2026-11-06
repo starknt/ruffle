@@ -38,6 +38,7 @@ mod local_connection;
 mod net_connection;
 mod orphan_manager;
 pub mod pixel_bender;
+pub mod playback;
 mod player;
 mod prelude;
 pub mod socket;

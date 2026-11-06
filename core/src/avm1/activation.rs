@@ -26,7 +26,6 @@ use std::fmt;
 use swf::avm1::read::Reader;
 use swf::avm1::types::*;
 use url::form_urlencoded;
-use web_time::Instant;
 
 use super::object_reference::MovieClipReference;
 
@@ -1255,9 +1254,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             *self.context.time_offset += 1;
         }
 
-        let time = Instant::now()
-            .duration_since(self.context.start_time)
-            .as_millis() as u32;
+        let time = self.context.playback.read(self.context.start_time) as u64 as u32;
         let result = time.wrapping_add(*self.context.time_offset);
         self.context.avm1.push(result.into());
         Ok(FrameControl::Continue)
