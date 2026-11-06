@@ -248,6 +248,7 @@ pub fn load_bytes<'gc>(
     args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
+    activation.context.load_manager.close_read(this);
 
     let arg0 = args.get_object(activation, 0, "data")?;
     let bytes = arg0.as_bytearray().unwrap().bytes().to_vec();
@@ -320,6 +321,7 @@ pub fn unload<'gc>(
     _args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
+    activation.context.load_manager.close_read(this);
 
     let loader_info = this
         .get_slot(loader_slots::_CONTENT_LOADER_INFO)
@@ -332,3 +334,5 @@ pub fn unload<'gc>(
 
     Ok(Value::Undefined)
 }
+
+pub use crate::avm2::globals::flash::net::url_loader::close;

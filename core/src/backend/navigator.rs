@@ -308,6 +308,15 @@ pub trait NavigatorBackend: Any {
     /// Fetch data and return it some time in the future.
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>;
 
+    /// This caller consumes the entire response with `body`. Chunked clients use `fetch`.
+    fn fetch_buffered(
+        &self,
+        request: Request,
+        _reason: FetchReason,
+    ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        self.fetch(request)
+    }
+
     /// Take a URL string and resolve it to the actual URL from which a file
     /// can be fetched. This includes handling of relative links and pre-processing.
     ///

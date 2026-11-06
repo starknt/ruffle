@@ -1,11 +1,13 @@
+mod assets;
 mod fetch;
+pub use assets::{AssetScheduler, AssetStats};
 
 use crate::backends::navigator::fetch::{Response, ResponseBody};
 use crate::content::PlayingContent;
 use async_channel::{Receiver, Sender, TryRecvError};
 use async_io::Timer;
 use futures_lite::FutureExt;
-use reqwest::{Proxy, cookie, header};
+use reqwest::{Proxy, cookie, cookie::CookieStore, header};
 use ruffle_core::backend::navigator::{
     ErrorResponse, NavigationMethod, NavigatorBackend, OwnedFuture, Request, SocketMode,
     SuccessResponse, async_return, create_fetch_error, get_encoding,
@@ -55,6 +57,9 @@ pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterfa
     // Client to use for network requests
     client: Option<Rc<reqwest::Client>>,
 
+    cookies: Arc<cookie::Jar>,
+    assets: Option<AssetScheduler>,
+
     socket_allowed: HashSet<String>,
 
     socket_mode: SocketMode,
@@ -67,6 +72,13 @@ pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterfa
 }
 
 impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F, I> {
+    /// Scope public whole-body reuse and connection limits to this navigator.
+    pub fn configure_buffered_assets(&mut self, allow: fn(&Url) -> bool) -> AssetScheduler {
+        let scheduler = AssetScheduler::new(allow);
+        self.assets = Some(scheduler.clone());
+        scheduler
+    }
+
     /// Construct a navigator backend with fetch and async capability.
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -81,8 +93,9 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
         content: Rc<PlayingContent>,
         interface: I,
     ) -> Self {
+        let cookies = Arc::new(cookie::Jar::default());
         let mut builder = reqwest::ClientBuilder::new()
-            .cookie_store(true)
+            .cookie_provider(cookies.clone())
             .user_agent(concat!(
                 "Ruffle/",
                 env!("CARGO_PKG_VERSION"),
@@ -96,10 +109,7 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
         }
 
         if let Some(cookie) = cookie {
-            let cookie_jar = cookie::Jar::default();
-            cookie_jar.add_cookie_str(&cookie, &base_url);
-            let cookie_store = std::sync::Arc::new(cookie_jar);
-            builder = builder.cookie_provider(cookie_store)
+            cookies.add_cookie_str(&cookie, &base_url);
         }
 
         if let Some(proxy) = proxy {
@@ -123,6 +133,8 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
 
         Self {
             future_spawner,
+            cookies,
+            assets: None,
             client,
             base_url,
             upgrade_to_https,
@@ -280,6 +292,28 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
                 Ok(response)
             }),
         }
+    }
+
+    fn fetch_buffered(
+        &self,
+        request: Request,
+        reason: ruffle_core::backend::navigator::FetchReason,
+    ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        if let (Some(scheduler), Some(client), Ok(url)) =
+            (&self.assets, &self.client, self.resolve_url(request.url()))
+            && request.method() == NavigationMethod::Get
+            && request.body().is_none()
+            && request.headers().is_empty()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && scheduler.allows(&url)
+            && self.cookies.cookies(&url).is_none()
+        {
+            return scheduler.fetch(client.as_ref().clone(), self.cookies.clone(), url, reason);
+        }
+        self.fetch(request)
     }
 
     fn resolve_url(&self, url: &str) -> Result<Url, ParseError> {

@@ -4,7 +4,9 @@ use ruffle_core::loader::Error;
 use ruffle_core::swf::Encoding;
 use std::sync::{Arc, Mutex};
 
-pub enum ResponseBody {
+pub(super) enum ResponseBody {
+    Shared(Option<std::rc::Rc<super::assets::SharedBody>>),
+    Scheduled(Option<super::assets::UnsharedBody>),
     /// The response's body comes from a file.
     File(Result<Vec<u8>, std::io::Error>),
 
@@ -16,7 +18,7 @@ pub enum ResponseBody {
     Network(Arc<Mutex<Option<ReqwestResponse>>>),
 }
 
-pub struct Response {
+pub(super) struct Response {
     pub url: String,
     pub response_body: ResponseBody,
     pub text_encoding: Option<&'static Encoding>,
@@ -36,6 +38,16 @@ impl SuccessResponse for Response {
     #[expect(clippy::await_holding_lock)]
     fn body(self: Box<Self>) -> OwnedFuture<Vec<u8>, Error> {
         match self.response_body {
+            ResponseBody::Shared(data) => {
+                Box::pin(async move { Ok(data.map_or_else(Vec::new, |b| b.bytes())) })
+            }
+            ResponseBody::Scheduled(body) => Box::pin(async move {
+                if let Some(body) = body {
+                    body.read().await
+                } else {
+                    Ok(Vec::new())
+                }
+            }),
             ResponseBody::File(file) => {
                 Box::pin(async move { file.map_err(|e| Error::FetchError(e.to_string())) })
             }
@@ -68,6 +80,19 @@ impl SuccessResponse for Response {
     #[expect(clippy::await_holding_lock)]
     fn next_chunk(&mut self) -> OwnedFuture<Option<Vec<u8>>, Error> {
         match &mut self.response_body {
+            ResponseBody::Shared(data) => {
+                let data = data.take();
+                Box::pin(async move { Ok(data.map(|body| body.bytes())) })
+            }
+            ResponseBody::Scheduled(body) => {
+                let body = body.take();
+                Box::pin(async move {
+                    match body {
+                        Some(body) => body.read().await.map(Some),
+                        None => Ok(None),
+                    }
+                })
+            }
             ResponseBody::File(file) => {
                 let res = file
                     .as_mut()
@@ -112,6 +137,8 @@ impl SuccessResponse for Response {
 
     fn expected_length(&self) -> Result<Option<u64>, Error> {
         match &self.response_body {
+            ResponseBody::Shared(body) => Ok(body.as_ref().map(|b| b.len() as u64)),
+            ResponseBody::Scheduled(body) => Ok(body.as_ref().and_then(|b| b.expected)),
             ResponseBody::File(file) => Ok(file.as_ref().map(|file| file.len() as u64).ok()),
             ResponseBody::Network(response) => {
                 let lock = response.lock().expect("no recursive locks");

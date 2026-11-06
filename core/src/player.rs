@@ -2711,7 +2711,12 @@ impl Player {
         }
 
         let self_reference = self.self_reference.clone();
-        let fetch = self.navigator.fetch(request);
+        let fetch = match fetch_reason {
+            FetchReason::LoadSwf | FetchReason::UrlLoader => {
+                self.navigator.fetch_buffered(request, fetch_reason)
+            }
+            FetchReason::Other => self.navigator.fetch(request),
+        };
         Box::pin(async move {
             let response = fetch.await;
 

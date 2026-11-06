@@ -219,12 +219,76 @@ impl From<crate::avm1::Error<'_>> for Error {
 /// Holds all in-progress loads for the player.
 #[derive(Collect)]
 #[collect(no_drop)]
-pub struct LoadManager<'gc>(SlotMap<LoaderHandle, MovieLoader<'gc>>);
+pub struct LoadManager<'gc> {
+    movies: SlotMap<LoaderHandle, MovieLoader<'gc>>,
+    active_reads: Vec<ActiveRead<'gc>>,
+    next_read: u64,
+}
+
+#[derive(Collect)]
+#[collect(no_drop)]
+struct ActiveRead<'gc> {
+    owner: Avm2Object<'gc>,
+    id: u64,
+    #[collect(require_static)]
+    movie: Option<LoaderHandle>,
+    #[collect(require_static)]
+    abort: futures::future::AbortHandle,
+}
 
 impl<'gc> LoadManager<'gc> {
     /// Construct a new `LoadManager`.
     pub fn new() -> Self {
-        Self(SlotMap::with_key())
+        Self {
+            movies: SlotMap::with_key(),
+            active_reads: Vec::new(),
+            next_read: 0,
+        }
+    }
+
+    pub(crate) fn close_read(&mut self, owner: Avm2Object<'gc>) {
+        if let Some(index) = self
+            .active_reads
+            .iter()
+            .position(|read| read.owner == owner)
+        {
+            let read = self.active_reads.swap_remove(index);
+            read.abort.abort();
+            if let Some(movie) = read.movie {
+                self.remove_loader(movie);
+            }
+        }
+    }
+
+    pub(crate) fn cancellable_read(
+        &mut self,
+        owner: Avm2Object<'gc>,
+        player: &Arc<Mutex<Player>>,
+        movie: Option<LoaderHandle>,
+        future: OwnedFuture<(), Error>,
+    ) -> OwnedFuture<(), Error> {
+        self.close_read(owner);
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        self.next_read += 1;
+        let id = self.next_read;
+        self.active_reads.push(ActiveRead {
+            owner,
+            id,
+            movie,
+            abort,
+        });
+        let player = Arc::downgrade(player);
+        Box::pin(async move {
+            let result = futures::future::Abortable::new(future, registration)
+                .await
+                .unwrap_or(Ok(()));
+            if let Some(player) = player.upgrade() {
+                player.lock().unwrap().mutate_with_update_context(|ctx| {
+                    ctx.load_manager.active_reads.retain(|read| read.id != id)
+                });
+            }
+            result
+        })
     }
 
     /// Add a new loader to the `LoadManager`.
@@ -237,7 +301,7 @@ impl<'gc> LoadManager<'gc> {
     /// Movie loaders are removed automatically after the loader status is set
     /// accordingly.
     pub fn add_loader(&mut self, loader: MovieLoader<'gc>) -> LoaderHandle {
-        let handle = self.0.insert(loader);
+        let handle = self.movies.insert(loader);
         let loader = self.get_loader_mut(handle).unwrap();
         loader.self_handle = Some(handle);
         handle
@@ -246,17 +310,17 @@ impl<'gc> LoadManager<'gc> {
     /// Remove a completed loader.
     /// This is used to remove a loader after the loading or unloading process has completed.
     pub fn remove_loader(&mut self, handle: LoaderHandle) {
-        self.0.remove(handle);
+        self.movies.remove(handle);
     }
 
     /// Retrieve a loader by handle.
     pub fn get_loader(&self, handle: LoaderHandle) -> Option<&MovieLoader<'gc>> {
-        self.0.get(handle)
+        self.movies.get(handle)
     }
 
     /// Retrieve a loader by handle for mutation.
     pub fn get_loader_mut(&mut self, handle: LoaderHandle) -> Option<&mut MovieLoader<'gc>> {
-        self.0.get_mut(handle)
+        self.movies.get_mut(handle)
     }
 
     /// Checks if the target clip on the given handle's loader
@@ -323,7 +387,14 @@ impl<'gc> LoadManager<'gc> {
         };
         let handle = self.add_loader(loader);
         let loader = self.get_loader_mut(handle).unwrap();
-        loader.movie_loader(player, request, loader_url)
+        let future = loader.movie_loader(player.clone(), request, loader_url);
+        if let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data
+            && let Some(owner) = loader_info.loader()
+        {
+            self.cancellable_read(owner.into(), &player, Some(handle), future)
+        } else {
+            future
+        }
     }
 
     pub fn load_asset_movie(
@@ -430,13 +501,13 @@ impl<'gc> LoadManager<'gc> {
         // is not defined. The container should be replaced with something
         // that preserves insertion order, such as `LinkedHashMap` -
         // unfortunately that doesn't provide automatic key generation.
-        let mut loaders: Vec<_> = self.0.keys().collect();
+        let mut loaders: Vec<_> = self.movies.keys().collect();
         // `SlotMap` doesn't provide reverse iteration, so reversing afterwards.
         loaders.reverse();
 
         // Removing the keys from `loaders` whose movie hasn't loaded yet.
         loaders.retain(|handle| {
-            self.0
+            self.movies
                 .get_mut(*handle)
                 .expect("valid key")
                 .movie_clip_loaded(queue, strings)
@@ -444,7 +515,7 @@ impl<'gc> LoadManager<'gc> {
 
         // Cleaning up the loaders that are done.
         for index in loaders {
-            self.0.remove(index);
+            self.movies.remove(index);
         }
     }
 
@@ -453,7 +524,7 @@ impl<'gc> LoadManager<'gc> {
     /// Returns true if *all* loaders finished preloading.
     pub fn preload_tick(context: &mut UpdateContext<'gc>, limit: &mut ExecutionLimit) -> bool {
         let mut did_finish = true;
-        let handles: Vec<_> = context.load_manager.0.iter().map(|(h, _)| h).collect();
+        let handles: Vec<_> = context.load_manager.movies.iter().map(|(h, _)| h).collect();
 
         for handle in handles {
             let status = match context.load_manager.get_loader(handle) {
@@ -482,7 +553,7 @@ impl<'gc> LoadManager<'gc> {
         {
             movie.try_fire_loaderinfo_events(context);
         }
-        let handles: Vec<_> = context.load_manager.0.iter().map(|(h, _)| h).collect();
+        let handles: Vec<_> = context.load_manager.movies.iter().map(|(h, _)| h).collect();
         for handle in handles {
             if let Some(MovieLoader { target_clip, .. }) = context.load_manager.get_loader(handle)
                 && let Some(movie) = target_clip.as_movie_clip()

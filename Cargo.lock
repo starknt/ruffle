@@ -4857,6 +4857,7 @@ dependencies = [
  "bytemuck",
  "cpal",
  "freetype-rs",
+ "futures",
  "futures-lite",
  "macro_rules_attribute",
  "reqwest",
