@@ -14,6 +14,11 @@ fn main() {
         out_dir.to_str().unwrap()
     );
 
+    println!(
+        "cargo::metadata=playerglobal_abc={}",
+        out_dir.join("playerglobal_import.abc").display()
+    );
+
     // This is overly conservative - it will cause us to rebuild playerglobals
     // if *any* files in these directories change, not just .as files.
     // However, this script is fast to run, so it shouldn't matter in practice.

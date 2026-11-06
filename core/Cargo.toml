@@ -1,5 +1,6 @@
 [package]
 name = "ruffle_core"
+links = "ruffle_core"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
