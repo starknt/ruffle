@@ -35,7 +35,7 @@ pub enum Character<'gc> {
 #[collect(no_drop)]
 pub struct BitmapCharacter<'gc> {
     #[collect(require_static)]
-    compressed: CompressedBitmap,
+    compressed: std::rc::Rc<crate::bitmap::symbol_pixels::SymbolImage>,
     /// A lazily constructed GPU handle, used when performing fills with this bitmap
     #[collect(require_static)]
     handle: OnceCell<BitmapHandle>,
@@ -47,14 +47,20 @@ pub struct BitmapCharacter<'gc> {
 impl<'gc> BitmapCharacter<'gc> {
     pub fn new(compressed: CompressedBitmap) -> Self {
         Self {
-            compressed,
+            compressed: std::rc::Rc::new(crate::bitmap::symbol_pixels::SymbolImage::new(
+                compressed,
+            )),
             handle: OnceCell::default(),
             avm2_class: Lock::new(BitmapClass::NoSubclass),
         }
     }
 
     pub fn compressed(&self) -> &CompressedBitmap {
-        &self.compressed
+        &self.compressed.data
+    }
+
+    pub(crate) fn symbol_image(&self) -> std::rc::Rc<crate::bitmap::symbol_pixels::SymbolImage> {
+        self.compressed.clone()
     }
 
     pub fn avm2_class(&self) -> BitmapClass<'gc> {
@@ -73,7 +79,7 @@ impl<'gc> BitmapCharacter<'gc> {
         if let Some(handle) = self.handle.get() {
             return Ok(handle.clone());
         }
-        let decoded = self.compressed.decode()?;
+        let decoded = self.compressed.data.decode()?;
         let new_handle = backend.register_bitmap(decoded)?;
         // FIXME - do we ever want to release this handle, to avoid taking up GPU memory?
         self.handle.set(new_handle.clone()).unwrap();

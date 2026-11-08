@@ -1,3 +1,7 @@
+#[cfg(feature = "imgtests")]
+pub(crate) fn test_optimized() -> bool {
+    std::env::var("RUFFLE_TEST_RENDERER_MODE").as_deref() == Ok("optimized")
+}
 use ruffle_test_framework::environment::{CompileMode, Environment};
 
 #[cfg(feature = "imgtests")]
@@ -107,7 +111,7 @@ mod renderer {
 
         Some((
             Box::new(NativeRenderInterface { name }),
-            Box::new(WgpuRenderBackend::new(descriptors, target).expect(
+            Box::new(WgpuRenderBackend::with_options(descriptors, target,super::test_optimized(),false).expect(
                 "WGPU Render backend creation must not fail, everything was checked ahead of time",
             )),
         ))

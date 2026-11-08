@@ -65,6 +65,7 @@ impl HostAdapter {
         method: &str,
         input: &str,
     ) -> Result<String, &'static str> {
+        let _timer = ruffle_render::profile::time(ruffle_render::profile::Phase::HostAction);
         player.mutate_with_update_context(|ctx| {
             let (domain, class) = *ctx
                 .dynamic_root

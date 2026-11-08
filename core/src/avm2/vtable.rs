@@ -20,6 +20,24 @@ use std::collections::HashMap;
 #[collect(no_drop)]
 pub struct VTable<'gc>(Gc<'gc, VTableData<'gc>>);
 
+// Bitmap symbol subclasses commonly introduce no properties. Lookup tables are
+// immutable once published; private namespaces, overrides and interface aliases
+// detach on insertion. Method scopes and writable slot caches stay per class.
+#[derive(Collect, Clone, Default)]
+#[collect(no_drop)]
+struct TraitNames<'gc>(std::rc::Rc<PropertyMap<'gc, Property>>);
+impl<'gc> std::ops::Deref for TraitNames<'gc> {
+    type Target = PropertyMap<'gc, Property>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for TraitNames<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        std::rc::Rc::make_mut(&mut self.0)
+    }
+}
+
 #[derive(Collect, Default)]
 #[collect(no_drop)]
 struct VTableData<'gc> {
@@ -27,7 +45,7 @@ struct VTableData<'gc> {
 
     protected_namespace: Option<Namespace<'gc>>,
 
-    resolved_traits: PropertyMap<'gc, Property>,
+    resolved_traits: TraitNames<'gc>,
 
     /// Use hashmaps for the metadata tables because metadata will rarely be present on traits
     slot_metadata_table: HashMap<usize, Box<[Metadata<'gc>]>>,
@@ -270,7 +288,7 @@ impl<'gc> VTable<'gc> {
         // so long-term it's still something we should verify.
         // (and it's far from the only verification check we lack anyway)
 
-        let mut resolved_traits = PropertyMap::new();
+        let mut resolved_traits = TraitNames::default();
         let mut slot_metadata_table = HashMap::new();
         let mut disp_metadata_table = HashMap::new();
         let mut slot_table = Vec::new();
@@ -284,7 +302,13 @@ impl<'gc> VTable<'gc> {
         let mut force_auto_assign_slots = false;
 
         if let Some(superclass_vtable) = superclass_vtable {
-            resolved_traits = superclass_vtable.resolved_traits().clone();
+            resolved_traits = if ruffle_render::profile::optimized() {
+                superclass_vtable.0.resolved_traits.clone()
+            } else {
+                TraitNames(std::rc::Rc::new(
+                    superclass_vtable.resolved_traits().clone(),
+                ))
+            };
             slot_metadata_table = superclass_vtable.0.slot_metadata_table.clone();
             disp_metadata_table = superclass_vtable.0.disp_metadata_table.clone();
             slot_table.extend_from_slice(&superclass_vtable.0.slot_table);

@@ -297,6 +297,10 @@ impl<'gc> LoadManager<'gc> {
         })
     }
 
+    pub fn pending_counts(&self) -> (usize, usize) {
+        (self.movies.len(), self.active_reads.len())
+    }
+
     /// Add a new loader to the `LoadManager`.
     ///
     /// Returns the loader handle for later inspection. A loader handle is
@@ -435,7 +439,8 @@ impl<'gc> LoadManager<'gc> {
                                 Some(url.clone()),
                                 None,
                             )
-                            .expect("Could not load movie");
+                            .expect("Could not load movie")
+                            .with_shared_bytes(ruffle_render::profile::optimized());
 
                             let movie = SwfMovie::new(uc.gc(), movie);
 
@@ -855,7 +860,8 @@ impl<'gc> MovieLoader<'gc> {
     ) -> Result<(), Error> {
         ContentType::sniff(&body).expect(ContentType::Swf)?;
 
-        let movie = SwfMovieData::from_data(&body, url, loader_url, None)?;
+        let movie = SwfMovieData::from_data(&body, url, loader_url, None)?
+            .with_shared_bytes(ruffle_render::profile::optimized());
         player.mutate_with_update_context(|uc| {
             // Make a copy of the properties on the root, so we can put them back after replacing it
             let mut root_properties: IndexMap<AvmString, Value> = IndexMap::new();
@@ -1044,7 +1050,8 @@ pub fn load_root_movie<'gc>(
                     .unwrap()
                     .ui()
                     .display_root_movie_download_failed_message(true, error.to_string());
-            })?;
+            })?
+            .with_shared_bytes(ruffle_render::profile::optimized());
         on_metadata(movie.header());
         movie.append_parameters(parameters);
         player.lock().unwrap().mutate_with_update_context(|uc| {
@@ -1801,7 +1808,8 @@ impl<'gc> MovieLoader<'gc> {
                     url.clone(),
                     loader_url.clone(),
                     load_bytes_info,
-                )?;
+                )?
+                .with_shared_bytes(ruffle_render::profile::optimized());
 
                 if matches!(vm_data, MovieLoaderVMData::Avm1 { .. }) {
                     // If AVM1 loads a SWF, that SWF is always interpreted as

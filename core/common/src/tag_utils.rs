@@ -66,6 +66,93 @@ impl<'gc> SwfMovieWeak<'gc> {
     }
 }
 
+/// The tag stream and, for a shareable movie, the exact FWS returned by LoaderInfo.bytes.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+struct Mapping {
+    file: std::fs::File,
+    view: memmap2::Mmap,
+}
+// The unlinked temporary file is private. Nothing writes to it after construction.
+// Both the read-only source and private VM mappings retain the file content.
+#[cfg(not(target_family = "wasm"))]
+impl Mapping {
+    fn new(bytes: &[u8]) -> std::io::Result<Self> {
+        use std::io::Write;
+        let mut file = tempfile::tempfile()?;
+        file.write_all(bytes)?;
+        let view = unsafe { memmap2::Mmap::map(&file)? };
+        Ok(Self { file, view })
+    }
+}
+#[derive(Clone, Debug, Collect)]
+#[collect(require_static)]
+pub struct MovieBytes {
+    file: Vec<u8>,
+    tags_offset: usize,
+    #[cfg(not(target_family = "wasm"))]
+    mapping: Option<Arc<Mapping>>,
+}
+impl From<Vec<u8>> for MovieBytes {
+    fn from(file: Vec<u8>) -> Self {
+        Self {
+            file,
+            tags_offset: 0,
+            #[cfg(not(target_family = "wasm"))]
+            mapping: None,
+        }
+    }
+}
+impl std::ops::Deref for MovieBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.file()[self.tags_offset..]
+    }
+}
+impl MovieBytes {
+    pub fn file(&self) -> &[u8] {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(m) = &self.mapping {
+            return &m.view;
+        }
+        &self.file
+    }
+    fn share_pages(&mut self) {
+        #[cfg(not(target_family = "wasm"))]
+        if self.file.len() >= 64 * 1024
+            && let Ok(m) = Mapping::new(&self.file)
+        {
+            self.mapping = Some(Arc::new(m));
+            self.file = Vec::new();
+        }
+    }
+    pub fn private_pages(&self) -> Option<PrivatePages> {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(m) = &self.mapping {
+            return unsafe { memmap2::MmapOptions::new().map_copy(&m.file) }
+                .ok()
+                .map(PrivatePages);
+        }
+        None
+    }
+}
+#[derive(Debug)]
+pub struct PrivatePages(
+    #[cfg(not(target_family = "wasm"))] memmap2::MmapMut,
+    #[cfg(target_family = "wasm")] Vec<u8>,
+);
+impl std::ops::Deref for PrivatePages {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for PrivatePages {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
 /// An open, fully parsed SWF movie ready to play back, either in a Player or a
 /// MovieClip.
 #[derive(Clone, Collect)]
@@ -75,7 +162,7 @@ pub struct SwfMovieData {
     header: HeaderExt,
 
     /// Uncompressed SWF data.
-    data: Arc<Vec<u8>>,
+    data: Arc<MovieBytes>,
 
     /// The URL the SWF was downloaded from.
     url: String,
@@ -125,7 +212,7 @@ impl SwfMovieData {
         let sandbox_type = SandboxType::infer(url.as_str(), &header);
         Self {
             header,
-            data: Arc::new(Vec::new()),
+            data: Arc::new(Vec::new().into()),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -155,7 +242,7 @@ impl SwfMovieData {
         Self {
             header,
             compressed_len,
-            data: Arc::new(Vec::new()),
+            data: Arc::new(Vec::new().into()),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -182,7 +269,7 @@ impl SwfMovieData {
         Self {
             header,
             compressed_len: compressed_data.len(),
-            data: Arc::new(compressed_data),
+            data: Arc::new(compressed_data.into()),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -206,7 +293,7 @@ impl SwfMovieData {
         let sandbox_type = SandboxType::infer(movie_url.as_str(), &header);
         Self {
             header,
-            data: Arc::new(Vec::new()),
+            data: Arc::new(Vec::new().into()),
             url: movie_url,
             loader_url: None,
             parameters: Vec::new(),
@@ -243,7 +330,7 @@ impl SwfMovieData {
 
         let mut movie = Self {
             header: swf_buf.header,
-            data: Arc::new(swf_buf.data),
+            data: Arc::new(swf_buf.data.into()),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -273,7 +360,7 @@ impl SwfMovieData {
         let sandbox_type = SandboxType::infer(url.as_str(), &header);
         let mut movie = Self {
             header,
-            data: Arc::new(Vec::new()),
+            data: Arc::new(Vec::new().into()),
             url,
             loader_url: None,
             parameters: Vec::new(),
@@ -308,6 +395,38 @@ impl SwfMovieData {
         &self.header
     }
 
+    /// Build the same uncompressed header as LoaderInfo.bytes once. Tag offsets stay
+    /// relative to the first tag via MovieBytes::deref, including existing SwfSlice APIs.
+    pub fn with_shared_bytes(mut self, enabled: bool) -> Self {
+        if !enabled || self.data.tags_offset != 0 || self.data.is_empty() || !self.is_movie {
+            return self;
+        }
+        let mut header = self.header.swf_header().clone();
+        header.compression = swf::Compression::None;
+        let mut prefix = Vec::new();
+        if swf::write_swf(&header, &[], &mut prefix).is_err() {
+            return self;
+        }
+        prefix.truncate(prefix.len() - 2);
+        let offset = prefix.len();
+        let total = offset + self.data.len();
+        let Ok(length) = u32::try_from(total) else {
+            return self;
+        };
+        prefix[4..8].copy_from_slice(&length.to_le_bytes());
+        let storage = Arc::make_mut(&mut self.data);
+        let n = storage.file.len();
+        storage.file.reserve_exact(offset);
+        storage.file.resize(total, 0);
+        storage.file.copy_within(0..n, offset);
+        storage.file[..offset].copy_from_slice(&prefix);
+        storage.tags_offset = offset;
+        storage.share_pages();
+        self
+    }
+    pub fn shared_file(&self) -> Option<Arc<MovieBytes>> {
+        (self.data.tags_offset > 0).then(|| self.data.clone())
+    }
     /// Get the version of the SWF.
     pub fn version(&self) -> u8 {
         self.header.version()
@@ -428,7 +547,7 @@ impl Debug for SwfMovieData {
 #[derive(Debug, Clone, Collect)]
 #[collect(no_drop)]
 pub struct SwfSlice {
-    entire_data: Arc<Vec<u8>>,
+    entire_data: Arc<MovieBytes>,
     swf_version: u8,
 
     pub start: usize,

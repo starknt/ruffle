@@ -452,6 +452,10 @@ impl<'gc> Library<'gc> {
         self.movie_libraries.get_or_insert_mut(movie)
     }
 
+    pub fn movie_count(&self) -> usize {
+        self.movie_libraries.0.len()
+    }
+
     pub fn known_movies(&self) -> impl Iterator<Item = SwfMovie<'gc>> {
         self.movie_libraries.known_movies()
     }

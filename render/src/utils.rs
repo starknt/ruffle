@@ -36,6 +36,7 @@ pub fn decode_define_bits_jpeg(
     data: &[u8],
     alpha_data: Option<&[u8]>,
 ) -> Result<Bitmap<'static>, Error> {
+    let _decode = crate::profile::time(crate::profile::Phase::Decode);
     let format = determine_jpeg_tag_format(data);
     if format != JpegTagFormat::Jpeg && alpha_data.is_some() {
         // Only DefineBitsJPEG3 with true JPEG data should have separate alpha data.
@@ -270,6 +271,7 @@ fn decode_jpeg(jpeg_data: &[u8], alpha_data: Option<&[u8]>) -> Result<Bitmap<'st
 pub fn decode_define_bits_lossless(
     swf_tag: &swf::DefineBitsLossless,
 ) -> Result<Bitmap<'static>, Error> {
+    let _decode = crate::profile::time(crate::profile::Phase::Decode);
     // Decompress the image data (DEFLATE compression).
     let mut decoded_data = decompress_zlib(&swf_tag.data)?;
 

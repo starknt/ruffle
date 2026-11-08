@@ -252,6 +252,16 @@ impl<'gc> BitmapData<'gc> {
         Self(data)
     }
 
+    pub(crate) fn from_symbol(
+        mc: &Mutation<'gc>,
+        symbol: std::rc::Rc<crate::bitmap::symbol_pixels::SymbolImage>,
+    ) -> Self {
+        let size = symbol.data.size();
+        let mut raw = BitmapRawData::new_with_pixels(size.width, size.height, true, Vec::new());
+        raw.pixels = crate::bitmap::symbol_pixels::Pixels::symbol(symbol);
+        Self(BitmapRawDataWrapper::new(Gc::new(mc, raw.into())))
+    }
+
     pub fn dummy(mc: &Mutation<'gc>) -> Self {
         Self(BitmapRawDataWrapper::dummy(mc))
     }
@@ -368,7 +378,7 @@ impl<'gc> BitmapData<'gc> {
 pub struct BitmapRawData<'gc> {
     /// The pixels in the bitmap, stored as a array of pre-multiplied ARGB colour values
     #[collect(require_static)]
-    pixels: Vec<Color>,
+    pixels: crate::bitmap::symbol_pixels::Pixels,
 
     width: u32,
     height: u32,
@@ -476,7 +486,7 @@ mod wrapper {
             BitmapRawDataWrapper(Gc::new(
                 mc,
                 BitmapRawData {
-                    pixels: Vec::new(),
+                    pixels: crate::bitmap::symbol_pixels::Pixels::owned(Vec::new()),
                     width: 0,
                     height: 0,
                     transparency: false,
@@ -669,8 +679,17 @@ mod wrapper {
 
             // Note - we do a CPU -> GPU sync, but we do *not* do a GPU -> CPU sync
             // (rendering is done on the GPU, so the CPU pixels don't need to be up-to-date).
-            inner_bitmap_data.update_dirty_texture(context.renderer);
-            let handle = inner_bitmap_data.bitmap_handle(context.renderer);
+            let view = if inner_bitmap_data.bitmap_handle.is_none()
+                && matches!(inner_bitmap_data.dirty_state, DirtyState::Clean)
+            {
+                inner_bitmap_data.pixels.view(context.renderer)
+            } else {
+                None
+            };
+            let handle = view.unwrap_or_else(|| {
+                inner_bitmap_data.update_dirty_texture(context.renderer);
+                inner_bitmap_data.bitmap_handle(context.renderer)
+            });
 
             context.commands.render_bitmap(
                 handle,
@@ -732,10 +751,14 @@ impl std::fmt::Debug for BitmapRawData<'_> {
 impl<'gc> BitmapRawData<'gc> {
     pub fn new(width: u32, height: u32, transparency: bool, fill_color: u32) -> Self {
         Self {
-            pixels: vec![
-                Color::bgra_u32(fill_color).to_premultiplied_alpha(transparency);
-                width as usize * height as usize
-            ],
+            pixels: crate::bitmap::symbol_pixels::Pixels::owned(vec![
+                Color::bgra_u32(fill_color)
+                    .to_premultiplied_alpha(
+                        transparency
+                    );
+                width as usize
+                    * height as usize
+            ]),
             width,
             height,
             transparency,
@@ -756,7 +779,7 @@ impl<'gc> BitmapRawData<'gc> {
         pixels: Vec<Color>,
     ) -> Self {
         Self {
-            pixels,
+            pixels: crate::bitmap::symbol_pixels::Pixels::owned(pixels),
             width,
             height,
             transparency,
@@ -777,7 +800,7 @@ impl<'gc> BitmapRawData<'gc> {
     pub fn dispose(&mut self) {
         self.width = 0;
         self.height = 0;
-        self.pixels = Vec::new(); // free the CPU pixel buffer
+        self.pixels = crate::bitmap::symbol_pixels::Pixels::owned(Vec::new()); // free the CPU pixel buffer
         self.bitmap_handle = None;
         // There's no longer a handle to update
         self.dirty_state = DirtyState::Clean;

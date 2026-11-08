@@ -24,7 +24,7 @@ use crate::avm2_stub_method;
 use crate::bitmap::bitmap_data::{BitmapData, ChannelOptions, ThresholdOperation};
 use crate::bitmap::bitmap_data::{BitmapDataDrawError, IBitmapDrawable};
 use crate::bitmap::{is_size_valid, operations};
-use crate::character::{Character, CompressedBitmap};
+use crate::character::{BitmapCharacter, Character};
 use crate::ecma_conversions::round_to_even;
 use crate::swf::BlendMode;
 use ruffle_render::filters::Filter;
@@ -72,9 +72,15 @@ fn get_rectangle_x_y_width_height<'gc>(
 /// class named by `name`.
 pub fn fill_bitmap_data_from_symbol<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    bd: &CompressedBitmap,
+    bd: &BitmapCharacter<'gc>,
 ) -> BitmapData<'gc> {
-    let bitmap = bd.decode().expect("Failed to decode BitmapData");
+    if ruffle_render::profile::optimized() {
+        return BitmapData::from_symbol(activation.gc(), bd.symbol_image());
+    }
+    let bitmap = bd
+        .compressed()
+        .decode()
+        .expect("Failed to decode BitmapData");
     BitmapData::new_with_pixels(
         activation.context.gc_context,
         bitmap.width(),
@@ -114,7 +120,7 @@ pub fn init<'gc>(
 
     let new_bitmap_data = if let Some(Character::Bitmap(bitmap)) = character {
         // Instantiating BitmapData from an Animate-style bitmap asset
-        fill_bitmap_data_from_symbol(activation, bitmap.compressed())
+        fill_bitmap_data_from_symbol(activation, &bitmap)
     } else {
         if character.is_some() {
             //TODO: Determine if mismatched symbols will still work as a

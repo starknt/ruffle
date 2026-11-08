@@ -164,6 +164,8 @@ fn trial_for_test(
     let env = env.clone();
 
     let trial = Trial::test(test.name.clone(), move || {
+        #[cfg(feature = "imgtests")]
+        let _scope = ruffle_render_wgpu::profile::enter(None, environment::test_optimized());
         let mut runner = test.create_test_runner(env.as_ref())?;
 
         loop {

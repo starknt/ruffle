@@ -32,6 +32,8 @@ mod globals;
 mod pipelines;
 mod pixel_bender;
 pub mod target;
+pub use ruffle_render::profile;
+mod idle_pool;
 
 pub mod backend;
 mod blend;
@@ -180,6 +182,7 @@ impl QueueSyncHandle {
         with_rgba: F,
         frame: &mut ActiveFrame,
     ) -> R {
+        let _readback = ruffle_render::profile::time(ruffle_render::profile::Phase::Readback);
         match self {
             QueueSyncHandle::AlreadyCopied {
                 index,
@@ -208,7 +211,7 @@ impl QueueSyncHandle {
                 );
 
                 let buffer = pool.take(&descriptors, buffer_dimensions.clone());
-                frame.command_encoder.copy_texture_to_buffer(
+                frame.encoder().copy_texture_to_buffer(
                     wgpu::TexelCopyTextureInfo {
                         texture: &texture.texture,
                         mip_level: 0,
@@ -257,6 +260,7 @@ impl QueueSyncHandle {
 
 #[derive(Debug)]
 pub struct Texture {
+    pub(crate) _allocation: ruffle_render::profile::GpuBitmap,
     pub(crate) texture: wgpu::Texture,
     view: wgpu::TextureView,
     repeating_linear: OnceCell<BitmapBinds>,

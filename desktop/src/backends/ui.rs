@@ -386,11 +386,14 @@ impl UiBackend for DesktopUiBackend {
         register: &mut dyn FnMut(FontDefinition),
     ) -> Vec<FontQuery> {
         cfg_select! {
-            all(unix, feature = "fontconfig") => {
-                fontconfig::sort_device_fonts(query, register, self.device_font_renderer, &self.font_atlases)
-                    .inspect_err(|err| tracing::error!("Cannot sort device fonts: {err}"))
-                    .unwrap_or_default()
-            }
+            all(unix, feature = "fontconfig") => fontconfig::sort_device_fonts(
+                query,
+                register,
+                self.device_font_renderer,
+                &self.font_atlases,
+            )
+            .inspect_err(|err| tracing::error!("Cannot sort device fonts: {err}"))
+            .unwrap_or_default(),
             _ => Vec::new(),
         }
     }

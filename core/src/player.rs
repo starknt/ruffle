@@ -601,6 +601,7 @@ impl Player {
     }
 
     pub fn tick(&mut self, dt: FloatDuration) {
+        let _logic = ruffle_render::profile::time(ruffle_render::profile::Phase::Logic);
         if !self.is_playing() {
             return;
         }
@@ -1091,6 +1092,10 @@ impl Player {
 
     pub fn suspend_after_next_frame(&mut self) {
         self.set_run_state(RunState::Stepping);
+    }
+
+    pub fn gc_object_count(&self) -> usize {
+        self.gc_arena.borrow().metrics().total_gc_count()
     }
 
     pub fn needs_render(&self) -> bool {
@@ -2610,6 +2615,7 @@ impl Player {
         self.update_mouse_state(EnumSet::empty(), false, &mut false);
 
         // GC
+        let _gc_time = ruffle_render::profile::time(ruffle_render::profile::Phase::Gc);
         self.gc_arena.borrow_mut().collect_debt();
 
         rval
@@ -3319,6 +3325,14 @@ impl PlayerBuilder {
 
                 // GC data
                 gc_arena: Rc::new(RefCell::new(GcArena::new(|gc_context| {
+                    if ruffle_render::profile::optimized() {
+                        // SWF loading creates large buffers outside the arena. Wake the incremental
+                        // collector sooner instead of waiting for the number of small AVM objects to double.
+                        gc_context.metrics().set_pacing(gc_arena::metrics::Pacing {
+                            sleep_factor: 0.15,
+                            ..Default::default()
+                        });
+                    }
                     Self::create_gc_root(
                         gc_context,
                         player_version,

@@ -53,10 +53,89 @@ pub enum ObjectEncoding {
     Amf3 = 3,
 }
 
+/// Each AS3 ByteArray owns its cursor, endian and encoding; read-only movie
+/// bytes can share storage with SwfSlice until the first actual write.
+#[derive(Debug)]
+enum Storage {
+    Owned(Vec<u8>),
+    Movie(std::sync::Arc<ruffle_common::tag_utils::MovieBytes>),
+    Private(ruffle_common::tag_utils::PrivatePages, usize),
+}
+impl Clone for Storage {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Movie(m) => Self::Movie(m.clone()),
+            s => Self::Owned(s.to_vec()),
+        }
+    }
+}
+impl std::ops::Deref for Storage {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Movie(m) => m.file(),
+            Self::Private(p, n) => &p[..*n],
+        }
+    }
+}
+impl std::ops::DerefMut for Storage {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        if let Self::Movie(m) = self {
+            ruffle_render::profile::loader_bytes(2, m.file().len());
+            *self = match m.private_pages() {
+                Some(p) => {
+                    let n = p.len();
+                    Self::Private(p, n)
+                }
+                None => Self::Owned(m.file().to_vec()),
+            };
+        }
+        match self {
+            Self::Owned(v) => v,
+            Self::Private(p, n) => &mut p[..*n],
+            _ => unreachable!(),
+        }
+    }
+}
+impl Storage {
+    fn resize(&mut self, n: usize, fill: u8) {
+        if n == self.len() {
+            return;
+        }
+        if n == 0 && !matches!(self, Self::Owned(_)) {
+            *self = Self::Owned(Vec::new());
+            return;
+        }
+        if let Self::Movie(m) = self
+            && n < m.file().len()
+            && let Some(p) = m.private_pages()
+        {
+            *self = Self::Private(p, n);
+            return;
+        }
+        if let Self::Private(p, len) = self
+            && n <= p.len()
+        {
+            if n > *len {
+                p[*len..n].fill(fill)
+            }
+            *len = n;
+            return;
+        }
+        if !matches!(self, Self::Owned(_)) {
+            *self = Self::Owned(self.to_vec());
+        }
+        if let Self::Owned(v) = self {
+            v.resize(n, fill);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ByteArrayStorage {
     /// Underlying ByteArray
-    bytes: Vec<u8>,
+    bytes: Storage,
 
     /// The current position to read/write from
     position: Cell<usize>,
@@ -72,7 +151,7 @@ impl ByteArrayStorage {
     /// Create a new ByteArrayStorage
     pub fn new(context: &mut UpdateContext<'_>) -> ByteArrayStorage {
         ByteArrayStorage {
-            bytes: Vec::new(),
+            bytes: Storage::Owned(Vec::new()),
             position: Cell::new(0),
             endian: Endian::Big,
             object_encoding: context.avm2.default_bytearray_encoding,
@@ -81,12 +160,23 @@ impl ByteArrayStorage {
 
     /// Create a new ByteArrayStorage using an already existing vector
     pub fn from_vec(context: &mut UpdateContext<'_>, bytes: Vec<u8>) -> ByteArrayStorage {
+        if ruffle_render::profile::optimized() && bytes.len() >= 64 * 1024 {
+            context
+                .gc()
+                .metrics()
+                .adjust_debt((bytes.capacity() / 1024) as f64);
+        }
         ByteArrayStorage {
-            bytes,
+            bytes: Storage::Owned(bytes),
             position: Cell::new(0),
             endian: Endian::Big,
             object_encoding: context.avm2.default_bytearray_encoding,
         }
+    }
+
+    pub fn set_shared_movie(&mut self, data: std::sync::Arc<ruffle_common::tag_utils::MovieBytes>) {
+        self.bytes = Storage::Movie(data);
+        self.position.set(0);
     }
 
     /// Write bytes at the next position in the ByteArray, growing if needed.
@@ -201,15 +291,15 @@ impl ByteArrayStorage {
             CompressionAlgorithm::Zlib => {
                 // Note: some content is sensitive to compression type
                 // (as it's visible in the header)
-                let mut encoder = ZlibEncoder::new(&*self.bytes, Compression::best());
+                let mut encoder = ZlibEncoder::new(&self.bytes[..], Compression::best());
                 encoder.read_to_end(&mut buffer).err().map(|e| e.into())
             }
             CompressionAlgorithm::Deflate => {
-                let mut encoder = DeflateEncoder::new(&*self.bytes, Compression::best());
+                let mut encoder = DeflateEncoder::new(&self.bytes[..], Compression::best());
                 encoder.read_to_end(&mut buffer).err().map(|e| e.into())
             }
             #[cfg(feature = "lzma")]
-            CompressionAlgorithm::Lzma => lzma_rs::lzma_compress(&mut &*self.bytes, &mut buffer)
+            CompressionAlgorithm::Lzma => lzma_rs::lzma_compress(&mut &self.bytes[..], &mut buffer)
                 .err()
                 .map(|e| e.into()),
             #[cfg(not(feature = "lzma"))]
@@ -228,17 +318,19 @@ impl ByteArrayStorage {
         let mut buffer = Vec::new();
         let error: Option<Box<dyn std::error::Error>> = match algorithm {
             CompressionAlgorithm::Zlib => {
-                let mut decoder = ZlibDecoder::new(&*self.bytes);
+                let mut decoder = ZlibDecoder::new(&self.bytes[..]);
                 decoder.read_to_end(&mut buffer).err().map(|e| e.into())
             }
             CompressionAlgorithm::Deflate => {
-                let mut decoder = DeflateDecoder::new(&*self.bytes);
+                let mut decoder = DeflateDecoder::new(&self.bytes[..]);
                 decoder.read_to_end(&mut buffer).err().map(|e| e.into())
             }
             #[cfg(feature = "lzma")]
-            CompressionAlgorithm::Lzma => lzma_rs::lzma_decompress(&mut &*self.bytes, &mut buffer)
-                .err()
-                .map(|e| e.into()),
+            CompressionAlgorithm::Lzma => {
+                lzma_rs::lzma_decompress(&mut &self.bytes[..], &mut buffer)
+                    .err()
+                    .map(|e| e.into())
+            }
             #[cfg(not(feature = "lzma"))]
             CompressionAlgorithm::Lzma => Some("Ruffle was not compiled with LZMA support".into()),
         };
@@ -276,13 +368,15 @@ impl ByteArrayStorage {
 
     #[inline]
     pub fn clear(&mut self) {
-        self.bytes.clear();
+        self.bytes.resize(0, 0);
         self.position.set(0)
     }
 
     #[inline]
     pub fn shrink_to_fit(&mut self) {
-        self.bytes.shrink_to_fit()
+        if let Storage::Owned(v) = &mut self.bytes {
+            v.shrink_to_fit()
+        }
     }
 
     #[inline]
@@ -307,7 +401,11 @@ impl ByteArrayStorage {
     /// method sets the bytearray's `position` to 0.
     pub fn swap_storage_with(&mut self, new_data: &mut Vec<u8>) {
         self.position.set(0);
-        std::mem::swap(&mut self.bytes, new_data);
+        let old = std::mem::replace(&mut self.bytes, Storage::Owned(std::mem::take(new_data)));
+        *new_data = match old {
+            Storage::Owned(v) => v,
+            s => s.to_vec(),
+        };
     }
 
     /// Write a single byte at any offset in the bytearray, panicking if out of bounds.
@@ -465,3 +563,40 @@ macro_rules! impl_read{
 
 impl_write!(write_float f32, write_double f64, write_int i32, write_unsigned_int u32, write_short i16, write_unsigned_short u16);
 impl_read!(read_float read_float_at 4; f32, read_double read_double_at 8; f64, read_int read_int_at 4; i32, read_unsigned_int read_unsigned_int_at 4; u32, read_short read_short_at 2; i16, read_unsigned_short read_unsigned_short_at 2; u16, read_byte read_byte_at 1; i8, read_unsigned_byte read_unsigned_byte_at 1; u8);
+
+#[cfg(test)]
+mod shared_movie_tests {
+    use super::Storage;
+    use ruffle_common::tag_utils::SwfMovieData;
+    #[test]
+    fn writing_one_loader_info_array_never_changes_the_movie_or_another_array() {
+        // A complete FWS large enough to exercise private page mappings on native builds.
+        let mut fws = Vec::new();
+        swf::write_swf(
+            &swf::Header::default_with_swf_version(10),
+            &[swf::Tag::DefineBinaryData(swf::DefineBinaryData {
+                id: 1,
+                data: &vec![0x5a; 96 * 1024],
+            })],
+            &mut fws,
+        )
+        .unwrap();
+        let movie = SwfMovieData::from_data(&fws, "file:///a.swf".into(), None, None)
+            .unwrap()
+            .with_shared_bytes(true);
+        let source = movie.shared_file().unwrap();
+        assert_eq!(source.file(), fws);
+        let mut left = Storage::Movie(source.clone());
+        let right = left.clone();
+        left[8192] = 0;
+        left.resize(8200, 0);
+        left.resize(16384, 0);
+        assert_eq!(left[8192], 0);
+        assert_eq!(right[8192], 0x5a);
+        assert!(left[8200..].iter().all(|b| *b == 0));
+        assert_eq!(source.file(), fws);
+        left.resize(2 * fws.len(), 0);
+        assert_eq!(&left[..3], b"FWS");
+        assert_eq!(right.len(), fws.len());
+    }
+}

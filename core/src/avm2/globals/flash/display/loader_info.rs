@@ -450,6 +450,13 @@ pub fn get_bytes<'gc>(
 
     let mut ba_write = ba.as_bytearray_mut().unwrap();
 
+    ruffle_render::profile::loader_bytes(0, root.data().len());
+    if let Some(data) = root.shared_file() {
+        ruffle_render::profile::loader_bytes(1, root.data().len());
+        ba_write.set_shared_movie(data);
+        return Ok(ba.into());
+    }
+
     // First, write a fake header corresponding to an
     // uncompressed SWF
     let mut header = root.header().swf_header().clone();

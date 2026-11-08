@@ -47,3 +47,5 @@ pub fn is_size_valid(swf_version: u8, width: u32, height: u32) -> bool {
     }
     true
 }
+
+pub(crate) mod symbol_pixels;
