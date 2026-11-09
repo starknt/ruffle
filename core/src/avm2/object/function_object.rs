@@ -16,6 +16,10 @@ use gc_arena::barrier::unlock;
 use gc_arena::{Collect, Gc, GcWeak, Mutation, lock::Lock};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_macros::istr;
+use std::time::Duration;
+use web_time::Instant;
+
+const SLOW_METHOD: Duration = Duration::from_millis(20);
 
 /// An Object which can be called to execute its function code.
 #[derive(Collect, Clone, Copy)]
@@ -96,7 +100,18 @@ impl<'gc> FunctionObject<'gc> {
     ) -> Result<Value<'gc>, Error<'gc>> {
         let exec = &self.0.exec;
 
-        exec.exec(receiver, arguments, activation, Some(self))
+        let started = ruffle_render::profile::enabled().then(Instant::now);
+        let result = exec.exec(receiver, arguments, activation, Some(self));
+        if let Some(started) = started
+            && started.elapsed() >= SLOW_METHOD
+        {
+            let method_name = exec.debug_full_name();
+            eprintln!(
+                "[render-profile] slow AVM2 method method={method_name} elapsed_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+        result
     }
 
     pub fn construct(

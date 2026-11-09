@@ -202,13 +202,24 @@ impl<'gc> Sockets<'gc> {
     pub fn update_sockets(context: &mut UpdateContext<'gc>) {
         let mut actions = vec![];
 
-        while let Ok(action) = context.sockets.receiver.try_recv() {
-            actions.push(action)
+        {
+            let _receive =
+                ruffle_render::profile::time(ruffle_render::profile::Phase::SocketReceive);
+            while let Ok(action) = context.sockets.receiver.try_recv() {
+                actions.push(action)
+            }
         }
 
         for action in actions {
+            match &action {
+                SocketAction::Connect(..) => ruffle_render::profile::socket_connect(),
+                SocketAction::Data(_, data) => ruffle_render::profile::socket_data(data.len()),
+                SocketAction::Close(..) => ruffle_render::profile::socket_close(),
+            }
             match action {
                 SocketAction::Connect(handle, ConnectionState::Connected) => {
+                    let _connect =
+                        ruffle_render::profile::time(ruffle_render::profile::Phase::SocketConnect);
                     let target = match context.sockets.sockets.get(handle) {
                         Some(socket) => {
                             socket.connected.set(true);
@@ -245,6 +256,8 @@ impl<'gc> Sockets<'gc> {
                     handle,
                     ConnectionState::Failed | ConnectionState::TimedOut,
                 ) => {
+                    let _connect =
+                        ruffle_render::profile::time(ruffle_render::profile::Phase::SocketConnect);
                     let target = match context.sockets.sockets.get(handle) {
                         Some(socket) => socket.target,
                         // Socket must have been closed before we could send event.
@@ -280,6 +293,8 @@ impl<'gc> Sockets<'gc> {
                     }
                 }
                 SocketAction::Data(handle, data) => {
+                    let _data =
+                        ruffle_render::profile::time(ruffle_render::profile::Phase::SocketData);
                     let target = match context.sockets.sockets.get(handle) {
                         Some(socket) => socket.target,
                         // Socket must have been closed before we could send event.
@@ -354,6 +369,8 @@ impl<'gc> Sockets<'gc> {
                     }
                 }
                 SocketAction::Close(handle) => {
+                    let _close =
+                        ruffle_render::profile::time(ruffle_render::profile::Phase::SocketClose);
                     let target = match context.sockets.sockets.remove(handle) {
                         Some(socket) => {
                             socket.connected.set(false);

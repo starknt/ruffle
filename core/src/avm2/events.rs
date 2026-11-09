@@ -11,6 +11,10 @@ use fnv::FnvHashMap;
 use gc_arena::Collect;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
+use std::time::Duration;
+use web_time::Instant;
+
+const SLOW_EVENT_HANDLER: Duration = Duration::from_millis(100);
 
 /// Which phase of event dispatch is currently occurring.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -455,7 +459,17 @@ fn dispatch_event_to_target<'gc>(
             activation.context.avm2.call_stack().borrow().depth(),
             *wall_clock,
         )));
+        let started = ruffle_render::profile::enabled().then(Instant::now);
         let result = handler.call(activation, global.into(), FunctionArgs::from_slice(args));
+        if let Some(started) = started
+            && started.elapsed() >= SLOW_EVENT_HANDLER
+        {
+            let handler_name = handler.executable().debug_full_name();
+            eprintln!(
+                "[render-profile] slow AVM2 event handler event={name} handler={handler_name} elapsed_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
         activation.context.playback.callback_clock.set(previous);
         if let Err(err) = result {
             let event_name = event.event().event_type();

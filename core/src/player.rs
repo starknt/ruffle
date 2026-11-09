@@ -618,9 +618,20 @@ impl Player {
             self.refresh_wall_deadline();
             return;
         }
-        self.update_sockets();
-        self.update_net_connections();
-        self.mutate_with_update_context(|ctx| Timers::update_wall_timers(ctx, dt));
+        {
+            let _socket = ruffle_render::profile::time(ruffle_render::profile::Phase::Socket);
+            self.update_sockets();
+        }
+        {
+            let _net_connection =
+                ruffle_render::profile::time(ruffle_render::profile::Phase::NetConnection);
+            self.update_net_connections();
+        }
+        {
+            let _wall_timers =
+                ruffle_render::profile::time(ruffle_render::profile::Phase::WallTimers);
+            self.mutate_with_update_context(|ctx| Timers::update_wall_timers(ctx, dt));
+        }
         let frame_ms = self.frame_duration().as_millis().max(1.0);
         self.playback.wall_frame_credit += dt.as_millis();
         if self.playback.wall_frame_credit >= frame_ms {
@@ -661,8 +672,15 @@ impl Player {
         }
         self.playback.batching_input = false;
         self.refresh_wall_deadline();
-        self.update(|context| StreamManager::tick(context, dt));
-        self.audio.tick();
+        {
+            let _streams = ruffle_render::profile::time(ruffle_render::profile::Phase::Streams);
+            self.update(|context| StreamManager::tick(context, dt));
+        }
+        {
+            let _audio_tick =
+                ruffle_render::profile::time(ruffle_render::profile::Phase::AudioTick);
+            self.audio.tick();
+        }
     }
 
     fn refresh_wall_deadline(&mut self) {
@@ -726,25 +744,48 @@ impl Player {
         // Adjust playback speed for next frame to stay in sync with timeline audio tracks ("stream" sounds).
         if let Some(wall_dt) = wall_dt {
             let cur_frame_offset = self.frame_accumulator.as_millis();
-            let audio_skew = self.mutate_with_update_context(|context| {
-                context
-                    .audio_manager
-                    .audio_skew_time(context.audio, cur_frame_offset)
-            });
+            let audio_skew = {
+                let _audio_skew =
+                    ruffle_render::profile::time(ruffle_render::profile::Phase::AudioSkew);
+                self.mutate_with_update_context(|context| {
+                    context
+                        .audio_manager
+                        .audio_skew_time(context.audio, cur_frame_offset)
+                })
+            };
             self.frame_accumulator += FloatDuration::from_secs(audio_skew);
 
-            self.update_sockets();
-            self.update_net_connections();
+            {
+                let _socket = ruffle_render::profile::time(ruffle_render::profile::Phase::Socket);
+                self.update_sockets();
+            }
+            {
+                let _net_connection =
+                    ruffle_render::profile::time(ruffle_render::profile::Phase::NetConnection);
+                self.update_net_connections();
+            }
             if !self.playback.wall_classes.is_empty() {
+                let _wall_timers =
+                    ruffle_render::profile::time(ruffle_render::profile::Phase::WallTimers);
                 self.mutate_with_update_context(|ctx| Timers::update_wall_timers(ctx, wall_dt));
             }
         }
-        self.update_timers(dt);
+        {
+            let _timers = ruffle_render::profile::time(ruffle_render::profile::Phase::Timers);
+            self.update_timers(dt);
+        }
         if let Some(wall_dt) = wall_dt {
-            self.update(|context| {
-                StreamManager::tick(context, wall_dt);
-            });
-            self.audio.tick();
+            {
+                let _streams = ruffle_render::profile::time(ruffle_render::profile::Phase::Streams);
+                self.update(|context| {
+                    StreamManager::tick(context, wall_dt);
+                });
+            }
+            {
+                let _audio_tick =
+                    ruffle_render::profile::time(ruffle_render::profile::Phase::AudioTick);
+                self.audio.tick();
+            }
         }
     }
 
@@ -2227,7 +2268,10 @@ impl Player {
             ),
             LoadBehavior::Blocking => (ExecutionLimit::none(), false),
         };
-        let preload_finished = self.preload(&mut execution_limit);
+        let preload_finished = {
+            let _preload = ruffle_render::profile::time(ruffle_render::profile::Phase::Preload);
+            self.preload(&mut execution_limit)
+        };
 
         if !preload_finished && !may_execute_while_streaming {
             return;
@@ -2235,15 +2279,32 @@ impl Player {
 
         self.update(|context| {
             // TODO: Is this order correct?
-            run_all_phases_avm2(context);
-            Avm1::run_frame(context);
-            AudioManager::update_sounds(context);
-            LocalConnections::update_connections(context);
+            {
+                let _avm2 = ruffle_render::profile::time(ruffle_render::profile::Phase::Avm2);
+                run_all_phases_avm2(context);
+            }
+            {
+                let _avm1 = ruffle_render::profile::time(ruffle_render::profile::Phase::Avm1);
+                Avm1::run_frame(context);
+            }
+            {
+                let _audio = ruffle_render::profile::time(ruffle_render::profile::Phase::Audio);
+                AudioManager::update_sounds(context);
+            }
+            {
+                let _connections =
+                    ruffle_render::profile::time(ruffle_render::profile::Phase::Connections);
+                LocalConnections::update_connections(context);
+            }
 
             // Only run the current list of callbacks - any callbacks added during callback execution
             // will be run at the end of the *next* frame.
-            for cb in std::mem::take(context.post_frame_callbacks) {
-                (cb.callback)(context, cb.data);
+            {
+                let _post_frame =
+                    ruffle_render::profile::time(ruffle_render::profile::Phase::PostFrame);
+                for cb in std::mem::take(context.post_frame_callbacks) {
+                    (cb.callback)(context, cb.data);
+                }
             }
         });
 

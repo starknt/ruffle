@@ -17,6 +17,23 @@ pub enum Phase {
     Executor,
     StageCpu,
     HostAction,
+    Preload,
+    Avm2,
+    Avm1,
+    Audio,
+    PostFrame,
+    Connections,
+    AudioSkew,
+    Socket,
+    NetConnection,
+    WallTimers,
+    Timers,
+    Streams,
+    AudioTick,
+    SocketReceive,
+    SocketConnect,
+    SocketData,
+    SocketClose,
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Timing {
@@ -26,7 +43,9 @@ pub struct Timing {
 }
 #[derive(Debug, Default, Clone)]
 pub struct Counters {
-    pub timings: [Timing; 9],
+    pub timings: [Timing; 26],
+    pub socket_events: [u64; 3],
+    pub socket_data_bytes: u64,
     pub cpu_bitmap_bytes: u64,
     pub peak_cpu_bitmap_bytes: u64,
     pub cpu_bitmaps: u64,
@@ -49,6 +68,9 @@ thread_local! {
 }
 pub fn optimized() -> bool {
     OPTIMIZED.get()
+}
+pub fn enabled() -> bool {
+    CURRENT.with_borrow(Option::is_some)
 }
 pub struct Scope(Option<RenderMetrics>, bool);
 pub fn enter(metrics: Option<&RenderMetrics>, optimized: bool) -> Scope {
@@ -97,6 +119,29 @@ pub fn uploaded(bytes: u64) {
     CURRENT.with_borrow(|m| {
         if let Some(m) = m {
             m.0.borrow_mut().upload_bytes += bytes;
+        }
+    });
+}
+pub fn socket_connect() {
+    CURRENT.with_borrow(|m| {
+        if let Some(m) = m {
+            m.0.borrow_mut().socket_events[0] += 1;
+        }
+    });
+}
+pub fn socket_data(bytes: usize) {
+    CURRENT.with_borrow(|m| {
+        if let Some(m) = m {
+            let mut counters = m.0.borrow_mut();
+            counters.socket_events[1] += 1;
+            counters.socket_data_bytes += bytes as u64;
+        }
+    });
+}
+pub fn socket_close() {
+    CURRENT.with_borrow(|m| {
+        if let Some(m) = m {
+            m.0.borrow_mut().socket_events[2] += 1;
         }
     });
 }
@@ -183,4 +228,20 @@ pub fn loader_bytes(index: usize, bytes: usize) {
             m.0.borrow_mut().loader_bytes[index] += bytes as u64;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RenderMetrics, enabled, enter};
+
+    #[test]
+    fn profiling_is_enabled_only_inside_an_active_scope() {
+        assert!(!enabled());
+        let metrics = RenderMetrics::default();
+        {
+            let _scope = enter(Some(&metrics), false);
+            assert!(enabled());
+        }
+        assert!(!enabled());
+    }
 }
