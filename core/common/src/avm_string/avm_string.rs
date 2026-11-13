@@ -61,6 +61,13 @@ impl<'gc> AvmString<'gc> {
         self.0.fnv_hash()
     }
 
+    /// Returns a stable identity for the managed string during its GC lifetime.
+    /// This is intended for non-GC inline-cache keys, never for user-visible data.
+    #[inline]
+    pub fn ptr_id(&self) -> usize {
+        Gc::as_ptr(self.0) as usize
+    }
+
     pub fn as_wstr(&self) -> &'gc WStr {
         Gc::as_ref(self.0).as_wstr()
     }

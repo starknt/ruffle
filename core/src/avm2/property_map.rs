@@ -4,10 +4,103 @@ use crate::avm2::AvmString;
 use crate::avm2::Multiname;
 use crate::avm2::Namespace;
 use crate::avm2::QName;
-use fnv::FnvBuildHasher;
 use gc_arena::Collect;
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hash, Hasher};
+
+#[inline]
+fn hash_cached_fnv<H: Hasher>(cached: u64, state: &mut H) {
+    state.write_u64(cached);
+}
+
+#[derive(Clone, Copy, Default)]
+struct PropertyMapBuildHasher;
+
+struct PropertyMapHasher {
+    hash: u64,
+}
+
+impl Hasher for PropertyMapHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hasher = fnv::FnvHasher::default();
+        hasher.write(bytes);
+        self.hash = hasher.finish();
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.hash = value;
+    }
+}
+
+impl BuildHasher for PropertyMapBuildHasher {
+    type Hasher = PropertyMapHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> Self::Hasher {
+        PropertyMapHasher { hash: 0 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Collect)]
+#[collect(no_drop)]
+struct PropertyMapKey<'gc>(AvmString<'gc>);
+
+impl PartialEq for PropertyMapKey<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for PropertyMapKey<'_> {}
+
+impl Hash for PropertyMapKey<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_cached_fnv(self.0.fnv_hash(), state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PropertyMapBuildHasher, hash_cached_fnv};
+    use fnv::FnvHasher;
+    use std::hash::{BuildHasher, Hasher};
+
+    #[test]
+    fn property_map_key_hashes_from_cached_fnv_value() {
+        let cached = 0x0102_0304_0506_0708;
+        let mut actual = FnvHasher::default();
+        hash_cached_fnv(cached, &mut actual);
+
+        let mut expected = FnvHasher::default();
+        expected.write_u64(cached);
+        assert_eq!(actual.finish(), expected.finish());
+    }
+
+    #[test]
+    fn property_map_build_hasher_returns_cached_fnv_value() {
+        let cached = 0x0102_0304_0506_0708;
+        let actual = PropertyMapBuildHasher.hash_one(&CachedHash(cached));
+        assert_eq!(actual, cached);
+    }
+
+    struct CachedHash(u64);
+
+    impl std::hash::Hash for CachedHash {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            hash_cached_fnv(self.0, state);
+        }
+    }
+}
 
 /// Type which represents named properties on an object.
 ///
@@ -26,7 +119,7 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, Collect)]
 #[collect(no_drop)]
 pub struct PropertyMap<'gc, V>(
-    HashMap<AvmString<'gc>, SmallVec<[(Namespace<'gc>, V); 2]>, FnvBuildHasher>,
+    HashMap<PropertyMapKey<'gc>, SmallVec<[(Namespace<'gc>, V); 2]>, PropertyMapBuildHasher>,
 );
 
 impl<V> Default for PropertyMap<'_, V> {
@@ -41,12 +134,15 @@ impl<'gc, V> PropertyMap<'gc, V> {
     }
 
     pub fn get(&self, name: QName<'gc>) -> Option<&V> {
-        self.0.get(&name.local_name()).iter().find_map(|v| {
-            v.iter()
-                .filter(|(n, _)| n.matches_ns(name.namespace()))
-                .map(|(_, v)| v)
-                .next()
-        })
+        self.0
+            .get(&PropertyMapKey(name.local_name()))
+            .iter()
+            .find_map(|v| {
+                v.iter()
+                    .filter(|(n, _)| n.matches_ns(name.namespace()))
+                    .map(|(_, v)| v)
+                    .next()
+            })
     }
 
     pub fn get_for_multiname(&self, name: &Multiname<'gc>) -> Option<&V> {
@@ -54,12 +150,15 @@ impl<'gc, V> PropertyMap<'gc, V> {
             unreachable!("Lookup on lazy Multiname should never happen ({:?})", name);
         }
         if let Some(local_name) = name.local_name() {
-            self.0.get(&local_name).iter().find_map(|v| {
-                v.iter()
-                    .filter(|(n, _)| name.namespace_set().iter().any(|ns| n.matches_ns(*ns)))
-                    .map(|(_, v)| v)
-                    .next()
-            })
+            self.0
+                .get(&PropertyMapKey(local_name))
+                .iter()
+                .find_map(|v| {
+                    v.iter()
+                        .filter(|(n, _)| name.namespace_set().iter().any(|ns| n.matches_ns(*ns)))
+                        .map(|(_, v)| v)
+                        .next()
+                })
         } else {
             None
         }
@@ -70,19 +169,22 @@ impl<'gc, V> PropertyMap<'gc, V> {
             unreachable!("Lookup on lazy Multiname should never happen ({:?})", name);
         }
         if let Some(local_name) = name.local_name() {
-            self.0.get(&local_name).iter().find_map(|v| {
-                v.iter()
-                    .filter(|(n, _)| name.namespace_set().iter().any(|ns| n.matches_ns(*ns)))
-                    .map(|(ns, v)| (*ns, v))
-                    .next()
-            })
+            self.0
+                .get(&PropertyMapKey(local_name))
+                .iter()
+                .find_map(|v| {
+                    v.iter()
+                        .filter(|(n, _)| name.namespace_set().iter().any(|ns| n.matches_ns(*ns)))
+                        .map(|(ns, v)| (*ns, v))
+                        .next()
+                })
         } else {
             None
         }
     }
 
     pub fn get_mut(&mut self, name: QName<'gc>) -> Option<&mut V> {
-        if let Some(bucket) = self.0.get_mut(&name.local_name())
+        if let Some(bucket) = self.0.get_mut(&PropertyMapKey(name.local_name()))
             && let Some((_, old_value)) = bucket
                 .iter_mut()
                 .find(|(n, _)| n.matches_ns(name.namespace()))
@@ -95,7 +197,7 @@ impl<'gc, V> PropertyMap<'gc, V> {
 
     pub fn contains_key(&self, name: QName<'gc>) -> bool {
         self.0
-            .get(&name.local_name())
+            .get(&PropertyMapKey(name.local_name()))
             .iter()
             .any(|v| v.iter().any(|(n, _)| n.matches_ns(name.namespace())))
     }
@@ -103,11 +205,11 @@ impl<'gc, V> PropertyMap<'gc, V> {
     pub fn iter(&self) -> impl Iterator<Item = (AvmString<'gc>, Namespace<'gc>, &V)> {
         self.0
             .iter()
-            .flat_map(|(k, vs)| vs.iter().map(|(ns, v)| (*k, *ns, v)))
+            .flat_map(|(k, vs)| vs.iter().map(|(ns, v)| (k.0, *ns, v)))
     }
 
     pub fn insert(&mut self, name: QName<'gc>, value: V) -> Option<V> {
-        let bucket = self.0.entry(name.local_name()).or_default();
+        let bucket = self.0.entry(PropertyMapKey(name.local_name())).or_default();
 
         if let Some(position) = bucket
             .iter()
@@ -126,7 +228,7 @@ impl<'gc, V> PropertyMap<'gc, V> {
 
     /// Preserves Flash Player ordering in scope caches and application domains.
     pub fn insert_at_end(&mut self, name: QName<'gc>, value: V) -> Option<V> {
-        let bucket = self.0.entry(name.local_name()).or_default();
+        let bucket = self.0.entry(PropertyMapKey(name.local_name())).or_default();
 
         if let Some((_, old_value)) = bucket
             .iter_mut()
@@ -140,7 +242,7 @@ impl<'gc, V> PropertyMap<'gc, V> {
     }
 
     pub fn remove(&mut self, name: QName<'gc>) -> Option<V> {
-        let bucket = self.0.get_mut(&name.local_name());
+        let bucket = self.0.get_mut(&PropertyMapKey(name.local_name()));
 
         if let Some(bucket) = bucket {
             let position = bucket

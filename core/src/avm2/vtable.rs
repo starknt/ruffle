@@ -14,7 +14,27 @@ use crate::string::{AvmString, StringContext};
 use gc_arena::barrier::{field, unlock};
 use gc_arena::lock::Lock;
 use gc_arena::{Collect, Gc, Mutation};
+use std::cell::Cell;
 use std::collections::HashMap;
+
+#[cfg(test)]
+mod tests {
+    use super::{Property, TraitLookupCache};
+
+    #[test]
+    fn trait_lookup_cache_distinguishes_name_and_namespace() {
+        let cache = TraitLookupCache::default();
+        assert!(cache.get(1, 2).is_none());
+
+        cache.set(1, 2, Some(Property::Method { disp_id: 7 }));
+        assert!(matches!(
+            cache.get(1, 2),
+            Some(Some(Property::Method { disp_id: 7 }))
+        ));
+        assert!(cache.get(1, 3).is_none());
+        assert!(cache.get(4, 2).is_none());
+    }
+}
 
 #[derive(Collect, Clone, Copy)]
 #[collect(no_drop)]
@@ -38,6 +58,31 @@ impl std::ops::DerefMut for TraitNames<'_> {
     }
 }
 
+#[derive(Default)]
+struct TraitLookupCache {
+    name: Cell<usize>,
+    namespace: Cell<usize>,
+    value: Cell<Option<Property>>,
+}
+
+impl TraitLookupCache {
+    #[inline]
+    fn get(&self, name: usize, namespace: usize) -> Option<Option<Property>> {
+        if self.name.get() == name && self.namespace.get() == namespace {
+            Some(self.value.get())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn set(&self, name: usize, namespace: usize, value: Option<Property>) {
+        self.name.set(name);
+        self.namespace.set(namespace);
+        self.value.set(value);
+    }
+}
+
 #[derive(Collect, Default)]
 #[collect(no_drop)]
 struct VTableData<'gc> {
@@ -46,6 +91,12 @@ struct VTableData<'gc> {
     protected_namespace: Option<Namespace<'gc>>,
 
     resolved_traits: TraitNames<'gc>,
+
+    /// One-entry inline cache for the overwhelmingly common single-namespace
+    /// trait lookup path. The keys are GC identities, so no managed values are
+    /// retained outside the GC graph.
+    #[collect(require_static)]
+    trait_lookup_cache: TraitLookupCache,
 
     /// Use hashmaps for the metadata tables because metadata will rarely be present on traits
     slot_metadata_table: HashMap<usize, Box<[Metadata<'gc>]>>,
@@ -167,7 +218,23 @@ impl<'gc> VTable<'gc> {
             return None;
         }
 
-        self.resolved_traits().get_for_multiname(name).cloned()
+        let namespace_set = name.namespace_set();
+        if let Some(local_name) = name.local_name()
+            && namespace_set.len() == 1
+        {
+            let cache = &self.0.trait_lookup_cache;
+            let name_id = local_name.ptr_id();
+            let namespace_id = namespace_set[0].ptr_id();
+            if let Some(value) = cache.get(name_id, namespace_id) {
+                return value;
+            }
+
+            let value = self.resolved_traits().get_for_multiname(name).cloned();
+            cache.set(name_id, namespace_id, value);
+            value
+        } else {
+            self.resolved_traits().get_for_multiname(name).cloned()
+        }
     }
 
     /// Coerces `value` to the type of the slot with id `slot_id`
@@ -550,6 +617,7 @@ impl<'gc> VTable<'gc> {
             scope,
             protected_namespace: defining_class_def.protected_namespace(),
             resolved_traits,
+            trait_lookup_cache: TraitLookupCache::default(),
             slot_metadata_table,
             disp_metadata_table,
             slot_table: slot_table.into_boxed_slice(),

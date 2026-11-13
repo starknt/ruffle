@@ -7,14 +7,94 @@ use crate::avm2::globals::slots::flash_events_event_dispatcher as slots;
 use crate::avm2::object::{EventObject, FunctionObject, Object, TObject as _};
 use crate::display_object::TDisplayObject;
 use crate::string::AvmString;
-use fnv::FnvHashMap;
 use gc_arena::Collect;
-use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::time::Duration;
 use web_time::Instant;
 
+#[cfg(test)]
+mod event_hash_tests {
+    use super::{EventMapBuildHasher, hash_cached_event};
+    use std::hash::{BuildHasher, Hash, Hasher};
+
+    #[test]
+    fn event_map_build_hasher_returns_cached_fnv_value() {
+        let cached = 0x0102_0304_0506_0708;
+        let actual = EventMapBuildHasher.hash_one(&CachedHash(cached));
+        assert_eq!(actual, cached);
+    }
+
+    struct CachedHash(u64);
+
+    impl Hash for CachedHash {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            hash_cached_event(self.0, state);
+        }
+    }
+}
+
 const SLOW_EVENT_HANDLER: Duration = Duration::from_millis(100);
+
+#[inline]
+fn hash_cached_event<H: Hasher>(cached: u64, state: &mut H) {
+    state.write_u64(cached);
+}
+
+#[derive(Clone, Copy, Default)]
+struct EventMapBuildHasher;
+
+struct EventMapHasher {
+    hash: u64,
+}
+
+impl Hasher for EventMapHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hasher = fnv::FnvHasher::default();
+        hasher.write(bytes);
+        self.hash = hasher.finish();
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.hash = value;
+    }
+}
+
+impl BuildHasher for EventMapBuildHasher {
+    type Hasher = EventMapHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> Self::Hasher {
+        EventMapHasher { hash: 0 }
+    }
+}
+
+#[derive(Clone, Copy, Collect)]
+#[collect(no_drop)]
+struct EventMapKey<'gc>(AvmString<'gc>);
+
+impl PartialEq for EventMapKey<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for EventMapKey<'_> {}
+
+impl Hash for EventMapKey<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        hash_cached_event(self.0.fnv_hash(), state);
+    }
+}
 
 /// Which phase of event dispatch is currently occurring.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -174,7 +254,7 @@ impl<'gc> Event<'gc> {
 #[derive(Clone, Collect)]
 #[collect(no_drop)]
 pub struct DispatchList<'gc>(
-    FnvHashMap<AvmString<'gc>, BTreeMap<i32, Vec<EventHandler<'gc>>>>,
+    HashMap<EventMapKey<'gc>, BTreeMap<i32, Vec<EventHandler<'gc>>>, EventMapBuildHasher>,
     Option<(i32, bool)>,
 );
 
@@ -187,7 +267,7 @@ impl<'gc> DispatchList<'gc> {
     /// Get all of the event handlers for a given event type, if such a type
     /// exists.
     fn get_event(&self, event: AvmString<'gc>) -> Option<&BTreeMap<i32, Vec<EventHandler<'gc>>>> {
-        self.0.get(&event)
+        self.0.get(&EventMapKey(event))
     }
 
     /// Get all of the event handlers for a given event type, for mutation.
@@ -198,7 +278,7 @@ impl<'gc> DispatchList<'gc> {
         &mut self,
         event: AvmString<'gc>,
     ) -> &mut BTreeMap<i32, Vec<EventHandler<'gc>>> {
-        self.0.entry(event).or_default()
+        self.0.entry(EventMapKey(event)).or_default()
     }
 
     /// Get a single priority level of event handlers for a given event type,
@@ -209,7 +289,7 @@ impl<'gc> DispatchList<'gc> {
         priority: i32,
     ) -> &mut Vec<EventHandler<'gc>> {
         self.0
-            .entry(event)
+            .entry(EventMapKey(event))
             .or_default()
             .entry(priority)
             .or_default()
@@ -289,7 +369,7 @@ impl<'gc> DispatchList<'gc> {
         let mut wall = false;
         let mut game = false;
         for (name, levels) in &self.0 {
-            if name.as_wstr() != b"timer" && name.as_wstr() != b"timerComplete" {
+            if name.0.as_wstr() != b"timer" && name.0.as_wstr() != b"timerComplete" {
                 continue;
             }
             for handler in levels.values().flatten() {

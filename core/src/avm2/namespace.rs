@@ -76,6 +76,15 @@ fn strip_version_mark(url: &WStr, is_playerglobals: bool) -> Option<(&WStr, ApiV
 }
 
 impl<'gc> Namespace<'gc> {
+    /// Returns a stable identity for this namespace during its GC lifetime.
+    /// This is used only by non-GC inline-cache keys.
+    #[inline]
+    pub fn ptr_id(self) -> usize {
+        self.0
+            .map(|namespace| Gc::as_ptr(namespace) as usize)
+            .unwrap_or(0)
+    }
+
     /// Read a namespace declaration from the ABC constant pool and copy it to
     /// a namespace value.
     /// NOTE: you should use the TranslationUnit.pool_namespace instead of calling this.
