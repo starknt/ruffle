@@ -495,11 +495,17 @@ pub trait TDisplayObjectContainer<'gc>:
             indices.map(Rc::new)
         });
         let src = container.render_list.clone();
-        let end = indices.as_ref().map_or(src.len(), |indices| indices.len());
-        LifecycleIter {
-            src,
-            indices: indices.clone(),
-            range: 0..end,
+        match indices {
+            None => LifecycleIter::Direct(RenderIter {
+                neg_i: src.len(),
+                src,
+                i: 0,
+            }),
+            Some(indices) => LifecycleIter::Projected {
+                src,
+                range: 0..indices.len(),
+                indices: indices.clone(),
+            },
         }
     }
 
@@ -1240,20 +1246,19 @@ impl ExactSizeIterator for RenderIter<'_> {}
 
 /// Lifecycle projection tied to one immutable render-list snapshot.
 #[cfg(any(feature = "lifecycle_projection", test))]
-pub struct LifecycleIter<'gc> {
-    src: Rc<Vec<DisplayObject<'gc>>>,
-    indices: Option<Rc<Vec<usize>>>,
-    range: std::ops::Range<usize>,
+pub enum LifecycleIter<'gc> {
+    Direct(RenderIter<'gc>),
+    Projected {
+        src: Rc<Vec<DisplayObject<'gc>>>,
+        indices: Rc<Vec<usize>>,
+        range: std::ops::Range<usize>,
+    },
 }
 
 #[cfg(any(feature = "lifecycle_projection", test))]
 impl<'gc> From<RenderIter<'gc>> for LifecycleIter<'gc> {
     fn from(iter: RenderIter<'gc>) -> Self {
-        Self {
-            src: iter.src,
-            indices: None,
-            range: iter.i..iter.neg_i,
-        }
+        Self::Direct(iter)
     }
 }
 
@@ -1261,7 +1266,12 @@ impl<'gc> From<RenderIter<'gc>> for LifecycleIter<'gc> {
 impl<'gc> LifecycleIter<'gc> {
     #[inline]
     pub fn is_projected(&self) -> bool {
-        self.indices.is_some()
+        matches!(self, Self::Projected { .. })
+    }
+
+    #[inline]
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct(_))
     }
 }
 
@@ -1270,25 +1280,40 @@ impl<'gc> Iterator for LifecycleIter<'gc> {
     type Item = DisplayObject<'gc>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let index = self.range.next()?;
-        match &self.indices {
-            Some(indices) => Some(self.src[indices[index]]),
-            None => Some(self.src[index]),
+        match self {
+            Self::Direct(iter) => iter.next(),
+            Self::Projected {
+                src,
+                indices,
+                range,
+            } => {
+                let index = range.next()?;
+                Some(src[indices[index]])
+            }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.range.size_hint()
+        match self {
+            Self::Direct(iter) => iter.size_hint(),
+            Self::Projected { range, .. } => range.size_hint(),
+        }
     }
 }
 
 #[cfg(any(feature = "lifecycle_projection", test))]
 impl<'gc> DoubleEndedIterator for LifecycleIter<'gc> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        let index = self.range.next_back()?;
-        match &self.indices {
-            Some(indices) => Some(self.src[indices[index]]),
-            None => Some(self.src[index]),
+        match self {
+            Self::Direct(iter) => iter.next_back(),
+            Self::Projected {
+                src,
+                indices,
+                range,
+            } => {
+                let index = range.next_back()?;
+                Some(src[indices[index]])
+            }
         }
     }
 }
@@ -1319,6 +1344,7 @@ mod lifecycle_tests {
                 parent.replace_at_depth(context, button, 3);
                 let mut snapshot = parent.iter_lifecycle_list();
                 assert!(snapshot.is_projected());
+                assert!(!snapshot.is_direct());
                 assert_eq!(snapshot.len(), 2);
                 assert_eq!(
                     snapshot.next_back().map(|child| child.as_ptr()),
@@ -1355,6 +1381,7 @@ mod lifecycle_tests {
                 parent.replace_at_depth(context, button, 2);
                 let snapshot = parent.iter_lifecycle_list();
                 assert!(!snapshot.is_projected());
+                assert!(snapshot.is_direct());
                 assert_eq!(snapshot.len(), 2);
             });
     }
