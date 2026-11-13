@@ -37,6 +37,9 @@ pub enum Phase {
     Wake,
     Input,
     Composite,
+    RenderTree,
+    RenderBackend,
+    RenderSubmit,
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Timing {
@@ -69,7 +72,7 @@ impl Default for AsyncEvent {
 
 #[derive(Debug, Default, Clone)]
 pub struct Counters {
-    pub timings: [Timing; 29],
+    pub timings: [Timing; 32],
     pub logical_frames: u64,
     pub socket_events: [u64; 3],
     pub socket_data_bytes: u64,

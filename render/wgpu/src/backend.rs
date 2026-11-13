@@ -586,6 +586,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
     ) {
+        let _render_backend =
+            ruffle_render::profile::time(ruffle_render::profile::Phase::RenderBackend);
         let Some(frame_output) = self.target.get_next_texture() else {
             // Attempt to recreate the swap chain in this case.
             self.target.resize(
@@ -1473,6 +1475,7 @@ impl ActiveFrame {
                 .create_command_encoder(&Default::default()),
         );
         let index = {
+            let _submit = ruffle_render::profile::time(ruffle_render::profile::Phase::RenderSubmit);
             let _submission = descriptors.lock_submission();
             target.submit(
                 &descriptors.device,
@@ -1497,6 +1500,7 @@ impl ActiveFrame {
                 .create_command_encoder(&Default::default()),
         );
         let index = {
+            let _submit = ruffle_render::profile::time(ruffle_render::profile::Phase::RenderSubmit);
             let _submission = descriptors.lock_submission();
             descriptors.queue.submit(Some(draw_encoder.finish()))
         };

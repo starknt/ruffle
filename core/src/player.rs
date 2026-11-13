@@ -2337,6 +2337,8 @@ impl Player {
         let mut background_color = Color::WHITE;
 
         let (cache_draws, commands) = self.enter_arena_mut(|gc_context, gc_root, this| {
+            let _render_tree =
+                ruffle_render::profile::time(ruffle_render::profile::Phase::RenderTree);
             let stage = gc_root.stage;
 
             let mut cache_draws = vec![];
