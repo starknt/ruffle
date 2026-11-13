@@ -1,5 +1,8 @@
 //! Management of async loaders
 
+#[cfg(test)]
+mod parse_tests;
+
 use crate::avm1::{Activation, ActivationIdentifier};
 use crate::avm1::{Attribute, Avm1};
 use crate::avm1::{ExecutionReason, NativeObject};
@@ -462,10 +465,8 @@ impl<'gc> LoadManager<'gc> {
                     player.lock().unwrap().mutate_with_update_context(|uc| {
                         let importer_movie = importer_movie.fetch(uc);
 
-                        if matches!(content_type, ContentType::Swf) {
-                            let movie = prepared
-                                .expect("Could not load movie")
-                                .with_shared_bytes(ruffle_render::profile::engine_optimized());
+                        if matches!(content_type, ContentType::Swf) || prepared.is_some() {
+                            let movie = prepared.expect("Could not load movie");
 
                             let movie = SwfMovie::new(uc.gc(), movie);
 
@@ -690,22 +691,43 @@ async fn prepare_swf_movie(
     loader_url: Option<String>,
     load_bytes_info: Option<LoadBytesInfo>,
 ) -> Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error> {
+    // Profiling mode is thread-local: capture it before entering rayon.
+    let shared_bytes = ruffle_render::profile::engine_optimized();
     let (sender, receiver) = async_channel::bounded(1);
     rayon::spawn_fifo(move || {
-        let result = if ContentType::sniff(&body) == ContentType::Swf {
-            SwfMovieData::from_data(&body, url, loader_url, load_bytes_info).map(Some)
-        } else if let Ok(uncompressed) = extract_swz(&body) {
-            SwfMovieData::from_data(&uncompressed, url, loader_url, load_bytes_info).map(Some)
-        } else {
-            Ok(None)
-        };
-        let _ = sender.send_blocking((body, result));
+        let result = prepare_swf_movie_data(body, url, loader_url, load_bytes_info, shared_bytes);
+        let _ = sender.send_blocking(result);
     });
-    let (body, result) = receiver
+    receiver
         .recv()
         .await
-        .expect("SWF parser worker dropped result");
-    result.map(|movie| (body, movie))
+        .expect("SWF parser worker dropped result")
+}
+
+/// Fully prepare immutable movie data, including the SWZ envelope and shared
+/// backing file. Callers install this result without parsing or copying it again.
+fn prepare_swf_movie_data(
+    body: Vec<u8>,
+    url: String,
+    loader_url: Option<String>,
+    load_bytes_info: Option<LoadBytesInfo>,
+    shared_bytes: bool,
+) -> Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error> {
+    let transport = body;
+    let uncompressed = if ContentType::sniff(&transport) == ContentType::Swf {
+        None
+    } else {
+        extract_swz(&transport).ok()
+    };
+    let parse_body = uncompressed.as_deref().unwrap_or(&transport);
+    if ContentType::sniff(parse_body) != ContentType::Swf {
+        return Ok((transport, None));
+    }
+    let movie = SwfMovieData::from_data(parse_body, url, loader_url, load_bytes_info)?
+        .with_shared_bytes(shared_bytes);
+    // Keep the original transport bytes for progress/bytesTotal accounting;
+    // the movie owns the normalized, decompressed bytes.
+    Ok((transport, Some(movie)))
 }
 
 fn prepare_swf_movie_inline(
@@ -714,14 +736,13 @@ fn prepare_swf_movie_inline(
     loader_url: Option<String>,
     load_bytes_info: Option<LoadBytesInfo>,
 ) -> Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error> {
-    let movie = if ContentType::sniff(&body) == ContentType::Swf {
-        SwfMovieData::from_data(&body, url, loader_url, load_bytes_info).map(Some)?
-    } else if let Ok(uncompressed) = extract_swz(&body) {
-        SwfMovieData::from_data(&uncompressed, url, loader_url, load_bytes_info).map(Some)?
-    } else {
-        None
-    };
-    Ok((body, movie))
+    prepare_swf_movie_data(
+        body,
+        url,
+        loader_url,
+        load_bytes_info,
+        ruffle_render::profile::engine_optimized(),
+    )
 }
 
 fn use_inline_movie_parse(url: &str) -> bool {
@@ -753,14 +774,7 @@ async fn prepare_swf_movie(
     loader_url: Option<String>,
     load_bytes_info: Option<LoadBytesInfo>,
 ) -> Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error> {
-    let movie = if ContentType::sniff(&body) == ContentType::Swf {
-        SwfMovieData::from_data(&body, url, loader_url, load_bytes_info).map(Some)?
-    } else if let Ok(uncompressed) = extract_swz(&body) {
-        SwfMovieData::from_data(&uncompressed, url, loader_url, load_bytes_info).map(Some)?
-    } else {
-        None
-    };
-    Ok((body, movie))
+    prepare_swf_movie_inline(body, url, loader_url, load_bytes_info)
 }
 
 /// The completion status of a `Loader` loading a movie.
@@ -1017,6 +1031,9 @@ impl<'gc> MovieLoader<'gc> {
             let response = wait_for_full_response(fetch).await;
             match response {
                 Ok((body, url, status, redirected)) if replacing_root_movie => {
+                    // Root replacement reports the downloaded envelope length,
+                    // even when the worker returns the inner SWF of a SWZ.
+                    let body_len = body.len();
                     ruffle_render::profile::async_event(
                         "swfParseQueued",
                         generation,
@@ -1040,7 +1057,7 @@ impl<'gc> MovieLoader<'gc> {
                         player,
                         handle,
                         generation,
-                        body.len(),
+                        body_len,
                         parse_duration_ns,
                         movie,
                         status,
@@ -1113,7 +1130,6 @@ impl<'gc> MovieLoader<'gc> {
         status: u16,
         redirected: bool,
     ) -> Result<(), Error> {
-        let movie = movie.with_shared_bytes(ruffle_render::profile::engine_optimized());
         player.mutate_with_update_context(|uc| {
             if !uc.load_manager.generation_matches(handle, generation) {
                 ruffle_render::profile::async_event(
@@ -1410,8 +1426,7 @@ pub fn load_root_movie<'gc>(
             prepare_swf_movie(body, spoofed_or_swf_url, None, None).await
         }
         .map_err(|error| Error::FetchError(format!("Could not parse root SWF: {error}")))?;
-        let mut movie = require_swf_movie(movie, &parsed_body)?
-            .with_shared_bytes(ruffle_render::profile::engine_optimized());
+        let mut movie = require_swf_movie(movie, &parsed_body)?;
         on_metadata(movie.header());
         movie.append_parameters(parameters);
         player.lock().unwrap().mutate_with_update_context(|uc| {
@@ -2117,10 +2132,16 @@ impl<'gc> MovieLoader<'gc> {
         generation: u64,
         parse_duration_ns: u64,
     ) -> Result<(), Error> {
-        let sniffed_type = ContentType::sniff(data);
+        let sniffed_type = if prepared.is_some() && ContentType::sniff(data) == ContentType::Unknown
+        {
+            ContentType::Swf
+        } else {
+            ContentType::sniff(data)
+        };
         let length = data.len();
 
-        if sniffed_type == ContentType::Unknown
+        if prepared.is_none()
+            && sniffed_type == ContentType::Unknown
             && let Ok(data) = extract_swz(data)
         {
             return Self::movie_loader_data(
@@ -2198,14 +2219,16 @@ impl<'gc> MovieLoader<'gc> {
 
         let movie = match sniffed_type {
             ContentType::Swf => {
-                let mut movie = prepared
-                    .unwrap_or(SwfMovieData::from_data(
+                let mut movie = match prepared {
+                    Some(movie) => movie,
+                    None => SwfMovieData::from_data(
                         data,
                         url.clone(),
                         loader_url.clone(),
                         load_bytes_info,
-                    )?)
-                    .with_shared_bytes(ruffle_render::profile::engine_optimized());
+                    )?
+                    .with_shared_bytes(ruffle_render::profile::engine_optimized()),
+                };
 
                 if matches!(vm_data, MovieLoaderVMData::Avm1 { .. }) {
                     // If AVM1 loads a SWF, that SWF is always interpreted as

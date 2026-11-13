@@ -2414,7 +2414,7 @@ pub trait TDisplayObject<'gc>:
             return;
         }
         CONSTRUCTION_REVISION.set(CONSTRUCTION_REVISION.get().wrapping_add(1));
-        let mut current: DisplayObject<'gc> = self.into();
+        let mut current: DisplayObject<'gc> = self;
         loop {
             let was_clean = current.base().construction_clean();
             current.base().set_construction_clean(false);
@@ -2432,7 +2432,7 @@ pub trait TDisplayObject<'gc>:
     /// Buttons and loaders remain traversal boundaries, including hidden states.
     #[no_dynamic]
     fn construction_is_settled(self) -> bool {
-        match self.into() {
+        match self {
             DisplayObject::MovieClip(clip) => clip.base().construction_clean(),
             DisplayObject::Bitmap(_)
             | DisplayObject::TextLine(_)
