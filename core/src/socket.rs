@@ -60,6 +60,14 @@ pub enum SocketAction {
     Close(SocketHandle),
 }
 
+/// Capture the number of actions that were ready when a frame started.
+/// Actions produced by ActionScript callbacks are deferred to the next frame,
+/// matching the previous drain-then-dispatch ordering without retaining a
+/// second Vec of all pending payloads.
+fn socket_action_budget(receiver: &Receiver<SocketAction>) -> usize {
+    receiver.len()
+}
+
 /// Manages the collection of Sockets.
 #[derive(Collect)]
 #[collect(no_drop)]
@@ -200,17 +208,16 @@ impl<'gc> Sockets<'gc> {
     }
 
     pub fn update_sockets(context: &mut UpdateContext<'gc>) {
-        let mut actions = vec![];
-
-        {
+        let action_budget = {
             let _receive =
                 ruffle_render::profile::time(ruffle_render::profile::Phase::SocketReceive);
-            while let Ok(action) = context.sockets.receiver.try_recv() {
-                actions.push(action)
-            }
-        }
+            socket_action_budget(&context.sockets.receiver)
+        };
 
-        for action in actions {
+        for _ in 0..action_budget {
+            let Ok(action) = context.sockets.receiver.try_recv() else {
+                break;
+            };
             match &action {
                 SocketAction::Connect(..) => ruffle_render::profile::socket_connect(),
                 SocketAction::Data(_, data) => ruffle_render::profile::socket_data(data.len()),
@@ -423,7 +430,8 @@ fn sanitize_host(host: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_host;
+    use super::{ConnectionState, SocketAction, SocketHandle, sanitize_host, socket_action_budget};
+    use async_channel::unbounded;
 
     #[test]
     fn truncate_host_at_null() {
@@ -438,5 +446,22 @@ mod tests {
     #[test]
     fn normal_host() {
         assert_eq!(sanitize_host("1.2.3.4"), "1.2.3.4");
+    }
+
+    #[test]
+    fn socket_action_budget_is_a_frame_snapshot() {
+        let (sender, receiver) = unbounded();
+        sender
+            .try_send(SocketAction::Connect(
+                SocketHandle::default(),
+                ConnectionState::Connected,
+            ))
+            .unwrap();
+        let budget = socket_action_budget(&receiver);
+        sender
+            .try_send(SocketAction::Close(SocketHandle::default()))
+            .unwrap();
+        assert_eq!(budget, 1);
+        assert_eq!(receiver.len(), 2);
     }
 }

@@ -45,7 +45,8 @@ fn prepared_movie_is_installed_without_reparsing_transport_bytes() {
         let result = MovieLoader::movie_loader_data(
             handle,
             uc,
-            transport,
+            &[],
+            transport.len(),
             "https://example.test/prepared.swf".into(),
             200,
             false,

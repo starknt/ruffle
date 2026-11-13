@@ -1219,20 +1219,43 @@ impl<'gc> MovieLoader<'gc> {
         prepared: Option<SwfMovieData>,
         parse_duration_ns: u64,
     ) -> Result<(), Error> {
-        player.mutate_with_update_context(|uc| {
-            MovieLoader::movie_loader_data(
-                handle,
-                uc,
-                &body,
-                url,
-                status,
-                redirected,
-                loader_url,
-                prepared,
-                generation,
-                parse_duration_ns,
-            )
-        })?;
+        let body_len = body.len();
+        if let Some(prepared) = prepared {
+            // The parser already owns the normalized bytes. Keep only the
+            // length needed for progress/LoaderInfo while installing it.
+            drop(body);
+            player.mutate_with_update_context(|uc| {
+                MovieLoader::movie_loader_data(
+                    handle,
+                    uc,
+                    &[],
+                    body_len,
+                    url,
+                    status,
+                    redirected,
+                    loader_url,
+                    Some(prepared),
+                    generation,
+                    parse_duration_ns,
+                )
+            })?;
+        } else {
+            player.mutate_with_update_context(|uc| {
+                MovieLoader::movie_loader_data(
+                    handle,
+                    uc,
+                    &body,
+                    body_len,
+                    url,
+                    status,
+                    redirected,
+                    loader_url,
+                    None,
+                    generation,
+                    parse_duration_ns,
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -1314,20 +1337,43 @@ impl<'gc> MovieLoader<'gc> {
                 .await;
                 let mut player = player.lock().unwrap();
                 match parsed {
-                    Ok((body, prepared)) => player.mutate_with_update_context(|uc| {
-                        MovieLoader::movie_loader_data(
-                            handle,
-                            uc,
-                            &body,
-                            generated_url,
-                            0,
-                            false,
-                            Some(loader_url),
-                            prepared,
-                            generation,
-                            parse_duration_ns,
-                        )
-                    }),
+                    Ok((body, Some(prepared))) => {
+                        let body_len = body.len();
+                        drop(body);
+                        player.mutate_with_update_context(|uc| {
+                            MovieLoader::movie_loader_data(
+                                handle,
+                                uc,
+                                &[],
+                                body_len,
+                                generated_url,
+                                0,
+                                false,
+                                Some(loader_url),
+                                Some(prepared),
+                                generation,
+                                parse_duration_ns,
+                            )
+                        })
+                    }
+                    Ok((body, None)) => {
+                        let body_len = body.len();
+                        player.mutate_with_update_context(|uc| {
+                            MovieLoader::movie_loader_data(
+                                handle,
+                                uc,
+                                &body,
+                                body_len,
+                                generated_url,
+                                0,
+                                false,
+                                Some(loader_url),
+                                None,
+                                generation,
+                                parse_duration_ns,
+                            )
+                        })
+                    }
                     Err(_error) => player.mutate_with_update_context(|uc| {
                         MovieLoader::movie_loader_parse_error(handle, uc, generation, generated_url)
                     }),
@@ -1361,6 +1407,7 @@ impl<'gc> MovieLoader<'gc> {
             handle,
             uc,
             &bytes,
+            bytes.len(),
             generated_url,
             0,
             false,
@@ -2117,6 +2164,7 @@ impl<'gc> MovieLoader<'gc> {
         handle: LoaderHandle,
         uc: &mut UpdateContext<'gc>,
         data: &[u8],
+        body_len: usize,
         url: String,
         status: u16,
         redirected: bool,
@@ -2131,7 +2179,7 @@ impl<'gc> MovieLoader<'gc> {
         } else {
             ContentType::sniff(data)
         };
-        let length = data.len();
+        let length = body_len;
 
         if prepared.is_none()
             && sniffed_type == ContentType::Unknown
@@ -2141,6 +2189,7 @@ impl<'gc> MovieLoader<'gc> {
                 handle,
                 uc,
                 &data,
+                body_len,
                 url,
                 status,
                 redirected,
@@ -2165,7 +2214,7 @@ impl<'gc> MovieLoader<'gc> {
                 generation,
                 0,
                 parse_duration_ns,
-                data.len(),
+                body_len,
                 Some("stale"),
             );
             return Ok(());
@@ -2175,7 +2224,7 @@ impl<'gc> MovieLoader<'gc> {
             generation,
             0,
             parse_duration_ns,
-            data.len(),
+            body_len,
             None,
         );
 
@@ -2261,7 +2310,7 @@ impl<'gc> MovieLoader<'gc> {
                 SwfMovieData::fake_with_compressed_len(
                     uc.root_swf.version(),
                     loader_url.clone(),
-                    data.len(),
+                    length,
                 ),
             );
 
@@ -2414,7 +2463,7 @@ impl<'gc> MovieLoader<'gc> {
                         SwfMovieData::fake_with_compressed_len(
                             activation.context.root_swf.version(),
                             loader_url.clone(),
-                            data.len(),
+                            length,
                         ),
                     );
 
@@ -2491,7 +2540,7 @@ impl<'gc> MovieLoader<'gc> {
                             SwfMovieData::fake_with_compressed_len(
                                 uc.root_swf.version(),
                                 loader_url,
-                                data.len(),
+                                length,
                             ),
                         );
 
