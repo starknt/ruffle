@@ -1209,7 +1209,7 @@ impl<'gc> Iterator for RenderIter<'gc> {
             return None;
         }
 
-        let this = self.src.get(self.i).cloned();
+        let this = self.src.get(self.i).copied();
 
         self.i += 1;
 
@@ -1228,7 +1228,7 @@ impl<'gc> DoubleEndedIterator for RenderIter<'gc> {
             return None;
         }
 
-        let this = self.src.get(self.neg_i - 1).cloned();
+        let this = self.src.get(self.neg_i - 1).copied();
 
         self.neg_i -= 1;
 
@@ -1259,11 +1259,9 @@ impl<'gc> From<RenderIter<'gc>> for LifecycleIter<'gc> {
 
 #[cfg(any(feature = "lifecycle_projection", test))]
 impl<'gc> LifecycleIter<'gc> {
-    fn child(&self, index: usize) -> DisplayObject<'gc> {
-        self.src[self
-            .indices
-            .as_ref()
-            .map_or(index, |indices| indices[index])]
+    #[inline]
+    pub fn is_projected(&self) -> bool {
+        self.indices.is_some()
     }
 }
 
@@ -1272,7 +1270,11 @@ impl<'gc> Iterator for LifecycleIter<'gc> {
     type Item = DisplayObject<'gc>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.range.next().map(|index| self.child(index))
+        let index = self.range.next()?;
+        match &self.indices {
+            Some(indices) => Some(self.src[indices[index]]),
+            None => Some(self.src[index]),
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1283,7 +1285,11 @@ impl<'gc> Iterator for LifecycleIter<'gc> {
 #[cfg(any(feature = "lifecycle_projection", test))]
 impl<'gc> DoubleEndedIterator for LifecycleIter<'gc> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.range.next_back().map(|index| self.child(index))
+        let index = self.range.next_back()?;
+        match &self.indices {
+            Some(indices) => Some(self.src[indices[index]]),
+            None => Some(self.src[index]),
+        }
     }
 }
 
@@ -1312,6 +1318,7 @@ mod lifecycle_tests {
                 parent.replace_at_depth(context, clip, 2);
                 parent.replace_at_depth(context, button, 3);
                 let mut snapshot = parent.iter_lifecycle_list();
+                assert!(snapshot.is_projected());
                 assert_eq!(snapshot.len(), 2);
                 assert_eq!(
                     snapshot.next_back().map(|child| child.as_ptr()),
@@ -1330,6 +1337,25 @@ mod lifecycle_tests {
                         .collect::<Vec<_>>(),
                     vec![leaf.as_ptr(), clip.as_ptr(), button.as_ptr()]
                 );
+            });
+    }
+
+    #[test]
+    fn lifecycle_snapshot_uses_direct_path_for_all_active_children() {
+        let player = PlayerBuilder::new().build();
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                let movie = context.stage.movie();
+                let parent = MovieClip::new(movie, context.gc());
+                let clip: DisplayObject<'_> = MovieClip::new(movie, context.gc()).into();
+                let button: DisplayObject<'_> = Avm2Button::empty_button(context).into();
+                parent.replace_at_depth(context, clip, 1);
+                parent.replace_at_depth(context, button, 2);
+                let snapshot = parent.iter_lifecycle_list();
+                assert!(!snapshot.is_projected());
+                assert_eq!(snapshot.len(), 2);
             });
     }
 
