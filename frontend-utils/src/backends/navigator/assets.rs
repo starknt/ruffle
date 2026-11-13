@@ -96,6 +96,7 @@ pub struct AssetScheduler {
     vfs: Rc<RefCell<Option<Arc<dyn AssetVfs>>>>,
     account_vfs: Rc<RefCell<Option<Arc<dyn AssetVfs>>>>,
     enabled: Rc<Cell<bool>>,
+    cache_first: Rc<Cell<bool>>,
     visible_assets: Rc<Cell<Option<fn(&Url) -> bool>>>,
 }
 
@@ -109,6 +110,7 @@ impl AssetScheduler {
             vfs: Rc::default(),
             account_vfs: Rc::default(),
             enabled: Rc::new(Cell::new(true)),
+            cache_first: Rc::new(Cell::new(false)),
             visible_assets: Rc::default(),
         }
     }
@@ -136,6 +138,12 @@ impl AssetScheduler {
     }
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.set(enabled);
+    }
+    /// Prefer an existing disk entry even after its HTTP freshness window.
+    /// Public game URLs are versioned by the Aola allow-list, so this avoids
+    /// re-fetching an already cached SWF or static asset during offline play.
+    pub fn set_cache_first(&self, enabled: bool) {
+        self.cache_first.set(enabled);
     }
     pub fn stats(&self) -> AssetStats {
         self.inner.borrow().stats
@@ -229,13 +237,14 @@ impl AssetScheduler {
         let private_vfs = self.account_vfs.borrow().clone();
         let disk_reads = self.disk_reads.clone();
         let schedule_transfers = self.enabled();
+        let cache_first = self.cache_first.get();
         async move {
             if let Some(disk) = vfs.clone()
                 && jar.cookies(&url).is_none()
             {
                 let hit = read_vfs(disk, url.to_string(), disk_reads.clone()).await;
                 if let Some((hit, slot)) = hit
-                    && hit.fresh_until > unix_now()
+                    && (cache_first || hit.fresh_until > unix_now())
                     && jar.cookies(&url).is_none()
                 {
                     {
