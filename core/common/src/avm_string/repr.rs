@@ -1,6 +1,8 @@
+use fnv::FnvHasher;
 use gc_arena::{Collect, Gc};
 use ruffle_wstr::{WStr, WString, panic_on_invalid_length, ptr as wptr, wstr_impl_traits};
 use std::cell::Cell;
+use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 
 /// Internal representation of `AvmAtom`s and (owned) `AvmString`s.
@@ -30,6 +32,11 @@ pub struct AvmStringRepr<'gc> {
 
     // If Some, the string is Dependent. The owner is assumed to be non-dynamic.
     owner: Option<Gc<'gc, Self>>,
+
+    // FNV is the fixed hasher used by AVM2 dynamic property maps. `u64::MAX`
+    // means that the content has not been hashed yet.
+    #[collect(require_static)]
+    fnv_hash: Cell<u64>,
 }
 
 impl<'gc> AvmStringRepr<'gc> {
@@ -42,6 +49,7 @@ impl<'gc> AvmStringRepr<'gc> {
             capacity,
             chars_used: Cell::new(meta.len32()),
             owner: None,
+            fnv_hash: Cell::new(u64::MAX),
         }
     }
 
@@ -71,6 +79,7 @@ impl<'gc> AvmStringRepr<'gc> {
             meta: unsafe { wptr::WStrMetadata::of(wstr) },
             chars_used: Cell::new(0),
             capacity: Cell::new(wptr::WStrMetadata::new32(0, interned)),
+            fnv_hash: Cell::new(u64::MAX),
         }
     }
 
@@ -160,6 +169,23 @@ impl<'gc> AvmStringRepr<'gc> {
         self.owner
     }
 
+    /// Returns the content hash used by dynamic AVM2 property maps.
+    #[inline]
+    pub fn fnv_hash(&self) -> u64 {
+        let cached = self.fnv_hash.get();
+        if cached != u64::MAX {
+            return cached;
+        }
+
+        let mut hasher = FnvHasher::default();
+        self.as_wstr().hash(&mut hasher);
+        let hash = hasher.finish();
+        if hash != u64::MAX {
+            self.fnv_hash.set(hash);
+        }
+        hash
+    }
+
     #[inline]
     pub fn as_wstr(&self) -> &WStr {
         // SAFETY: we own a `WString`.
@@ -192,6 +218,24 @@ impl Drop for AvmStringRepr<'_> {
             // It could also have been an empty owned WString, but
             // these don't need to be dropped either.
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AvmStringRepr;
+    use fnv::FnvHasher;
+    use ruffle_wstr::WString;
+    use std::hash::{Hash, Hasher};
+
+    #[test]
+    fn cached_fnv_hash_matches_string_hash() {
+        let repr = AvmStringRepr::from_raw(WString::from_utf8("PetDetailDataMap"), false);
+        let mut expected = FnvHasher::default();
+        repr.as_wstr().hash(&mut expected);
+
+        assert_eq!(repr.fnv_hash(), expected.finish());
+        assert_eq!(repr.fnv_hash(), expected.finish());
     }
 }
 

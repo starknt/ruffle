@@ -55,6 +55,12 @@ impl<'gc> AvmString<'gc> {
         self.0.is_dependent()
     }
 
+    /// Returns the cached FNV hash used by AVM2 dynamic property maps.
+    #[inline]
+    pub fn fnv_hash(&self) -> u64 {
+        self.0.fnv_hash()
+    }
+
     pub fn as_wstr(&self) -> &'gc WStr {
         Gc::as_ref(self.0).as_wstr()
     }

@@ -5,7 +5,7 @@ use gc_arena::Collect;
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use std::cell::Cell;
-use std::hash::{BuildHasher, Hash};
+use std::hash::BuildHasher;
 
 #[derive(Debug, Collect, Copy, Clone)]
 #[collect(no_drop)]
@@ -26,6 +26,31 @@ pub enum DynamicKey<'gc> {
     Object(Object<'gc>),
 }
 
+/// Computes a map hash without repeating work that is already cached by the
+/// key. Dynamic AVM2 property names are immutable strings, so their FNV hash
+/// can be reused across every object lookup.
+pub trait DynamicMapKey: Eq {
+    fn hash_with(&self, hasher: &FnvBuildHasher) -> u64;
+}
+
+impl<'gc> DynamicMapKey for DynamicKey<'gc> {
+    #[inline]
+    fn hash_with(&self, hasher: &FnvBuildHasher) -> u64 {
+        match self {
+            DynamicKey::String(name) => name.fnv_hash(),
+            DynamicKey::Uint(value) => hasher.hash_one(value),
+            DynamicKey::Object(object) => hasher.hash_one(object),
+        }
+    }
+}
+
+impl<'a> DynamicMapKey for &'a str {
+    #[inline]
+    fn hash_with(&self, hasher: &FnvBuildHasher) -> u64 {
+        hasher.hash_one(self)
+    }
+}
+
 /// A HashMap designed for dynamic properties on an object.
 ///
 /// Uses `HashTable` directly to expose stable bucket indices, which are
@@ -44,15 +69,15 @@ pub struct DynamicMap<K, V> {
     real_index: Cell<usize>,
 }
 
-impl<K: Eq + Hash, V> Default for DynamicMap<K, V> {
+impl<K: DynamicMapKey, V> Default for DynamicMap<K, V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: Eq + Hash, V> DynamicMap<K, V> {
+impl<K: DynamicMapKey, V> DynamicMap<K, V> {
     fn hash_key(&self, key: &K) -> u64 {
-        self.hasher.hash_one(key)
+        key.hash_with(&self.hasher)
     }
 
     pub fn new() -> Self {
@@ -115,10 +140,11 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
 
     pub fn insert(&mut self, key: K, new_value: V) {
         let hash = self.hash_key(&key);
+        let hasher = &self.hasher;
 
         match self
             .table
-            .entry(hash, |(k, _)| *k == key, |(k, _)| self.hasher.hash_one(k))
+            .entry(hash, |(k, _)| *k == key, |(k, _)| k.hash_with(hasher))
         {
             Entry::Occupied(mut occupied) => {
                 // NOTE: When inserting a new value into an already-occupied entry,
