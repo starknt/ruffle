@@ -407,6 +407,7 @@ impl<'gc> TDisplayObjectContainer<'gc> for Avm1Button<'gc> {
     }
 
     fn raw_container_mut(&self, mc: &Mutation<'gc>) -> RefMut<'_, ChildContainer<'gc>> {
+        self.invalidate_construction();
         let data = unlock!(Gc::write(mc, self.0), Avm1ButtonData, cell);
         RefMut::map(data.borrow_mut(), |this| &mut this.container)
     }

@@ -910,6 +910,7 @@ impl<'gc> TDisplayObjectContainer<'gc> for Stage<'gc> {
     }
 
     fn raw_container_mut(&self, gc_context: &Mutation<'gc>) -> RefMut<'_, ChildContainer<'gc>> {
+        self.invalidate_construction();
         unlock!(Gc::write(gc_context, self.0), StageData, child).borrow_mut()
     }
 }

@@ -1,1 +1,4 @@
-num_ticks = 2
+# External SWFs are parsed on native workers. Allow real scheduling time
+# for both chained loads; the exact sandbox trace remains the assertion.
+num_ticks = 60
+sleep_to_meet_frame_rate = true

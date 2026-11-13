@@ -1,0 +1,7 @@
+exit 1 []
+exit 1 []
+exit 1 []
+mutate-left
+exit 1 [constructed]
+exit 2 [constructed,constructed]
+exit 1 [constructed]

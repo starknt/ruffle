@@ -27,6 +27,17 @@ use std::hash::Hash;
 use std::num::NonZero;
 use swf::{ColorTransform, Fixed8};
 
+// Used only to reject a clean-subtree result when an AS callback mutated the
+// tree during construction. Thread-local because all display/AVM work stays on
+// the player thread; unrelated players can only cause conservative invalidation.
+thread_local! {
+    static CONSTRUCTION_REVISION: Cell<u64> = const { Cell::new(0) };
+}
+
+fn construction_revision() -> u64 {
+    CONSTRUCTION_REVISION.get()
+}
+
 mod avm1_button;
 mod avm2_button;
 mod bitmap;
@@ -819,6 +830,14 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     fn set_being_removed_by_avm2(&self, value: bool) {
         self.set_flag(DisplayObjectFlags::BEING_REMOVED_BY_AVM2, value);
+    }
+
+    fn construction_clean(&self) -> bool {
+        self.contains_flag(DisplayObjectFlags::CONSTRUCTION_CLEAN)
+    }
+
+    fn set_construction_clean(&self, clean: bool) {
+        self.set_flag(DisplayObjectFlags::CONSTRUCTION_CLEAN, clean);
     }
 
     fn manual_frame_construct(&self) -> bool {
@@ -1954,6 +1973,12 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn set_parent(self, context: &mut UpdateContext<'gc>, parent: Option<DisplayObject<'gc>>) {
         let had_parent = self.parent().is_some();
+        if let Some(old_parent) = self.parent() {
+            old_parent.invalidate_construction();
+        }
+        if let Some(new_parent) = parent {
+            new_parent.invalidate_construction();
+        }
         let write = Gc::write(context.gc(), self.base());
         DisplayObjectBase::set_parent_ignoring_orphan_list(write, parent);
         let parent_removed = had_parent && parent.is_none();
@@ -2335,6 +2360,7 @@ pub trait TDisplayObject<'gc>:
     /// normal frame construction by `MovieClip::construct_frame`.
     #[no_dynamic]
     fn set_manual_frame_construct(&self, value: bool) {
+        (*self).invalidate_construction();
         self.base().set_manual_frame_construct(value);
     }
 
@@ -2378,6 +2404,49 @@ pub trait TDisplayObject<'gc>:
     }
 
     fn set_state(self, _context: &mut UpdateContext<'gc>, _state: ButtonState) {}
+
+    /// Invalidate construction state through the real parent chain. This must
+    /// also run outside optimized scopes (loader completions can mutate a tree
+    /// between frames). A dirty MovieClip already keeps its ancestors dirty.
+    #[no_dynamic]
+    fn invalidate_construction(self) {
+        if !cfg!(feature = "construction_cache") {
+            return;
+        }
+        CONSTRUCTION_REVISION.set(CONSTRUCTION_REVISION.get().wrapping_add(1));
+        let mut current: DisplayObject<'gc> = self.into();
+        loop {
+            let was_clean = current.base().construction_clean();
+            current.base().set_construction_clean(false);
+            if current.as_movie_clip().is_some() && !was_clean {
+                break;
+            }
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            current = parent;
+        }
+    }
+
+    /// Whether another construct_frame visit is a no-op until invalidation.
+    /// Buttons and loaders remain traversal boundaries, including hidden states.
+    #[no_dynamic]
+    fn construction_is_settled(self) -> bool {
+        match self.into() {
+            DisplayObject::MovieClip(clip) => clip.base().construction_clean(),
+            DisplayObject::Bitmap(_)
+            | DisplayObject::TextLine(_)
+            | DisplayObject::Avm1Button(_) => true,
+            DisplayObject::Graphic(_)
+            | DisplayObject::MorphShape(_)
+            | DisplayObject::EditText(_)
+            | DisplayObject::Text(_)
+            | DisplayObject::Video(_) => self.object2().is_some(),
+            DisplayObject::Stage(_)
+            | DisplayObject::LoaderDisplay(_)
+            | DisplayObject::Avm2Button(_) => false,
+        }
+    }
 
     /// Run any start-of-frame actions for this display object.
     ///
@@ -3097,6 +3166,9 @@ bitflags! {
         /// events before removing it. Removing it again with these methods in
         /// the meantime throws an error.
         const BEING_REMOVED_BY_AVM2   = 1 << 17;
+
+        /// A MovieClip subtree with no pending construction or frame scripts.
+        const CONSTRUCTION_CLEAN = 1 << 18;
     }
 }
 

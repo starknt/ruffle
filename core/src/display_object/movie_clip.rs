@@ -1,4 +1,7 @@
 //! `MovieClip` display object and support code.
+
+#[cfg(all(test, feature = "construction_cache"))]
+mod construction_cache_tests;
 use crate::avm1::ActivationIdentifier as Avm1ActivationIdentifier;
 use crate::avm1::Avm1;
 use crate::avm1::ExecutionReason as Avm1ExecutionReason;
@@ -355,7 +358,11 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn instantiate(self, mc: &Mutation<'gc>) -> Self {
-        Self(Gc::new(mc, (*self.0).clone()))
+        let instance = Self(Gc::new(mc, (*self.0).clone()));
+        if cfg!(feature = "construction_cache") {
+            instance.base().set_construction_clean(false);
+        }
+        instance
     }
 
     /// Replace the current MovieClipData with a completely new movie.
@@ -373,6 +380,7 @@ impl<'gc> MovieClip<'gc> {
         is_root: bool,
         loader_info: Option<LoaderInfoObject<'gc>>,
     ) {
+        self.invalidate_construction();
         let write = Gc::write(context.gc(), self.0);
 
         let movie = movie.unwrap_or_else(|| {
@@ -401,6 +409,7 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn set_initialized(self) {
+        self.invalidate_construction();
         self.0.set_initialized(true);
     }
 
@@ -497,6 +506,7 @@ impl<'gc> MovieClip<'gc> {
             return true;
         }
 
+        self.invalidate_construction();
         let reader = &mut swf.read_from(progress.next_preload_chunk.get());
 
         let mut sub_preload_done = true;
@@ -820,6 +830,9 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn set_has_pending_script(self, value: bool) {
+        if value != self.0.has_pending_script.get() {
+            self.invalidate_construction();
+        }
         self.0.has_pending_script.set(value);
     }
 
@@ -1140,6 +1153,7 @@ impl<'gc> MovieClip<'gc> {
     /// This sets the current preload frame of this MovieClipto a given number (resulting
     /// in the _framesloaded / framesLoaded property being the given number - 1).
     pub fn set_cur_preload_frame(self, cur_preload_frame: u16) {
+        self.invalidate_construction();
         self.0
             .shared
             .get()
@@ -1150,6 +1164,7 @@ impl<'gc> MovieClip<'gc> {
 
     /// This sets the current frame of this MovieClip to a given number.
     pub fn set_current_frame(self, current_frame: FrameNumber) {
+        self.invalidate_construction();
         self.0.current_frame.set(current_frame);
     }
 
@@ -1397,6 +1412,7 @@ impl<'gc> MovieClip<'gc> {
             NextFrame::Same => self.stop(context),
         }
 
+        self.invalidate_construction();
         let tag_stream_start = shared.swf_data.as_ref().as_ptr() as u64;
         let data = shared.swf_data.clone();
         let mut reader = data.read_from(self.0.tag_stream_pos.get());
@@ -1641,6 +1657,7 @@ impl<'gc> MovieClip<'gc> {
     }
 
     fn run_goto(mut self, context: &mut UpdateContext<'gc>, frame: FrameNumber, is_implicit: bool) {
+        self.invalidate_construction();
         if cfg!(feature = "timeline_debug") {
             tracing::debug!(
                 "[{}]: {} from frame {} to frame {}",
@@ -2144,6 +2161,7 @@ impl<'gc> MovieClip<'gc> {
         callable: Option<Avm2Object<'gc>>,
         context: &mut UpdateContext<'gc>,
     ) {
+        self.invalidate_construction();
         let current_frame = self.current_frame();
 
         let write = unlock!(Gc::write(context.gc(), self.0), MovieClipData, cell);
@@ -2597,6 +2615,19 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
     /// Construct objects placed on this frame.
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
+        let optimized =
+            cfg!(feature = "construction_cache") && ruffle_render::profile::engine_optimized();
+        if optimized && self.base().construction_clean() {
+            return;
+        }
+        #[cfg(all(test, feature = "construction_cache"))]
+        construction_cache_tests::record_visit();
+        let revision = if optimized {
+            super::construction_revision()
+        } else {
+            0
+        };
+        let mut children_settled = false;
         // AVM1 code expects to execute in line with timeline instructions, so
         // it's exempted from frame construction.
         if self.movie().is_action_script_3()
@@ -2626,6 +2657,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                 let running_construct_frame = self
                     .0
                     .contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME);
+                children_settled = true;
                 for child in self.iter_render_list() {
                     // Under some conditions, we won't run `construct_frame` on
                     // a not-yet-constructed child
@@ -2636,6 +2668,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                         // on this clip, Flash avoids running `construct_frame` on
                         // the non-constructed children of this clip.
                         if running_construct_frame {
+                            children_settled = false;
                             continue;
                         }
 
@@ -2644,11 +2677,15 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                         // However, if the child has already been constructed, we run
                         // `construct_frame` like normal.
                         if child.manual_frame_construct() {
+                            children_settled = false;
                             continue;
                         }
                     }
 
                     child.construct_frame(context);
+                    if optimized {
+                        children_settled &= child.construction_is_settled();
+                    }
                 }
             }
         }
@@ -2657,6 +2694,18 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             // Check for frame-scripts before starting the frame-script phase,
             // to differentiate the pre-existing scripts from those introduced during frame-script phase.
             self.check_has_pending_script();
+        }
+
+        // Never mark an ancestor clean after a constructor/event changed an
+        // already visited descendant. No new allocation or GC root is needed.
+        if optimized
+            && children_settled
+            && revision == super::construction_revision()
+            && self.0.initialized()
+            && self.0.object2.get().is_some()
+            && self.0.cell.borrow().frame_scripts.is_empty()
+        {
+            self.base().set_construction_clean(true);
         }
     }
 
@@ -2786,6 +2835,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn set_object2(self, context: &mut UpdateContext<'gc>, to: Avm2StageObject<'gc>) {
+        self.invalidate_construction();
         let write = Gc::write(context.gc(), self.0);
         unlock!(write, MovieClipData, object2).set(Some(to));
         if self.parent().is_none() {
@@ -2888,6 +2938,7 @@ impl<'gc> TDisplayObjectContainer<'gc> for MovieClip<'gc> {
     }
 
     fn raw_container_mut(&self, mc: &Mutation<'gc>) -> RefMut<'_, ChildContainer<'gc>> {
+        self.invalidate_construction();
         let write = unlock!(Gc::write(mc, self.0), MovieClipData, cell);
         RefMut::map(write.borrow_mut(), |r| &mut r.container)
     }

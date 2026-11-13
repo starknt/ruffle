@@ -214,6 +214,7 @@ impl<'gc> TDisplayObjectContainer<'gc> for LoaderDisplay<'gc> {
     }
 
     fn raw_container_mut(&self, gc_context: &Mutation<'gc>) -> RefMut<'_, ChildContainer<'gc>> {
+        self.invalidate_construction();
         unlock!(Gc::write(gc_context, self.0), LoaderDisplayData, container).borrow_mut()
     }
 }
