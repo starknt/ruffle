@@ -10,13 +10,15 @@ use gc_arena::Collect;
 #[collect(no_drop)]
 pub(super) enum MethodCache<T> {
     Dense(Vec<Option<T>>),
-    Sparse(Vec<(usize, T)>),
+    SparseEmpty,
+    SparseOne(usize, T),
+    SparseMany(Vec<(usize, T)>),
 }
 
 impl<T> MethodCache<T> {
     pub(super) fn new(sparse: bool) -> Self {
         if sparse {
-            Self::Sparse(Vec::new())
+            Self::SparseEmpty
         } else {
             Self::Dense(Vec::new())
         }
@@ -25,7 +27,9 @@ impl<T> MethodCache<T> {
     pub(super) fn get(&self, id: usize) -> Option<&T> {
         match self {
             Self::Dense(entries) => entries.get(id).and_then(Option::as_ref),
-            Self::Sparse(entries) => entries
+            Self::SparseEmpty => None,
+            Self::SparseOne(entry_id, value) => (*entry_id == id).then_some(value),
+            Self::SparseMany(entries) => entries
                 .binary_search_by_key(&id, |entry| entry.0)
                 .ok()
                 .map(|index| &entries[index].1),
@@ -40,25 +44,44 @@ impl<T> MethodCache<T> {
     }
 
     pub(super) fn insert(&mut self, id: usize, value: T) {
-        match self {
-            Self::Dense(entries) => {
+        let current = std::mem::replace(self, Self::SparseEmpty);
+        *self = match current {
+            Self::Dense(mut entries) => {
                 if entries.len() <= id {
                     entries.resize_with(id + 1, || None);
                 }
                 entries[id] = Some(value);
+                Self::Dense(entries)
             }
-            Self::Sparse(entries) => match entries.binary_search_by_key(&id, |entry| entry.0) {
-                Ok(index) => entries[index].1 = value,
-                Err(index) => entries.insert(index, (id, value)),
-            },
-        }
+            Self::SparseEmpty => Self::SparseOne(id, value),
+            Self::SparseOne(entry_id, _) if entry_id == id => Self::SparseOne(id, value),
+            Self::SparseOne(entry_id, old_value) => {
+                let mut entries = Vec::with_capacity(2);
+                if entry_id < id {
+                    entries.push((entry_id, old_value));
+                    entries.push((id, value));
+                } else {
+                    entries.push((id, value));
+                    entries.push((entry_id, old_value));
+                }
+                Self::SparseMany(entries)
+            }
+            Self::SparseMany(mut entries) => {
+                match entries.binary_search_by_key(&id, |entry| entry.0) {
+                    Ok(index) => entries[index].1 = value,
+                    Err(index) => entries.insert(index, (id, value)),
+                }
+                Self::SparseMany(entries)
+            }
+        };
     }
 
     #[cfg(test)]
     fn allocated_bytes(&self) -> usize {
         match self {
             Self::Dense(entries) => entries.capacity() * std::mem::size_of::<Option<T>>(),
-            Self::Sparse(entries) => entries.capacity() * std::mem::size_of::<(usize, T)>(),
+            Self::SparseEmpty | Self::SparseOne(_, _) => 0,
+            Self::SparseMany(entries) => entries.capacity() * std::mem::size_of::<(usize, T)>(),
         }
     }
 }
@@ -66,6 +89,15 @@ impl<T> MethodCache<T> {
 #[cfg(test)]
 mod tests {
     use super::MethodCache;
+    use std::mem::size_of;
+
+    #[test]
+    fn sparse_cache_has_bounded_object_footprint() {
+        assert!(
+            size_of::<MethodCache<u8>>() <= size_of::<Vec<Option<u8>>>() + size_of::<usize>(),
+            "sparse cache grew beyond one pointer word over the stock Vec footprint"
+        );
+    }
 
     #[test]
     fn sparse_dispatch_ids_do_not_allocate_empty_slots() {
@@ -74,6 +106,26 @@ mod tests {
         assert_eq!(cache.get(4096), Some(&1));
         assert_eq!(cache.get(4095), None);
         assert!(cache.allocated_bytes() < 4096);
+    }
+
+    #[test]
+    fn sparse_small_cache_entries_stay_inline() {
+        let mut cache = MethodCache::new(true);
+        cache.insert(3, 1_u8);
+
+        assert_eq!(cache.get(3), Some(&1));
+        assert_eq!(cache.allocated_bytes(), 0);
+    }
+
+    #[test]
+    fn sparse_second_entry_spills_without_losing_lookup() {
+        let mut cache = MethodCache::new(true);
+        cache.insert(3, 1_u8);
+        cache.insert(17, 2_u8);
+
+        assert_eq!(cache.get(3), Some(&1));
+        assert_eq!(cache.get(17), Some(&2));
+        assert!(cache.allocated_bytes() > 0);
     }
 
     #[test]
