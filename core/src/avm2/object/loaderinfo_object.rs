@@ -294,6 +294,10 @@ impl<'gc> LoaderInfoObject<'gc> {
 
         let content = loader.child_by_index(0);
 
+        if let Some(content) = content {
+            context.load_manager.invalidate_target_loads(content);
+        }
+
         if content.is_some() {
             let unload_evt = EventObject::bare_default_event(context, "unload");
             Avm2::dispatch_event(context, unload_evt, self.into());

@@ -41,6 +41,29 @@ pub struct Timing {
     pub nanos: u64,
     pub max_nanos: u64,
 }
+#[derive(Debug, Clone)]
+pub struct AsyncEvent {
+    pub kind: &'static str,
+    pub generation: u64,
+    pub queue_depth: u64,
+    pub duration_ns: u64,
+    pub bytes: u64,
+    pub error: Option<&'static str>,
+}
+
+impl Default for AsyncEvent {
+    fn default() -> Self {
+        Self {
+            kind: "unknown",
+            generation: 0,
+            queue_depth: 0,
+            duration_ns: 0,
+            bytes: 0,
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Counters {
     pub timings: [Timing; 26],
@@ -59,6 +82,7 @@ pub struct Counters {
     pub peak_idle: [u64; 2],
     pub peak_pool: u64,
     pub upload_bytes: u64,
+    pub async_events: Vec<AsyncEvent>,
 }
 #[derive(Clone, Default, Debug)]
 pub struct RenderMetrics(Rc<RefCell<Counters>>);
@@ -88,6 +112,10 @@ impl Drop for Scope {
 impl RenderMetrics {
     pub fn snapshot(&self) -> Counters {
         self.0.borrow().clone()
+    }
+
+    pub fn take_async_events(&self) -> Vec<AsyncEvent> {
+        std::mem::take(&mut self.0.borrow_mut().async_events)
     }
     fn record(&self, phase: Phase, nanos: u64) {
         let mut all = self.0.borrow_mut();
@@ -220,6 +248,28 @@ impl Drop for GpuBitmap {
             c.gpu_bitmap_bytes -= b;
         }
     }
+}
+
+pub fn async_event(
+    kind: &'static str,
+    generation: u64,
+    queue_depth: usize,
+    duration_ns: u64,
+    bytes: usize,
+    error: Option<&'static str>,
+) {
+    CURRENT.with_borrow(|m| {
+        if let Some(m) = m {
+            m.0.borrow_mut().async_events.push(AsyncEvent {
+                kind,
+                generation,
+                queue_depth: queue_depth as u64,
+                duration_ns,
+                bytes: bytes as u64,
+                error,
+            });
+        }
+    });
 }
 
 pub fn loader_bytes(index: usize, bytes: usize) {

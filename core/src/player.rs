@@ -6,6 +6,7 @@ use crate::avm1::Object;
 use crate::avm1::Value;
 use crate::avm1::VariableDumper;
 use crate::avm1::{Activation, ActivationIdentifier};
+use crate::avm2::globals::flash::display::shader_job::{PendingShaderJob, ShaderJobQueue};
 use crate::avm2::object::EventObject as Avm2EventObject;
 use crate::avm2::{Activation as Avm2Activation, Avm2, CallStack, SharedObjectObject};
 use crate::backend::navigator::ErrorResponse;
@@ -231,6 +232,9 @@ struct GcRootData<'gc> {
     dynamic_root: DynamicRootSet<'gc>,
 
     post_frame_callbacks: Vec<PostFrameCallback<'gc>>,
+    shader_job_queue: ShaderJobQueue,
+    pending_shader_jobs: VecDeque<PendingShaderJob<'gc>>,
+    active_shader_jobs: VecDeque<PendingShaderJob<'gc>>,
 }
 
 #[derive(Collect)]
@@ -271,6 +275,9 @@ impl<'gc> GcRootData<'gc> {
         &mut LocalConnections<'gc>,
         &mut OrphanManager<'gc>,
         &mut Vec<PostFrameCallback<'gc>>,
+        &mut ShaderJobQueue,
+        &mut VecDeque<PendingShaderJob<'gc>>,
+        &mut VecDeque<PendingShaderJob<'gc>>,
         &mut MouseData<'gc>,
         DynamicRootSet<'gc>,
     ) {
@@ -297,6 +304,9 @@ impl<'gc> GcRootData<'gc> {
             &mut self.local_connections,
             &mut self.orphan_manager,
             &mut self.post_frame_callbacks,
+            &mut self.shader_job_queue,
+            &mut self.pending_shader_jobs,
+            &mut self.active_shader_jobs,
             &mut self.mouse_data,
             self.dynamic_root,
         )
@@ -2278,6 +2288,7 @@ impl Player {
         }
 
         self.update(|context| {
+            crate::avm2::globals::flash::display::shader_job::begin_frame(context);
             // TODO: Is this order correct?
             {
                 let _avm2 = ruffle_render::profile::time(ruffle_render::profile::Phase::Avm2);
@@ -2305,6 +2316,7 @@ impl Player {
                 for cb in std::mem::take(context.post_frame_callbacks) {
                     (cb.callback)(context, cb.data);
                 }
+                crate::avm2::globals::flash::display::shader_job::process_post_frame(context);
             }
         });
 
@@ -2543,6 +2555,9 @@ impl Player {
                 local_connections,
                 orphan_manager,
                 post_frame_callbacks,
+                shader_job_queue,
+                pending_shader_jobs,
+                active_shader_jobs,
                 mouse_data,
                 dynamic_root,
             ) = gc_root.update_context_params();
@@ -2603,6 +2618,9 @@ impl Player {
                 orphan_manager,
                 dynamic_root,
                 post_frame_callbacks,
+                shader_job_queue,
+                pending_shader_jobs,
+                active_shader_jobs,
                 notification_sender: this.notification_sender.as_ref(),
                 frame_script_cleanup_queue: VecDeque::new(),
             };
@@ -3276,6 +3294,9 @@ impl PlayerBuilder {
             orphan_manager: OrphanManager::default(),
             dynamic_root: DynamicRootSet::new(gc_context),
             post_frame_callbacks: Vec::new(),
+            shader_job_queue: ShaderJobQueue::default(),
+            pending_shader_jobs: VecDeque::new(),
+            active_shader_jobs: VecDeque::new(),
         };
 
         GcRoot {

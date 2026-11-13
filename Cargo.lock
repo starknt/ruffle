@@ -4771,6 +4771,7 @@ dependencies = [
  "png",
  "quick-xml",
  "rand",
+ "rayon",
  "realfft",
  "regress",
  "ruffle_common",

@@ -121,6 +121,26 @@ pub trait RenderBackend: Any {
         target: &PixelBenderTarget,
     ) -> Result<PixelBenderOutput, Error>;
 
+    /// Submit a Pixel Bender job without exposing renderer state to AVM2.
+    /// Backends with asynchronous readback override this pair; the default
+    /// keeps compatibility for backends that only have a synchronous path.
+    fn submit_pixelbender_shader(
+        &mut self,
+        handle: PixelBenderShaderHandle,
+        arguments: &[PixelBenderShaderArgument],
+        target: &PixelBenderTarget,
+    ) -> Result<PixelBenderPending, Error> {
+        self.run_pixelbender_shader(handle, arguments, target)
+            .map(PixelBenderPending::ready)
+    }
+
+    fn poll_pixelbender_shader(
+        &mut self,
+        pending: &mut PixelBenderPending,
+    ) -> Result<Option<PixelBenderOutput>, Error> {
+        Ok(pending.take_ready())
+    }
+
     fn resolve_sync_handle(
         &mut self,
         handle: Box<dyn SyncHandle>,
@@ -141,6 +161,37 @@ pub enum PixelBenderTarget {
 pub enum PixelBenderOutput {
     Bitmap(Box<dyn SyncHandle>),
     Bytes(Vec<u8>),
+}
+
+/// Opaque state owned by a renderer between submission and readback.
+/// No AVM value or renderer reference is stored here.
+pub struct PixelBenderPending {
+    backend: Box<dyn Any>,
+    ready: Option<PixelBenderOutput>,
+}
+
+impl PixelBenderPending {
+    pub fn ready(output: PixelBenderOutput) -> Self {
+        Self {
+            backend: Box::new(()),
+            ready: Some(output),
+        }
+    }
+
+    pub fn from_backend<T: Any>(state: T) -> Self {
+        Self {
+            backend: Box::new(state),
+            ready: None,
+        }
+    }
+
+    pub fn backend_mut<T: Any>(&mut self) -> Option<&mut T> {
+        self.backend.downcast_mut::<T>()
+    }
+
+    fn take_ready(&mut self) -> Option<PixelBenderOutput> {
+        self.ready.take()
+    }
 }
 
 pub trait IndexBuffer: Any {}

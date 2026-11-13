@@ -16,7 +16,10 @@ use ruffle_render::shape_utils::GradientType;
 use ruffle_render::tessellator::{Gradient as TessGradient, Vertex as TessVertex};
 use std::any::Any;
 use std::cell::{Cell, OnceCell};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    mpsc::{Receiver, TryRecvError},
+};
 use swf::GradientSpread;
 pub use wgpu;
 pub use wgpu_profiler;
@@ -158,6 +161,58 @@ impl From<TessGradient> for GradientUniforms {
     }
 }
 
+pub struct AsyncReadback {
+    buffer: PoolEntry<wgpu::Buffer, BufferDimensions>,
+    dimensions: BufferDimensions,
+    descriptors: Arc<Descriptors>,
+    receiver: Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+impl AsyncReadback {
+    fn new(
+        buffer: PoolEntry<wgpu::Buffer, BufferDimensions>,
+        dimensions: BufferDimensions,
+        descriptors: Arc<Descriptors>,
+        index: Option<wgpu::SubmissionIndex>,
+    ) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        let _ = index;
+        let _ = descriptors.device.poll(wgpu::PollType::Poll);
+        Self {
+            buffer,
+            dimensions,
+            descriptors,
+            receiver,
+        }
+    }
+
+    pub fn poll(&mut self) -> Result<Option<(Vec<u8>, u32)>, String> {
+        self.descriptors
+            .device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| format!("wgpu poll failed: {error:?}"))?;
+        match self.receiver.try_recv() {
+            Ok(Ok(())) => {
+                let Ok(map) = self.buffer.slice(..).get_mapped_range() else {
+                    return Ok(None);
+                };
+                let bytes = map.to_vec();
+                drop(map);
+                self.buffer.unmap();
+                Ok(Some((bytes, self.dimensions.padded_bytes_per_row)))
+            }
+            Ok(Err(error)) => Err(format!("buffer map failed: {error:?}")),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err("buffer map callback disconnected".into()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum QueueSyncHandle {
     AlreadyCopied {
@@ -177,6 +232,58 @@ pub enum QueueSyncHandle {
 impl SyncHandle for QueueSyncHandle {}
 
 impl QueueSyncHandle {
+    pub fn prepare_async(self, frame: &mut ActiveFrame) -> AsyncReadback {
+        match self {
+            QueueSyncHandle::AlreadyCopied {
+                index,
+                buffer,
+                copy_dimensions,
+                descriptors,
+            } => AsyncReadback::new(buffer, copy_dimensions, descriptors, index),
+            QueueSyncHandle::NotCopied {
+                handle,
+                copy_area,
+                descriptors,
+                pool,
+            } => {
+                let texture = as_texture(&handle);
+                let dimensions = BufferDimensions::new(
+                    copy_area.width() as usize,
+                    copy_area.height() as usize,
+                    texture.texture.format(),
+                );
+                let buffer = pool.take(&descriptors, dimensions.clone());
+                frame.encoder().copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: copy_area.x_min,
+                            y: copy_area.y_min,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(dimensions.padded_bytes_per_row),
+                            rows_per_image: None,
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: copy_area.width(),
+                        height: copy_area.height(),
+                        depth_or_array_layers: 1,
+                    },
+                );
+                let index = frame.submit_direct(&descriptors);
+                AsyncReadback::new(buffer, dimensions, descriptors, Some(index))
+            }
+        }
+    }
+
     pub fn capture<R, F: FnOnce(&[u8], u32) -> R>(
         self,
         with_rgba: F,

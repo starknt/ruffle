@@ -10,12 +10,13 @@ use crate::target::{MaybeOwnedBuffer, TextureTarget};
 use crate::target::{RenderTargetFrame, TextureBufferInfo};
 use crate::utils::{BufferDimensions, run_copy_pipeline};
 use crate::{
-    Descriptors, Error, QueueSyncHandle, RenderTarget, SwapChainTarget, Texture, as_texture,
-    format_list, get_backend_names,
+    AsyncReadback, Descriptors, Error, QueueSyncHandle, RenderTarget, SwapChainTarget, Texture,
+    as_texture, format_list, get_backend_names,
 };
 use image::imageops::FilterType;
 use ruffle_render::backend::{
-    BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
+    BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderPending,
+    PixelBenderTarget,
 };
 use ruffle_render::backend::{RenderBackend, ShapeHandle, ViewportDimensions};
 use ruffle_render::bitmap::{
@@ -446,6 +447,17 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             }) => unreachable!("Buffer must be Borrowed as it was set to be Borrowed earlier"),
         }
     }
+}
+
+enum WgpuPixelBenderPending {
+    Bitmap(Option<Box<dyn SyncHandle>>),
+    Bytes {
+        sync_handle: Option<QueueSyncHandle>,
+        readback: Option<AsyncReadback>,
+        width: usize,
+        output_channels: usize,
+        has_padding: bool,
+    },
 }
 
 impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
@@ -1026,6 +1038,93 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         arguments: &[PixelBenderShaderArgument],
         target: &PixelBenderTarget,
     ) -> Result<PixelBenderOutput, BitmapError> {
+        let mut pending = self.submit_pixelbender_shader(shader, arguments, target)?;
+        loop {
+            if let Some(output) = self.poll_pixelbender_shader(&mut pending)? {
+                return Ok(output);
+            }
+            self.descriptors
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .map_err(|_| {
+                    BitmapError::Unimplemented(Cow::Borrowed("Pixel Bender poll failed"))
+                })?;
+        }
+    }
+
+    fn poll_pixelbender_shader(
+        &mut self,
+        pending: &mut PixelBenderPending,
+    ) -> Result<Option<PixelBenderOutput>, BitmapError> {
+        let state =
+            pending
+                .backend_mut::<WgpuPixelBenderPending>()
+                .ok_or(BitmapError::Unimplemented(Cow::Borrowed(
+                    "Invalid Pixel Bender pending state",
+                )))?;
+        match state {
+            WgpuPixelBenderPending::Bitmap(handle) => {
+                Ok(handle.take().map(PixelBenderOutput::Bitmap))
+            }
+            WgpuPixelBenderPending::Bytes {
+                sync_handle,
+                readback,
+                width,
+                output_channels,
+                has_padding,
+            } => {
+                if readback.is_none() {
+                    let handle = sync_handle
+                        .take()
+                        .expect("Pixel Bender readback handle missing");
+                    *readback = Some(handle.prepare_async(&mut self.active_frame));
+                    return Ok(None);
+                }
+                let Some((raw_pixels, buffer_width)) =
+                    readback.as_mut().unwrap().poll().map_err(|error| {
+                        BitmapError::Unimplemented(Cow::Owned(
+                            format!("Pixel Bender readback poll failed: {error}").into(),
+                        ))
+                    })?
+                else {
+                    return Ok(None);
+                };
+                let pixels = if buffer_width as usize
+                    != *width * *output_channels as usize * std::mem::size_of::<f32>()
+                {
+                    let mut new_pixels = Vec::new();
+                    for row in raw_pixels.chunks(buffer_width as usize) {
+                        let actual_row = &row[0..(*width * std::mem::size_of::<[f32; 4]>())];
+                        for pixel in actual_row
+                            .as_chunks::<{ std::mem::size_of::<[f32; 4]>() }>()
+                            .0
+                        {
+                            if *has_padding {
+                                new_pixels
+                                    .extend_from_slice(&pixel[0..(3 * std::mem::size_of::<f32>())]);
+                            } else {
+                                new_pixels.extend_from_slice(pixel);
+                            }
+                        }
+                    }
+                    new_pixels
+                } else {
+                    raw_pixels
+                };
+                Ok(Some(PixelBenderOutput::Bytes(pixels)))
+            }
+        }
+    }
+
+    fn submit_pixelbender_shader(
+        &mut self,
+        shader: PixelBenderShaderHandle,
+        arguments: &[PixelBenderShaderArgument],
+        target: &PixelBenderTarget,
+    ) -> Result<PixelBenderPending, BitmapError> {
         let output_channels = shader
             .0
             .parsed_shader()
@@ -1151,44 +1250,18 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
 
         match target {
-            PixelBenderTarget::Bitmap(_) => Ok(PixelBenderOutput::Bitmap(sync_handle)),
-            PixelBenderTarget::Bytes { width, .. } => {
-                let mut output = None;
-                self.resolve_sync_handle(
-                    sync_handle,
-                    Box::new(|raw_pixels, buffer_width| {
-                        let width = *width as usize;
-
-                        if buffer_width as usize
-                            != width * output_channels * std::mem::size_of::<f32>()
-                        {
-                            let mut new_pixels = Vec::new();
-                            for row in raw_pixels.chunks(buffer_width as usize) {
-                                let actual_row = &row[0..(width * std::mem::size_of::<[f32; 4]>())];
-
-                                for pixel in actual_row
-                                    .as_chunks::<{ std::mem::size_of::<[f32; 4]>() }>()
-                                    .0
-                                {
-                                    if has_padding {
-                                        // Take the first three channels
-                                        new_pixels.extend_from_slice(
-                                            &pixel[0..(3 * std::mem::size_of::<f32>())],
-                                        );
-                                    } else {
-                                        // Copy the pixel as-is
-                                        new_pixels.extend_from_slice(pixel);
-                                    }
-                                }
-                            }
-                            output = Some(new_pixels);
-                        } else {
-                            output = Some(raw_pixels.to_vec());
-                        };
-                    }),
-                )?;
-                Ok(PixelBenderOutput::Bytes(output.unwrap()))
-            }
+            PixelBenderTarget::Bitmap(_) => Ok(PixelBenderPending::from_backend(
+                WgpuPixelBenderPending::Bitmap(Some(sync_handle)),
+            )),
+            PixelBenderTarget::Bytes { width, .. } => Ok(PixelBenderPending::from_backend(
+                WgpuPixelBenderPending::Bytes {
+                    sync_handle: Some(*sync_handle),
+                    readback: None,
+                    width: *width as usize,
+                    output_channels,
+                    has_padding,
+                },
+            )),
         }
     }
 

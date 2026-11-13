@@ -49,6 +49,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use std::time::Instant;
 use swf::read::{extract_swz, read_compression_type};
 use thiserror::Error;
 use url::{ParseError, Url, form_urlencoded};
@@ -155,15 +156,6 @@ impl ContentType {
             ContentType::Swf
         } else {
             determine_jpeg_tag_format(data).into()
-        }
-    }
-
-    /// Assert that content is of a given type, and error otherwise.
-    fn expect(self, expected: Self) -> Result<Self, Error> {
-        if self == expected {
-            Ok(self)
-        } else {
-            Err(Error::UnexpectedData(expected, self))
         }
     }
 }
@@ -323,6 +315,17 @@ impl<'gc> LoadManager<'gc> {
         self.movies.remove(handle);
     }
 
+    /// Invalidate parses that target the same display object. The old future
+    /// may finish naturally, but its generation check prevents installation or
+    /// loader events after a replacement or unload.
+    pub fn invalidate_target_loads(&mut self, target_clip: DisplayObject<'gc>) {
+        for loader in self.movies.values_mut() {
+            if DisplayObject::ptr_eq(loader.target_clip, target_clip) {
+                invalidate_generation(&mut loader.generation);
+            }
+        }
+    }
+
     /// Retrieve a loader by handle.
     pub fn get_loader(&self, handle: LoaderHandle) -> Option<&MovieLoader<'gc>> {
         self.movies.get(handle)
@@ -368,6 +371,10 @@ impl<'gc> LoadManager<'gc> {
         loader_url: Option<String>,
         vm_data: MovieLoaderVMData<'gc>,
     ) -> OwnedFuture<(), Error> {
+        // A new request for the same target supersedes every older request,
+        // including AVM1 loads that are not wrapped in an abortable read.
+        self.invalidate_target_loads(target_clip);
+
         // When an AVM2 movie loads an AVM1 movie, that AVM1 movie cannot load
         // another movie over itself, as in loadMovie(..., _root). Attempts to
         // do so will be silently ignored.
@@ -390,6 +397,7 @@ impl<'gc> LoadManager<'gc> {
 
         let loader = MovieLoader {
             self_handle: None,
+            generation: 0,
             target_clip,
             vm_data,
             loader_status: LoaderStatus::Pending,
@@ -427,20 +435,37 @@ impl<'gc> LoadManager<'gc> {
                 // FP will ignore it and continue to execute the movie.
                 Ok((body, url, _status, _redirected)) => {
                     let content_type = ContentType::sniff(&body);
+                    let bytes_len = body.len();
+                    ruffle_render::profile::async_event(
+                        "swfParseQueued",
+                        0,
+                        0,
+                        0,
+                        body.len(),
+                        None,
+                    );
+                    let (parsed, parse_duration_ns) =
+                        prepare_swf_movie_for_url(body, url.clone(), Some(url.clone()), None).await;
+                    let (_, prepared) = parsed.map_err(|error| {
+                        Error::FetchError(format!("Could not parse imported SWF: {error}"))
+                    })?;
+                    ruffle_render::profile::async_event(
+                        "swfParseCompleted",
+                        0,
+                        0,
+                        parse_duration_ns,
+                        bytes_len,
+                        None,
+                    );
                     tracing::info!("Loading imported movie: {:?}", url);
 
                     player.lock().unwrap().mutate_with_update_context(|uc| {
                         let importer_movie = importer_movie.fetch(uc);
 
                         if matches!(content_type, ContentType::Swf) {
-                            let movie = SwfMovieData::from_data(
-                                &body,
-                                url.clone(),
-                                Some(url.clone()),
-                                None,
-                            )
-                            .expect("Could not load movie")
-                            .with_shared_bytes(ruffle_render::profile::optimized());
+                            let movie = prepared
+                                .expect("Could not load movie")
+                                .with_shared_bytes(ruffle_render::profile::optimized());
 
                             let movie = SwfMovie::new(uc.gc(), movie);
 
@@ -488,8 +513,10 @@ impl<'gc> LoadManager<'gc> {
         loader_url: String,
         vm_data: MovieLoaderVMData<'gc>,
     ) -> Result<(), Error> {
+        context.load_manager.invalidate_target_loads(target_clip);
         let loader = MovieLoader {
             self_handle: None,
+            generation: 0,
             target_clip,
             vm_data,
             loader_status: LoaderStatus::Pending,
@@ -582,6 +609,62 @@ impl Default for LoadManager<'_> {
     }
 }
 
+#[cfg(test)]
+mod generation_tests {
+    #[test]
+    fn newer_request_invalidates_previous_generation() {
+        let mut generation = 0_u64;
+        let first = super::next_generation(&mut generation);
+        let second = super::next_generation(&mut generation);
+
+        assert_ne!(first, second);
+        assert!(!super::generation_is_current(generation, first));
+        assert!(super::generation_is_current(generation, second));
+    }
+
+    #[test]
+    fn invalidation_rejects_result_after_unload() {
+        let mut generation = 0_u64;
+        let request = super::next_generation(&mut generation);
+
+        super::invalidate_generation(&mut generation);
+
+        assert!(!super::generation_is_current(generation, request));
+    }
+
+    #[test]
+    fn root_parse_rejects_non_swf_without_panicking() {
+        let result = super::require_swf_movie(None, &[]);
+        assert!(matches!(
+            result,
+            Err(super::Error::UnexpectedData(
+                super::ContentType::Swf,
+                super::ContentType::Unknown
+            ))
+        ));
+    }
+}
+
+fn next_generation(generation: &mut u64) -> u64 {
+    *generation = generation.wrapping_add(1);
+    *generation
+}
+
+fn invalidate_generation(generation: &mut u64) {
+    let _ = next_generation(generation);
+}
+
+fn generation_is_current(current: u64, expected: u64) -> bool {
+    current == expected
+}
+
+fn require_swf_movie(movie: Option<SwfMovieData>, data: &[u8]) -> Result<SwfMovieData, Error> {
+    movie.ok_or(Error::UnexpectedData(
+        ContentType::Swf,
+        ContentType::sniff(data),
+    ))
+}
+
 async fn wait_for_full_response(
     response: OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>,
 ) -> Result<(Vec<u8>, String, u16, bool), ErrorResponse> {
@@ -595,6 +678,89 @@ async fn wait_for_full_response(
         Ok(body) => Ok((body, url, status, redirected)),
         Err(error) => Err(ErrorResponse { url, error }),
     }
+}
+
+/// Prepare SWF bytes without holding the player lock. Native builds use the
+/// shared rayon pool; WASM keeps the same async shape with a synchronous
+/// fallback because browser workers cannot access the core parser directly.
+#[cfg(not(target_family = "wasm"))]
+async fn prepare_swf_movie(
+    body: Vec<u8>,
+    url: String,
+    loader_url: Option<String>,
+    load_bytes_info: Option<LoadBytesInfo>,
+) -> Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error> {
+    let (sender, receiver) = async_channel::bounded(1);
+    rayon::spawn_fifo(move || {
+        let result = if ContentType::sniff(&body) == ContentType::Swf {
+            SwfMovieData::from_data(&body, url, loader_url, load_bytes_info).map(Some)
+        } else if let Ok(uncompressed) = extract_swz(&body) {
+            SwfMovieData::from_data(&uncompressed, url, loader_url, load_bytes_info).map(Some)
+        } else {
+            Ok(None)
+        };
+        let _ = sender.send_blocking((body, result));
+    });
+    let (body, result) = receiver
+        .recv()
+        .await
+        .expect("SWF parser worker dropped result");
+    result.map(|movie| (body, movie))
+}
+
+fn prepare_swf_movie_inline(
+    body: Vec<u8>,
+    url: String,
+    loader_url: Option<String>,
+    load_bytes_info: Option<LoadBytesInfo>,
+) -> Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error> {
+    let movie = if ContentType::sniff(&body) == ContentType::Swf {
+        SwfMovieData::from_data(&body, url, loader_url, load_bytes_info).map(Some)?
+    } else if let Ok(uncompressed) = extract_swz(&body) {
+        SwfMovieData::from_data(&uncompressed, url, loader_url, load_bytes_info).map(Some)?
+    } else {
+        None
+    };
+    Ok((body, movie))
+}
+
+fn use_inline_movie_parse(url: &str) -> bool {
+    url.starts_with("file:") || url.starts_with("data:") || url.starts_with("ruffle:")
+}
+
+async fn prepare_swf_movie_for_url(
+    body: Vec<u8>,
+    url: String,
+    loader_url: Option<String>,
+    load_bytes_info: Option<LoadBytesInfo>,
+) -> (
+    Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error>,
+    u64,
+) {
+    let started = Instant::now();
+    let result = if use_inline_movie_parse(&url) {
+        prepare_swf_movie_inline(body, url, loader_url, load_bytes_info)
+    } else {
+        prepare_swf_movie(body, url, loader_url, load_bytes_info).await
+    };
+    (result, started.elapsed().as_nanos() as u64)
+}
+
+#[cfg(target_family = "wasm")]
+async fn prepare_swf_movie(
+    body: Vec<u8>,
+    url: String,
+    loader_url: Option<String>,
+    load_bytes_info: Option<LoadBytesInfo>,
+) -> Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error> {
+    let movie = if ContentType::sniff(&body) == ContentType::Swf {
+        SwfMovieData::from_data(&body, url, loader_url, load_bytes_info).map(Some)?
+    } else if let Ok(uncompressed) = extract_swz(&body) {
+        SwfMovieData::from_data(&uncompressed, url, loader_url, load_bytes_info).map(Some)?
+    } else {
+        None
+    };
+    Ok((body, movie))
 }
 
 /// The completion status of a `Loader` loading a movie.
@@ -656,6 +822,11 @@ pub struct MovieLoader<'gc> {
     #[collect(require_static)]
     self_handle: Option<LoaderHandle>,
 
+    /// Monotonically increasing request token. Results from older requests
+    /// are discarded before they can touch AVM state.
+    #[collect(require_static)]
+    generation: u64,
+
     /// The target movie clip to load the movie into.
     target_clip: DisplayObject<'gc>,
 
@@ -679,6 +850,19 @@ pub struct MovieLoader<'gc> {
     /// completed and we expect the Player to periodically tick preload
     /// until loading completes.
     movie: Option<SwfMovie<'gc>>,
+}
+
+impl<'gc> LoadManager<'gc> {
+    fn generation_matches(&self, handle: LoaderHandle, generation: u64) -> bool {
+        self.movies
+            .get(handle)
+            .map(|loader| generation_is_current(loader.generation, generation))
+            .unwrap_or(false)
+    }
+
+    fn current_generation(&self, handle: LoaderHandle) -> Option<u64> {
+        self.movies.get(handle).map(|loader| loader.generation)
+    }
 }
 
 impl<'gc> MovieLoader<'gc> {
@@ -774,6 +958,7 @@ impl<'gc> MovieLoader<'gc> {
         loader_url: Option<String>,
     ) -> OwnedFuture<(), Error> {
         let handle = self.self_handle.expect("Loader not self-introduced");
+        let generation = next_generation(&mut self.generation);
 
         Box::pin(async move {
             let request_url = request.url().to_string();
@@ -830,18 +1015,87 @@ impl<'gc> MovieLoader<'gc> {
             })?;
 
             let response = wait_for_full_response(fetch).await;
-            let player = player.lock().unwrap();
             match response {
                 Ok((body, url, status, redirected)) if replacing_root_movie => {
+                    ruffle_render::profile::async_event(
+                        "swfParseQueued",
+                        generation,
+                        0,
+                        0,
+                        body.len(),
+                        None,
+                    );
+                    let (parsed, parse_duration_ns) =
+                        prepare_swf_movie_for_url(body, url.clone(), loader_url.clone(), None)
+                            .await;
+                    let (body, prepared) = parsed.map_err(|error| {
+                        Error::FetchError(format!("Could not parse SWF: {error}"))
+                    })?;
+                    let player = player.lock().unwrap();
+                    let movie = prepared.ok_or(Error::UnexpectedData(
+                        ContentType::Swf,
+                        ContentType::sniff(&body),
+                    ))?;
                     Self::on_success_root_movie(
-                        player, handle, loader_url, body, url, status, redirected,
+                        player,
+                        handle,
+                        generation,
+                        body.len(),
+                        parse_duration_ns,
+                        movie,
+                        status,
+                        redirected,
                     )?;
                 }
                 Ok((body, url, status, redirected)) => {
-                    Self::on_success(player, handle, loader_url, body, url, status, redirected)?;
+                    ruffle_render::profile::async_event(
+                        "swfParseQueued",
+                        generation,
+                        0,
+                        0,
+                        body.len(),
+                        None,
+                    );
+                    let (parsed, parse_duration_ns) =
+                        prepare_swf_movie_for_url(body, url.clone(), loader_url.clone(), None)
+                            .await;
+                    let (body, prepared) = parsed.map_err(|error| {
+                        Error::FetchError(format!("Could not parse SWF: {error}"))
+                    })?;
+                    let player = player.lock().unwrap();
+                    Self::on_success(
+                        player,
+                        handle,
+                        generation,
+                        loader_url,
+                        body,
+                        url,
+                        status,
+                        redirected,
+                        prepared,
+                        parse_duration_ns,
+                    )?;
                 }
                 Err(response) => {
-                    Self::on_error(player, handle, response)?;
+                    let mut player = player.lock().unwrap();
+                    let mut current = false;
+                    player.mutate_with_update_context(|uc| -> Result<(), Error> {
+                        current = uc.load_manager.generation_matches(handle, generation);
+                        if !current {
+                            ruffle_render::profile::async_event(
+                                "swfParseDropped",
+                                generation,
+                                0,
+                                0,
+                                0,
+                                Some("stale-error"),
+                            );
+                        }
+                        Ok(())
+                    })?;
+                    if current {
+                        Self::on_error(player, handle, response)?;
+                    }
                 }
             }
 
@@ -852,17 +1106,34 @@ impl<'gc> MovieLoader<'gc> {
     fn on_success_root_movie(
         mut player: MutexGuard<'_, Player>,
         handle: LoaderHandle,
-        loader_url: Option<String>,
-        body: Vec<u8>,
-        url: String,
+        generation: u64,
+        body_len: usize,
+        parse_duration_ns: u64,
+        movie: SwfMovieData,
         status: u16,
         redirected: bool,
     ) -> Result<(), Error> {
-        ContentType::sniff(&body).expect(ContentType::Swf)?;
-
-        let movie = SwfMovieData::from_data(&body, url, loader_url, None)?
-            .with_shared_bytes(ruffle_render::profile::optimized());
+        let movie = movie.with_shared_bytes(ruffle_render::profile::optimized());
         player.mutate_with_update_context(|uc| {
+            if !uc.load_manager.generation_matches(handle, generation) {
+                ruffle_render::profile::async_event(
+                    "swfParseDropped",
+                    generation,
+                    0,
+                    0,
+                    body_len,
+                    Some("stale"),
+                );
+                return Ok(());
+            }
+            ruffle_render::profile::async_event(
+                "swfParseCompleted",
+                generation,
+                0,
+                parse_duration_ns,
+                body_len,
+                None,
+            );
             // Make a copy of the properties on the root, so we can put them back after replacing it
             let mut root_properties: IndexMap<AvmString, Value> = IndexMap::new();
             if let Some(root) = uc.stage.root_clip()
@@ -901,32 +1172,39 @@ impl<'gc> MovieLoader<'gc> {
             }
 
             // For some reason, progress event is dispatched twice here.
-            MovieLoader::movie_loader_progress(handle, uc, body.len(), body.len())?;
-            MovieLoader::movie_loader_progress(handle, uc, body.len(), body.len())?;
+            MovieLoader::movie_loader_progress(handle, uc, body_len, body_len)?;
+            MovieLoader::movie_loader_progress(handle, uc, body_len, body_len)?;
 
             MovieLoader::movie_loader_complete(handle, uc, None, status, redirected)
         })?;
         Ok(())
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn on_success(
         mut player: MutexGuard<'_, Player>,
         handle: LoaderHandle,
+        generation: u64,
         loader_url: Option<String>,
         body: Vec<u8>,
         url: String,
         status: u16,
         redirected: bool,
+        prepared: Option<SwfMovieData>,
+        parse_duration_ns: u64,
     ) -> Result<(), Error> {
         player.mutate_with_update_context(|uc| {
             MovieLoader::movie_loader_data(
                 handle,
                 uc,
                 &body,
-                url.to_string(),
+                url,
                 status,
                 redirected,
                 loader_url,
+                prepared,
+                generation,
+                parse_duration_ns,
             )
         })?;
         Ok(())
@@ -969,6 +1247,86 @@ impl<'gc> MovieLoader<'gc> {
         loader_url: String,
         bytes: Vec<u8>,
     ) -> Result<(), Error> {
+        let generation = match uc.load_manager.get_loader_mut(handle) {
+            Some(loader) => next_generation(&mut loader.generation),
+            None => return Err(Error::Cancelled),
+        };
+        if !use_inline_movie_parse(&loader_url) {
+            let player = uc.player_handle();
+            let vm_data = match uc.load_manager.get_loader(handle) {
+                Some(Self { vm_data, .. }) => *vm_data,
+                None => return Err(Error::Cancelled),
+            };
+            let clip = match uc.load_manager.get_loader(handle) {
+                Some(Self { target_clip, .. }) => *target_clip,
+                None => return Err(Error::Cancelled),
+            };
+            if let Some(mc) = clip.as_movie_clip() {
+                if !mc.movie().is_action_script_3() {
+                    mc.avm1_unload(uc);
+                }
+                mc.replace_with_movie(uc, None, false, None);
+            }
+            MovieLoader::movie_loader_start(handle, uc)?;
+            let generated_url = format!("{}/[[DYNAMIC]]/1", loader_url);
+            let load_bytes_info = vm_data.load_bytes_info();
+            let future = Box::pin(async move {
+                ruffle_render::profile::async_event(
+                    "swfParseQueued",
+                    generation,
+                    0,
+                    0,
+                    bytes.len(),
+                    None,
+                );
+                let (parsed, parse_duration_ns) = prepare_swf_movie_for_url(
+                    bytes,
+                    generated_url.clone(),
+                    Some(loader_url.clone()),
+                    load_bytes_info,
+                )
+                .await;
+                let mut player = player.lock().unwrap();
+                match parsed {
+                    Ok((body, prepared)) => player.mutate_with_update_context(|uc| {
+                        MovieLoader::movie_loader_data(
+                            handle,
+                            uc,
+                            &body,
+                            generated_url,
+                            0,
+                            false,
+                            Some(loader_url),
+                            prepared,
+                            generation,
+                            parse_duration_ns,
+                        )
+                    }),
+                    Err(_error) => {
+                        ruffle_render::profile::async_event(
+                            "swfParseDropped",
+                            generation,
+                            0,
+                            0,
+                            0,
+                            Some("parse"),
+                        );
+                        player.mutate_with_update_context(|uc| {
+                            MovieLoader::movie_loader_error(
+                                handle,
+                                uc,
+                                "Could not parse SWF",
+                                0,
+                                false,
+                                generated_url,
+                            )
+                        })
+                    }
+                }
+            });
+            uc.navigator.spawn_future(future);
+            return Ok(());
+        }
         let clip = match uc.load_manager.get_loader(handle) {
             Some(Self { target_clip, .. }) => *target_clip,
             None => return Err(Error::Cancelled),
@@ -998,6 +1356,9 @@ impl<'gc> MovieLoader<'gc> {
             0,
             false,
             Some(loader_url),
+            None,
+            uc.load_manager.current_generation(handle).unwrap_or(0),
+            0,
         )
     }
 }
@@ -1043,14 +1404,13 @@ pub fn load_root_movie<'gc>(
             .map(|u| u.to_string())
             .unwrap_or(swf_url);
 
-        let mut movie = SwfMovieData::from_data(&body, spoofed_or_swf_url, None, None)
-            .inspect_err(|error| {
-                player
-                    .lock()
-                    .unwrap()
-                    .ui()
-                    .display_root_movie_download_failed_message(true, error.to_string());
-            })?
+        let (parsed_body, movie) = if use_inline_movie_parse(&spoofed_or_swf_url) {
+            prepare_swf_movie_inline(body, spoofed_or_swf_url, None, None)
+        } else {
+            prepare_swf_movie(body, spoofed_or_swf_url, None, None).await
+        }
+        .map_err(|error| Error::FetchError(format!("Could not parse root SWF: {error}")))?;
+        let mut movie = require_swf_movie(movie, &parsed_body)?
             .with_shared_bytes(ruffle_render::profile::optimized());
         on_metadata(movie.header());
         movie.append_parameters(parameters);
@@ -1744,6 +2104,7 @@ impl<'gc> MovieLoader<'gc> {
     }
 
     /// Load data into a movie loader.
+    #[expect(clippy::too_many_arguments)]
     fn movie_loader_data(
         handle: LoaderHandle,
         uc: &mut UpdateContext<'gc>,
@@ -1752,6 +2113,9 @@ impl<'gc> MovieLoader<'gc> {
         status: u16,
         redirected: bool,
         loader_url: Option<String>,
+        prepared: Option<SwfMovieData>,
+        generation: u64,
+        parse_duration_ns: u64,
     ) -> Result<(), Error> {
         let sniffed_type = ContentType::sniff(data);
         let length = data.len();
@@ -1759,7 +2123,18 @@ impl<'gc> MovieLoader<'gc> {
         if sniffed_type == ContentType::Unknown
             && let Ok(data) = extract_swz(data)
         {
-            return Self::movie_loader_data(handle, uc, &data, url, status, redirected, loader_url);
+            return Self::movie_loader_data(
+                handle,
+                uc,
+                &data,
+                url,
+                status,
+                redirected,
+                loader_url,
+                prepared,
+                generation,
+                parse_duration_ns,
+            );
         }
         let (clip, vm_data) = match uc.load_manager.get_loader(handle) {
             Some(Self {
@@ -1769,6 +2144,26 @@ impl<'gc> MovieLoader<'gc> {
             }) => (*target_clip, *vm_data),
             None => return Err(Error::Cancelled),
         };
+
+        if !uc.load_manager.generation_matches(handle, generation) {
+            ruffle_render::profile::async_event(
+                "swfParseDropped",
+                generation,
+                0,
+                parse_duration_ns,
+                data.len(),
+                Some("stale"),
+            );
+            return Ok(());
+        }
+        ruffle_render::profile::async_event(
+            "swfParseCompleted",
+            generation,
+            0,
+            parse_duration_ns,
+            data.len(),
+            None,
+        );
 
         let load_bytes_info = vm_data.load_bytes_info();
 
@@ -1803,13 +2198,14 @@ impl<'gc> MovieLoader<'gc> {
 
         let movie = match sniffed_type {
             ContentType::Swf => {
-                let mut movie = SwfMovieData::from_data(
-                    data,
-                    url.clone(),
-                    loader_url.clone(),
-                    load_bytes_info,
-                )?
-                .with_shared_bytes(ruffle_render::profile::optimized());
+                let mut movie = prepared
+                    .unwrap_or(SwfMovieData::from_data(
+                        data,
+                        url.clone(),
+                        loader_url.clone(),
+                        load_bytes_info,
+                    )?)
+                    .with_shared_bytes(ruffle_render::profile::optimized());
 
                 if matches!(vm_data, MovieLoaderVMData::Avm1 { .. }) {
                     // If AVM1 loads a SWF, that SWF is always interpreted as

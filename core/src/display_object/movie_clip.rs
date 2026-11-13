@@ -2379,6 +2379,11 @@ impl<'gc> MovieClip<'gc> {
         // Ruffle is probably replacing a MovieClip differently to Flash, therefore
         // introducing these regressions when trying to emulate that delay.
 
+        // Invalidate any external parse targeting this clip before the unload
+        // state transition. Detached futures may finish, but cannot install a
+        // movie or dispatch stale loader events afterward.
+        context.load_manager.invalidate_target_loads(self.into());
+
         if self.is_root() {
             let player = context.player_handle();
             let mc = MovieClipHandle::stash(context, self);

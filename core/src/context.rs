@@ -7,6 +7,7 @@ use crate::avm1::Avm1;
 use crate::avm1::{Object as Avm1Object, Value as Avm1Value};
 use crate::avm2::Activation as Avm2Activation;
 use crate::avm2::api_version::ApiVersion;
+use crate::avm2::globals::flash::display::shader_job::{PendingShaderJob, ShaderJobQueue};
 use crate::avm2::{Avm2, LoaderInfoObject, SharedObjectObject, SoundChannelObject};
 use crate::backend::{
     audio::{AudioBackend, AudioManager, SoundHandle, SoundInstanceHandle},
@@ -234,6 +235,10 @@ pub struct UpdateContext<'gc> {
     /// These functions are run at the end of each frame execution.
     /// Currently, this is just used for handling `Loader.loadBytes`
     pub post_frame_callbacks: &'gc mut Vec<PostFrameCallback<'gc>>,
+
+    pub shader_job_queue: &'gc mut ShaderJobQueue,
+    pub pending_shader_jobs: &'gc mut VecDeque<PendingShaderJob<'gc>>,
+    pub active_shader_jobs: &'gc mut VecDeque<PendingShaderJob<'gc>>,
 
     pub notification_sender: Option<&'gc Sender<PlayerNotification>>,
 
