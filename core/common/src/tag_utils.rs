@@ -488,6 +488,14 @@ impl SwfMovieData {
         self.compressed_len
     }
 
+    /// Override the length reported to LoaderInfo and preload progress.
+    /// SWZ parsing consumes the inner bytes, while Flash reports progress
+    /// against the downloaded outer envelope.
+    pub fn with_compressed_len(mut self, compressed_len: usize) -> Self {
+        self.compressed_len = compressed_len;
+        self
+    }
+
     pub fn uncompressed_len(&self) -> i32 {
         self.header.uncompressed_len()
     }

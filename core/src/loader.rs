@@ -634,6 +634,15 @@ mod generation_tests {
     }
 
     #[test]
+    fn stale_load_bytes_parse_error_is_rejected_after_a_new_request() {
+        let mut generation = 0_u64;
+        let stale = super::next_generation(&mut generation);
+        let _current = super::next_generation(&mut generation);
+
+        assert!(!super::generation_is_current(generation, stale));
+    }
+
+    #[test]
     fn root_parse_rejects_non_swf_without_panicking() {
         let result = super::require_swf_movie(None, &[]);
         assert!(matches!(
@@ -724,7 +733,8 @@ fn prepare_swf_movie_data(
         return Ok((transport, None));
     }
     let movie = SwfMovieData::from_data(parse_body, url, loader_url, load_bytes_info)?
-        .with_shared_bytes(shared_bytes);
+        .with_shared_bytes(shared_bytes)
+        .with_compressed_len(transport.len());
     // Keep the original transport bytes for progress/bytesTotal accounting;
     // the movie owns the normalized, decompressed bytes.
     Ok((transport, Some(movie)))
@@ -1318,26 +1328,9 @@ impl<'gc> MovieLoader<'gc> {
                             parse_duration_ns,
                         )
                     }),
-                    Err(_error) => {
-                        ruffle_render::profile::async_event(
-                            "swfParseDropped",
-                            generation,
-                            0,
-                            0,
-                            0,
-                            Some("parse"),
-                        );
-                        player.mutate_with_update_context(|uc| {
-                            MovieLoader::movie_loader_error(
-                                handle,
-                                uc,
-                                "Could not parse SWF",
-                                0,
-                                false,
-                                generated_url,
-                            )
-                        })
-                    }
+                    Err(_error) => player.mutate_with_update_context(|uc| {
+                        MovieLoader::movie_loader_parse_error(handle, uc, generation, generated_url)
+                    }),
                 }
             });
             uc.navigator.spawn_future(future);
@@ -2748,6 +2741,27 @@ impl<'gc> MovieLoader<'gc> {
         loader.loader_status = LoaderStatus::Succeeded;
 
         Ok(())
+    }
+
+    fn movie_loader_parse_error(
+        handle: LoaderHandle,
+        uc: &mut UpdateContext<'gc>,
+        generation: u64,
+        swf_url: String,
+    ) -> Result<(), Error> {
+        if !uc.load_manager.generation_matches(handle, generation) {
+            ruffle_render::profile::async_event(
+                "swfParseDropped",
+                generation,
+                0,
+                0,
+                0,
+                Some("stale-parse"),
+            );
+            return Ok(());
+        }
+        ruffle_render::profile::async_event("swfParseDropped", generation, 0, 0, 0, Some("parse"));
+        Self::movie_loader_error(handle, uc, "Could not parse SWF", 0, false, swf_url)
     }
 
     /// Report a movie loader error to script code.

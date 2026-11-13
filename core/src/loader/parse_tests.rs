@@ -59,6 +59,38 @@ fn prepared_movie_is_installed_without_reparsing_transport_bytes() {
     });
 }
 
+#[test]
+fn stale_load_bytes_parse_error_does_not_fail_a_new_loader_generation() {
+    let player = PlayerBuilder::new()
+        .with_movie(SwfMovieData::empty(8, None))
+        .build();
+    player.lock().unwrap().mutate_with_update_context(|uc| {
+        let clip = uc.stage.root_clip().unwrap();
+        let handle = uc.load_manager.add_loader(MovieLoader {
+            self_handle: None,
+            generation: 2,
+            target_clip: clip,
+            vm_data: MovieLoaderVMData::Avm1 {
+                broadcaster: None,
+                base_clip: clip,
+            },
+            loader_status: LoaderStatus::Pending,
+            movie: None,
+        });
+        MovieLoader::movie_loader_parse_error(
+            handle,
+            uc,
+            1,
+            "https://example.test/stale.swf".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            uc.load_manager.get_loader(handle).unwrap().loader_status,
+            LoaderStatus::Pending
+        );
+    });
+}
+
 #[cfg(not(target_family = "wasm"))]
 #[test]
 fn worker_returns_shared_bytes_before_main_thread_installation() {
@@ -104,6 +136,7 @@ fn worker_returns_inner_swf_without_requiring_main_thread_swz_extraction() {
     .unwrap();
     assert!(movie.is_some());
     assert_eq!(transport, swz(&bytes), "worker must retain transport bytes");
+    assert_eq!(movie.unwrap().compressed_len(), transport.len());
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -159,6 +192,8 @@ fn inline_and_worker_preparation_preserve_bytes_metadata_and_stock_mode() {
             assert_eq!(worker.sandbox_type(), SandboxType::LocalWithFile);
             assert_eq!(worker.shared_file().is_some(), optimized);
             assert_eq!(inline.shared_file().is_some(), optimized);
+            assert_eq!(worker.compressed_len(), worker_body.len());
+            assert_eq!(inline.compressed_len(), inline_body.len());
         }
     }
 }
