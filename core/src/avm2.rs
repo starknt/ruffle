@@ -61,6 +61,7 @@ pub mod globals;
 mod index;
 mod metadata;
 mod method;
+mod method_cache;
 mod multiname;
 mod namespace;
 pub mod object;

@@ -5,6 +5,7 @@ use crate::avm2::class::Class;
 use crate::avm2::dynamic_map::{DynamicKey, DynamicMap};
 use crate::avm2::error;
 use crate::avm2::index::{ArrayIndex, parse_u32_index};
+use crate::avm2::method_cache::MethodCache;
 use crate::avm2::object::{ClassObject, FunctionObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::vtable::VTable;
@@ -67,7 +68,7 @@ pub struct ScriptObjectData<'gc> {
     slots: Box<[Lock<Value<'gc>>]>,
 
     /// Methods stored on this object.
-    bound_methods: RefLock<Vec<Option<FunctionObject<'gc>>>>,
+    bound_methods: RefLock<MethodCache<FunctionObject<'gc>>>,
 
     /// Implicit prototype of this script object.
     proto: Lock<Option<Object<'gc>>>,
@@ -165,7 +166,9 @@ impl<'gc> ScriptObjectData<'gc> {
         ScriptObjectData {
             values: RefLock::new(Default::default()),
             slots,
-            bound_methods: RefLock::new(Vec::new()),
+            bound_methods: RefLock::new(MethodCache::new(
+                ruffle_render::profile::engine_optimized(),
+            )),
             proto: Lock::new(proto),
             instance_class,
             vtable: Lock::new(vtable),
@@ -189,14 +192,14 @@ impl<'gc> ScriptObjectWrapper<'gc> {
         unlock!(Gc::write(mc, self.0), ScriptObjectData, values).borrow_mut()
     }
 
-    fn bound_methods(&self) -> Ref<'_, Vec<Option<FunctionObject<'gc>>>> {
+    fn bound_methods(&self) -> Ref<'_, MethodCache<FunctionObject<'gc>>> {
         self.0.bound_methods.borrow()
     }
 
     fn bound_methods_mut(
         &self,
         mc: &Mutation<'gc>,
-    ) -> RefMut<'_, Vec<Option<FunctionObject<'gc>>>> {
+    ) -> RefMut<'_, MethodCache<FunctionObject<'gc>>> {
         unlock!(Gc::write(mc, self.0), ScriptObjectData, bound_methods).borrow_mut()
     }
 
@@ -298,7 +301,7 @@ impl<'gc> ScriptObjectWrapper<'gc> {
 
     /// Retrieve a bound method from the method table.
     pub fn get_bound_method(self, id: usize) -> Option<FunctionObject<'gc>> {
-        self.bound_methods().get(id).and_then(|v| *v)
+        self.bound_methods().get_copied(id)
     }
 
     pub fn has_own_dynamic_property(self, name: &Multiname<'gc>) -> bool {
@@ -360,13 +363,7 @@ impl<'gc> ScriptObjectWrapper<'gc> {
         disp_id: usize,
         function: FunctionObject<'gc>,
     ) {
-        let mut bound_methods = self.bound_methods_mut(mc);
-
-        if bound_methods.len() <= disp_id {
-            bound_methods.resize_with(disp_id + 1, Default::default);
-        }
-
-        *bound_methods.get_mut(disp_id).unwrap() = Some(function);
+        self.bound_methods_mut(mc).insert(disp_id, function);
     }
 
     /// Get the `Class` for this object.
