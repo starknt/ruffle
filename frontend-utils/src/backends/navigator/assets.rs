@@ -391,9 +391,10 @@ impl AssetScheduler {
                 .filter(|v| v.len() <= 512 && v.starts_with('"') && v.ends_with('"'))
                 .map(str::to_owned);
             let fresh_until = fresh_until(http.headers());
-            let disk = if cacheable
-                && ((anonymous && fresh_until > unix_now()) || (!anonymous && tag.is_some()))
-            {
+            // Versioned public assets are safe to retain even when the server omits
+            // freshness metadata. `cache_first` can then serve that immutable URL
+            // without making another network request.
+            let disk = if cacheable && (anonymous || tag.is_some()) {
                 store.map(|store| DiskWrite {
                     store,
                     url: url.to_string(),
