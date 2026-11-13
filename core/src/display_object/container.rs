@@ -17,6 +17,8 @@ use crate::tag_utils::SwfMovieData;
 use gc_arena::{Collect, Mutation};
 use ruffle_macros::{enum_trait_object, istr};
 use ruffle_render::commands::CommandHandler;
+#[cfg(any(feature = "lifecycle_projection", test))]
+use std::cell::OnceCell;
 use std::cell::{Ref, RefMut};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -457,6 +459,50 @@ pub trait TDisplayObjectContainer<'gc>:
         RenderIter::from_container(self)
     }
 
+    /// Snapshot of children with non-empty enter-frame or frame-script work.
+    /// Construction and render traversal must still visit every child. This
+    /// filters only immutable display-object types, never playback state.
+    #[cfg(any(feature = "lifecycle_projection", test))]
+    #[no_dynamic]
+    fn iter_lifecycle_list(self) -> LifecycleIter<'gc> {
+        let container = self.raw_container();
+        let indices = container.lifecycle_indices.get_or_init(|| {
+            let mut indices: Option<Vec<usize>> = None;
+            for (index, child) in container.render_list.iter().enumerate() {
+                let active = match child {
+                    DisplayObject::Stage(_)
+                    | DisplayObject::MovieClip(_)
+                    | DisplayObject::LoaderDisplay(_)
+                    | DisplayObject::Avm1Button(_)
+                    | DisplayObject::Avm2Button(_) => true,
+                    DisplayObject::Bitmap(_)
+                    | DisplayObject::EditText(_)
+                    | DisplayObject::TextLine(_)
+                    | DisplayObject::Graphic(_)
+                    | DisplayObject::MorphShape(_)
+                    | DisplayObject::Text(_)
+                    | DisplayObject::Video(_) => false,
+                };
+                if active {
+                    if let Some(indices) = &mut indices {
+                        indices.push(index);
+                    }
+                } else if indices.is_none() {
+                    // No extra allocation for an entirely active list.
+                    indices = Some((0..index).collect::<Vec<_>>());
+                }
+            }
+            indices.map(Rc::new)
+        });
+        let src = container.render_list.clone();
+        let end = indices.as_ref().map_or(src.len(), |indices| indices.len());
+        LifecycleIter {
+            src,
+            indices: indices.clone(),
+            range: 0..end,
+        }
+    }
+
     fn is_tab_children_avm1(self, _context: &mut UpdateContext<'gc>) -> bool {
         true
     }
@@ -616,6 +662,12 @@ pub struct ChildContainer<'gc> {
     /// updated list.
     render_list: Rc<Vec<DisplayObject<'gc>>>,
 
+    // Indices only: no extra GC roots, and old iterators retain the matching
+    // COW render-list snapshot. Every structural edit invalidates this cache.
+    #[cfg(any(feature = "lifecycle_projection", test))]
+    #[collect(require_static)]
+    lifecycle_indices: OnceCell<Option<Rc<Vec<usize>>>>,
+
     /// The mapping from timeline Depths to child display objects.
     ///
     /// This list is the list used to map depths to actual display objects.
@@ -650,6 +702,8 @@ impl<'gc> ChildContainer<'gc> {
     pub fn new(movie: &SwfMovieData) -> Self {
         Self {
             render_list: Rc::new(Vec::new()),
+            #[cfg(any(feature = "lifecycle_projection", test))]
+            lifecycle_indices: OnceCell::new(),
             depth_list: BTreeMap::new(),
             has_pending_removals: false,
             mouse_children: true,
@@ -1123,6 +1177,8 @@ impl<'gc> ChildContainer<'gc> {
     }
 
     fn render_list_mut(&mut self) -> &mut Vec<DisplayObject<'gc>> {
+        #[cfg(any(feature = "lifecycle_projection", test))]
+        self.lifecycle_indices.take();
         Rc::make_mut(&mut self.render_list)
     }
 }
@@ -1139,11 +1195,9 @@ pub struct RenderIter<'gc> {
 
 impl<'gc> RenderIter<'gc> {
     fn from_container(src: DisplayObjectContainer<'gc>) -> Self {
-        Self {
-            src: src.raw_container().render_list.clone(),
-            i: 0,
-            neg_i: src.num_children(),
-        }
+        let src = src.raw_container().render_list.clone();
+        let neg_i = src.len();
+        Self { src, i: 0, neg_i }
     }
 }
 
@@ -1183,3 +1237,216 @@ impl<'gc> DoubleEndedIterator for RenderIter<'gc> {
 }
 
 impl ExactSizeIterator for RenderIter<'_> {}
+
+/// Lifecycle projection tied to one immutable render-list snapshot.
+#[cfg(any(feature = "lifecycle_projection", test))]
+pub struct LifecycleIter<'gc> {
+    src: Rc<Vec<DisplayObject<'gc>>>,
+    indices: Option<Rc<Vec<usize>>>,
+    range: std::ops::Range<usize>,
+}
+
+#[cfg(any(feature = "lifecycle_projection", test))]
+impl<'gc> From<RenderIter<'gc>> for LifecycleIter<'gc> {
+    fn from(iter: RenderIter<'gc>) -> Self {
+        Self {
+            src: iter.src,
+            indices: None,
+            range: iter.i..iter.neg_i,
+        }
+    }
+}
+
+#[cfg(any(feature = "lifecycle_projection", test))]
+impl<'gc> LifecycleIter<'gc> {
+    fn child(&self, index: usize) -> DisplayObject<'gc> {
+        self.src[self
+            .indices
+            .as_ref()
+            .map_or(index, |indices| indices[index])]
+    }
+}
+
+#[cfg(any(feature = "lifecycle_projection", test))]
+impl<'gc> Iterator for LifecycleIter<'gc> {
+    type Item = DisplayObject<'gc>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.range.next().map(|index| self.child(index))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.range.size_hint()
+    }
+}
+
+#[cfg(any(feature = "lifecycle_projection", test))]
+impl<'gc> DoubleEndedIterator for LifecycleIter<'gc> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.range.next_back().map(|index| self.child(index))
+    }
+}
+
+#[cfg(any(feature = "lifecycle_projection", test))]
+impl ExactSizeIterator for LifecycleIter<'_> {}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::display_object::{avm2_button::Avm2Button, graphic::Graphic};
+    use crate::player::PlayerBuilder;
+
+    #[test]
+    fn lifecycle_snapshot_skips_leaves_but_keeps_buttons_and_clips() {
+        let player = PlayerBuilder::new().build();
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                let movie = context.stage.movie();
+                let parent = MovieClip::new(movie, context.gc());
+                let leaf: DisplayObject<'_> = Graphic::empty(context).into();
+                let clip: DisplayObject<'_> = MovieClip::new(movie, context.gc()).into();
+                let button: DisplayObject<'_> = Avm2Button::empty_button(context).into();
+                parent.replace_at_depth(context, leaf, 1);
+                parent.replace_at_depth(context, clip, 2);
+                parent.replace_at_depth(context, button, 3);
+                let mut snapshot = parent.iter_lifecycle_list();
+                assert_eq!(snapshot.len(), 2);
+                assert_eq!(
+                    snapshot.next_back().map(|child| child.as_ptr()),
+                    Some(button.as_ptr())
+                );
+                assert_eq!(
+                    snapshot.next().map(|child| child.as_ptr()),
+                    Some(clip.as_ptr())
+                );
+                assert_eq!(snapshot.next().map(|child| child.as_ptr()), None);
+                assert_eq!(snapshot.next_back().map(|child| child.as_ptr()), None);
+                assert_eq!(
+                    parent
+                        .iter_render_list()
+                        .map(|child| child.as_ptr())
+                        .collect::<Vec<_>>(),
+                    vec![leaf.as_ptr(), clip.as_ptr(), button.as_ptr()]
+                );
+            });
+    }
+
+    #[test]
+    fn lifecycle_snapshot_survives_replacement_and_reordering() {
+        let player = PlayerBuilder::new().build();
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                let movie = context.stage.movie();
+                let mut parent = MovieClip::new(movie, context.gc());
+                let leaf: DisplayObject<'_> = Graphic::empty(context).into();
+                let a: DisplayObject<'_> = MovieClip::new(movie, context.gc()).into();
+                let b: DisplayObject<'_> = MovieClip::new(movie, context.gc()).into();
+                let c: DisplayObject<'_> = MovieClip::new(movie, context.gc()).into();
+                parent.replace_at_depth(context, a, 1);
+                parent.replace_at_depth(context, leaf, 2);
+                parent.replace_at_depth(context, b, 3);
+                let old = parent.iter_lifecycle_list();
+                parent.replace_at_depth(context, c, 1);
+                parent.swap_at_index(context, 0, 2);
+                assert_eq!(
+                    old.map(|child| child.as_ptr()).collect::<Vec<_>>(),
+                    vec![a.as_ptr(), b.as_ptr()]
+                );
+                assert_eq!(
+                    parent
+                        .iter_lifecycle_list()
+                        .map(|child| child.as_ptr())
+                        .collect::<Vec<_>>(),
+                    vec![b.as_ptr(), c.as_ptr()]
+                );
+                parent.remove_child(context, c);
+                assert_eq!(
+                    parent
+                        .iter_lifecycle_list()
+                        .map(|child| child.as_ptr())
+                        .collect::<Vec<_>>(),
+                    vec![b.as_ptr()]
+                );
+            });
+    }
+
+    #[test]
+    fn lifecycle_snapshot_invalidates_empty_and_all_active_lists() {
+        let player = PlayerBuilder::new().build();
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                let movie = context.stage.movie();
+                let parent = MovieClip::new(movie, context.gc());
+                let leaf: DisplayObject<'_> = Graphic::empty(context).into();
+                let clip: DisplayObject<'_> = MovieClip::new(movie, context.gc()).into();
+                assert_eq!(parent.iter_lifecycle_list().len(), 0);
+                parent.replace_at_depth(context, leaf, 1);
+                assert_eq!(parent.iter_lifecycle_list().len(), 0);
+                parent.replace_at_depth(context, clip, 1);
+                assert_eq!(
+                    parent
+                        .iter_lifecycle_list()
+                        .map(|child| child.as_ptr())
+                        .collect::<Vec<_>>(),
+                    vec![clip.as_ptr()]
+                );
+                parent.replace_at_depth(context, leaf, 1);
+                assert_eq!(parent.iter_lifecycle_list().len(), 0);
+            });
+    }
+
+    #[test]
+    #[ignore = "diagnostic traversal benchmark; prints timings without an FPS threshold"]
+    fn lifecycle_snapshot_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let player = PlayerBuilder::new().build();
+        player.lock().unwrap().mutate_with_update_context(|context| {
+            for active_every in [1, 16, 0] {
+                let movie = context.stage.movie();
+                let parent = MovieClip::new(movie, context.gc());
+                for index in 0..1024 {
+                    let child = if active_every > 0 && index % active_every == 0 {
+                        MovieClip::new(movie, context.gc()).into()
+                    } else {
+                        Graphic::empty(context).into()
+                    };
+                    parent.replace_at_depth(context, child, index + 1);
+                }
+                // Warm the projection independently of the measured steady state.
+                black_box(parent.iter_lifecycle_list().count());
+                let mut full = Vec::new();
+                let mut projected = Vec::new();
+                for sample in 0..31 {
+                    // Alternate order to reduce systematic warm-cache bias.
+                    for offset in 0..2 {
+                        let filtered = (sample + offset) % 2 == 0;
+                        let start = Instant::now();
+                        for _ in 0..100 {
+                            if filtered {
+                                for child in parent.iter_lifecycle_list() {
+                                    black_box(child);
+                                }
+                            } else {
+                                for child in parent.iter_render_list() {
+                                    black_box(child);
+                                }
+                            }
+                        }
+                        let samples = if filtered { &mut projected } else { &mut full };
+                        samples.push(start.elapsed().as_nanos() / 100);
+                    }
+                }
+                full.sort_unstable();
+                projected.sort_unstable();
+                println!("active_every={active_every} full_ns_p50={} full_ns_p95={} projected_ns_p50={} projected_ns_p95={}", full[15], full[29], projected[15], projected[29]);
+            }
+        });
+    }
+}

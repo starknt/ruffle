@@ -2536,8 +2536,17 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
         let skip_frame = self.base().should_skip_next_enter_frame();
+        #[cfg(not(feature = "lifecycle_projection"))]
+        let children = self.iter_render_list();
+        // Preserve propagation of the skip flag even to otherwise inert leaves.
+        #[cfg(feature = "lifecycle_projection")]
+        let children = if !skip_frame && ruffle_render::profile::engine_optimized() {
+            self.iter_lifecycle_list()
+        } else {
+            self.iter_render_list().into()
+        };
         //Child removals from looping gotos appear to resolve in reverse order.
-        for child in self.iter_render_list().rev() {
+        for child in children.rev() {
             if skip_frame {
                 // If we're skipping our current frame, then we want to skip it for our children
                 // as well. This counts as the skipped frame for any children that already
@@ -2654,7 +2663,15 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
         self.run_local_frame_scripts(context);
 
-        for child in self.iter_render_list() {
+        #[cfg(not(feature = "lifecycle_projection"))]
+        let children = self.iter_render_list();
+        #[cfg(feature = "lifecycle_projection")]
+        let children = if ruffle_render::profile::engine_optimized() {
+            self.iter_lifecycle_list()
+        } else {
+            self.iter_render_list().into()
+        };
+        for child in children {
             child.run_frame_scripts(context);
         }
     }
