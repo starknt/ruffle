@@ -735,9 +735,9 @@ fn prepare_swf_movie_data(
     let movie = SwfMovieData::from_data(parse_body, url, loader_url, load_bytes_info)?
         .with_shared_bytes(shared_bytes)
         .with_compressed_len(transport.len());
-    // Keep the original transport bytes for progress/bytesTotal accounting;
-    // the movie owns the normalized, decompressed bytes.
-    Ok((transport, Some(movie)))
+    // The movie records the original transport length for progress/bytesTotal;
+    // do not send the transport buffer back through the loader channel.
+    Ok((Vec::new(), Some(movie)))
 }
 
 fn prepare_swf_movie_inline(
@@ -1219,7 +1219,9 @@ impl<'gc> MovieLoader<'gc> {
         prepared: Option<SwfMovieData>,
         parse_duration_ns: u64,
     ) -> Result<(), Error> {
-        let body_len = body.len();
+        let body_len = prepared
+            .as_ref()
+            .map_or_else(|| body.len(), SwfMovieData::compressed_len);
         if let Some(prepared) = prepared {
             // The parser already owns the normalized bytes. Keep only the
             // length needed for progress/LoaderInfo while installing it.
@@ -1338,7 +1340,7 @@ impl<'gc> MovieLoader<'gc> {
                 let mut player = player.lock().unwrap();
                 match parsed {
                     Ok((body, Some(prepared))) => {
-                        let body_len = body.len();
+                        let body_len = prepared.compressed_len();
                         drop(body);
                         player.mutate_with_update_context(|uc| {
                             MovieLoader::movie_loader_data(

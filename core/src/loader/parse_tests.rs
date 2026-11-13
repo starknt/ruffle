@@ -136,8 +136,11 @@ fn worker_returns_inner_swf_without_requiring_main_thread_swz_extraction() {
     ))
     .unwrap();
     assert!(movie.is_some());
-    assert_eq!(transport, swz(&bytes), "worker must retain transport bytes");
-    assert_eq!(movie.unwrap().compressed_len(), transport.len());
+    assert!(
+        transport.is_empty(),
+        "parsed SWF must release transport bytes"
+    );
+    assert_eq!(movie.unwrap().compressed_len(), swz(&bytes).len());
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -172,6 +175,7 @@ fn inline_and_worker_preparation_preserve_bytes_metadata_and_stock_mode() {
     for optimized in [false, true] {
         let _scope = ruffle_render::profile::enter_engine(optimized);
         for body in [movie_bytes(), swz(&movie_bytes())] {
+            let compressed_len = body.len();
             let info = Some(LoadBytesInfo {
                 loader_sandbox_type: SandboxType::LocalWithFile,
             });
@@ -187,14 +191,15 @@ fn inline_and_worker_preparation_preserve_bytes_metadata_and_stock_mode() {
             let (inline_body, inline) = prepare_swf_movie_inline(body, url, origin, info).unwrap();
             let (worker, inline) = (worker.unwrap(), inline.unwrap());
             assert_eq!(worker_body, inline_body);
+            assert!(worker_body.is_empty());
             assert_eq!(worker.data(), inline.data());
             assert_eq!(worker.url(), inline.url());
             assert_eq!(worker.parameters(), inline.parameters());
             assert_eq!(worker.sandbox_type(), SandboxType::LocalWithFile);
             assert_eq!(worker.shared_file().is_some(), optimized);
             assert_eq!(inline.shared_file().is_some(), optimized);
-            assert_eq!(worker.compressed_len(), worker_body.len());
-            assert_eq!(inline.compressed_len(), inline_body.len());
+            assert_eq!(worker.compressed_len(), compressed_len);
+            assert_eq!(inline.compressed_len(), compressed_len);
         }
     }
 }
