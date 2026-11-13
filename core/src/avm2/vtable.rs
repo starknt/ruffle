@@ -369,7 +369,7 @@ impl<'gc> VTable<'gc> {
         let mut force_auto_assign_slots = false;
 
         if let Some(superclass_vtable) = superclass_vtable {
-            resolved_traits = if ruffle_render::profile::optimized() {
+            resolved_traits = if ruffle_render::profile::engine_optimized() {
                 superclass_vtable.0.resolved_traits.clone()
             } else {
                 TraitNames(std::rc::Rc::new(

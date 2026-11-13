@@ -17,6 +17,7 @@ pub struct Descriptors {
     pub limits: wgpu::Limits,
     pub backend: Backend,
     pub queue: wgpu::Queue,
+    pub submission_lock: Option<Arc<Mutex<()>>>,
     pub bitmap_samplers: BitmapSamplers,
     pub bind_layouts: BindLayouts,
     pub quad: Quad,
@@ -54,6 +55,7 @@ impl Descriptors {
             limits,
             backend,
             queue,
+            submission_lock: None,
             bitmap_samplers,
             bind_layouts,
             quad,
@@ -62,6 +64,13 @@ impl Descriptors {
             pipelines: Default::default(),
             filters,
         }
+    }
+
+    pub fn lock_submission(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.submission_lock.as_ref().map(|lock| {
+            lock.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
     }
 
     pub fn copy_pipeline(

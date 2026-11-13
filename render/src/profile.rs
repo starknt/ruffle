@@ -34,6 +34,9 @@ pub enum Phase {
     SocketConnect,
     SocketData,
     SocketClose,
+    Wake,
+    Input,
+    Composite,
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Timing {
@@ -66,7 +69,8 @@ impl Default for AsyncEvent {
 
 #[derive(Debug, Default, Clone)]
 pub struct Counters {
-    pub timings: [Timing; 26],
+    pub timings: [Timing; 29],
+    pub logical_frames: u64,
     pub socket_events: [u64; 3],
     pub socket_data_bytes: u64,
     pub cpu_bitmap_bytes: u64,
@@ -89,9 +93,28 @@ pub struct RenderMetrics(Rc<RefCell<Counters>>);
 thread_local! {
     static CURRENT: RefCell<Option<RenderMetrics>> = const { RefCell::new(None) };
     static OPTIMIZED: Cell<bool> = const { Cell::new(false) };
+    static ENGINE_OPTIMIZED: Cell<Option<bool>> = const { Cell::new(None) };
 }
 pub fn optimized() -> bool {
     OPTIMIZED.get()
+}
+pub fn engine_optimized() -> bool {
+    ENGINE_OPTIMIZED.get().unwrap_or_else(optimized)
+}
+
+pub struct EngineScope(Option<bool>, std::marker::PhantomData<Rc<()>>);
+
+pub fn enter_engine(enabled: bool) -> EngineScope {
+    EngineScope(
+        ENGINE_OPTIMIZED.replace(Some(enabled)),
+        std::marker::PhantomData,
+    )
+}
+
+impl Drop for EngineScope {
+    fn drop(&mut self) {
+        ENGINE_OPTIMIZED.set(self.0);
+    }
 }
 pub fn enabled() -> bool {
     CURRENT.with_borrow(Option::is_some)
@@ -140,6 +163,22 @@ pub fn submitted() {
     CURRENT.with_borrow(|m| {
         if let Some(m) = m {
             m.0.borrow_mut().stage_submissions += 1;
+        }
+    });
+}
+
+pub fn logical_frame() {
+    CURRENT.with_borrow(|m| {
+        if let Some(m) = m {
+            m.0.borrow_mut().logical_frames += 1;
+        }
+    });
+}
+
+pub fn record_host_duration(phase: Phase, nanos: u64) {
+    CURRENT.with_borrow(|m| {
+        if let Some(m) = m {
+            m.record(phase, nanos);
         }
     });
 }

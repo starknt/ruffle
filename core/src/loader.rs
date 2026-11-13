@@ -465,7 +465,7 @@ impl<'gc> LoadManager<'gc> {
                         if matches!(content_type, ContentType::Swf) {
                             let movie = prepared
                                 .expect("Could not load movie")
-                                .with_shared_bytes(ruffle_render::profile::optimized());
+                                .with_shared_bytes(ruffle_render::profile::engine_optimized());
 
                             let movie = SwfMovie::new(uc.gc(), movie);
 
@@ -1113,7 +1113,7 @@ impl<'gc> MovieLoader<'gc> {
         status: u16,
         redirected: bool,
     ) -> Result<(), Error> {
-        let movie = movie.with_shared_bytes(ruffle_render::profile::optimized());
+        let movie = movie.with_shared_bytes(ruffle_render::profile::engine_optimized());
         player.mutate_with_update_context(|uc| {
             if !uc.load_manager.generation_matches(handle, generation) {
                 ruffle_render::profile::async_event(
@@ -1411,7 +1411,7 @@ pub fn load_root_movie<'gc>(
         }
         .map_err(|error| Error::FetchError(format!("Could not parse root SWF: {error}")))?;
         let mut movie = require_swf_movie(movie, &parsed_body)?
-            .with_shared_bytes(ruffle_render::profile::optimized());
+            .with_shared_bytes(ruffle_render::profile::engine_optimized());
         on_metadata(movie.header());
         movie.append_parameters(parameters);
         player.lock().unwrap().mutate_with_update_context(|uc| {
@@ -2205,7 +2205,7 @@ impl<'gc> MovieLoader<'gc> {
                         loader_url.clone(),
                         load_bytes_info,
                     )?)
-                    .with_shared_bytes(ruffle_render::profile::optimized());
+                    .with_shared_bytes(ruffle_render::profile::engine_optimized());
 
                 if matches!(vm_data, MovieLoaderVMData::Avm1 { .. }) {
                     // If AVM1 loads a SWF, that SWF is always interpreted as

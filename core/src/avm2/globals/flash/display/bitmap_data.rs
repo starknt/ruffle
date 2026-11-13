@@ -74,7 +74,7 @@ pub fn fill_bitmap_data_from_symbol<'gc>(
     activation: &mut Activation<'_, 'gc>,
     bd: &BitmapCharacter<'gc>,
 ) -> BitmapData<'gc> {
-    if ruffle_render::profile::optimized() {
+    if ruffle_render::profile::engine_optimized() {
         return BitmapData::from_symbol(activation.gc(), bd.symbol_image());
     }
     let bitmap = bd

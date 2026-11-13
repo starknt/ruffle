@@ -1472,12 +1472,15 @@ impl ActiveFrame {
                 .device
                 .create_command_encoder(&Default::default()),
         );
-        let index = target.submit(
-            &descriptors.device,
-            &descriptors.queue,
-            Some(draw_encoder.finish()),
-            frame,
-        );
+        let index = {
+            let _submission = descriptors.lock_submission();
+            target.submit(
+                &descriptors.device,
+                &descriptors.queue,
+                Some(draw_encoder.finish()),
+                frame,
+            )
+        };
         self.staging_belt.recall();
         self.command_encoder.dirty = false;
         self.budget.submitted(&descriptors.queue);
@@ -1493,7 +1496,10 @@ impl ActiveFrame {
                 .device
                 .create_command_encoder(&Default::default()),
         );
-        let index = descriptors.queue.submit(Some(draw_encoder.finish()));
+        let index = {
+            let _submission = descriptors.lock_submission();
+            descriptors.queue.submit(Some(draw_encoder.finish()))
+        };
         self.staging_belt.recall();
         self.command_encoder.dirty = false;
         self.budget.submitted(&descriptors.queue);

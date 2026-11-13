@@ -944,6 +944,7 @@ impl Context3D for WgpuContext3D {
                 // easily re-use it across multiple `DrawTriangles` calls.
                 drop(render_pass);
 
+                let _submission = self.descriptors.lock_submission();
                 self.descriptors.queue.submit([
                     finished_buffer_command_encoder.finish(),
                     render_command_encoder.finish(),
