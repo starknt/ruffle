@@ -11,6 +11,9 @@ version.workspace = true
 workspace = true
 
 [features]
+default = ["avm_debug"]
+# Allow optimized execution regressions to exercise release-only fast paths.
+avm_debug = ["ruffle_core/avm_debug", "ruffle_test_framework/avm_debug"]
 # Enable running image comparison tests. This is off by default,
 # since the images we compare against are generated on CI, and may
 # not match your local machine's Vulkan version / image output.
@@ -26,7 +29,7 @@ lzma = ["ruffle_test_framework/lzma"]
 [dependencies]
 ruffle_render_wgpu = { path = "../render/wgpu", optional = true }
 ruffle_fs_tests_runner = { path = "fs-tests-runner" }
-ruffle_test_framework = { path = "framework", features = ["clap"] }
+ruffle_test_framework = { path = "framework", default-features = false, features = ["clap"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -35,7 +38,7 @@ temp-dir = "0.2.0"
 ruffle_core = { path = "../core" }
 
 [dev-dependencies]
-ruffle_core = { path = "../core", features = ["timeline_debug", "avm_debug", "audio", "mp3", "aac", "default_font"] }
+ruffle_core = { path = "../core", features = ["timeline_debug", "audio", "mp3", "aac", "default_font"] }
 libtest-mimic = { workspace = true }
 image = { workspace = true, features = ["png"] }
 futures = { workspace = true }
