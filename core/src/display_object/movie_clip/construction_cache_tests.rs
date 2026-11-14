@@ -6,10 +6,15 @@ use std::cell::Cell;
 
 thread_local! {
     static VISITS: Cell<usize> = const { Cell::new(0) };
+    static SCRIPT_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(super) fn record_visit() {
     VISITS.set(VISITS.get() + 1);
+}
+
+pub(super) fn record_script_visit() {
+    SCRIPT_VISITS.set(SCRIPT_VISITS.get() + 1);
 }
 
 fn with_tree(test: impl for<'gc> FnOnce(MovieClip<'gc>, MovieClip<'gc>, &mut UpdateContext<'gc>)) {
@@ -64,6 +69,49 @@ fn settled_construction_subtree_avoids_revisiting_descendants() {
             0,
             "settled static tree should perform no construction visits"
         );
+    });
+}
+
+#[test]
+fn settled_scriptless_subtree_avoids_frame_script_walks() {
+    with_tree(|root, _, context| {
+        *context.frame_phase = FramePhase::FrameScripts;
+        SCRIPT_VISITS.set(0);
+        for _ in 0..10 {
+            root.run_frame_scripts(context);
+        }
+        assert_eq!(SCRIPT_VISITS.get(), 0);
+
+        let _scope = ruffle_render::profile::enter_engine(false);
+        root.run_frame_scripts(context);
+        assert_eq!(SCRIPT_VISITS.get(), 2, "stock must retain the full walk");
+    });
+}
+
+#[test]
+fn queued_goto_survives_construction_before_frame_scripts() {
+    with_tree(|root, child, context| {
+        // Exercise the enqueue path used while an AS3 frame script is active.
+        child.play();
+        child
+            .0
+            .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, true);
+        child.goto_frame(
+            context,
+            GotoInfo {
+                frame: child.current_frame(),
+                stop_or_play: StopOrPlay::Stop,
+            },
+        );
+        child
+            .0
+            .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, false);
+        assert!(child.playing(), "goto must remain deferred");
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::FrameScripts;
+        root.run_frame_scripts(context);
+        assert!(!child.playing(), "the queued goto must execute");
+        assert!(child.0.queued_goto.get().is_none());
     });
 }
 
@@ -138,6 +186,69 @@ fn dirty_subtree_reparenting_invalidates_previously_settled_parent() {
         assert!(leaf.object2().is_some());
         assert!(old_root.is_empty());
         assert_eq!(child.parent().unwrap().as_ptr(), new_root.as_ptr());
+    });
+}
+
+#[test]
+fn reparented_pending_script_runs_under_a_previously_settled_parent() {
+    with_tree(|mut root, child, context| {
+        let new_root = MovieClip::new(root.movie(), context.gc());
+        new_root.construct_frame(context);
+        new_root.construct_frame(context);
+        let callable = context.avm2.classes().object.into();
+        child.register_frame_script(child.current_frame(), Some(callable), context);
+        root.remove_child(context, child.into());
+        new_root.replace_at_depth(context, child.into(), 1);
+        *context.frame_phase = FramePhase::FrameScripts;
+        new_root.run_frame_scripts(context);
+        assert_eq!(
+            child.last_queued_script_frame(),
+            Some(child.current_frame())
+        );
+        assert!(!child.has_pending_script());
+    });
+}
+
+#[test]
+#[ignore = "diagnostic frame-script traversal benchmark; no FPS assertion"]
+fn settled_frame_scripts_benchmark() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    with_tree(|root, _, context| {
+        for index in 2..102 {
+            let branch = MovieClip::new(root.movie(), context.gc());
+            let mut parent = branch;
+            for _ in 0..10 {
+                let child = MovieClip::new(root.movie(), context.gc());
+                parent.replace_at_depth(context, child.into(), 1);
+                parent = child;
+            }
+            root.replace_at_depth(context, branch.into(), index);
+        }
+        root.construct_frame(context);
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::FrameScripts;
+        let mut samples = [Vec::new(), Vec::new()];
+        for sample in 0..31 {
+            for offset in 0..2 {
+                let mode = (sample + offset) % 2;
+                let _scope = ruffle_render::profile::enter_engine(mode == 1);
+                SCRIPT_VISITS.set(0);
+                let start = Instant::now();
+                for _ in 0..100 {
+                    black_box(root).run_frame_scripts(context);
+                }
+                samples[mode].push(start.elapsed().as_nanos() / 100);
+                assert_eq!(SCRIPT_VISITS.get(), if mode == 1 { 0 } else { 110_200 });
+            }
+        }
+        for sample in &mut samples {
+            sample.sort_unstable();
+        }
+        println!(
+            "stock_ns_p50={} stock_ns_p95={} optimized_ns_p50={} optimized_ns_p95={}",
+            samples[0][15], samples[0][29], samples[1][15], samples[1][29]
+        );
     });
 }
 

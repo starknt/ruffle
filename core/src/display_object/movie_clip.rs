@@ -930,6 +930,7 @@ impl<'gc> MovieClip<'gc> {
                 // On all other versions, as well as in SWFv9 for gotos not to
                 // the current frame, the goto is properly queued.
 
+                self.invalidate_construction();
                 self.0.queued_goto.set(Some(goto_info));
 
                 // If we have a frame script on that frame, add ourselves to the
@@ -2700,18 +2701,33 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
         // Never mark an ancestor clean after a constructor/event changed an
         // already visited descendant. No new allocation or GC root is needed.
+        // run_frame_scripts also uses this state: only scriptless subtrees
+        // without queued gotos qualify, even if a script already ran this frame.
         if optimized
             && children_settled
             && revision == super::construction_revision()
             && self.0.initialized()
             && self.0.object2.get().is_some()
             && self.0.cell.borrow().frame_scripts.is_empty()
+            && self.0.queued_goto.get().is_none()
         {
             self.base().set_construction_clean(true);
         }
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        // A construction-clean subtree contains no registered frame scripts,
+        // queued gotos, or unsettled lifecycle boundaries. Reuse that proof;
+        // merely checking this clip's current script would miss descendant work.
+        // Registration, timeline/child mutations and queued gotos invalidate it.
+        if cfg!(feature = "construction_cache")
+            && ruffle_render::profile::engine_optimized()
+            && self.base().construction_clean()
+        {
+            return;
+        }
+        #[cfg(all(test, feature = "construction_cache"))]
+        construction_cache_tests::record_script_visit();
         self.run_local_frame_scripts(context);
 
         #[cfg(not(feature = "lifecycle_projection"))]
