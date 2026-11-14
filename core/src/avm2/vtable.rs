@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 #[cfg(test)]
 mod tests {
-    use super::{Property, PropertyMap, TraitLookupCache, TraitNames};
-    use crate::avm2::{Namespace, QName};
+    use super::{Property, PropertyMap, TraitLookupCache, TraitNames, VTable, VTableData};
+    use crate::avm2::{Multiname, Namespace, QName};
     use crate::string::AvmString;
     use gc_arena::collect::Trace;
     use gc_arena::{Arena, Collect, Gc, GcWeak, Rootable};
@@ -192,6 +192,49 @@ mod tests {
         assert!(cache.get(1, 3).is_none());
         assert!(cache.get(4, 2).is_none());
     }
+
+    #[test]
+    fn trait_queries_remain_correct_after_temporary_names_are_collected() {
+        let mut arena = Arena::<Rootable![VTable<'_>]>::new(|mc| {
+            let mut names = TraitNames::default();
+            for slot_id in 0..2 {
+                names.insert(
+                    QName::new(
+                        Namespace::any(),
+                        AvmString::new_utf8(mc, format!("field{slot_id:03}")),
+                    ),
+                    Property::Slot { slot_id },
+                );
+            }
+            VTable(Gc::new(
+                mc,
+                VTableData {
+                    resolved_traits: names,
+                    ..Default::default()
+                },
+            ))
+        });
+        for iteration in 0..256 {
+            arena.mutate(|mc, table| {
+                let expected = match iteration % 3 {
+                    0 => None,
+                    n => Some(n - 1),
+                };
+                let text = expected
+                    .map_or_else(|| "missing0".to_owned(), |slot| format!("field{slot:03}"));
+                let query = Multiname::new(Namespace::any(), AvmString::new_utf8(mc, text));
+                let result = table.get_trait(&query).map(|p| match p {
+                    Property::Slot { slot_id } => slot_id,
+                    _ => panic!("unexpected fixture trait"),
+                });
+                assert_eq!(
+                    result, expected,
+                    "stale trait after GC on iteration {iteration}"
+                );
+            });
+            arena.finish_cycle();
+        }
+    }
 }
 
 #[derive(Collect, Clone, Copy)]
@@ -282,8 +325,10 @@ struct VTableData<'gc> {
     resolved_traits: TraitNames<'gc>,
 
     /// One-entry inline cache for the overwhelmingly common single-namespace
-    /// trait lookup path. The keys are GC identities, so no managed values are
-    /// retained outside the GC graph.
+    /// trait lookup path. Only identities of keys in this vtable's immutable
+    /// resolved_traits may be stored: they remain alive for the cache's lifetime.
+    /// Query keys and negative results are not cached, since temporary query
+    /// strings/namespaces may be collected and their addresses reused.
     #[collect(require_static)]
     trait_lookup_cache: TraitLookupCache,
 
@@ -420,9 +465,16 @@ impl<'gc> VTable<'gc> {
                 return value;
             }
 
-            let value = self.resolved_traits().get_for_multiname(name).cloned();
-            cache.set(name_id, namespace_id, value);
-            value
+            self.resolved_traits()
+                .get_key_value_for_multiname(name)
+                .map(|(key, value)| {
+                    cache.set(
+                        key.local_name().ptr_id(),
+                        key.namespace().ptr_id(),
+                        Some(*value),
+                    );
+                    *value
+                })
         } else {
             self.resolved_traits().get_for_multiname(name).cloned()
         }

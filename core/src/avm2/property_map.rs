@@ -146,17 +146,24 @@ impl<'gc, V> PropertyMap<'gc, V> {
     }
 
     pub fn get_for_multiname(&self, name: &Multiname<'gc>) -> Option<&V> {
+        self.get_key_value_for_multiname(name)
+            .map(|(_, value)| value)
+    }
+
+    /// Return the key held by this map, not the caller's possibly temporary
+    /// string/namespace. VTable's identity cache relies on that ownership.
+    pub fn get_key_value_for_multiname(&self, name: &Multiname<'gc>) -> Option<(QName<'gc>, &V)> {
         if name.has_lazy_component() {
             unreachable!("Lookup on lazy Multiname should never happen ({:?})", name);
         }
         if let Some(local_name) = name.local_name() {
             self.0
-                .get(&PropertyMapKey(local_name))
-                .iter()
-                .find_map(|v| {
-                    v.iter()
+                .get_key_value(&PropertyMapKey(local_name))
+                .and_then(|(key, values)| {
+                    values
+                        .iter()
                         .filter(|(n, _)| name.namespace_set().iter().any(|ns| n.matches_ns(*ns)))
-                        .map(|(_, v)| v)
+                        .map(|(ns, v)| (QName::new(*ns, key.0), v))
                         .next()
                 })
         } else {
@@ -165,22 +172,8 @@ impl<'gc, V> PropertyMap<'gc, V> {
     }
 
     pub fn get_with_ns_for_multiname(&self, name: &Multiname<'gc>) -> Option<(Namespace<'gc>, &V)> {
-        if name.has_lazy_component() {
-            unreachable!("Lookup on lazy Multiname should never happen ({:?})", name);
-        }
-        if let Some(local_name) = name.local_name() {
-            self.0
-                .get(&PropertyMapKey(local_name))
-                .iter()
-                .find_map(|v| {
-                    v.iter()
-                        .filter(|(n, _)| name.namespace_set().iter().any(|ns| n.matches_ns(*ns)))
-                        .map(|(ns, v)| (*ns, v))
-                        .next()
-                })
-        } else {
-            None
-        }
+        self.get_key_value_for_multiname(name)
+            .map(|(key, value)| (key.namespace(), value))
     }
 
     pub fn get_mut(&mut self, name: QName<'gc>) -> Option<&mut V> {
