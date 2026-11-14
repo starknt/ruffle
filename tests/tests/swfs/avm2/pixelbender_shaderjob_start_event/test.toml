@@ -1,4 +1,5 @@
-num_ticks = 5
+num_ticks = 60
+sleep_to_meet_frame_rate = true
 
 [[compilers]]
 type = "Asc"

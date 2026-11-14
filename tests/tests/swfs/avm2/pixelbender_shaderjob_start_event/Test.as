@@ -4,6 +4,7 @@ package {
     import flash.display.ShaderJob;
     import flash.events.Event;
     import flash.events.ShaderEvent;
+    import flash.system.fscommand;
     import flash.utils.ByteArray;
 
     /*
@@ -48,6 +49,9 @@ package {
                 trace("  bitmapData: " + (shaderEvent == null ? null : shaderEvent.bitmapData)
                     + ", vector: " + (shaderEvent == null ? null : shaderEvent.vector));
                 trace("  target: " + toHex(target));
+                if (!waitForCompletion) {
+                    fscommand("quit");
+                }
             });
             job.start(waitForCompletion);
         }

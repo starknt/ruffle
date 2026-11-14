@@ -745,6 +745,16 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     pub fn set_skip_next_enter_frame(&self, skip: bool) {
+        if skip && cfg!(feature = "construction_cache") {
+            // A cached stopped ancestor must still visit us to consume and
+            // propagate this flag. This also covers SWF9 nested gotos and
+            // loader completions outside the player's optimized scope.
+            self.set_construction_clean(false);
+            CONSTRUCTION_REVISION.set(CONSTRUCTION_REVISION.get().wrapping_add(1));
+            if let Some(parent) = self.parent.get() {
+                parent.invalidate_construction();
+            }
+        }
         self.set_flag(DisplayObjectFlags::SKIP_NEXT_ENTER_FRAME, skip);
     }
 
@@ -877,6 +887,17 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     fn set_construction_clean(&self, clean: bool) {
         self.set_flag(DisplayObjectFlags::CONSTRUCTION_CLEAN, clean);
+        if !clean {
+            self.set_enter_frame_idle(false);
+        }
+    }
+
+    fn enter_frame_idle(&self) -> bool {
+        self.contains_flag(DisplayObjectFlags::ENTER_FRAME_IDLE)
+    }
+
+    fn set_enter_frame_idle(&self, idle: bool) {
+        self.set_flag(DisplayObjectFlags::ENTER_FRAME_IDLE, idle);
     }
 
     fn manual_frame_construct(&self) -> bool {
@@ -2446,7 +2467,8 @@ pub trait TDisplayObject<'gc>:
 
     /// Invalidate construction state through the real parent chain. This must
     /// also run outside optimized scopes (loader completions can mutate a tree
-    /// between frames). A dirty MovieClip already keeps its ancestors dirty.
+    /// between frames). A MovieClip dirty in both caches already keeps its
+    /// ancestors dirty.
     #[no_dynamic]
     fn invalidate_construction(self) {
         if !cfg!(feature = "construction_cache") {
@@ -2456,8 +2478,9 @@ pub trait TDisplayObject<'gc>:
         let mut current: DisplayObject<'gc> = self;
         loop {
             let was_clean = current.base().construction_clean();
+            let was_idle = current.base().enter_frame_idle();
             current.base().set_construction_clean(false);
-            if current.as_movie_clip().is_some() && !was_clean {
+            if current.as_movie_clip().is_some() && !was_clean && !was_idle {
                 break;
             }
             let Some(parent) = current.parent() else {
@@ -2484,6 +2507,26 @@ pub trait TDisplayObject<'gc>:
             DisplayObject::Stage(_)
             | DisplayObject::LoaderDisplay(_)
             | DisplayObject::Avm2Button(_) => false,
+        }
+    }
+
+    /// Whether enter_frame has no work until the construction state is invalidated.
+    /// Loader and button internals stay conservative traversal boundaries.
+    #[no_dynamic]
+    fn enter_frame_is_idle(self) -> bool {
+        match self {
+            DisplayObject::MovieClip(clip) => clip.base().enter_frame_idle(),
+            DisplayObject::Stage(_)
+            | DisplayObject::LoaderDisplay(_)
+            | DisplayObject::Avm2Button(_) => false,
+            DisplayObject::Bitmap(_)
+            | DisplayObject::Graphic(_)
+            | DisplayObject::MorphShape(_)
+            | DisplayObject::EditText(_)
+            | DisplayObject::Text(_)
+            | DisplayObject::TextLine(_)
+            | DisplayObject::Video(_)
+            | DisplayObject::Avm1Button(_) => true,
         }
     }
 
@@ -3208,6 +3251,9 @@ bitflags! {
 
         /// A MovieClip subtree with no pending construction or frame scripts.
         const CONSTRUCTION_CLEAN = 1 << 18;
+
+        /// An initialized AVM2 subtree with no playing clips or queued tags.
+        const ENTER_FRAME_IDLE = 1 << 19;
     }
 }
 

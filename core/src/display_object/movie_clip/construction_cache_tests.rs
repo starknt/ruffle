@@ -7,6 +7,7 @@ use std::cell::Cell;
 thread_local! {
     static VISITS: Cell<usize> = const { Cell::new(0) };
     static SCRIPT_VISITS: Cell<usize> = const { Cell::new(0) };
+    static ENTER_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(super) fn record_visit() {
@@ -15,6 +16,10 @@ pub(super) fn record_visit() {
 
 pub(super) fn record_script_visit() {
     SCRIPT_VISITS.set(SCRIPT_VISITS.get() + 1);
+}
+
+pub(super) fn record_enter_visit() {
+    ENTER_VISITS.set(ENTER_VISITS.get() + 1);
 }
 
 fn with_tree(test: impl for<'gc> FnOnce(MovieClip<'gc>, MovieClip<'gc>, &mut UpdateContext<'gc>)) {
@@ -85,6 +90,220 @@ fn settled_scriptless_subtree_avoids_frame_script_walks() {
         let _scope = ruffle_render::profile::enter_engine(false);
         root.run_frame_scripts(context);
         assert_eq!(SCRIPT_VISITS.get(), 2, "stock must retain the full walk");
+    });
+}
+
+#[test]
+fn stopped_subtree_avoids_enter_frame_walks() {
+    with_tree(|root, child, context| {
+        assert!(!root.playing() && !child.playing());
+        *context.frame_phase = FramePhase::Enter;
+        ENTER_VISITS.set(0);
+        for _ in 0..10 {
+            root.enter_frame(context);
+        }
+        assert_eq!(
+            ENTER_VISITS.get(),
+            0,
+            "stopped settled subtrees have no tick work"
+        );
+
+        let _scope = ruffle_render::profile::enter_engine(false);
+        root.enter_frame(context);
+        assert_eq!(ENTER_VISITS.get(), 2, "stock must retain the full walk");
+    });
+}
+
+#[test]
+fn stopped_scripted_subtree_skips_ticks_but_still_runs_frame_scripts() {
+    with_tree(|root, child, context| {
+        child.register_frame_script(
+            child.current_frame(),
+            Some(context.avm2.classes().object.into()),
+            context,
+        );
+        root.construct_frame(context);
+        assert!(child.has_pending_script());
+        *context.frame_phase = FramePhase::Enter;
+        ENTER_VISITS.set(0);
+        root.enter_frame(context);
+        assert_eq!(
+            ENTER_VISITS.get(),
+            0,
+            "stopped scripts do not require timeline ticks"
+        );
+        *context.frame_phase = FramePhase::FrameScripts;
+        root.run_frame_scripts(context);
+        assert_eq!(
+            child.last_queued_script_frame(),
+            Some(child.current_frame())
+        );
+        assert!(!child.has_pending_script());
+        // The parent and child have scripts below them, so construction is
+        // still dirty. play must nevertheless invalidate the idle ancestors.
+        child.play();
+        *context.frame_phase = FramePhase::Enter;
+        ENTER_VISITS.set(0);
+        root.enter_frame(context);
+        assert_eq!(
+            ENTER_VISITS.get(),
+            2,
+            "dirty construction must not stop idle invalidation"
+        );
+    });
+}
+
+#[test]
+fn playing_descendant_wakes_stopped_ancestors() {
+    with_tree(|root, child, context| {
+        child.replace_with_movie(context, Some(root.movie()), false, None);
+        assert!(child.preload(context, &mut ExecutionLimit::none()));
+        child.stop(context);
+        root.construct_frame(context);
+        root.construct_frame(context);
+        assert_eq!(child.current_frame(), 0);
+        {
+            let _scope = ruffle_render::profile::enter_engine(false);
+            child.play();
+        }
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::Enter;
+        ENTER_VISITS.set(0);
+        root.enter_frame(context);
+        assert_eq!(ENTER_VISITS.get(), 2, "play must reach the descendant");
+        assert_eq!(
+            child.current_frame(),
+            1,
+            "the resumed timeline must advance"
+        );
+    });
+}
+
+#[test]
+fn descendant_skip_flag_is_consumed_under_a_stopped_ancestor() {
+    with_tree(|root, child, context| {
+        child.base().set_skip_next_enter_frame(true);
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::Enter;
+        root.enter_frame(context);
+        assert!(!child.base().should_skip_next_enter_frame());
+        assert!(
+            child
+                .child_by_index(0)
+                .unwrap()
+                .base()
+                .should_skip_next_enter_frame(),
+            "the existing skip propagation to inert leaves must remain observable"
+        );
+    });
+}
+
+#[test]
+fn parent_skip_flag_still_propagates_through_stopped_subtrees() {
+    with_tree(|root, child, context| {
+        root.base().set_skip_next_enter_frame(true);
+        *context.frame_phase = FramePhase::Enter;
+        root.enter_frame(context);
+        assert!(!root.base().should_skip_next_enter_frame());
+        assert!(!child.base().should_skip_next_enter_frame());
+        assert!(
+            child
+                .child_by_index(0)
+                .unwrap()
+                .base()
+                .should_skip_next_enter_frame()
+        );
+    });
+}
+
+#[test]
+fn reparented_playing_descendant_wakes_a_stopped_tree() {
+    with_tree(|root, child, context| {
+        let added = MovieClip::new(root.movie(), context.gc());
+        added.replace_with_movie(context, Some(root.movie()), false, None);
+        assert!(added.preload(context, &mut ExecutionLimit::none()));
+        added.stop(context);
+        added.construct_frame(context);
+        added.construct_frame(context);
+        added.play();
+        child.replace_at_depth(context, added.into(), 2);
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::Enter;
+        root.enter_frame(context);
+        assert_eq!(
+            added.current_frame(),
+            1,
+            "newly attached active children must still tick"
+        );
+    });
+}
+
+#[test]
+fn stopping_an_active_descendant_makes_the_tree_idle_again() {
+    with_tree(|root, child, context| {
+        child.play();
+        root.construct_frame(context);
+        child.stop(context);
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::Enter;
+        ENTER_VISITS.set(0);
+        root.enter_frame(context);
+        assert_eq!(ENTER_VISITS.get(), 0);
+    });
+}
+
+#[test]
+fn replacing_a_cached_movie_preserves_the_new_timeline_tick() {
+    with_tree(|root, child, context| {
+        child.replace_with_movie(context, Some(root.movie()), false, None);
+        assert!(child.preload(context, &mut ExecutionLimit::none()));
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::Enter;
+        root.enter_frame(context);
+        assert_eq!(child.current_frame(), 1);
+    });
+}
+
+#[test]
+#[ignore = "diagnostic stopped-subtree traversal benchmark; no FPS assertion"]
+fn stopped_enter_frame_benchmark() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    with_tree(|root, _, context| {
+        for index in 2..102 {
+            let branch = MovieClip::new(root.movie(), context.gc());
+            let mut parent = branch;
+            for _ in 0..10 {
+                let child = MovieClip::new(root.movie(), context.gc());
+                parent.replace_at_depth(context, child.into(), 1);
+                parent = child;
+            }
+            root.replace_at_depth(context, branch.into(), index);
+        }
+        root.construct_frame(context);
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::Enter;
+        let mut samples = [Vec::new(), Vec::new()];
+        for sample in 0..31 {
+            for offset in 0..2 {
+                let mode = (sample + offset) % 2;
+                let _scope = ruffle_render::profile::enter_engine(mode == 1);
+                ENTER_VISITS.set(0);
+                let start = Instant::now();
+                for _ in 0..100 {
+                    black_box(root).enter_frame(context);
+                }
+                samples[mode].push(start.elapsed().as_nanos() / 100);
+                assert_eq!(ENTER_VISITS.get(), if mode == 1 { 0 } else { 110_200 });
+            }
+        }
+        for sample in &mut samples {
+            sample.sort_unstable();
+        }
+        println!(
+            "stock_ns_p50={} stock_ns_p95={} optimized_ns_p50={} optimized_ns_p95={}",
+            samples[0][15], samples[0][29], samples[1][15], samples[1][29]
+        );
     });
 }
 

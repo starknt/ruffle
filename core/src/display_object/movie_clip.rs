@@ -864,6 +864,9 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn play(self) {
+        if !self.playing() {
+            self.invalidate_construction();
+        }
         self.0.play()
     }
 
@@ -888,6 +891,9 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn stop(self, context: &mut UpdateContext<'gc>) {
+        if self.playing() {
+            self.invalidate_construction();
+        }
         self.0.stop(context)
     }
 
@@ -2556,6 +2562,17 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
+        // This proof includes every descendant, and is invalidated by play,
+        // goto, queued tags, child changes and skip-frame propagation. Global
+        // enterFrame broadcasts are still performed by the stage as usual.
+        if cfg!(feature = "construction_cache")
+            && ruffle_render::profile::engine_optimized()
+            && self.base().enter_frame_idle()
+        {
+            return;
+        }
+        #[cfg(all(test, feature = "construction_cache"))]
+        construction_cache_tests::record_enter_visit();
         let skip_frame = self.base().should_skip_next_enter_frame();
         #[cfg(not(feature = "lifecycle_projection"))]
         let children = self.iter_render_list();
@@ -2631,6 +2648,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             0
         };
         let mut children_settled = false;
+        let mut children_idle = false;
         // AVM1 code expects to execute in line with timeline instructions, so
         // it's exempted from frame construction.
         if self.movie().is_action_script_3()
@@ -2661,6 +2679,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                     .0
                     .contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME);
                 children_settled = true;
+                children_idle = true;
                 for child in self.iter_render_list() {
                     // Under some conditions, we won't run `construct_frame` on
                     // a not-yet-constructed child
@@ -2672,6 +2691,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                         // the non-constructed children of this clip.
                         if running_construct_frame {
                             children_settled = false;
+                            children_idle = false;
                             continue;
                         }
 
@@ -2681,6 +2701,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                         // `construct_frame` like normal.
                         if child.manual_frame_construct() {
                             children_settled = false;
+                            children_idle = false;
                             continue;
                         }
                     }
@@ -2688,6 +2709,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                     child.construct_frame(context);
                     if optimized {
                         children_settled &= child.construction_is_settled();
+                        children_idle &= child.enter_frame_is_idle();
                     }
                 }
             }
@@ -2701,17 +2723,24 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
         // Never mark an ancestor clean after a constructor/event changed an
         // already visited descendant. No new allocation or GC root is needed.
-        // run_frame_scripts also uses this state: only scriptless subtrees
-        // without queued gotos qualify, even if a script already ran this frame.
+        // Construction/frame-script walks require a scriptless subtree. Tick
+        // walks can also skip stopped scripted clips, because their scripts
+        // are handled separately by run_frame_scripts (and may wake the cache).
         if optimized
-            && children_settled
             && revision == super::construction_revision()
             && self.0.initialized()
             && self.0.object2.get().is_some()
-            && self.0.cell.borrow().frame_scripts.is_empty()
             && self.0.queued_goto.get().is_none()
         {
-            self.base().set_construction_clean(true);
+            if children_settled && self.0.cell.borrow().frame_scripts.is_empty() {
+                self.base().set_construction_clean(true);
+            }
+            self.base().set_enter_frame_idle(
+                children_idle
+                    && !self.playing()
+                    && !self.base().should_skip_next_enter_frame()
+                    && self.0.queued_tags.borrow().is_empty(),
+            );
         }
     }
 
