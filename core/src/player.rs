@@ -2697,6 +2697,9 @@ impl Player {
 
         // GC
         let _gc_time = ruffle_render::profile::time(ruffle_render::profile::Phase::Gc);
+        #[cfg(feature = "tracy_avm")]
+        let _gc_span = tracy_client::Client::running()
+            .map(|client| client.span(tracy_client::span_location!("Aola GC collect_debt"), 0));
         self.gc_arena.borrow_mut().collect_debt();
 
         rval
