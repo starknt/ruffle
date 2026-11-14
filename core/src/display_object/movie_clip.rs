@@ -843,6 +843,11 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn set_last_queued_script_frame(self, frame: Option<FrameNumber>) {
+        if cfg!(feature = "scripted_construction_cache")
+            && frame != self.0.last_queued_script_frame.get()
+        {
+            self.invalidate_construction();
+        }
         self.0.last_queued_script_frame.set(frame);
     }
 
@@ -2546,6 +2551,13 @@ impl<'gc> MovieClip<'gc> {
         let has_pending_script = self.has_frame_script(self.0.current_frame.get());
         self.set_has_pending_script(has_pending_script);
     }
+
+    fn local_frame_scripts_are_idle(self) -> bool {
+        self.0.queued_goto.get().is_none()
+            && !self.is_executing_avm2_frame_script()
+            && (!self.has_pending_script()
+                || self.last_queued_script_frame() == Some(self.0.queued_script_frame.get()))
+    }
 }
 
 impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
@@ -2649,6 +2661,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         };
         let mut children_settled = false;
         let mut children_idle = false;
+        let mut child_scripts_idle = false;
         // AVM1 code expects to execute in line with timeline instructions, so
         // it's exempted from frame construction.
         if self.movie().is_action_script_3()
@@ -2680,6 +2693,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                     .contains_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME);
                 children_settled = true;
                 children_idle = true;
+                child_scripts_idle = true;
                 for child in self.iter_render_list() {
                     // Under some conditions, we won't run `construct_frame` on
                     // a not-yet-constructed child
@@ -2692,6 +2706,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                         if running_construct_frame {
                             children_settled = false;
                             children_idle = false;
+                            child_scripts_idle = false;
                             continue;
                         }
 
@@ -2702,6 +2717,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                         if child.manual_frame_construct() {
                             children_settled = false;
                             children_idle = false;
+                            child_scripts_idle = false;
                             continue;
                         }
                     }
@@ -2710,6 +2726,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                     if optimized {
                         children_settled &= child.construction_is_settled();
                         children_idle &= child.enter_frame_is_idle();
+                        if cfg!(feature = "scripted_construction_cache") {
+                            child_scripts_idle &= child.frame_scripts_are_idle();
+                        }
                     }
                 }
             }
@@ -2723,17 +2742,28 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
         // Never mark an ancestor clean after a constructor/event changed an
         // already visited descendant. No new allocation or GC root is needed.
-        // Construction/frame-script walks require a scriptless subtree. Tick
-        // walks can also skip stopped scripted clips, because their scripts
-        // are handled separately by run_frame_scripts (and may wake the cache).
+        // Scripted subtrees may settle only after checking pending scripts in
+        // Construct. Script execution has a separate proof, so construction
+        // cannot hide a pending script or a reentrant queued goto.
         if optimized
             && revision == super::construction_revision()
             && self.0.initialized()
             && self.0.object2.get().is_some()
             && self.0.queued_goto.get().is_none()
         {
-            if children_settled && self.0.cell.borrow().frame_scripts.is_empty() {
+            if children_settled
+                && (self.0.cell.borrow().frame_scripts.is_empty()
+                    || (cfg!(feature = "scripted_construction_cache")
+                        && *context.frame_phase == FramePhase::Construct))
+            {
                 self.base().set_construction_clean(true);
+            }
+            if cfg!(feature = "scripted_construction_cache") {
+                self.base().set_frame_scripts_idle(
+                    self.base().construction_clean()
+                        && child_scripts_idle
+                        && self.local_frame_scripts_are_idle(),
+                );
             }
             self.base().set_enter_frame_idle(
                 children_idle
@@ -2745,16 +2775,19 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
-        // A construction-clean subtree contains no registered frame scripts,
-        // queued gotos, or unsettled lifecycle boundaries. Reuse that proof;
-        // merely checking this clip's current script would miss descendant work.
-        // Registration, timeline/child mutations and queued gotos invalidate it.
-        if cfg!(feature = "construction_cache")
-            && ruffle_render::profile::engine_optimized()
-            && self.base().construction_clean()
-        {
+        let optimized =
+            cfg!(feature = "construction_cache") && ruffle_render::profile::engine_optimized();
+        // The original cache only admits scriptless trees. The candidate also
+        // admits scripted trees and must use the independent script proof.
+        let idle = if cfg!(feature = "scripted_construction_cache") {
+            self.base().frame_scripts_idle()
+        } else {
+            self.base().construction_clean()
+        };
+        if optimized && idle {
             return;
         }
+        let revision = super::construction_revision();
         #[cfg(all(test, feature = "construction_cache"))]
         construction_cache_tests::record_script_visit();
         self.run_local_frame_scripts(context);
@@ -2767,8 +2800,20 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         } else {
             self.iter_render_list().into()
         };
+        let mut children_idle = true;
         for child in children {
             child.run_frame_scripts(context);
+            if cfg!(feature = "scripted_construction_cache") && optimized {
+                children_idle &= child.frame_scripts_are_idle();
+            }
+        }
+        if cfg!(feature = "scripted_construction_cache")
+            && optimized
+            && revision == super::construction_revision()
+            && self.base().construction_clean()
+        {
+            self.base()
+                .set_frame_scripts_idle(children_idle && self.local_frame_scripts_are_idle());
         }
     }
 

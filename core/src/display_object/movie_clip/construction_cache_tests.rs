@@ -516,3 +516,166 @@ fn settled_construction_benchmark() {
         );
     });
 }
+
+#[cfg(feature = "scripted_construction_cache")]
+fn settle_scripted_tree<'gc>(
+    root: MovieClip<'gc>,
+    child: MovieClip<'gc>,
+    context: &mut UpdateContext<'gc>,
+) {
+    child.register_frame_script(
+        child.current_frame(),
+        Some(context.avm2.classes().object.into()),
+        context,
+    );
+    for _ in 0..3 {
+        *context.frame_phase = FramePhase::Construct;
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::FrameScripts;
+        root.run_frame_scripts(context);
+    }
+    assert_eq!(
+        child.last_queued_script_frame(),
+        Some(child.current_frame())
+    );
+}
+
+#[test]
+#[cfg(feature = "scripted_construction_cache")]
+fn consumed_scripted_subtree_avoids_repeated_nested_frame_walks() {
+    with_tree(|root, child, context| {
+        settle_scripted_tree(root, child, context);
+        VISITS.set(0);
+        SCRIPT_VISITS.set(0);
+        for _ in 0..10 {
+            *context.frame_phase = FramePhase::Construct;
+            root.construct_frame(context);
+            *context.frame_phase = FramePhase::FrameScripts;
+            root.run_frame_scripts(context);
+        }
+        assert_eq!(
+            VISITS.get(),
+            0,
+            "consumed scripts must not force repeated construction"
+        );
+        assert_eq!(
+            SCRIPT_VISITS.get(),
+            0,
+            "already consumed scripts have no remaining work"
+        );
+        let _scope = ruffle_render::profile::enter_engine(false);
+        *context.frame_phase = FramePhase::Construct;
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::FrameScripts;
+        root.run_frame_scripts(context);
+        assert_eq!(VISITS.get(), 2, "stock still constructs both clips");
+        assert_eq!(
+            SCRIPT_VISITS.get(),
+            2,
+            "stock still visits both script nodes"
+        );
+    });
+}
+
+#[test]
+#[cfg(feature = "scripted_construction_cache")]
+fn rearming_consumed_script_invalidates_ancestors_without_a_new_registration() {
+    with_tree(|root, child, context| {
+        settle_scripted_tree(root, child, context);
+        assert!(child.has_pending_script());
+        child.set_last_queued_script_frame(None);
+        SCRIPT_VISITS.set(0);
+        root.run_frame_scripts(context);
+        assert_eq!(
+            child.last_queued_script_frame(),
+            Some(child.current_frame()),
+            "rearmed script was hidden by an idle ancestor"
+        );
+        assert!(!child.has_pending_script());
+        assert_eq!(SCRIPT_VISITS.get(), 2);
+    });
+}
+
+#[test]
+#[cfg(feature = "scripted_construction_cache")]
+fn scripted_tree_constructed_outside_construct_still_checks_pending_scripts() {
+    with_tree(|root, child, context| {
+        child.register_frame_script(
+            child.current_frame(),
+            Some(context.avm2.classes().object.into()),
+            context,
+        );
+        child.set_has_pending_script(false);
+        *context.frame_phase = FramePhase::FrameScripts;
+        for _ in 0..3 {
+            root.construct_frame(context);
+            root.run_frame_scripts(context);
+        }
+        assert!(!root.base().construction_clean());
+        assert_eq!(child.last_queued_script_frame(), None);
+        *context.frame_phase = FramePhase::Construct;
+        root.construct_frame(context);
+        assert!(child.has_pending_script());
+        *context.frame_phase = FramePhase::FrameScripts;
+        root.run_frame_scripts(context);
+        assert_eq!(
+            child.last_queued_script_frame(),
+            Some(child.current_frame())
+        );
+    });
+}
+
+#[test]
+#[ignore = "diagnostic settled scripted-subtree benchmark; no FPS assertion"]
+#[cfg(feature = "scripted_construction_cache")]
+fn settled_scripted_subtree_benchmark() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    with_tree(|root, child, context| {
+        for depth in 2..102 {
+            let branch = MovieClip::new(root.movie(), context.gc());
+            root.replace_at_depth(context, branch.into(), depth);
+            root.construct_frame(context);
+            branch.register_frame_script(
+                branch.current_frame(),
+                Some(context.avm2.classes().object.into()),
+                context,
+            );
+        }
+        settle_scripted_tree(root, child, context);
+        let mut stock = Vec::new();
+        let mut optimized = Vec::new();
+        for sample in 0..31 {
+            for offset in 0..2 {
+                let enabled = (sample + offset) % 2 == 0;
+                let _scope = ruffle_render::profile::enter_engine(enabled);
+                VISITS.set(0);
+                SCRIPT_VISITS.set(0);
+                let start = Instant::now();
+                for _ in 0..100 {
+                    *context.frame_phase = FramePhase::Construct;
+                    black_box(root).construct_frame(context);
+                    *context.frame_phase = FramePhase::FrameScripts;
+                    black_box(root).run_frame_scripts(context);
+                }
+                let nanos = start.elapsed().as_nanos() / 100;
+                if enabled {
+                    assert_eq!(VISITS.get(), 0);
+                    assert_eq!(SCRIPT_VISITS.get(), 0);
+                    optimized.push(nanos);
+                } else {
+                    assert_eq!(VISITS.get(), 10200);
+                    assert_eq!(SCRIPT_VISITS.get(), 10200);
+                    stock.push(nanos);
+                }
+            }
+        }
+        stock.sort_unstable();
+        optimized.sort_unstable();
+        println!(
+            "stock_ns_p50={} stock_ns_p95={} optimized_ns_p50={} optimized_ns_p95={}",
+            stock[15], stock[29], optimized[15], optimized[29]
+        );
+    });
+}

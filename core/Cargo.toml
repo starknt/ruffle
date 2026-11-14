@@ -80,6 +80,8 @@ workspace = true
 version = "0.4.70"
 
 [features]
+# Diagnostic candidate: cache settled scripted subtrees; default off.
+scripted_construction_cache = ["construction_cache"]
 default = []
 # Experimental lifecycle child projection; application A/B has not established a benefit.
 lifecycle_projection = []

@@ -144,31 +144,82 @@ pub fn run_inner_goto_frame<'gc>(
     // Note - we do *not* call `enter_frame` or dispatch an `enterFrame` event
 
     *context.frame_phase = FramePhase::Construct;
-    OrphanManager::each_orphan_obj(context, |orphan, context| {
-        orphan.construct_frame(context);
-    });
-    stage.construct_frame(context);
-    broadcast_frame_constructed(context);
+    {
+        #[cfg(feature = "tracy_avm")]
+        let _span = tracy_client::Client::running().map(|client| {
+            client.span(
+                tracy_client::span_location!("Aola goto construct orphans"),
+                0,
+            )
+        });
+        OrphanManager::each_orphan_obj(context, |orphan, context| {
+            orphan.construct_frame(context);
+        });
+    }
+    {
+        #[cfg(feature = "tracy_avm")]
+        let _span = tracy_client::Client::running().map(|client| {
+            client.span(tracy_client::span_location!("Aola goto construct stage"), 0)
+        });
+        stage.construct_frame(context);
+    }
+    {
+        #[cfg(feature = "tracy_avm")]
+        let _span = tracy_client::Client::running().map(|client| {
+            client.span(
+                tracy_client::span_location!("Aola goto broadcast constructed"),
+                0,
+            )
+        });
+        broadcast_frame_constructed(context);
+    }
 
     *context.frame_phase = FramePhase::FrameScripts;
-    stage.run_frame_scripts(context);
-    OrphanManager::each_orphan_obj(context, |orphan, context| {
-        orphan.run_frame_scripts(context);
-    });
+    {
+        #[cfg(feature = "tracy_avm")]
+        let _span = tracy_client::Client::running()
+            .map(|client| client.span(tracy_client::span_location!("Aola goto scripts stage"), 0));
+        stage.run_frame_scripts(context);
+    }
+    {
+        #[cfg(feature = "tracy_avm")]
+        let _span = tracy_client::Client::running().map(|client| {
+            client.span(tracy_client::span_location!("Aola goto scripts orphans"), 0)
+        });
+        OrphanManager::each_orphan_obj(context, |orphan, context| {
+            orphan.run_frame_scripts(context);
+        });
+    }
 
-    for child in removed_frame_scripts {
-        child.run_frame_scripts(context);
+    {
+        #[cfg(feature = "tracy_avm")]
+        let _span = tracy_client::Client::running().map(|client| {
+            client.span(tracy_client::span_location!("Aola goto removed scripts"), 0)
+        });
+        for child in removed_frame_scripts {
+            child.run_frame_scripts(context);
+        }
     }
 
     *context.frame_phase = FramePhase::Exit;
-    broadcast_frame_exited(context);
+    {
+        #[cfg(feature = "tracy_avm")]
+        let _span = tracy_client::Client::running()
+            .map(|client| client.span(tracy_client::span_location!("Aola goto broadcast exit"), 0));
+        broadcast_frame_exited(context);
+    }
 
     // We cannot easily remove dead `GcWeak` instances from the orphan list
     // inside `each_orphan_movie`, since the callback may modify the orphan list.
     // Instead, we do one cleanup at the end of the frame.
     // This performs special handling of clips which became orphaned as
     // a result of a RemoveObject tag - see `cleanup_dead_orphans` for details.
-    context.orphan_manager.cleanup_dead_orphans(context.gc());
+    {
+        #[cfg(feature = "tracy_avm")]
+        let _span = tracy_client::Client::running()
+            .map(|client| client.span(tracy_client::span_location!("Aola goto orphan cleanup"), 0));
+        context.orphan_manager.cleanup_dead_orphans(context.gc());
+    }
 
     *context.frame_phase = old_phase;
 }

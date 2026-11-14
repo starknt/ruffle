@@ -889,7 +889,18 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.set_flag(DisplayObjectFlags::CONSTRUCTION_CLEAN, clean);
         if !clean {
             self.set_enter_frame_idle(false);
+            if cfg!(feature = "scripted_construction_cache") {
+                self.set_frame_scripts_idle(false);
+            }
         }
+    }
+
+    fn frame_scripts_idle(&self) -> bool {
+        self.contains_flag(DisplayObjectFlags::FRAME_SCRIPTS_IDLE)
+    }
+
+    fn set_frame_scripts_idle(&self, idle: bool) {
+        self.set_flag(DisplayObjectFlags::FRAME_SCRIPTS_IDLE, idle);
     }
 
     fn enter_frame_idle(&self) -> bool {
@@ -2467,7 +2478,7 @@ pub trait TDisplayObject<'gc>:
 
     /// Invalidate construction state through the real parent chain. This must
     /// also run outside optimized scopes (loader completions can mutate a tree
-    /// between frames). A MovieClip dirty in both caches already keeps its
+    /// between frames). A MovieClip dirty in every cache already keeps its
     /// ancestors dirty.
     #[no_dynamic]
     fn invalidate_construction(self) {
@@ -2479,8 +2490,10 @@ pub trait TDisplayObject<'gc>:
         loop {
             let was_clean = current.base().construction_clean();
             let was_idle = current.base().enter_frame_idle();
+            let scripts_were_idle = cfg!(feature = "scripted_construction_cache")
+                && current.base().frame_scripts_idle();
             current.base().set_construction_clean(false);
-            if current.as_movie_clip().is_some() && !was_clean && !was_idle {
+            if current.as_movie_clip().is_some() && !was_clean && !was_idle && !scripts_were_idle {
                 break;
             }
             let Some(parent) = current.parent() else {
@@ -2516,6 +2529,26 @@ pub trait TDisplayObject<'gc>:
     fn enter_frame_is_idle(self) -> bool {
         match self {
             DisplayObject::MovieClip(clip) => clip.base().enter_frame_idle(),
+            DisplayObject::Stage(_)
+            | DisplayObject::LoaderDisplay(_)
+            | DisplayObject::Avm2Button(_) => false,
+            DisplayObject::Bitmap(_)
+            | DisplayObject::Graphic(_)
+            | DisplayObject::MorphShape(_)
+            | DisplayObject::EditText(_)
+            | DisplayObject::Text(_)
+            | DisplayObject::TextLine(_)
+            | DisplayObject::Video(_)
+            | DisplayObject::Avm1Button(_) => true,
+        }
+    }
+
+    /// Whether a frame-script walk is a no-op until lifecycle invalidation.
+    /// Hidden button states and loader contents remain traversal boundaries.
+    #[no_dynamic]
+    fn frame_scripts_are_idle(self) -> bool {
+        match self {
+            DisplayObject::MovieClip(clip) => clip.base().frame_scripts_idle(),
             DisplayObject::Stage(_)
             | DisplayObject::LoaderDisplay(_)
             | DisplayObject::Avm2Button(_) => false,
@@ -3249,11 +3282,14 @@ bitflags! {
         /// the meantime throws an error.
         const BEING_REMOVED_BY_AVM2   = 1 << 17;
 
-        /// A MovieClip subtree with no pending construction or frame scripts.
+        /// A MovieClip subtree with no pending construction work.
         const CONSTRUCTION_CLEAN = 1 << 18;
 
         /// An initialized AVM2 subtree with no playing clips or queued tags.
         const ENTER_FRAME_IDLE = 1 << 19;
+
+        /// A constructed subtree with no fresh frame scripts or queued gotos.
+        const FRAME_SCRIPTS_IDLE = 1 << 20;
     }
 }
 
