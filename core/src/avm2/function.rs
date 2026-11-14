@@ -240,6 +240,12 @@ pub fn exec<'gc>(
     activation: &mut Activation<'_, 'gc>,
     callee: Option<FunctionObject<'gc>>,
 ) -> Result<Value<'gc>, Error<'gc>> {
+    #[cfg(feature = "avm2_fast_accessors")]
+    if let Some(result) =
+        super::fast_accessor::try_exec(method, receiver, user_arguments, activation)
+    {
+        return result;
+    }
     let mc = activation.gc();
 
     let caller_dxns = activation.default_xml_namespace();

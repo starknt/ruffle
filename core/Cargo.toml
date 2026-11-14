@@ -80,6 +80,7 @@ workspace = true
 version = "0.4.70"
 
 [features]
+avm2_fast_accessors = []
 # Experimental ordered orphan scheduling; default off.
 orphan_worklist = ["button_lifecycle_cache"]
 # Anonymous lifecycle traversal diagnostics; no default instrumentation.

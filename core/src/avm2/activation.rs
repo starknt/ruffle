@@ -924,7 +924,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     }
 
     #[inline(always)]
-    fn timeout_check(&mut self) -> Result<(), Error<'gc>> {
+    pub(super) fn timeout_check(&mut self) -> Result<(), Error<'gc>> {
         *self.context.actions_since_timeout_check += 1;
         if *self.context.actions_since_timeout_check >= 10000 {
             *self.context.actions_since_timeout_check = 0;

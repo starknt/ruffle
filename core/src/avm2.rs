@@ -54,6 +54,10 @@ mod e4x;
 pub mod error;
 pub mod error_messages;
 mod events;
+#[cfg(feature = "avm2_fast_accessors")]
+mod fast_accessor;
+#[cfg(all(test, feature = "avm2_fast_accessors", feature = "lifecycle_counts"))]
+mod fast_accessor_tests;
 mod filters;
 mod flv;
 mod function;

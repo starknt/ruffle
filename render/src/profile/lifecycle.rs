@@ -62,6 +62,8 @@ names!(Count, COUNT_NAMES,
     WorklistWake => "worklistWake",
     WorklistButtonWake => "worklistButtonWake",
     WorklistFallback => "worklistFallback",
+    FastAccessorHit => "fastAccessorHit",
+    FastAccessorCandidate => "fastAccessorCandidate",
 );
 
 #[derive(Clone, Debug)]
