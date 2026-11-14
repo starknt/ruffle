@@ -125,6 +125,26 @@ pub struct BitmapCache {
     warned_for_oversize: bool,
 }
 
+const STOCK_MAX_CACHE_PIXELS_AVM1: u64 = 2880 * 2880;
+const STOCK_MAX_CACHE_PIXELS_AVM2: u64 = 16_777_215;
+// cacheAsBitmap is an optimization. Keep the optimized path bounded so a
+// long-lived SWF cannot retain an unbounded set of large offscreen textures.
+const OPTIMIZED_MAX_CACHE_PIXELS_AVM1: u64 = 2_000_000;
+const OPTIMIZED_MAX_CACHE_PIXELS_AVM2: u64 = 4_000_000;
+
+fn cache_size_is_acceptable(swf_version: u8, width: u32, height: u32, optimized: bool) -> bool {
+    let max_dimension = if swf_version > 9 { 8191 } else { 2880 };
+    let max_pixels = match (optimized, swf_version > 9) {
+        (true, true) => OPTIMIZED_MAX_CACHE_PIXELS_AVM2,
+        (true, false) => OPTIMIZED_MAX_CACHE_PIXELS_AVM1,
+        (false, true) => STOCK_MAX_CACHE_PIXELS_AVM2,
+        (false, false) => STOCK_MAX_CACHE_PIXELS_AVM1,
+    };
+    width < max_dimension
+        && height < max_dimension
+        && u64::from(width) * u64::from(height) < max_pixels
+}
+
 impl BitmapCache {
     /// Forcefully make this BitmapCache invalid and require regeneration.
     /// This should be used for changes that aren't automatically detected, such as children.
@@ -170,12 +190,12 @@ impl BitmapCache {
         {
             return; // No need to resize it
         }
-        let acceptable_size = if swf_version > 9 {
-            let total = actual_width * actual_height;
-            actual_width < 8191 && actual_height < 8191 && total < 16777215
-        } else {
-            actual_width < 2880 && actual_height < 2880
-        };
+        let acceptable_size = cache_size_is_acceptable(
+            swf_version,
+            actual_width,
+            actual_height,
+            ruffle_render::profile::engine_optimized(),
+        );
 
         if renderer.is_offscreen_supported()
             && let Some(actual_width) = NonZero::new(actual_width)
@@ -202,6 +222,25 @@ impl BitmapCache {
 
     fn bitmap(&self) -> Option<BitmapInfo> {
         self.bitmap.clone()
+    }
+}
+
+#[cfg(test)]
+mod bitmap_cache_tests {
+    use super::cache_size_is_acceptable;
+
+    #[test]
+    fn optimized_cache_budget_rejects_large_gpu_surfaces() {
+        assert!(cache_size_is_acceptable(10, 1999, 1999, true));
+        assert!(!cache_size_is_acceptable(10, 2000, 2000, true));
+        assert!(cache_size_is_acceptable(9, 1400, 1400, true));
+        assert!(!cache_size_is_acceptable(9, 1500, 1500, true));
+    }
+
+    #[test]
+    fn stock_cache_budget_keeps_legacy_limit() {
+        assert!(cache_size_is_acceptable(10, 4095, 4095, false));
+        assert!(!cache_size_is_acceptable(10, 4096, 4096, false));
     }
 }
 
@@ -1076,7 +1115,7 @@ pub fn render_base<'gc>(
             } else {
                 if !cache.warned_for_oversize {
                     tracing::warn!(
-                        "Skipping cacheAsBitmap for incredibly large object {:?} ({width} x {height})",
+                        "Skipping cacheAsBitmap for large object {:?} ({width} x {height})",
                         name
                     );
                     cache.warned_for_oversize = true;
