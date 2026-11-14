@@ -108,13 +108,18 @@ mod renderer {
 
         let adapter_info = descriptors.adapter.get_info();
         let name = format!("{}-{:?}", std::env::consts::OS, adapter_info.backend);
+        let mut renderer = WgpuRenderBackend::with_options(
+            descriptors,
+            target,
+            super::test_optimized(),
+            false,
+        )
+        .expect("WGPU Render backend creation must not fail, everything was checked ahead of time");
+        renderer.set_blend_batching(
+            std::env::var("RUFFLE_TEST_BLEND_BATCHES").as_deref() == Ok("bounded"),
+        );
 
-        Some((
-            Box::new(NativeRenderInterface { name }),
-            Box::new(WgpuRenderBackend::with_options(descriptors, target,super::test_optimized(),false).expect(
-                "WGPU Render backend creation must not fail, everything was checked ahead of time",
-            )),
-        ))
+        Some((Box::new(NativeRenderInterface { name }), Box::new(renderer)))
     }
 
     impl RenderInterface for NativeRenderInterface {

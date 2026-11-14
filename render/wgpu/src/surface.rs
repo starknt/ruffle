@@ -1,8 +1,11 @@
+mod batches;
 pub mod buffers;
 mod chunk;
 mod commands;
 pub mod mask;
 pub mod target;
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests;
 
 use crate::backend::RenderTargetMode;
 use crate::blend::ComplexBlend;
@@ -16,6 +19,7 @@ use crate::surface::commands::chunk_blends;
 use crate::utils::run_copy_pipeline;
 use crate::utils::supported_sample_count;
 use crate::{Descriptors, Pipelines};
+use batches::CommandBatches;
 use chunk::{Chunk, CommandRenderer};
 use ruffle_render::commands::CommandList;
 use ruffle_render::pixel_bender_support::{ImageInputTexture, PixelBenderShaderArgument};
@@ -128,132 +132,176 @@ impl Surface {
         );
 
         let mut mask_state = MaskState::empty();
-        let chunks = chunk_blends(
+        for commands in CommandBatches::new(
             commands,
-            descriptors,
-            staging_belt,
-            chunk_buffers,
-            draw_encoder,
-            meshes,
-            self.quality,
             target.width(),
             target.height(),
-            match nearest_layer {
-                LayerRef::Current => LayerRef::Parent(&target),
-                layer => layer,
-            },
-            texture_pool,
-        );
+            texture_pool.blend_batching(),
+        ) {
+            let chunks = chunk_blends(
+                commands,
+                descriptors,
+                staging_belt,
+                chunk_buffers,
+                draw_encoder,
+                meshes,
+                self.quality,
+                target.width(),
+                target.height(),
+                match nearest_layer {
+                    LayerRef::Current => LayerRef::Parent(&target),
+                    layer => layer,
+                },
+                texture_pool,
+                mask_state,
+            );
 
-        for chunk in chunks {
-            match chunk {
-                Chunk::Draw {
-                    chunk,
-                    needs_stencil,
-                    chunk_buffer_builder,
-                } => {
-                    chunk_buffer_builder.copy_to(
-                        staging_belt,
-                        &descriptors.device,
-                        draw_encoder,
-                        chunk_buffers,
-                    );
-                    let mut render_pass = draw_encoder.scoped_render_pass(
-                        format!(
-                            "Chunked draw calls {}",
-                            if needs_stencil {
-                                "(with stencil)"
-                            } else {
-                                "(Stencilless)"
-                            }
-                        ),
-                        wgpu::RenderPassDescriptor {
-                            color_attachments: &[target.color_attachments()],
-                            depth_stencil_attachment: if needs_stencil {
-                                target.stencil_attachment(descriptors, texture_pool)
-                            } else {
-                                None
-                            },
-                            ..Default::default()
-                        },
-                    );
-                    render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
-                    render_pass.set_bind_group(1, &chunk_buffers.bind_group, &[]);
-                    let mut renderer = CommandRenderer::new(
-                        &self.pipelines,
-                        chunk_buffers,
-                        &mut mask_state,
+            for chunk in chunks {
+                match chunk {
+                    Chunk::Draw {
+                        chunk,
                         needs_stencil,
-                    );
-
-                    for command in &chunk {
-                        renderer.execute(&mut render_pass.scope(command.name()), command);
-                    }
-                }
-                Chunk::Blend {
-                    texture,
-                    blend_mode: ChunkBlendMode::Shader(shader),
-                    needs_stencil,
-                } => {
-                    assert!(!needs_stencil, "Shader blend mode not implemented in masks");
-                    let parent_blend_buffer =
-                        target.update_blend_buffer(descriptors, texture_pool, draw_encoder);
-                    run_pixelbender_shader_impl(
-                        descriptors,
-                        shader,
-                        ShaderMode::Filter,
-                        &[
-                            PixelBenderShaderArgument::ImageInput {
-                                index: 0,
-                                channels: 0xFF,
-                                name: "background".to_string(),
-                                texture: Some(ImageInputTexture::TextureRef(
-                                    parent_blend_buffer.texture(),
-                                )),
-                            },
-                            PixelBenderShaderArgument::ImageInput {
-                                index: 1,
-                                channels: 0xff,
-                                name: "foreground".to_string(),
-                                texture: Some(ImageInputTexture::TextureRef(texture.texture())),
-                            },
-                        ],
-                        parent_blend_buffer.texture(),
-                        draw_encoder,
-                        target.color_attachments(),
-                        target.sample_count(),
-                        &FilterSource::for_entire_texture(texture.texture()),
-                    )
-                    .expect("Failed to run PixelBender blend mode");
-                }
-                Chunk::Blend {
-                    texture,
-                    blend_mode: ChunkBlendMode::Complex(blend_mode),
-                    needs_stencil,
-                } => {
-                    let parent = match blend_mode {
-                        ComplexBlend::Alpha | ComplexBlend::Erase => {
-                            match nearest_layer {
-                                LayerRef::None => {
-                                    // An Alpha or Erase with no Layer above it should be ignored
-                                    continue;
+                        chunk_buffer_builder,
+                    } => {
+                        chunk_buffer_builder.copy_to(
+                            staging_belt,
+                            &descriptors.device,
+                            draw_encoder,
+                            chunk_buffers,
+                        );
+                        let mut render_pass = draw_encoder.scoped_render_pass(
+                            format!(
+                                "Chunked draw calls {}",
+                                if needs_stencil {
+                                    "(with stencil)"
+                                } else {
+                                    "(Stencilless)"
                                 }
-                                LayerRef::Current => &target,
-                                LayerRef::Parent(layer) => layer,
-                            }
+                            ),
+                            wgpu::RenderPassDescriptor {
+                                color_attachments: &[target.color_attachments()],
+                                depth_stencil_attachment: if needs_stencil {
+                                    target.stencil_attachment(descriptors, texture_pool)
+                                } else {
+                                    None
+                                },
+                                ..Default::default()
+                            },
+                        );
+                        render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
+                        render_pass.set_bind_group(1, &chunk_buffers.bind_group, &[]);
+                        let mut renderer = CommandRenderer::new(
+                            &self.pipelines,
+                            chunk_buffers,
+                            &mut mask_state,
+                            needs_stencil,
+                        );
+
+                        for command in &chunk {
+                            renderer.execute(&mut render_pass.scope(command.name()), command);
                         }
-                        _ => &target,
-                    };
+                    }
+                    Chunk::Blend {
+                        texture,
+                        blend_mode: ChunkBlendMode::Shader(shader),
+                        needs_stencil,
+                    } => {
+                        assert!(!needs_stencil, "Shader blend mode not implemented in masks");
+                        let parent_blend_buffer =
+                            target.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                        run_pixelbender_shader_impl(
+                            descriptors,
+                            shader,
+                            ShaderMode::Filter,
+                            &[
+                                PixelBenderShaderArgument::ImageInput {
+                                    index: 0,
+                                    channels: 0xFF,
+                                    name: "background".to_string(),
+                                    texture: Some(ImageInputTexture::TextureRef(
+                                        parent_blend_buffer.texture(),
+                                    )),
+                                },
+                                PixelBenderShaderArgument::ImageInput {
+                                    index: 1,
+                                    channels: 0xff,
+                                    name: "foreground".to_string(),
+                                    texture: Some(ImageInputTexture::TextureRef(texture.texture())),
+                                },
+                            ],
+                            parent_blend_buffer.texture(),
+                            draw_encoder,
+                            target.color_attachments(),
+                            target.sample_count(),
+                            &FilterSource::for_entire_texture(texture.texture()),
+                        )
+                        .expect("Failed to run PixelBender blend mode");
+                    }
+                    Chunk::Blend {
+                        texture,
+                        blend_mode: ChunkBlendMode::Complex(blend_mode),
+                        needs_stencil,
+                    } => {
+                        let parent = match blend_mode {
+                            ComplexBlend::Alpha | ComplexBlend::Erase => {
+                                match nearest_layer {
+                                    LayerRef::None => {
+                                        // An Alpha or Erase with no Layer above it should be ignored
+                                        continue;
+                                    }
+                                    LayerRef::Current => &target,
+                                    LayerRef::Parent(layer) => layer,
+                                }
+                            }
+                            _ => &target,
+                        };
 
-                    let parent_blend_buffer =
-                        parent.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                        let parent_blend_buffer =
+                            parent.update_blend_buffer(descriptors, texture_pool, draw_encoder);
 
-                    let blend_bind_group =
-                        descriptors
-                            .device
-                            .create_bind_group(&wgpu::BindGroupDescriptor {
+                        let blend_bind_group =
+                            descriptors
+                                .device
+                                .create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: create_debug_label!(
+                                        "Complex blend binds {:?} {}",
+                                        blend_mode,
+                                        if needs_stencil {
+                                            "(with stencil)"
+                                        } else {
+                                            "(Stencilless)"
+                                        }
+                                    )
+                                    .as_deref(),
+                                    layout: &descriptors.bind_layouts.blend,
+                                    entries: &[
+                                        wgpu::BindGroupEntry {
+                                            binding: 0,
+                                            resource: wgpu::BindingResource::TextureView(
+                                                parent_blend_buffer.view(),
+                                            ),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 1,
+                                            resource: wgpu::BindingResource::TextureView(
+                                                texture.view(),
+                                            ),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 2,
+                                            resource: wgpu::BindingResource::Sampler(
+                                                descriptors
+                                                    .bitmap_samplers
+                                                    .get_sampler(false, false),
+                                            ),
+                                        },
+                                    ],
+                                });
+
+                        let mut render_pass =
+                            draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: create_debug_label!(
-                                    "Complex blend binds {:?} {}",
+                                    "Complex blend {:?} {}",
                                     blend_mode,
                                     if needs_stencil {
                                         "(with stencil)"
@@ -262,81 +310,47 @@ impl Surface {
                                     }
                                 )
                                 .as_deref(),
-                                layout: &descriptors.bind_layouts.blend,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            parent_blend_buffer.view(),
-                                        ),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            texture.view(),
-                                        ),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 2,
-                                        resource: wgpu::BindingResource::Sampler(
-                                            descriptors.bitmap_samplers.get_sampler(false, false),
-                                        ),
-                                    },
-                                ],
-                            });
-
-                    let mut render_pass =
-                        draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: create_debug_label!(
-                                "Complex blend {:?} {}",
-                                blend_mode,
-                                if needs_stencil {
-                                    "(with stencil)"
+                                color_attachments: &[target.color_attachments()],
+                                depth_stencil_attachment: if needs_stencil {
+                                    target.stencil_attachment(descriptors, texture_pool)
                                 } else {
-                                    "(Stencilless)"
-                                }
-                            )
-                            .as_deref(),
-                            color_attachments: &[target.color_attachments()],
-                            depth_stencil_attachment: if needs_stencil {
-                                target.stencil_attachment(descriptors, texture_pool)
-                            } else {
-                                None
-                            },
-                            ..Default::default()
-                        });
-                    render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
+                                    None
+                                },
+                                ..Default::default()
+                            });
+                        render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
 
-                    if needs_stencil {
-                        mask_state.apply_stencil_reference(&mut render_pass);
-                        render_pass.set_pipeline(
-                            self.pipelines.complex_blends[blend_mode].pipeline_for(mask_state.mode),
+                        if needs_stencil {
+                            mask_state.apply_stencil_reference(&mut render_pass);
+                            render_pass.set_pipeline(
+                                self.pipelines.complex_blends[blend_mode]
+                                    .pipeline_for(mask_state.mode),
+                            );
+                        } else {
+                            render_pass.set_pipeline(
+                                self.pipelines.complex_blends[blend_mode].stencilless_pipeline(),
+                            );
+                        }
+
+                        render_pass.set_bind_group(2, &blend_bind_group, &[]);
+
+                        render_pass.set_vertex_buffer(
+                            0,
+                            descriptors
+                                .quad
+                                .vertex_buffer
+                                .slice(descriptors.quad.vertices_pos.clone()),
                         );
-                    } else {
-                        render_pass.set_pipeline(
-                            self.pipelines.complex_blends[blend_mode].stencilless_pipeline(),
+                        render_pass.set_index_buffer(
+                            descriptors.quad.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
                         );
+
+                        render_pass.draw_indexed(descriptors.quad.indices_quad.clone(), 0, 0..1);
                     }
-
-                    render_pass.set_bind_group(2, &blend_bind_group, &[]);
-
-                    render_pass.set_vertex_buffer(
-                        0,
-                        descriptors
-                            .quad
-                            .vertex_buffer
-                            .slice(descriptors.quad.vertices_pos.clone()),
-                    );
-                    render_pass.set_index_buffer(
-                        descriptors.quad.index_buffer.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-
-                    render_pass.draw_indexed(descriptors.quad.indices_quad.clone(), 0, 0..1);
                 }
             }
         }
-
         // If nothing happened, ensure it's cleared so we don't operate on garbage data
         target.ensure_cleared(draw_encoder);
 

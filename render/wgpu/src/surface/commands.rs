@@ -43,6 +43,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     height: u32,
     nearest_layer: LayerRef,
     texture_pool: &'encoder mut TexturePool,
+    mask_state: MaskState,
 ) -> Vec<Chunk> {
     WgpuCommandHandler::new(
         descriptors,
@@ -55,6 +56,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         height,
         nearest_layer,
         texture_pool,
+        mask_state,
     )
     .chunk_blends(commands)
 }
@@ -92,6 +94,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         height: u32,
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
+        mask_state: MaskState,
     ) -> Self {
         let chunk_buffer_builder = ChunkBufferBuilder::new(chunk_buffers, &descriptors.limits);
 
@@ -116,8 +119,8 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             result: vec![],
             current: vec![],
             chunk_buffer_builder,
-            needs_stencil: false,
-            mask_state: MaskState::empty(),
+            needs_stencil: mask_state.count > 0,
+            mask_state,
         }
     }
 

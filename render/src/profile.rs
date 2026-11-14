@@ -89,6 +89,8 @@ pub struct Counters {
     pub peak_idle: [u64; 2],
     pub peak_pool: u64,
     pub upload_bytes: u64,
+    pub blend_batch_splits: u64,
+    pub blend_batch_fallbacks: u64,
     pub async_events: Vec<AsyncEvent>,
 }
 #[derive(Clone, Default, Debug)]
@@ -189,6 +191,22 @@ pub fn uploaded(bytes: u64) {
     CURRENT.with_borrow(|m| {
         if let Some(m) = m {
             m.0.borrow_mut().upload_bytes += bytes;
+        }
+    });
+}
+
+pub fn blend_batch_split() {
+    CURRENT.with_borrow(|m| {
+        if let Some(m) = m {
+            m.0.borrow_mut().blend_batch_splits += 1;
+        }
+    });
+}
+
+pub fn blend_batch_fallback() {
+    CURRENT.with_borrow(|m| {
+        if let Some(m) = m {
+            m.0.borrow_mut().blend_batch_fallbacks += 1;
         }
     });
 }

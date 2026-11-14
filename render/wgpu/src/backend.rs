@@ -298,13 +298,20 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             meshes: Vec::new(),
             shape_tessellator: ShapeTessellator::new(),
             viewport_scale_factor: 1.0,
-            texture_pool: TexturePool::new(budget.clone()),
-            offscreen_texture_pool: TexturePool::new(budget),
+            texture_pool: TexturePool::new(budget.clone(), false),
+            offscreen_texture_pool: TexturePool::new(budget, false),
             offscreen_buffer_pool: Arc::new(offscreen_buffer_pool),
             chunk_buffers,
             active_frame,
             profiler,
         })
+    }
+
+    /// Opt into experimental intermediate-texture batching. This reduces live
+    /// allocations but can increase submission/GPU latency. Stock stays unbatched.
+    pub fn set_blend_batching(&mut self, enabled: bool) {
+        self.texture_pool.set_blend_batching(enabled);
+        self.offscreen_texture_pool.set_blend_batching(enabled);
     }
 
     fn register_shape_internal(
@@ -489,7 +496,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
 
         self.viewport_scale_factor = dimensions.scale_factor;
-        self.texture_pool = TexturePool::new(self.budget.clone());
+        self.texture_pool =
+            TexturePool::new(self.budget.clone(), self.texture_pool.blend_batching());
     }
 
     fn create_context3d(
@@ -710,7 +718,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
         if !self.optimized {
-            self.offscreen_texture_pool = TexturePool::new(self.budget.clone());
+            self.offscreen_texture_pool = TexturePool::new(self.budget.clone(), false);
         }
         let (idle, peak, combined) = self.budget.stats();
         ruffle_render::profile::pool(idle, peak, combined);
