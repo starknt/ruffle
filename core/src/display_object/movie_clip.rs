@@ -2,6 +2,8 @@
 
 #[cfg(all(test, feature = "construction_cache"))]
 mod construction_cache_tests;
+#[cfg(test)]
+mod mouse_pick_tests;
 use crate::avm1::ActivationIdentifier as Avm1ActivationIdentifier;
 use crate::avm1::Avm1;
 use crate::avm1::ExecutionReason as Avm1ExecutionReason;
@@ -2733,6 +2735,8 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn self_bounds(self, mode: BoundsMode) -> Rectangle<Twips> {
+        #[cfg(test)]
+        mouse_pick_tests::record_bounds_visit();
         let include_strokes = mode.includes_strokes();
 
         self.drawing()
@@ -3325,7 +3329,11 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
             }
 
             // Check drawing, because this selects the current clip, it must have mouse enabled
-            if self.world_bounds(BoundsMode::Engine).contains(point)
+            // Children have already been tested, including invisible button hit
+            // areas. Without our own drawing there is nothing left to hit; do
+            // not recursively measure those children again just to return Miss.
+            if (!ruffle_render::profile::engine_optimized() || self.0.drawing.get().is_some())
+                && self.world_bounds(BoundsMode::Engine).contains(point)
                 && let Some(drawing) = self.drawing()
                 && drawing.hit_test(local_matrix * point, &local_matrix)
             {
