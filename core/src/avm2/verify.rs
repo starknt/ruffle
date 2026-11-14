@@ -8,6 +8,8 @@ use crate::avm2::error::{
 use crate::avm2::method::Method;
 use crate::avm2::op::{LookupSwitch, Op};
 use crate::avm2::script::TranslationUnit;
+#[cfg(feature = "verified_code_index")]
+use crate::avm2::verified_code::VerifiedCode;
 use crate::avm2::{Activation, Error, QName};
 use crate::string::AvmString;
 
@@ -23,6 +25,9 @@ use swf::error::AbcParseError;
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct VerifiedMethodInfo<'gc> {
+    #[cfg(feature = "verified_code_index")]
+    pub parsed_code: VerifiedCode<'gc>,
+    #[cfg(not(feature = "verified_code_index"))]
     pub parsed_code: Vec<Op<'gc>>,
 
     pub exceptions: Vec<Exception<'gc>>,
@@ -518,6 +523,10 @@ pub fn verify_method<'gc>(
         resolved_param_config,
         jump_targets,
     )?;
+
+    #[cfg(feature = "verified_code_index")]
+    let verified_code =
+        VerifiedCode::new(verified_code, ruffle_render::profile::engine_optimized());
 
     Ok(VerifiedMethodInfo {
         parsed_code: verified_code,

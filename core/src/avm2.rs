@@ -81,6 +81,8 @@ mod stubs;
 mod traits;
 mod value;
 pub mod vector;
+#[cfg(feature = "verified_code_index")]
+mod verified_code;
 mod verify;
 mod vtable;
 

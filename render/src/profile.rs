@@ -71,6 +71,15 @@ impl Default for AsyncEvent {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct PublishedCodeStats {
+    pub methods: u64,
+    pub input_storage_bytes: u64,
+    pub output_storage_bytes: u64,
+    pub instructions: u64,
+    pub trace_items: u64,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct Counters {
     pub timings: [Timing; 32],
     pub logical_frames: u64,
@@ -91,6 +100,8 @@ pub struct Counters {
     pub upload_bytes: u64,
     pub blend_batch_splits: u64,
     pub blend_batch_fallbacks: u64,
+    /// Cumulative publication totals, not currently live allocations or RSS.
+    pub published_code: PublishedCodeStats,
     pub async_events: Vec<AsyncEvent>,
 }
 #[derive(Clone, Default, Debug)]
@@ -199,6 +210,25 @@ pub fn blend_batch_split() {
     CURRENT.with_borrow(|m| {
         if let Some(m) = m {
             m.0.borrow_mut().blend_batch_splits += 1;
+        }
+    });
+}
+
+pub fn code_published(
+    input_bytes: usize,
+    output_bytes: usize,
+    instructions: usize,
+    trace_items: usize,
+) {
+    CURRENT.with_borrow(|m| {
+        if let Some(m) = m {
+            let mut counters = m.0.borrow_mut();
+            let stats = &mut counters.published_code;
+            stats.methods += 1;
+            stats.input_storage_bytes += input_bytes as u64;
+            stats.output_storage_bytes += output_bytes as u64;
+            stats.instructions += instructions as u64;
+            stats.trace_items += trace_items as u64;
         }
     });
 }
