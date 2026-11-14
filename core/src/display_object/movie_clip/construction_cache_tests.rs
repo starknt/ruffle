@@ -679,3 +679,249 @@ fn settled_scripted_subtree_benchmark() {
         );
     });
 }
+
+#[test]
+#[cfg(all(feature = "lifecycle_counts", feature = "scripted_construction_cache"))]
+fn lifecycle_counts_distinguish_cache_hits_from_pending_script_work() {
+    use ruffle_render::profile::lifecycle::{Count, Phase, scope};
+    use ruffle_render::profile::{RenderMetrics, enter};
+    with_tree(|root, child, context| {
+        let metrics = RenderMetrics::default();
+        let _player = enter(Some(&metrics), true);
+        {
+            let _phase = scope(Phase::OrphanConstruct);
+            root.construct_frame(context);
+            child.register_frame_script(
+                child.current_frame(),
+                Some(context.avm2.classes().object.into()),
+                context,
+            );
+            root.construct_frame(context);
+        }
+        assert!(child.has_pending_script());
+        {
+            let _phase = scope(Phase::OrphanScripts);
+            *context.frame_phase = FramePhase::FrameScripts;
+            root.run_frame_scripts(context);
+        }
+        assert_eq!(
+            child.last_queued_script_frame(),
+            Some(child.current_frame())
+        );
+        let counts = metrics.snapshot().lifecycle;
+        let construct = counts.values[Phase::OrphanConstruct as usize];
+        assert_eq!(construct[Count::ConstructVisit as usize], 3);
+        assert_eq!(construct[Count::ConstructHit as usize], 1);
+        assert_eq!(construct[Count::RegisteredScripts as usize], 1);
+        let scripts = counts.values[Phase::OrphanScripts as usize];
+        assert_eq!(scripts[Count::ScriptsVisit as usize], 2);
+        assert_eq!(scripts[Count::ScriptsHit as usize], 0);
+        assert_eq!(scripts[Count::ScriptsPending as usize], 0);
+    });
+}
+
+#[cfg(feature = "button_lifecycle_cache")]
+fn with_button_tree(
+    test: impl for<'gc> FnOnce(
+        MovieClip<'gc>,
+        MovieClip<'gc>,
+        crate::display_object::Avm2Button<'gc>,
+        &mut UpdateContext<'gc>,
+    ),
+) {
+    with_tree(|root, up, context| {
+        let hidden = MovieClip::new(root.movie(), context.gc());
+        hidden.construct_frame(context);
+        hidden.construct_frame(context);
+        let button = crate::display_object::Avm2Button::empty_button(context);
+        let object = Avm2StageObject::for_display_object(
+            context.gc(),
+            button.into(),
+            context.avm2.classes().simplebutton,
+        );
+        button.set_object2(context, object);
+        button.set_state_child(context, swf::ButtonState::UP, Some(up.into()));
+        button.set_state_child(context, swf::ButtonState::OVER, Some(hidden.into()));
+        root.replace_at_depth(context, button.into(), 1);
+        for _ in 0..3 {
+            *context.frame_phase = FramePhase::Construct;
+            root.construct_frame(context);
+            *context.frame_phase = FramePhase::FrameScripts;
+            root.run_frame_scripts(context);
+        }
+        assert!(
+            hidden.parent().is_none(),
+            "test must cover a foreign state root"
+        );
+        test(root, hidden, button, context);
+    });
+}
+
+#[test]
+#[cfg(feature = "button_lifecycle_cache")]
+fn settled_button_states_allow_ancestor_walks_to_stop() {
+    with_button_tree(|root, _, _, context| {
+        VISITS.set(0);
+        SCRIPT_VISITS.set(0);
+        for _ in 0..5 {
+            *context.frame_phase = FramePhase::Construct;
+            root.construct_frame(context);
+            *context.frame_phase = FramePhase::FrameScripts;
+            root.run_frame_scripts(context);
+        }
+        assert_eq!(
+            VISITS.get(),
+            0,
+            "buttons must not permanently block settled ancestors"
+        );
+        assert_eq!(SCRIPT_VISITS.get(), 0);
+        let _stock = ruffle_render::profile::enter_engine(false);
+        root.construct_frame(context);
+        root.run_frame_scripts(context);
+        assert_eq!(VISITS.get(), 3);
+        assert_eq!(SCRIPT_VISITS.get(), 3);
+    });
+}
+
+#[test]
+#[cfg(feature = "button_lifecycle_cache")]
+fn hidden_button_state_script_wakes_a_cached_ancestor() {
+    with_button_tree(|root, hidden, _, context| {
+        hidden.register_frame_script(
+            hidden.current_frame(),
+            Some(context.avm2.classes().object.into()),
+            context,
+        );
+        *context.frame_phase = FramePhase::Construct;
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::FrameScripts;
+        root.run_frame_scripts(context);
+        assert_eq!(
+            hidden.last_queued_script_frame(),
+            Some(hidden.current_frame())
+        );
+        assert!(!hidden.has_pending_script());
+    });
+}
+
+#[test]
+#[cfg(feature = "button_lifecycle_cache")]
+fn hidden_button_state_play_wakes_cached_enter_frame() {
+    with_button_tree(|root, hidden, _, context| {
+        hidden.play();
+        assert!(hidden.playing());
+        ENTER_VISITS.set(0);
+        *context.frame_phase = FramePhase::Enter;
+        root.enter_frame(context);
+        assert_eq!(
+            ENTER_VISITS.get(),
+            2,
+            "the ancestor and hidden playing state must tick"
+        );
+    });
+}
+
+#[test]
+#[cfg(feature = "button_lifecycle_cache")]
+fn replacing_an_inactive_button_state_keeps_its_pending_script() {
+    with_button_tree(|root, _, button, context| {
+        let replacement = MovieClip::new(root.movie(), context.gc());
+        *context.frame_phase = FramePhase::Construct;
+        replacement.construct_frame(context);
+        replacement.register_frame_script(
+            replacement.current_frame(),
+            Some(context.avm2.classes().object.into()),
+            context,
+        );
+        button.set_state_child(context, swf::ButtonState::OVER, Some(replacement.into()));
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::FrameScripts;
+        root.run_frame_scripts(context);
+        assert_eq!(
+            replacement.last_queued_script_frame(),
+            Some(replacement.current_frame())
+        );
+    });
+}
+
+#[test]
+#[cfg(feature = "button_lifecycle_cache")]
+fn reloaded_hidden_button_state_still_invalidates_its_observers() {
+    with_button_tree(|root, hidden, _, context| {
+        hidden.replace_with_movie(context, Some(root.movie()), false, None);
+        assert!(hidden.preload(context, &mut ExecutionLimit::none()));
+        *context.frame_phase = FramePhase::Enter;
+        hidden.enter_frame(context);
+        hidden.set_initialized();
+        hidden.stop(context);
+        for _ in 0..3 {
+            *context.frame_phase = FramePhase::Construct;
+            root.construct_frame(context);
+            *context.frame_phase = FramePhase::FrameScripts;
+            root.run_frame_scripts(context);
+        }
+        assert!(root.enter_frame_is_idle());
+        hidden.play();
+        ENTER_VISITS.set(0);
+        root.enter_frame(context);
+        assert_eq!(
+            ENTER_VISITS.get(),
+            2,
+            "reloading must preserve hidden-state invalidation"
+        );
+    });
+}
+
+#[test]
+#[cfg(feature = "button_lifecycle_cache")]
+fn nested_shared_button_states_settle_and_wake_after_descendant_mutation() {
+    with_button_tree(|root, hidden, button, context| {
+        let nested = crate::display_object::Avm2Button::empty_button(context);
+        let object = Avm2StageObject::for_display_object(
+            context.gc(),
+            nested.into(),
+            context.avm2.classes().simplebutton,
+        );
+        nested.set_object2(context, object);
+        let state = MovieClip::new(root.movie(), context.gc());
+        let descendant = MovieClip::new(root.movie(), context.gc());
+        state.replace_at_depth(context, descendant.into(), 1);
+        nested.set_state_child(context, swf::ButtonState::OVER, Some(state.into()));
+        // Also observed directly by another button: there is no single owner.
+        button.set_state_child(context, swf::ButtonState::DOWN, Some(state.into()));
+        hidden.replace_at_depth(context, nested.into(), 1);
+        for _ in 0..5 {
+            *context.frame_phase = FramePhase::Construct;
+            root.construct_frame(context);
+            *context.frame_phase = FramePhase::FrameScripts;
+            root.run_frame_scripts(context);
+        }
+        VISITS.set(0);
+        root.construct_frame(context);
+        assert_eq!(VISITS.get(), 0, "nested state epochs must converge");
+        descendant.register_frame_script(
+            descendant.current_frame(),
+            Some(context.avm2.classes().object.into()),
+            context,
+        );
+        *context.frame_phase = FramePhase::Construct;
+        root.construct_frame(context);
+        *context.frame_phase = FramePhase::FrameScripts;
+        root.run_frame_scripts(context);
+        assert_eq!(
+            descendant.last_queued_script_frame(),
+            Some(descendant.current_frame())
+        );
+        for _ in 0..5 {
+            *context.frame_phase = FramePhase::Construct;
+            root.construct_frame(context);
+            *context.frame_phase = FramePhase::FrameScripts;
+            root.run_frame_scripts(context);
+        }
+        VISITS.set(0);
+        SCRIPT_VISITS.set(0);
+        root.construct_frame(context);
+        root.run_frame_scripts(context);
+        assert_eq!((VISITS.get(), SCRIPT_VISITS.get()), (0, 0));
+    });
+}

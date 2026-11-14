@@ -52,6 +52,8 @@ use gc_arena::{Collect, DynamicRoot, Gc, GcWeak, Mutation, Rootable};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_macros::istr;
 use ruffle_render::perspective_projection::PerspectiveProjection;
+#[cfg(feature = "lifecycle_counts")]
+use ruffle_render::profile::lifecycle::{self, Count};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, Ref, RefCell, RefMut};
@@ -218,6 +220,9 @@ pub struct MovieClipData<'gc> {
 
     has_pending_script: Cell<bool>,
 
+    #[cfg(feature = "button_lifecycle_cache")]
+    button_state_revision: Cell<u64>,
+
     /// Force enable button mode, which causes all mouse-related events to
     /// trigger on this clip rather than any input-eligible children.
     button_mode: Cell<bool>,
@@ -262,6 +267,8 @@ impl<'gc> MovieClipData<'gc> {
             last_queued_script_frame: Cell::new(None),
             queued_script_frame: Cell::new(0),
             has_pending_script: Cell::new(false),
+            #[cfg(feature = "button_lifecycle_cache")]
+            button_state_revision: Cell::new(0),
             queued_goto: Cell::new(None),
             drop_target: Lock::new(None),
             queued_tags: Default::default(),
@@ -833,6 +840,8 @@ impl<'gc> MovieClip<'gc> {
 
     pub fn set_has_pending_script(self, value: bool) {
         if value != self.0.has_pending_script.get() {
+            #[cfg(feature = "lifecycle_counts")]
+            lifecycle::add(Count::PendingChanged, 1);
             self.invalidate_construction();
         }
         self.0.has_pending_script.set(value);
@@ -846,6 +855,8 @@ impl<'gc> MovieClip<'gc> {
         if cfg!(feature = "scripted_construction_cache")
             && frame != self.0.last_queued_script_frame.get()
         {
+            #[cfg(feature = "lifecycle_counts")]
+            lifecycle::add(Count::LastQueuedChanged, 1);
             self.invalidate_construction();
         }
         self.0.last_queued_script_frame.set(frame);
@@ -2558,6 +2569,18 @@ impl<'gc> MovieClip<'gc> {
             && (!self.has_pending_script()
                 || self.last_queued_script_frame() == Some(self.0.queued_script_frame.get()))
     }
+
+    pub(super) fn button_cache_valid(self) -> bool {
+        #[cfg(feature = "button_lifecycle_cache")]
+        {
+            !self.base().subtree_has_button()
+                || self.0.button_state_revision.get() == super::button_state_revision()
+        }
+        #[cfg(not(feature = "button_lifecycle_cache"))]
+        {
+            true
+        }
+    }
 }
 
 impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
@@ -2580,6 +2603,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         if cfg!(feature = "construction_cache")
             && ruffle_render::profile::engine_optimized()
             && self.base().enter_frame_idle()
+            && self.button_cache_valid()
         {
             return;
         }
@@ -2647,9 +2671,16 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
     /// Construct objects placed on this frame.
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
+        #[cfg(feature = "lifecycle_counts")]
+        lifecycle::add(Count::ConstructVisit, 1);
         let optimized =
             cfg!(feature = "construction_cache") && ruffle_render::profile::engine_optimized();
+        if optimized && !self.button_cache_valid() {
+            self.base().clear_lifecycle_cache();
+        }
         if optimized && self.base().construction_clean() {
+            #[cfg(feature = "lifecycle_counts")]
+            lifecycle::add(Count::ConstructHit, 1);
             return;
         }
         #[cfg(all(test, feature = "construction_cache"))]
@@ -2662,6 +2693,8 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         let mut children_settled = false;
         let mut children_idle = false;
         let mut child_scripts_idle = false;
+        #[cfg(feature = "button_lifecycle_cache")]
+        let button_revision = super::button_state_revision();
         // AVM1 code expects to execute in line with timeline instructions, so
         // it's exempted from frame construction.
         if self.movie().is_action_script_3()
@@ -2678,6 +2711,8 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             self.0.unset_loop_queued();
 
             if needs_construction {
+                #[cfg(feature = "lifecycle_counts")]
+                lifecycle::add(Count::NewObject, 1);
                 self.construct_as_avm2_object(context);
                 self.on_construction_complete(context);
                 // If we're in the load frame and we were constructed by ActionScript,
@@ -2704,6 +2739,8 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                         // on this clip, Flash avoids running `construct_frame` on
                         // the non-constructed children of this clip.
                         if running_construct_frame {
+                            #[cfg(feature = "lifecycle_counts")]
+                            lifecycle::add(Count::ChildRecursive, 1);
                             children_settled = false;
                             children_idle = false;
                             child_scripts_idle = false;
@@ -2715,6 +2752,8 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                         // However, if the child has already been constructed, we run
                         // `construct_frame` like normal.
                         if child.manual_frame_construct() {
+                            #[cfg(feature = "lifecycle_counts")]
+                            lifecycle::add(Count::ChildManual, 1);
                             children_settled = false;
                             children_idle = false;
                             child_scripts_idle = false;
@@ -2723,6 +2762,25 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                     }
 
                     child.construct_frame(context);
+                    #[cfg(feature = "button_lifecycle_cache")]
+                    if matches!(child, DisplayObject::Avm2Button(_))
+                        || child.base().subtree_has_button()
+                    {
+                        self.base()
+                            .set_flag(super::DisplayObjectFlags::SUBTREE_HAS_BUTTON, true);
+                    }
+                    #[cfg(feature = "lifecycle_counts")]
+                    if !child.construction_is_settled() {
+                        lifecycle::add(
+                            match child {
+                                DisplayObject::MovieClip(_) => Count::ChildMovieClip,
+                                DisplayObject::Avm2Button(_) => Count::ChildButton,
+                                DisplayObject::LoaderDisplay(_) => Count::ChildLoader,
+                                _ => Count::ChildLeaf,
+                            },
+                            1,
+                        );
+                    }
                     if optimized {
                         children_settled &= child.construction_is_settled();
                         children_idle &= child.enter_frame_is_idle();
@@ -2740,23 +2798,75 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             self.check_has_pending_script();
         }
 
+        #[cfg(feature = "lifecycle_counts")]
+        for (count, applies) in [
+            (Count::Uninitialized, !self.0.initialized()),
+            (Count::NoObject, self.0.object2.get().is_none()),
+            (Count::QueuedGoto, self.0.queued_goto.get().is_some()),
+            (
+                Count::RevisionChanged,
+                revision != super::construction_revision(),
+            ),
+            (Count::ChildrenUnsettled, !children_settled),
+            (
+                Count::RegisteredScripts,
+                !self.0.cell.borrow().frame_scripts.is_empty(),
+            ),
+            (
+                Count::OutsideConstruct,
+                *context.frame_phase != FramePhase::Construct,
+            ),
+            (
+                Count::ManualLoad,
+                !self.0.initialized() && self.placed_by_avm2_script(),
+            ),
+            (
+                Count::NoTimeline,
+                self.movie().is_action_script_3()
+                    && self.frames_loaded() < 1
+                    && self.header_frames() != 0,
+            ),
+            (Count::NotAvm2, !self.movie().is_action_script_3()),
+            (Count::NotOptimized, !optimized),
+        ] {
+            if applies {
+                lifecycle::add(count, 1);
+            }
+        }
+
         // Never mark an ancestor clean after a constructor/event changed an
         // already visited descendant. No new allocation or GC root is needed.
         // Scripted subtrees may settle only after checking pending scripts in
         // Construct. Script execution has a separate proof, so construction
         // cannot hide a pending script or a reentrant queued goto.
+        let button_proof_fresh = {
+            #[cfg(feature = "button_lifecycle_cache")]
+            {
+                !self.base().subtree_has_button()
+                    || button_revision == super::button_state_revision()
+            }
+            #[cfg(not(feature = "button_lifecycle_cache"))]
+            {
+                true
+            }
+        };
         if optimized
+            && button_proof_fresh
             && revision == super::construction_revision()
             && self.0.initialized()
             && self.0.object2.get().is_some()
             && self.0.queued_goto.get().is_none()
         {
+            #[cfg(feature = "button_lifecycle_cache")]
+            self.0.button_state_revision.set(button_revision);
             if children_settled
                 && (self.0.cell.borrow().frame_scripts.is_empty()
                     || (cfg!(feature = "scripted_construction_cache")
                         && *context.frame_phase == FramePhase::Construct))
             {
                 self.base().set_construction_clean(true);
+                #[cfg(feature = "lifecycle_counts")]
+                lifecycle::add(Count::ConstructSettled, 1);
             }
             if cfg!(feature = "scripted_construction_cache") {
                 self.base().set_frame_scripts_idle(
@@ -2775,6 +2885,8 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        #[cfg(feature = "lifecycle_counts")]
+        lifecycle::add(Count::ScriptsVisit, 1);
         let optimized =
             cfg!(feature = "construction_cache") && ruffle_render::profile::engine_optimized();
         // The original cache only admits scriptless trees. The candidate also
@@ -2784,7 +2896,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         } else {
             self.base().construction_clean()
         };
-        if optimized && idle {
+        if optimized && idle && self.button_cache_valid() {
+            #[cfg(feature = "lifecycle_counts")]
+            lifecycle::add(Count::ScriptsHit, 1);
             return;
         }
         let revision = super::construction_revision();
@@ -2811,9 +2925,37 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             && optimized
             && revision == super::construction_revision()
             && self.base().construction_clean()
+            && self.button_cache_valid()
         {
             self.base()
                 .set_frame_scripts_idle(children_idle && self.local_frame_scripts_are_idle());
+        }
+        #[cfg(feature = "lifecycle_counts")]
+        for (count, applies) in [
+            (
+                Count::ScriptsConstructionDirty,
+                !self.base().construction_clean(),
+            ),
+            (
+                Count::ScriptsPending,
+                self.has_pending_script()
+                    && self.last_queued_script_frame() != Some(self.0.queued_script_frame.get()),
+            ),
+            (
+                Count::ScriptsExecuting,
+                self.is_executing_avm2_frame_script(),
+            ),
+            (Count::ScriptsGoto, self.0.queued_goto.get().is_some()),
+            (Count::ScriptsChildActive, !children_idle),
+            (
+                Count::ScriptsRevisionChanged,
+                revision != super::construction_revision(),
+            ),
+            (Count::ScriptsSettled, self.base().frame_scripts_idle()),
+        ] {
+            if applies {
+                lifecycle::add(count, 1);
+            }
         }
     }
 

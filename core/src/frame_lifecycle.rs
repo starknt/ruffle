@@ -145,6 +145,10 @@ pub fn run_inner_goto_frame<'gc>(
 
     *context.frame_phase = FramePhase::Construct;
     {
+        #[cfg(feature = "lifecycle_counts")]
+        let _counts = ruffle_render::profile::lifecycle::scope(
+            ruffle_render::profile::lifecycle::Phase::OrphanConstruct,
+        );
         #[cfg(feature = "tracy_avm")]
         let _span = tracy_client::Client::running().map(|client| {
             client.span(
@@ -157,6 +161,10 @@ pub fn run_inner_goto_frame<'gc>(
         });
     }
     {
+        #[cfg(feature = "lifecycle_counts")]
+        let _counts = ruffle_render::profile::lifecycle::scope(
+            ruffle_render::profile::lifecycle::Phase::StageConstruct,
+        );
         #[cfg(feature = "tracy_avm")]
         let _span = tracy_client::Client::running().map(|client| {
             client.span(tracy_client::span_location!("Aola goto construct stage"), 0)
@@ -176,12 +184,20 @@ pub fn run_inner_goto_frame<'gc>(
 
     *context.frame_phase = FramePhase::FrameScripts;
     {
+        #[cfg(feature = "lifecycle_counts")]
+        let _counts = ruffle_render::profile::lifecycle::scope(
+            ruffle_render::profile::lifecycle::Phase::StageScripts,
+        );
         #[cfg(feature = "tracy_avm")]
         let _span = tracy_client::Client::running()
             .map(|client| client.span(tracy_client::span_location!("Aola goto scripts stage"), 0));
         stage.run_frame_scripts(context);
     }
     {
+        #[cfg(feature = "lifecycle_counts")]
+        let _counts = ruffle_render::profile::lifecycle::scope(
+            ruffle_render::profile::lifecycle::Phase::OrphanScripts,
+        );
         #[cfg(feature = "tracy_avm")]
         let _span = tracy_client::Client::running().map(|client| {
             client.span(tracy_client::span_location!("Aola goto scripts orphans"), 0)

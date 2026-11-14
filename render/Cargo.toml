@@ -52,6 +52,7 @@ approx = { workspace = true }
 
 [features]
 default = []
+lifecycle_counts = []
 tessellator = ["lyon"]
 web = ["wasm-bindgen"]
 wgpu = ["dep:wgpu"]

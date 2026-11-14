@@ -52,8 +52,26 @@ impl<'gc> OrphanManager<'gc> {
         // the iteration in this method.
         let orphan_objs: Rc<_> = context.orphan_manager.orphans.clone();
 
+        #[cfg(feature = "lifecycle_counts")]
+        ruffle_render::profile::lifecycle::add(
+            ruffle_render::profile::lifecycle::Count::OrphanEntries,
+            orphan_objs.len() as u64,
+        );
+
         for orphan in orphan_objs.iter() {
             if let Some(dobj) = valid_orphan(*orphan, context.gc()) {
+                #[cfg(feature = "lifecycle_counts")]
+                {
+                    use ruffle_render::profile::lifecycle::{Count, add};
+                    add(
+                        if dobj.as_movie_clip().is_some() {
+                            Count::OrphanMovieClip
+                        } else {
+                            Count::OrphanOther
+                        },
+                        1,
+                    );
+                }
                 f(dobj, context);
             }
         }

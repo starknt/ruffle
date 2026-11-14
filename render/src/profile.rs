@@ -6,6 +6,9 @@ use std::{
 };
 use web_time::Instant;
 
+#[cfg(feature = "lifecycle_counts")]
+pub mod lifecycle;
+
 #[derive(Debug, Clone, Copy)]
 pub enum Phase {
     Logic,
@@ -81,6 +84,8 @@ pub struct PublishedCodeStats {
 
 #[derive(Debug, Default, Clone)]
 pub struct Counters {
+    #[cfg(feature = "lifecycle_counts")]
+    pub lifecycle: lifecycle::Counters,
     pub timings: [Timing; 32],
     pub logical_frames: u64,
     pub socket_events: [u64; 3],
@@ -401,5 +406,45 @@ mod tests {
             assert!(enabled());
         }
         assert!(!enabled());
+    }
+
+    #[test]
+    #[cfg(feature = "lifecycle_counts")]
+    fn lifecycle_counts_restore_nested_phases_and_remain_per_player() {
+        use super::lifecycle::{Count, Phase, add, scope};
+        let first = RenderMetrics::default();
+        let second = RenderMetrics::default();
+        // No active player means no counter is retained.
+        add(Count::ConstructVisit, 100);
+        {
+            let _player = enter(Some(&first), true);
+            let _phase = scope(Phase::OrphanConstruct);
+            add(Count::ConstructVisit, 1);
+            {
+                let _nested = scope(Phase::StageScripts);
+                add(Count::ScriptsVisit, 2);
+            }
+            {
+                let _other_player = enter(Some(&second), true);
+                add(Count::ConstructVisit, 4);
+            }
+            add(Count::ConstructVisit, 8);
+        }
+        let first = first.snapshot().lifecycle;
+        let second = second.snapshot().lifecycle;
+        assert_eq!(
+            first.values[Phase::OrphanConstruct as usize][Count::ConstructVisit as usize],
+            9
+        );
+        assert_eq!(
+            first.values[Phase::StageScripts as usize][Count::ScriptsVisit as usize],
+            2
+        );
+        assert_eq!(
+            second.values[Phase::OrphanConstruct as usize][Count::ConstructVisit as usize],
+            4
+        );
+        assert_eq!(first.values.iter().flatten().sum::<u64>(), 11);
+        assert_eq!(second.values.iter().flatten().sum::<u64>(), 4);
     }
 }

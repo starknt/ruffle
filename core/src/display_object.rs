@@ -38,6 +38,18 @@ fn construction_revision() -> u64 {
     CONSTRUCTION_REVISION.get()
 }
 
+// Hidden button states have no parent link to their button. A separate epoch
+// invalidates proofs that include buttons without retaining foreign GC roots.
+#[cfg(feature = "button_lifecycle_cache")]
+thread_local! {
+    static BUTTON_STATE_REVISION: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(feature = "button_lifecycle_cache")]
+fn button_state_revision() -> u64 {
+    BUTTON_STATE_REVISION.get()
+}
+
 mod avm1_button;
 mod avm2_button;
 mod bitmap;
@@ -430,7 +442,12 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     /// Reset all properties that would be adjusted by a movie load.
     fn reset_for_movie_load(&self) {
-        let flags_to_keep = self.flags.get() & DisplayObjectFlags::LOCK_ROOT;
+        let retained = DisplayObjectFlags::LOCK_ROOT;
+        // Other buttons may still reference this object as an inactive state.
+        // Movie replacement resets its contents, not those foreign references.
+        #[cfg(feature = "button_lifecycle_cache")]
+        let retained = retained | DisplayObjectFlags::BUTTON_STATE_ROOT;
+        let flags_to_keep = self.flags.get() & retained;
         self.flags.set(flags_to_keep | DisplayObjectFlags::VISIBLE);
     }
 
@@ -888,11 +905,35 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn set_construction_clean(&self, clean: bool) {
         self.set_flag(DisplayObjectFlags::CONSTRUCTION_CLEAN, clean);
         if !clean {
-            self.set_enter_frame_idle(false);
-            if cfg!(feature = "scripted_construction_cache") {
-                self.set_frame_scripts_idle(false);
+            self.clear_lifecycle_cache();
+            #[cfg(feature = "button_lifecycle_cache")]
+            if self.contains_flag(DisplayObjectFlags::BUTTON_STATE_ROOT) {
+                BUTTON_STATE_REVISION.set(BUTTON_STATE_REVISION.get().wrapping_add(1));
             }
         }
+    }
+
+    /// Clear a stale proof without announcing another mutation. In particular,
+    /// epoch validation must not perpetually invalidate other hidden states.
+    fn clear_lifecycle_cache(&self) {
+        self.set_flag(DisplayObjectFlags::CONSTRUCTION_CLEAN, false);
+        self.set_enter_frame_idle(false);
+        if cfg!(feature = "scripted_construction_cache") {
+            self.set_frame_scripts_idle(false);
+        }
+    }
+
+    #[cfg(feature = "button_lifecycle_cache")]
+    fn mark_button_state_root(&self) {
+        // Sticky even after reassignment: retaining an old marker only causes
+        // conservative invalidation, including for shared or reparented states.
+        self.set_flag(DisplayObjectFlags::BUTTON_STATE_ROOT, true);
+        BUTTON_STATE_REVISION.set(BUTTON_STATE_REVISION.get().wrapping_add(1));
+    }
+
+    #[cfg(feature = "button_lifecycle_cache")]
+    fn subtree_has_button(&self) -> bool {
+        self.contains_flag(DisplayObjectFlags::SUBTREE_HAS_BUTTON)
     }
 
     fn frame_scripts_idle(&self) -> bool {
@@ -2485,9 +2526,19 @@ pub trait TDisplayObject<'gc>:
         if !cfg!(feature = "construction_cache") {
             return;
         }
+        #[cfg(feature = "lifecycle_counts")]
+        ruffle_render::profile::lifecycle::add(
+            ruffle_render::profile::lifecycle::Count::Invalidations,
+            1,
+        );
         CONSTRUCTION_REVISION.set(CONSTRUCTION_REVISION.get().wrapping_add(1));
         let mut current: DisplayObject<'gc> = self;
         loop {
+            #[cfg(feature = "lifecycle_counts")]
+            ruffle_render::profile::lifecycle::add(
+                ruffle_render::profile::lifecycle::Count::InvalidatedAncestors,
+                1,
+            );
             let was_clean = current.base().construction_clean();
             let was_idle = current.base().enter_frame_idle();
             let scripts_were_idle = cfg!(feature = "scripted_construction_cache")
@@ -2504,11 +2555,13 @@ pub trait TDisplayObject<'gc>:
     }
 
     /// Whether another construct_frame visit is a no-op until invalidation.
-    /// Buttons and loaders remain traversal boundaries, including hidden states.
+    /// Loaders remain boundaries; the button candidate proves all hidden states.
     #[no_dynamic]
     fn construction_is_settled(self) -> bool {
         match self {
-            DisplayObject::MovieClip(clip) => clip.base().construction_clean(),
+            DisplayObject::MovieClip(clip) => {
+                clip.base().construction_clean() && clip.button_cache_valid()
+            }
             DisplayObject::Bitmap(_)
             | DisplayObject::TextLine(_)
             | DisplayObject::Avm1Button(_) => true,
@@ -2517,9 +2570,8 @@ pub trait TDisplayObject<'gc>:
             | DisplayObject::EditText(_)
             | DisplayObject::Text(_)
             | DisplayObject::Video(_) => self.object2().is_some(),
-            DisplayObject::Stage(_)
-            | DisplayObject::LoaderDisplay(_)
-            | DisplayObject::Avm2Button(_) => false,
+            DisplayObject::Avm2Button(button) => button.construction_is_idle(),
+            DisplayObject::Stage(_) | DisplayObject::LoaderDisplay(_) => false,
         }
     }
 
@@ -2528,10 +2580,11 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn enter_frame_is_idle(self) -> bool {
         match self {
-            DisplayObject::MovieClip(clip) => clip.base().enter_frame_idle(),
-            DisplayObject::Stage(_)
-            | DisplayObject::LoaderDisplay(_)
-            | DisplayObject::Avm2Button(_) => false,
+            DisplayObject::MovieClip(clip) => {
+                clip.base().enter_frame_idle() && clip.button_cache_valid()
+            }
+            DisplayObject::Avm2Button(button) => button.enter_frame_is_idle(),
+            DisplayObject::Stage(_) | DisplayObject::LoaderDisplay(_) => false,
             DisplayObject::Bitmap(_)
             | DisplayObject::Graphic(_)
             | DisplayObject::MorphShape(_)
@@ -2548,10 +2601,11 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn frame_scripts_are_idle(self) -> bool {
         match self {
-            DisplayObject::MovieClip(clip) => clip.base().frame_scripts_idle(),
-            DisplayObject::Stage(_)
-            | DisplayObject::LoaderDisplay(_)
-            | DisplayObject::Avm2Button(_) => false,
+            DisplayObject::MovieClip(clip) => {
+                clip.base().frame_scripts_idle() && clip.button_cache_valid()
+            }
+            DisplayObject::Avm2Button(button) => button.scripts_are_idle(),
+            DisplayObject::Stage(_) | DisplayObject::LoaderDisplay(_) => false,
             DisplayObject::Bitmap(_)
             | DisplayObject::Graphic(_)
             | DisplayObject::MorphShape(_)
@@ -3290,6 +3344,10 @@ bitflags! {
 
         /// A constructed subtree with no fresh frame scripts or queued gotos.
         const FRAME_SCRIPTS_IDLE = 1 << 20;
+
+        /// Sticky markers used only by the button lifecycle candidate.
+        const SUBTREE_HAS_BUTTON = 1 << 21;
+        const BUTTON_STATE_ROOT = 1 << 22;
     }
 }
 
