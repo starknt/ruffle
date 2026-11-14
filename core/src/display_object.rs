@@ -46,7 +46,7 @@ thread_local! {
 }
 
 #[cfg(feature = "button_lifecycle_cache")]
-fn button_state_revision() -> u64 {
+pub(crate) fn button_state_revision() -> u64 {
     BUTTON_STATE_REVISION.get()
 }
 
@@ -447,6 +447,8 @@ impl<'gc> DisplayObjectBase<'gc> {
         // Movie replacement resets its contents, not those foreign references.
         #[cfg(feature = "button_lifecycle_cache")]
         let retained = retained | DisplayObjectFlags::BUTTON_STATE_ROOT;
+        #[cfg(feature = "orphan_worklist")]
+        let retained = retained | DisplayObjectFlags::ORPHAN_WORKLIST_OBSERVED;
         let flags_to_keep = self.flags.get() & retained;
         self.flags.set(flags_to_keep | DisplayObjectFlags::VISIBLE);
     }
@@ -746,6 +748,8 @@ impl<'gc> DisplayObjectBase<'gc> {
     /// You should almost always use `DisplayObject.set_parent` instead, which
     /// properly handles 'orphan' movie clips
     fn set_parent_ignoring_orphan_list(this: &Write<Self>, parent: Option<DisplayObject<'gc>>) {
+        #[cfg(feature = "orphan_worklist")]
+        this.wake_orphan_worklists();
         unlock!(this, Self, parent).set(parent)
     }
 
@@ -916,10 +920,25 @@ impl<'gc> DisplayObjectBase<'gc> {
     /// Clear a stale proof without announcing another mutation. In particular,
     /// epoch validation must not perpetually invalidate other hidden states.
     fn clear_lifecycle_cache(&self) {
+        #[cfg(feature = "orphan_worklist")]
+        self.wake_orphan_worklists();
         self.set_flag(DisplayObjectFlags::CONSTRUCTION_CLEAN, false);
         self.set_enter_frame_idle(false);
         if cfg!(feature = "scripted_construction_cache") {
             self.set_frame_scripts_idle(false);
+        }
+    }
+
+    #[cfg(feature = "orphan_worklist")]
+    pub(crate) fn observe_orphan_worklist(&self) -> usize {
+        self.set_flag(DisplayObjectFlags::ORPHAN_WORKLIST_OBSERVED, true);
+        self as *const Self as usize
+    }
+
+    #[cfg(feature = "orphan_worklist")]
+    fn wake_orphan_worklists(&self) {
+        if self.contains_flag(DisplayObjectFlags::ORPHAN_WORKLIST_OBSERVED) {
+            crate::orphan_manager::worklist::wake(self as *const Self as usize);
         }
     }
 
@@ -3347,6 +3366,8 @@ bitflags! {
 
         /// Sticky markers used only by the button lifecycle candidate.
         const SUBTREE_HAS_BUTTON = 1 << 21;
+        #[cfg(feature = "orphan_worklist")]
+        const ORPHAN_WORKLIST_OBSERVED = 1 << 23;
         const BUTTON_STATE_ROOT = 1 << 22;
     }
 }

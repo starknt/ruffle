@@ -80,6 +80,8 @@ workspace = true
 version = "0.4.70"
 
 [features]
+# Experimental ordered orphan scheduling; default off.
+orphan_worklist = ["button_lifecycle_cache"]
 # Anonymous lifecycle traversal diagnostics; no default instrumentation.
 lifecycle_counts = ["ruffle_render/lifecycle_counts"]
 # Diagnostic candidate: settle button subtrees with hidden-state invalidation.

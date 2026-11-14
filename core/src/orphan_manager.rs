@@ -5,6 +5,9 @@ use crate::display_object::{DisplayObject, DisplayObjectWeak, TDisplayObject};
 use gc_arena::{Collect, Mutation};
 use std::rc::Rc;
 
+#[cfg(feature = "orphan_worklist")]
+pub(crate) mod worklist;
+
 /// The list of 'orphan' objects - these objects have no parent,
 /// so we need to manually run their frames in `run_all_phases_avm2` to match
 /// Flash's behavior. Clips are added to this list with `add_orphan_movie`.
@@ -18,6 +21,8 @@ use std::rc::Rc;
 #[collect(no_drop)]
 pub struct OrphanManager<'gc> {
     orphans: Rc<Vec<DisplayObjectWeak<'gc>>>,
+    #[cfg(feature = "orphan_worklist")]
+    worklist: Option<Rc<worklist::Worklist<'gc>>>,
 }
 
 impl<'gc> OrphanManager<'gc> {
@@ -46,6 +51,10 @@ impl<'gc> OrphanManager<'gc> {
         context: &mut UpdateContext<'gc>,
         mut f: impl FnMut(DisplayObject<'gc>, &mut UpdateContext<'gc>),
     ) {
+        #[cfg(feature = "orphan_worklist")]
+        if ruffle_render::profile::engine_optimized() && worklist::Worklist::each(context, &mut f) {
+            return;
+        }
         // Clone the Rc before iterating over it. Any modifications must go through
         // `Rc::make_mut` in `orphan_objects_mut`, which will leave this `Rc` unmodified.
         // This ensures that any orphan additions/removals done by `f` will not affect
@@ -81,6 +90,16 @@ impl<'gc> OrphanManager<'gc> {
     /// that have been garbage collected, or are no longer orphans
     /// (they've since acquired a parent).
     pub fn cleanup_dead_orphans(&mut self, mc: &Mutation<'gc>) {
+        #[cfg(feature = "orphan_worklist")]
+        if self
+            .orphans
+            .iter()
+            .all(|d| valid_orphan(*d, mc).is_some_and(|dobj| dobj.placed_by_avm2_script()))
+        {
+            // A cached worklist owns the same immutable member snapshot. Do not
+            // copy it on every goto when cleanup has no membership changes.
+            return;
+        }
         self.orphans_mut().retain(|d| {
             if let Some(dobj) = valid_orphan(*d, mc) {
                 // All clips that become orphaned (have their parent removed, or start out with no parent)
@@ -115,6 +134,8 @@ impl<'gc> Default for OrphanManager<'gc> {
     fn default() -> Self {
         Self {
             orphans: Rc::new(Vec::new()),
+            #[cfg(feature = "orphan_worklist")]
+            worklist: None,
         }
     }
 }

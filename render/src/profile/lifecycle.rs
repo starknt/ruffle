@@ -56,6 +56,12 @@ names!(Count, COUNT_NAMES,
     InvalidatedAncestors => "invalidatedAncestors",
     PendingChanged => "pendingChanged",
     LastQueuedChanged => "lastQueuedChanged",
+    WorklistVisit => "worklistVisit",
+    WorklistEntries => "worklistEntries",
+    WorklistSkipped => "worklistSkipped",
+    WorklistWake => "worklistWake",
+    WorklistButtonWake => "worklistButtonWake",
+    WorklistFallback => "worklistFallback",
 );
 
 #[derive(Clone, Debug)]

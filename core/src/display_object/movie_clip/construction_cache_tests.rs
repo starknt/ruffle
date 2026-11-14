@@ -78,6 +78,162 @@ fn settled_construction_subtree_avoids_revisiting_descendants() {
 }
 
 #[test]
+#[cfg(feature = "orphan_worklist")]
+fn settled_orphan_worklist_avoids_even_root_callbacks() {
+    use crate::orphan_manager::OrphanManager;
+    with_tree(|root, _, context| {
+        *context.orphan_manager = OrphanManager::default();
+        context.orphan_manager.add_orphan_obj(root.into());
+        let mut calls = 0;
+        for phase in [FramePhase::Construct, FramePhase::FrameScripts] {
+            *context.frame_phase = phase;
+            OrphanManager::each_orphan_obj(context, |_, _| calls += 1);
+        }
+        assert_eq!(
+            calls, 0,
+            "settled roots must not reach the lifecycle callback"
+        );
+        let _stock = ruffle_render::profile::enter_engine(false);
+        OrphanManager::each_orphan_obj(context, |_, _| calls += 1);
+        assert_eq!(
+            calls, 1,
+            "stock must still visit the original orphan snapshot"
+        );
+    });
+}
+
+#[test]
+#[cfg(feature = "orphan_worklist")]
+fn observing_an_orphan_does_not_make_it_a_hidden_button_state() {
+    with_tree(|root, _, _| {
+        root.base().observe_orphan_worklist();
+        let revision = crate::display_object::button_state_revision();
+        root.invalidate_construction();
+        assert_eq!(crate::display_object::button_state_revision(), revision);
+    });
+}
+
+#[test]
+#[cfg(feature = "orphan_worklist")]
+fn orphan_worklist_wakes_later_members_without_repeating_earlier_members() {
+    use crate::orphan_manager::OrphanManager;
+    with_tree(|root, _, context| {
+        let later = MovieClip::new(root.movie(), context.gc());
+        later.construct_frame(context);
+        later.construct_frame(context);
+        *context.orphan_manager = OrphanManager::default();
+        context.orphan_manager.add_orphan_obj(root.into());
+        context.orphan_manager.add_orphan_obj(later.into());
+        OrphanManager::each_orphan_obj(context, |_, _| panic!("settled fixture"));
+        root.invalidate_construction();
+        let mut order = Vec::new();
+        OrphanManager::each_orphan_obj(context, |dobj, context| {
+            order.push(dobj.as_ptr());
+            dobj.construct_frame(context);
+            if dobj.as_ptr() == root.as_ptr() {
+                later.invalidate_construction();
+            } else {
+                root.invalidate_construction();
+            }
+        });
+        assert_eq!(order, [root.as_ptr(), later.as_ptr()]);
+        let mut next = Vec::new();
+        OrphanManager::each_orphan_obj(context, |dobj, context| {
+            next.push(dobj.as_ptr());
+            dobj.construct_frame(context);
+        });
+        assert_eq!(next, [root.as_ptr()]);
+    });
+}
+
+#[test]
+#[cfg(feature = "orphan_worklist")]
+fn orphan_worklist_additions_wait_for_the_next_snapshot() {
+    use crate::orphan_manager::OrphanManager;
+    with_tree(|root, _, context| {
+        let added = MovieClip::new(root.movie(), context.gc());
+        *context.orphan_manager = OrphanManager::default();
+        context.orphan_manager.add_orphan_obj(root.into());
+        root.invalidate_construction();
+        let mut order = Vec::new();
+        OrphanManager::each_orphan_obj(context, |dobj, context| {
+            order.push(dobj.as_ptr());
+            dobj.construct_frame(context);
+            context.orphan_manager.add_orphan_obj(added.into());
+        });
+        assert_eq!(order, [root.as_ptr()]);
+        let mut next = Vec::new();
+        OrphanManager::each_orphan_obj(context, |dobj, context| {
+            next.push(dobj.as_ptr());
+            dobj.construct_frame(context);
+        });
+        assert_eq!(next, [added.as_ptr()]);
+    });
+}
+
+#[test]
+#[cfg(feature = "orphan_worklist")]
+fn nested_orphan_cleanup_does_not_remove_members_from_an_outer_snapshot() {
+    use crate::orphan_manager::OrphanManager;
+    with_tree(|root, _, context| {
+        let later = MovieClip::new(root.movie(), context.gc());
+        later.construct_frame(context);
+        later.construct_frame(context);
+        root.base().set_placed_by_avm2_script(true);
+        *context.orphan_manager = OrphanManager::default();
+        context.orphan_manager.add_orphan_obj(root.into());
+        context.orphan_manager.add_orphan_obj(later.into());
+        OrphanManager::each_orphan_obj(context, |_, _| panic!("settled fixture"));
+        root.invalidate_construction();
+        let mut order = Vec::new();
+        OrphanManager::each_orphan_obj(context, |dobj, context| {
+            order.push(dobj.as_ptr());
+            dobj.construct_frame(context);
+            if dobj.as_ptr() == root.as_ptr() {
+                later.set_parent(context, Some(root.into()));
+                context.orphan_manager.cleanup_dead_orphans(context.gc());
+                OrphanManager::each_orphan_obj(context, |nested, context| {
+                    assert_eq!(nested.as_ptr(), root.as_ptr());
+                    nested.construct_frame(context);
+                });
+                later.set_parent(context, None);
+                later.invalidate_construction();
+            }
+        });
+        assert_eq!(order, [root.as_ptr(), later.as_ptr()]);
+    });
+}
+
+#[test]
+#[cfg(feature = "orphan_worklist")]
+fn orphan_worklist_hidden_state_and_reload_wake_parked_roots() {
+    use crate::orphan_manager::OrphanManager;
+    with_button_tree(|root, hidden, _, context| {
+        *context.orphan_manager = OrphanManager::default();
+        context.orphan_manager.add_orphan_obj(root.into());
+        *context.frame_phase = FramePhase::Construct;
+        OrphanManager::each_orphan_obj(context, |_, _| panic!("settled fixture"));
+        hidden.replace_with_movie(context, Some(root.movie()), false, None);
+        let mut calls = 0;
+        OrphanManager::each_orphan_obj(context, |dobj, context| {
+            calls += 1;
+            dobj.construct_frame(context);
+        });
+        assert_eq!(
+            calls, 1,
+            "hidden state replacement must invalidate the proof"
+        );
+        root.replace_with_movie(context, Some(root.movie()), false, None);
+        root.base().set_construction_clean(true);
+        OrphanManager::each_orphan_obj(context, |_, _| panic!("settled fixture"));
+        root.invalidate_construction();
+        let mut reloaded = 0;
+        OrphanManager::each_orphan_obj(context, |_, _| reloaded += 1);
+        assert_eq!(reloaded, 1, "movie load must retain the worklist observer");
+    });
+}
+
+#[test]
 fn settled_scriptless_subtree_avoids_frame_script_walks() {
     with_tree(|root, _, context| {
         *context.frame_phase = FramePhase::FrameScripts;
