@@ -19,7 +19,165 @@ use std::collections::HashMap;
 
 #[cfg(test)]
 mod tests {
-    use super::{Property, TraitLookupCache};
+    use super::{Property, PropertyMap, TraitLookupCache, TraitNames};
+    use crate::avm2::{Namespace, QName};
+    use crate::string::AvmString;
+    use gc_arena::collect::Trace;
+    use gc_arena::{Arena, Collect, Gc, GcWeak, Rootable};
+    use std::collections::HashSet;
+
+    #[derive(Default)]
+    struct DirectEdges {
+        visits: usize,
+        targets: HashSet<usize>,
+    }
+
+    impl<'gc> Trace<'gc> for DirectEdges {
+        fn trace_gc(&mut self, gc: Gc<'gc, ()>) {
+            self.visits += 1;
+            self.targets.insert(Gc::as_ptr(gc) as usize);
+        }
+
+        fn trace_gc_weak(&mut self, _gc: GcWeak<'gc, ()>) {
+            panic!("trait names must not hold weak GC edges");
+        }
+    }
+
+    #[test]
+    fn published_trait_names_do_not_rescan_properties_per_inheritor() {
+        let _scope = ruffle_render::profile::enter(None, true);
+        let player = crate::player::PlayerBuilder::new().build();
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                let table = context.avm2.classes().sprite.instance_vtable();
+                assert!(table.resolved_traits().iter().count() > 32);
+                let mut edges = DirectEdges::default();
+                for _ in 0..64 {
+                    table.0.resolved_traits.clone().trace(&mut edges);
+                }
+                assert_eq!(edges.visits, 64, "one shared GC edge per inheritor");
+                assert_eq!(edges.targets.len(), 1, "all inheritors trace the same node");
+            });
+    }
+
+    #[test]
+    fn published_trait_overrides_stay_isolated_across_collection() {
+        let _scope = ruffle_render::profile::enter(None, true);
+        let mut arena = Arena::<Rootable![Vec<TraitNames<'_>>]>::new(|mc| {
+            let name = QName::new(Namespace::any(), AvmString::new_utf8(mc, "inherited"));
+            let mut parent = TraitNames::default();
+            parent.insert(name, Property::Slot { slot_id: 7 });
+            parent.publish(mc);
+            let sibling = parent.clone();
+            let mut child = parent.clone();
+            child.insert(name, Property::Slot { slot_id: 19 });
+            child.insert(
+                QName::new(Namespace::any(), AvmString::new_utf8(mc, "childOnly")),
+                Property::Method { disp_id: 23 },
+            );
+            child.publish(mc);
+            vec![parent, sibling, child]
+        });
+        arena.finish_cycle();
+        arena.mutate(|mc, tables| {
+            let name = QName::new(Namespace::any(), AvmString::new_utf8(mc, "inherited"));
+            let extra = QName::new(Namespace::any(), AvmString::new_utf8(mc, "childOnly"));
+            for table in &tables[..2] {
+                assert!(matches!(
+                    table.get(name),
+                    Some(Property::Slot { slot_id: 7 })
+                ));
+                assert!(table.get(extra).is_none());
+            }
+            assert!(matches!(
+                tables[2].get(name),
+                Some(Property::Slot { slot_id: 19 })
+            ));
+            assert!(matches!(
+                tables[2].get(extra),
+                Some(Property::Method { disp_id: 23 })
+            ));
+        });
+    }
+
+    #[test]
+    fn shared_trait_node_lives_until_its_last_inheritor_is_removed() {
+        type WeakNames<'gc> = GcWeak<'gc, std::rc::Rc<PropertyMap<'gc, Property>>>;
+        let _scope = ruffle_render::profile::enter(None, true);
+        let mut arena = Arena::<Rootable![(Vec<TraitNames<'_>>, WeakNames<'_>)]>::new(|mc| {
+            let mut names = TraitNames::default();
+            names.insert(
+                QName::new(Namespace::any(), AvmString::new_utf8(mc, "live")),
+                Property::Slot { slot_id: 3 },
+            );
+            names.publish(mc);
+            let TraitNames::Shared(node) = names else {
+                panic!("expected a published node")
+            };
+            (vec![names.clone(), names], Gc::downgrade(node))
+        });
+        arena.mutate_root(|_, root| {
+            root.0.pop();
+        });
+        arena.finish_cycle();
+        arena.mutate(|mc, root| {
+            assert!(root.1.upgrade(mc).is_some());
+            let name = QName::new(Namespace::any(), AvmString::new_utf8(mc, "live"));
+            assert!(matches!(
+                root.0[0].get(name),
+                Some(Property::Slot { slot_id: 3 })
+            ));
+        });
+        arena.mutate_root(|_, root| root.0.clear());
+        arena.finish_cycle();
+        arena.mutate(|mc, root| assert!(root.1.upgrade(mc).is_none()));
+    }
+
+    #[test]
+    #[ignore = "diagnostic GC sharing benchmark; no wall-clock threshold"]
+    fn inherited_trait_collection_benchmark() {
+        use std::time::Instant;
+        let mut samples = [Vec::new(), Vec::new()];
+        for sample in 0..31 {
+            for offset in 0..2 {
+                let mode = (sample + offset) % 2;
+                let _scope = ruffle_render::profile::enter(None, mode == 1);
+                let mut arena = Arena::<Rootable![Vec<TraitNames<'_>>]>::new(|mc| {
+                    let mut names = TraitNames::default();
+                    for index in 0..512 {
+                        names.insert(
+                            QName::new(
+                                Namespace::any(),
+                                AvmString::new_utf8(mc, format!("field{index}")),
+                            ),
+                            Property::Slot { slot_id: index },
+                        );
+                    }
+                    names.publish(mc);
+                    vec![names; 1024]
+                });
+                arena.finish_cycle();
+                let start = Instant::now();
+                arena.finish_cycle();
+                samples[mode].push(start.elapsed().as_nanos());
+                arena.mutate(|_, tables| {
+                    assert_eq!(tables[0].iter().count(), 512);
+                    let mut edges = DirectEdges::default();
+                    tables.trace(&mut edges);
+                    assert_eq!(edges.visits, if mode == 1 { 1024 } else { 524_288 });
+                });
+            }
+        }
+        for sample in &mut samples {
+            sample.sort_unstable();
+        }
+        println!(
+            "stock_gc_ns_p50={} stock_gc_ns_p95={} optimized_gc_ns_p50={} optimized_gc_ns_p95={}",
+            samples[0][15], samples[0][29], samples[1][15], samples[1][29]
+        );
+    }
 
     #[test]
     fn trait_lookup_cache_distinguishes_name_and_namespace() {
@@ -43,18 +201,49 @@ pub struct VTable<'gc>(Gc<'gc, VTableData<'gc>>);
 // Bitmap symbol subclasses commonly introduce no properties. Lookup tables are
 // immutable once published; private namespaces, overrides and interface aliases
 // detach on insertion. Method scopes and writable slot caches stay per class.
-#[derive(Collect, Clone, Default)]
+#[derive(Collect, Clone)]
 #[collect(no_drop)]
-struct TraitNames<'gc>(std::rc::Rc<PropertyMap<'gc, Property>>);
+enum TraitNames<'gc> {
+    Building(std::rc::Rc<PropertyMap<'gc, Property>>),
+    // Rc alone shares allocation, but Collect for Rc traces its contents for
+    // every inheritor. A published GC node lets the collector mark it once.
+    Shared(Gc<'gc, std::rc::Rc<PropertyMap<'gc, Property>>>),
+}
+
+impl Default for TraitNames<'_> {
+    fn default() -> Self {
+        Self::Building(Default::default())
+    }
+}
+
+impl<'gc> TraitNames<'gc> {
+    fn publish(&mut self, mc: &Mutation<'gc>) {
+        if ruffle_render::profile::engine_optimized()
+            && let Self::Building(names) = self
+        {
+            *self = Self::Shared(Gc::new(mc, names.clone()));
+        }
+    }
+}
+
 impl<'gc> std::ops::Deref for TraitNames<'gc> {
     type Target = PropertyMap<'gc, Property>;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        match self {
+            Self::Building(names) => names,
+            Self::Shared(names) => names,
+        }
     }
 }
 impl std::ops::DerefMut for TraitNames<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        std::rc::Rc::make_mut(&mut self.0)
+        if let Self::Shared(names) = self {
+            *self = Self::Building(std::rc::Rc::clone(names));
+        }
+        let Self::Building(names) = self else {
+            unreachable!()
+        };
+        std::rc::Rc::make_mut(names)
     }
 }
 
@@ -153,12 +342,13 @@ impl<'gc> VTable<'gc> {
         superclass_vtable: Option<Self>,
         mc: &Mutation<'gc>,
     ) -> Result<Self, VTableInitError> {
-        let this = Self::init_vtable(
+        let mut this = Self::init_vtable(
             defining_class_def,
             super_class_obj,
             scope,
             superclass_vtable,
         )?;
+        this.resolved_traits.publish(mc);
         Ok(VTable(Gc::new(mc, this)))
     }
 
@@ -177,6 +367,7 @@ impl<'gc> VTable<'gc> {
             superclass_vtable,
         )?;
         Self::copy_interface_properties(&mut this, defining_class_def, context);
+        this.resolved_traits.publish(context.gc());
 
         Ok(VTable(Gc::new(context.gc(), this)))
     }
@@ -372,7 +563,7 @@ impl<'gc> VTable<'gc> {
             resolved_traits = if ruffle_render::profile::engine_optimized() {
                 superclass_vtable.0.resolved_traits.clone()
             } else {
-                TraitNames(std::rc::Rc::new(
+                TraitNames::Building(std::rc::Rc::new(
                     superclass_vtable.resolved_traits().clone(),
                 ))
             };
