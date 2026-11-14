@@ -29,6 +29,7 @@ type Error = Box<dyn std::error::Error>;
 #[macro_use]
 pub mod utils;
 
+mod bitmap_residency;
 mod bitmaps;
 mod context3d;
 mod globals;

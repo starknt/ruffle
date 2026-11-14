@@ -86,6 +86,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     chunk_buffers: ChunkBuffers,
     active_frame: ActiveFrame,
     profiler: GpuProfiler,
+    bitmap_residency: Option<crate::bitmap_residency::BitmapResidency>,
 }
 
 impl WgpuRenderBackend<SwapChainTarget> {
@@ -304,7 +305,17 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             chunk_buffers,
             active_frame,
             profiler,
+            bitmap_residency: None,
         })
+    }
+
+    /// Limit retained, reconstructible symbol uploads. In-flight commands and
+    /// writable bitmaps are separate owners and are not constrained by this cache.
+    /// None and stock rendering retain the original ownership policy.
+    pub fn set_immutable_bitmap_cache_limit(&mut self, limit: Option<u64>) {
+        self.bitmap_residency = limit
+            .filter(|limit| self.optimized && *limit > 0)
+            .map(crate::bitmap_residency::BitmapResidency::new);
     }
 
     /// Opt into experimental intermediate-texture batching. This reduces live
@@ -809,6 +820,19 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         }));
 
         Ok(handle)
+    }
+
+    fn cache_immutable_bitmap(&mut self, bitmap: &BitmapHandle) -> bool {
+        let Some(cache) = &mut self.bitmap_residency else {
+            return false;
+        };
+        let texture = as_texture(bitmap);
+        let bytes = u64::from(texture.texture.width())
+            * u64::from(texture.texture.height())
+            * u64::from(texture.texture.format().block_copy_size(None).unwrap_or(4));
+        cache.retain(bitmap, bytes);
+        ruffle_render::profile::record_bitmap_residency(cache.stats());
+        true
     }
 
     #[instrument(level = "debug", skip_all)]

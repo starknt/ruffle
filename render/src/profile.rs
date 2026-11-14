@@ -100,9 +100,27 @@ pub struct Counters {
     pub upload_bytes: u64,
     pub blend_batch_splits: u64,
     pub blend_batch_fallbacks: u64,
+    pub bitmap_residency: Option<BitmapResidencyStats>,
     /// Cumulative publication totals, not currently live allocations or RSS.
     pub published_code: PublishedCodeStats,
     pub async_events: Vec<AsyncEvent>,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct BitmapResidencyStats {
+    pub retained_bytes: u64,
+    pub retained_entries: usize,
+    pub hits: u64,
+    pub insertions: u64,
+    pub evictions: u64,
+}
+
+pub fn record_bitmap_residency(stats: BitmapResidencyStats) {
+    CURRENT.with_borrow(|current| {
+        if let Some(metrics) = current {
+            metrics.0.borrow_mut().bitmap_residency = Some(stats);
+        }
+    });
 }
 #[derive(Clone, Default, Debug)]
 pub struct RenderMetrics(Rc<RefCell<Counters>>);

@@ -94,6 +94,14 @@ pub trait RenderBackend: Any {
     ) -> Result<BitmapHandle, Error>;
 
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, Error>;
+
+    /// Offer an immutable, reconstructible bitmap to the backend's residency
+    /// cache. If accepted, the caller may keep only a weak handle and recreate
+    /// it after eviction. Never offer mutable BitmapData or GPU-written targets.
+    fn cache_immutable_bitmap(&mut self, _bitmap: &BitmapHandle) -> bool {
+        false
+    }
+
     fn update_texture(
         &mut self,
         handle: &BitmapHandle,

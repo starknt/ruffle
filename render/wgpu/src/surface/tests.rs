@@ -289,3 +289,102 @@ fn benchmark_blend_batches_encode_and_submit() {
             .unwrap();
     }
 }
+
+#[test]
+#[ignore = "requires a real Vulkan adapter"]
+fn immutable_bitmap_eviction_preserves_recorded_pixels_and_releases_gpu_memory() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+
+    let descriptors = gpu();
+    let memory = || {
+        descriptors
+            .device
+            .get_internal_counters()
+            .hal
+            .texture_memory
+            .read()
+    };
+    let target = TextureTarget::new(&descriptors.device, (128, 128)).unwrap();
+    let mut renderer =
+        WgpuRenderBackend::with_options(descriptors.clone(), target, true, false).unwrap();
+    renderer.set_quality(StageQuality::Low);
+    renderer.submit_frame(Color::WHITE, CommandList::new(), vec![]);
+    renderer.capture_frame().unwrap();
+    let baseline = memory();
+    assert!(baseline > 0, "run with wgpu/counters");
+    // Retain exactly one upload. The first draw must survive eviction before
+    // submit_frame, and subsequent reuploads must preserve independent pixels.
+    renderer.set_immutable_bitmap_cache_limit(Some(64 * 64 * 4));
+    for _ in 0..3 {
+        let mut commands = CommandList::new();
+        for (x, rgba) in [(0.0, [255, 0, 0, 255]), (64.0, [0, 0, 255, 255])] {
+            let handle = renderer
+                .register_bitmap(Bitmap::new(
+                    64,
+                    64,
+                    BitmapFormat::Rgba,
+                    rgba.repeat(64 * 64),
+                ))
+                .unwrap();
+            assert!(renderer.cache_immutable_bitmap(&handle));
+            commands.render_bitmap(
+                handle,
+                Transform {
+                    matrix: Matrix::translate(Twips::from_pixels(x), Twips::ZERO),
+                    ..Default::default()
+                },
+                false,
+                PixelSnapping::Never,
+                PixelRegion::for_region(0, 0, 64, 64),
+            );
+        }
+        renderer.submit_frame(Color::WHITE, commands, vec![]);
+        let actual = renderer.capture_frame().unwrap();
+        assert_eq!(actual.get_pixel(32, 32).0, [255, 0, 0, 255]);
+        assert_eq!(actual.get_pixel(96, 32).0, [0, 0, 255, 255]);
+        assert_eq!(actual.get_pixel(32, 96).0, [255, 255, 255, 255]);
+    }
+    // Drain only in this explicit test, never in the eviction implementation.
+    renderer.submit_frame(Color::WHITE, CommandList::new(), vec![]);
+    renderer.capture_frame().unwrap();
+    descriptors
+        .device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    let retained = memory();
+    renderer.set_immutable_bitmap_cache_limit(None);
+    descriptors
+        .device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    assert_eq!(
+        retained - memory(),
+        64 * 64 * 4,
+        "only one cached upload should remain"
+    );
+    assert_eq!(memory(), baseline, "evicted native GPU textures leaked");
+}
+
+#[test]
+#[ignore = "requires a real Vulkan adapter"]
+fn immutable_bitmap_cache_is_opt_in_and_stock_stays_unmanaged() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat};
+    let descriptors = gpu();
+    for optimized in [false, true] {
+        let target = TextureTarget::new(&descriptors.device, (4, 4)).unwrap();
+        let mut renderer =
+            WgpuRenderBackend::with_options(descriptors.clone(), target, optimized, false).unwrap();
+        let handle = renderer
+            .register_bitmap(Bitmap::new(1, 1, BitmapFormat::Rgba, vec![255; 4]))
+            .unwrap();
+        assert!(!renderer.cache_immutable_bitmap(&handle));
+        for limit in [Some(4), Some(0), None] {
+            renderer.set_immutable_bitmap_cache_limit(limit);
+            assert_eq!(
+                renderer.cache_immutable_bitmap(&handle),
+                optimized && limit == Some(4)
+            );
+        }
+    }
+}

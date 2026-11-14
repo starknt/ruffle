@@ -119,6 +119,11 @@ mod renderer {
             std::env::var("RUFFLE_TEST_BLEND_BATCHES").as_deref() == Ok("bounded"),
         );
 
+        renderer.set_immutable_bitmap_cache_limit(
+            (std::env::var("RUFFLE_TEST_SYMBOL_GPU_CACHE").as_deref() == Ok("bounded"))
+                .then_some(256 * 1024 * 1024),
+        );
+
         Some((Box::new(NativeRenderInterface { name }), Box::new(renderer)))
     }
 

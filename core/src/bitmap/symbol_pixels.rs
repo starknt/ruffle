@@ -16,6 +16,9 @@ use std::{
     sync::Weak,
 };
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug)]
 pub struct SymbolImage {
     pub data: CompressedBitmap,
@@ -63,10 +66,16 @@ impl Pixels {
     }
     pub fn view(&mut self, renderer: &mut dyn RenderBackend) -> Option<BitmapHandle> {
         let s = self.symbol.as_ref()?;
-        if self.view.is_none() {
-            self.view = s.view(renderer).ok()
+        if let Some(view) = &self.view {
+            return Some(view.clone());
         }
-        self.view.clone()
+        let view = s.view(renderer).ok()?;
+        // Only unmodified symbols reach this path. Their compressed source can
+        // recreate an evicted upload without readback or changing AS3 lifetime.
+        if !renderer.cache_immutable_bitmap(&view) {
+            self.view = Some(view.clone());
+        }
+        Some(view)
     }
     fn materialize(&self) -> &(Vec<Color>, BitmapAllocation) {
         self.data.get_or_init(|| {
