@@ -97,12 +97,21 @@ pub struct Counters {
     pub gpu_bitmaps: u64,
     pub gpu_bitmap_bytes: u64,
     pub peak_gpu_bitmap_bytes: u64,
+    pub gpu_meshes: u64,
+    pub gpu_mesh_bytes: u64,
+    pub peak_gpu_mesh_bytes: u64,
     pub gpu_frame: Option<u64>,
+    pub bitmap_readbacks: u64,
+    pub bitmap_readback_bytes: u64,
+    pub bitmap_readback_nanos: u64,
+    pub bitmap_gpu_copies: u64,
+    pub bitmap_gpu_copy_fallbacks: u64,
     pub loader_bytes: [u64; 3],
     pub idle: [u64; 2],
     pub peak_idle: [u64; 2],
     pub peak_pool: u64,
     pub upload_bytes: u64,
+    pub executor_queue_depth: u64,
     pub blend_batch_splits: u64,
     pub blend_batch_fallbacks: u64,
     pub bitmap_residency: Option<BitmapResidencyStats>,
@@ -225,6 +234,30 @@ pub fn uploaded(bytes: u64) {
     CURRENT.with_borrow(|m| {
         if let Some(m) = m {
             m.0.borrow_mut().upload_bytes += bytes;
+        }
+    });
+}
+
+pub fn bitmap_readback(bytes: u64, nanos: u64) {
+    CURRENT.with_borrow(|m| {
+        if let Some(m) = m {
+            let mut counters = m.0.borrow_mut();
+            counters.bitmap_readbacks += 1;
+            counters.bitmap_readback_bytes += bytes;
+            counters.bitmap_readback_nanos += nanos;
+        }
+    });
+}
+
+pub fn bitmap_gpu_copy(supported: bool) {
+    CURRENT.with_borrow(|m| {
+        if let Some(m) = m {
+            let mut counters = m.0.borrow_mut();
+            if supported {
+                counters.bitmap_gpu_copies += 1;
+            } else {
+                counters.bitmap_gpu_copy_fallbacks += 1;
+            }
         }
     });
 }
@@ -363,6 +396,33 @@ impl Drop for GpuBitmap {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct GpuMesh(Option<(RenderMetrics, u64)>);
+impl GpuMesh {
+    pub fn new(bytes: u64) -> Self {
+        Self(CURRENT.with_borrow(|m| {
+            m.clone().map(|m| {
+                {
+                    let mut c = m.0.borrow_mut();
+                    c.gpu_meshes += 1;
+                    c.gpu_mesh_bytes += bytes;
+                    c.peak_gpu_mesh_bytes = c.peak_gpu_mesh_bytes.max(c.gpu_mesh_bytes);
+                }
+                (m, bytes)
+            })
+        }))
+    }
+}
+impl Drop for GpuMesh {
+    fn drop(&mut self) {
+        if let Some((m, b)) = &self.0 {
+            let mut c = m.0.borrow_mut();
+            c.gpu_meshes -= 1;
+            c.gpu_mesh_bytes -= b;
+        }
+    }
+}
+
 pub fn async_event(
     kind: &'static str,
     generation: u64,
@@ -393,9 +453,29 @@ pub fn loader_bytes(index: usize, bytes: usize) {
     });
 }
 
+pub fn executor_queue_depth(depth: usize) {
+    CURRENT.with_borrow(|m| {
+        if let Some(m) = m {
+            m.0.borrow_mut().executor_queue_depth = depth as u64;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RenderMetrics, enabled, enter};
+    use super::{
+        RenderMetrics, bitmap_gpu_copy, bitmap_readback, enabled, enter, executor_queue_depth,
+    };
+
+    #[test]
+    fn executor_queue_depth_is_recorded_in_the_current_metrics() {
+        let metrics = RenderMetrics::default();
+        let _scope = enter(Some(&metrics), true);
+
+        executor_queue_depth(3);
+
+        assert_eq!(metrics.snapshot().executor_queue_depth, 3);
+    }
 
     #[test]
     fn profiling_is_enabled_only_inside_an_active_scope() {
@@ -406,6 +486,56 @@ mod tests {
             assert!(enabled());
         }
         assert!(!enabled());
+    }
+
+    #[test]
+    fn bitmap_readback_records_count_bytes_and_time() {
+        let metrics = RenderMetrics::default();
+        {
+            let _scope = enter(Some(&metrics), false);
+            bitmap_readback(4096, 12);
+            bitmap_readback(1024, 7);
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.bitmap_readbacks, 2);
+        assert_eq!(snapshot.bitmap_readback_bytes, 5120);
+        assert_eq!(snapshot.bitmap_readback_nanos, 19);
+    }
+
+    #[test]
+    fn bitmap_gpu_copy_records_success_and_fallbacks() {
+        let metrics = RenderMetrics::default();
+        {
+            let _scope = enter(Some(&metrics), false);
+            bitmap_gpu_copy(true);
+            bitmap_gpu_copy(false);
+            bitmap_gpu_copy(true);
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.bitmap_gpu_copies, 2);
+        assert_eq!(snapshot.bitmap_gpu_copy_fallbacks, 1);
+    }
+
+    #[test]
+    fn gpu_mesh_allocation_tracks_live_and_peak_bytes() {
+        let metrics = RenderMetrics::default();
+        {
+            let _scope = enter(Some(&metrics), false);
+            let first = super::GpuMesh::new(128);
+            let second = super::GpuMesh::new(256);
+            let snapshot = metrics.snapshot();
+            assert_eq!(snapshot.gpu_meshes, 2);
+            assert_eq!(snapshot.gpu_mesh_bytes, 384);
+            assert_eq!(snapshot.peak_gpu_mesh_bytes, 384);
+            drop(first);
+            drop(second);
+        }
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.gpu_meshes, 0);
+        assert_eq!(snapshot.gpu_mesh_bytes, 0);
+        assert_eq!(snapshot.peak_gpu_mesh_bytes, 384);
     }
 
     #[test]

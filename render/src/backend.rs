@@ -109,6 +109,18 @@ pub trait RenderBackend: Any {
         region: PixelRegion,
     ) -> Result<(), Error>;
 
+    /// Copies an exact RGBA bitmap region on the GPU when the backend supports it.
+    /// Returning `None` keeps the caller on its CPU fallback path.
+    fn copy_bitmap_region(
+        &mut self,
+        _source: BitmapHandle,
+        _source_region: PixelRegion,
+        _destination: BitmapHandle,
+        _destination_region: PixelRegion,
+    ) -> Result<Option<Box<dyn SyncHandle>>, Error> {
+        Ok(None)
+    }
+
     fn create_context3d(&mut self, profile: Context3DProfile) -> Result<Box<dyn Context3D>, Error>;
 
     fn debug_info(&self) -> Cow<'static, str>;

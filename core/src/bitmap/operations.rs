@@ -798,6 +798,20 @@ pub fn compare<'gc>(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::can_copy_pixels_on_gpu;
+
+    #[test]
+    fn gpu_copy_requires_matching_transparency_and_plain_copy_semantics() {
+        assert!(can_copy_pixels_on_gpu(true, true, false, false, false));
+        assert!(!can_copy_pixels_on_gpu(true, false, false, false, false));
+        assert!(!can_copy_pixels_on_gpu(true, true, true, false, false));
+        assert!(!can_copy_pixels_on_gpu(true, true, false, true, false));
+        assert!(!can_copy_pixels_on_gpu(true, true, false, false, true));
+    }
+}
+
 pub fn hit_test_point(
     renderer: &mut dyn RenderBackend,
     target: BitmapData,
@@ -1068,6 +1082,32 @@ pub fn copy_pixels<'gc>(
         return;
     }
 
+    let target_has_pending_gpu_write =
+        !target.can_read(PixelRegion::for_whole_size(target.width(), target.height()));
+    let gpu_copy_candidate = can_copy_pixels_on_gpu(
+        source_transparency,
+        transparency,
+        merge_alpha,
+        false,
+        target_has_pending_gpu_write,
+    ) && !source_bitmap.ptr_eq(target);
+    if gpu_copy_candidate {
+        let source_handle = source_bitmap.bitmap_handle(context.gc(), context.renderer);
+        let target_handle = target.bitmap_handle(context.gc(), context.renderer);
+        if let Ok(Some(sync_handle)) = context.renderer.copy_bitmap_region(
+            source_handle,
+            source_region,
+            target_handle,
+            dest_region,
+        ) {
+            target.mark_gpu_dirty(context.gc(), sync_handle, dest_region);
+            ruffle_render::profile::bitmap_gpu_copy(true);
+            return;
+        }
+    }
+
+    ruffle_render::profile::bitmap_gpu_copy(false);
+
     copy_on_cpu(
         context.gc(),
         context.renderer,
@@ -1077,6 +1117,19 @@ pub fn copy_pixels<'gc>(
         dest_region,
         (source_transparency && !transparency) || merge_alpha,
     );
+}
+
+fn can_copy_pixels_on_gpu(
+    source_transparency: bool,
+    target_transparency: bool,
+    merge_alpha: bool,
+    has_alpha_source: bool,
+    target_has_pending_gpu_write: bool,
+) -> bool {
+    source_transparency == target_transparency
+        && !merge_alpha
+        && !has_alpha_source
+        && !target_has_pending_gpu_write
 }
 
 #[expect(clippy::too_many_arguments)]

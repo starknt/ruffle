@@ -5,6 +5,7 @@ use crate::display_object::{BoundsMode, DisplayObjectBase};
 use crate::library::MovieLibrarySource;
 use crate::prelude::*;
 use crate::tag_utils::SwfMovie;
+use crate::tessellation_cache::TessellationCache;
 use crate::vminterface::Instantiator;
 use core::fmt;
 use gc_arena::barrier::unlock;
@@ -113,7 +114,11 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
         let ratio = self.ratio();
         let shared = self.0.shared.get();
-        let shape_handle = shared.get_shape(context, ratio);
+        let matrix = &context.transform_stack.transform().matrix;
+        let scale_x = f32::abs(matrix.a + matrix.c);
+        let scale_y = f32::abs(matrix.b + matrix.d);
+        let current_scale = ((scale_x * scale_x + scale_y * scale_y) / 2.0).sqrt();
+        let shape_handle = shared.get_shape(context, ratio, current_scale);
         context
             .commands
             .render_shape(shape_handle, context.transform_stack.transform());
@@ -185,7 +190,7 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
 
 /// A precalculated intermediate frame for a morph shape.
 struct Frame {
-    shape_handle: Option<ShapeHandle>,
+    shape_cache: TessellationCache,
     shape: swf::Shape,
     bounds: Rectangle<Twips>,
 }
@@ -231,16 +236,23 @@ impl<'gc> MorphShapeShared<'gc> {
 
     /// Retrieves the `ShapeHandle` for the given ratio.
     /// Lazily initializes and tessellates the shape if it does not yet exist.
-    fn get_shape(&self, context: &mut RenderContext<'_, 'gc>, ratio: u16) -> ShapeHandle {
+    fn get_shape(
+        &self,
+        context: &mut RenderContext<'_, 'gc>,
+        ratio: u16,
+        scale: f32,
+    ) -> ShapeHandle {
         let mut frame = self.get_frame(ratio);
-        if let Some(handle) = frame.shape_handle.clone() {
+        if let Some(handle) = frame.shape_cache.find_near_and_touch(scale) {
             handle
         } else {
             let library = context.library.library_for_movie(self.movie).unwrap();
-            let handle = context
-                .renderer
-                .register_shape((&frame.shape).into(), &MovieLibrarySource { library });
-            frame.shape_handle = Some(handle.clone());
+            let handle = context.renderer.register_shape_with_scale(
+                (&frame.shape).into(),
+                &MovieLibrarySource { library },
+                scale,
+            );
+            frame.shape_cache.insert(scale, handle.clone());
             handle
         }
     }
@@ -371,7 +383,7 @@ impl<'gc> MorphShapeShared<'gc> {
         };
 
         Frame {
-            shape_handle: None,
+            shape_cache: TessellationCache::new(),
             shape,
             bounds,
         }

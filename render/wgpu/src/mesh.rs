@@ -19,6 +19,7 @@ pub struct Mesh {
     pub draws: Vec<Draw>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
+    pub _allocation: ruffle_render::profile::GpuMesh,
 }
 
 impl ShapeHandleImpl for Mesh {}

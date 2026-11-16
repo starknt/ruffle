@@ -9,6 +9,8 @@ use enumset::EnumSetType;
 use indexmap::IndexMap;
 use std::any::Any;
 use std::borrow::Cow;
+#[cfg(not(target_family = "wasm"))]
+use std::cell::Cell;
 use std::fmt;
 use std::fmt::Display;
 use std::fs::File;
@@ -16,6 +18,8 @@ use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+#[cfg(not(target_family = "wasm"))]
+use std::rc::Rc;
 use std::time::Duration;
 use swf::avm1::types::SendVarsMethod;
 use url::{ParseError, Url};
@@ -361,20 +365,33 @@ pub trait NavigatorBackend: Any {
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub struct NullExecutor(futures::executor::LocalPool);
+pub struct NullExecutor {
+    pool: futures::executor::LocalPool,
+    pending: Rc<Cell<usize>>,
+}
 
 #[cfg(not(target_family = "wasm"))]
 impl NullExecutor {
     pub fn new() -> Self {
-        Self(futures::executor::LocalPool::new())
+        Self {
+            pool: futures::executor::LocalPool::new(),
+            pending: Rc::new(Cell::new(0)),
+        }
     }
 
     pub fn spawner(&self) -> NullSpawner {
-        NullSpawner(self.0.spawner())
+        NullSpawner {
+            spawner: self.pool.spawner(),
+            pending: self.pending.clone(),
+        }
+    }
+
+    pub fn pending_tasks(&self) -> usize {
+        self.pending.get()
     }
 
     pub fn run(&mut self) {
-        self.0.run_until_stalled();
+        self.pool.run_until_stalled();
     }
 }
 
@@ -385,17 +402,34 @@ impl Default for NullExecutor {
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub struct NullSpawner(futures::executor::LocalSpawner);
+pub struct NullSpawner {
+    spawner: futures::executor::LocalSpawner,
+    pending: Rc<Cell<usize>>,
+}
 
 #[cfg(not(target_family = "wasm"))]
 impl NullSpawner {
     pub fn spawn_local(&self, future: OwnedFuture<(), Error>) {
         use futures::task::LocalSpawnExt;
-        let _ = self.0.spawn_local(async move {
+        self.pending.set(self.pending.get().saturating_add(1));
+        let pending = self.pending.clone();
+        let result = self.spawner.spawn_local(async move {
+            struct PendingGuard(Rc<Cell<usize>>);
+
+            impl Drop for PendingGuard {
+                fn drop(&mut self) {
+                    self.0.set(self.0.get().saturating_sub(1));
+                }
+            }
+
+            let _pending = PendingGuard(pending);
             if let Err(e) = future.await {
                 tracing::error!("Asynchronous error occurred: {}", e);
             }
         });
+        if result.is_err() {
+            self.pending.set(self.pending.get().saturating_sub(1));
+        }
     }
 }
 
@@ -413,6 +447,10 @@ impl NullExecutor {
     }
 
     pub fn run(&mut self) {}
+
+    pub fn pending_tasks(&self) -> usize {
+        0
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -739,5 +777,32 @@ pub fn get_encoding(content_type: &str) -> Option<&'static Encoding> {
         Encoding::for_label(encoding_string.as_bytes())
     } else {
         None
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::NullExecutor;
+    use crate::loader::Error;
+    use futures::channel::oneshot;
+
+    #[test]
+    fn null_executor_reports_pending_tasks_until_completion() {
+        let mut executor = NullExecutor::new();
+        let spawner = executor.spawner();
+        let (sender, receiver) = oneshot::channel::<()>();
+
+        spawner.spawn_local(Box::pin(async move {
+            let _ = receiver.await;
+            Ok::<(), Error>(())
+        }));
+
+        assert_eq!(executor.pending_tasks(), 1);
+        executor.run();
+        assert_eq!(executor.pending_tasks(), 1);
+
+        sender.send(()).unwrap();
+        executor.run();
+        assert_eq!(executor.pending_tasks(), 0);
     }
 }

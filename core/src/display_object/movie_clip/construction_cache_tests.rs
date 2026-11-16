@@ -78,6 +78,109 @@ fn settled_construction_subtree_avoids_revisiting_descendants() {
 }
 
 #[test]
+fn settled_stage_avoids_revisiting_root_children() {
+    let mut bytes = Vec::new();
+    swf::write_swf(
+        &swf::Header::default_with_swf_version(10),
+        &[
+            swf::Tag::FileAttributes(swf::FileAttributes::IS_ACTION_SCRIPT_3),
+            swf::Tag::ShowFrame,
+        ],
+        &mut bytes,
+    )
+    .unwrap();
+    let movie = SwfMovieData::from_data(
+        &bytes,
+        "file:///construction-cache-stage-test.swf".into(),
+        None,
+        None,
+    )
+    .unwrap();
+    let player = PlayerBuilder::new().with_movie(movie).build();
+    let _scope = ruffle_render::profile::enter(None, true);
+    player
+        .lock()
+        .unwrap()
+        .mutate_with_update_context(|context| {
+            *context.frame_phase = FramePhase::Construct;
+            context.stage.construct_frame(context);
+            context.stage.construct_frame(context);
+            assert!(
+                context.stage.base().construction_clean(),
+                "stage should settle after its initial constructions"
+            );
+            VISITS.set(0);
+            context.stage.construct_frame(context);
+            assert_eq!(
+                VISITS.get(),
+                0,
+                "a settled stage should not revisit its root MovieClip"
+            );
+            let root = context.stage.root_clip().unwrap();
+            root.invalidate_construction();
+            context.stage.construct_frame(context);
+            assert_eq!(
+                VISITS.get(),
+                1,
+                "stage invalidation should restore the root construction visit"
+            );
+        });
+}
+
+#[test]
+#[cfg(feature = "scripted_construction_cache")]
+fn settled_stage_avoids_revisiting_frame_scripts() {
+    let mut bytes = Vec::new();
+    swf::write_swf(
+        &swf::Header::default_with_swf_version(10),
+        &[
+            swf::Tag::FileAttributes(swf::FileAttributes::IS_ACTION_SCRIPT_3),
+            swf::Tag::ShowFrame,
+        ],
+        &mut bytes,
+    )
+    .unwrap();
+    let movie = SwfMovieData::from_data(
+        &bytes,
+        "file:///construction-cache-stage-script-test.swf".into(),
+        None,
+        None,
+    )
+    .unwrap();
+    let player = PlayerBuilder::new().with_movie(movie).build();
+    let _scope = ruffle_render::profile::enter(None, true);
+    player
+        .lock()
+        .unwrap()
+        .mutate_with_update_context(|context| {
+            *context.frame_phase = FramePhase::Construct;
+            context.stage.construct_frame(context);
+            context.stage.construct_frame(context);
+            *context.frame_phase = FramePhase::FrameScripts;
+            context.stage.run_frame_scripts(context);
+            assert!(
+                context.stage.base().frame_scripts_idle(),
+                "stage should record an idle frame-script proof"
+            );
+            SCRIPT_VISITS.set(0);
+            context.stage.run_frame_scripts(context);
+            assert_eq!(
+                SCRIPT_VISITS.get(),
+                0,
+                "an idle stage should not revisit frame-script children"
+            );
+            let root = context.stage.root_clip().unwrap();
+            root.invalidate_construction();
+            context.stage.run_frame_scripts(context);
+            assert_eq!(
+                SCRIPT_VISITS.get(),
+                1,
+                "stage invalidation should restore frame-script traversal"
+            );
+        });
+}
+
+#[test]
 #[cfg(feature = "orphan_worklist")]
 fn settled_orphan_worklist_avoids_even_root_callbacks() {
     use crate::orphan_manager::OrphanManager;

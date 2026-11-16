@@ -211,17 +211,13 @@ fn finish_shader_job<'gc>(
 ) -> Result<(), Error<'gc>> {
     match output {
         PixelBenderOutput::Bitmap(sync_handle) => {
-            let target_bitmap = target
+            let bitmap = target
                 .as_bitmap_data()
-                .expect("Bitmap ShaderJob target disappeared")
-                .sync(context.renderer);
-            let mut target_bitmap_data = target_bitmap.borrow_mut(context.gc_context);
-            let width = target_bitmap_data.width();
-            let height = target_bitmap_data.height();
-            target_bitmap_data.set_gpu_dirty(
+                .expect("Bitmap ShaderJob target disappeared");
+            bitmap.mark_gpu_dirty(
                 context.gc_context,
                 sync_handle,
-                PixelRegion::for_whole_size(width, height),
+                PixelRegion::for_whole_size(bitmap.width(), bitmap.height()),
             );
         }
         PixelBenderOutput::Bytes(pixels) => {
@@ -529,13 +525,9 @@ pub fn start<'gc>(
     let output_height = this.get_slot(shader_job_slots::_HEIGHT).as_u32();
 
     let pixel_bender_target = if let Some(bitmap) = target.as_bitmap_data() {
-        let target_bitmap = bitmap.sync(activation.context.renderer);
-        // Perform both a GPU->CPU and CPU->GPU sync before writing to it.
-        // FIXME - are both necessary?
-        let mut target_bitmap_data = target_bitmap.borrow_mut(activation.gc());
-        target_bitmap_data.update_dirty_texture(activation.context.renderer);
-
-        PixelBenderTarget::Bitmap(target_bitmap_data.bitmap_handle(activation.context.renderer))
+        PixelBenderTarget::Bitmap(
+            bitmap.bitmap_handle(activation.gc(), activation.context.renderer),
+        )
     } else {
         PixelBenderTarget::Bytes {
             width: output_width,
@@ -589,17 +581,11 @@ pub fn start<'gc>(
 
     match output {
         PixelBenderOutput::Bitmap(sync_handle) => {
-            let target_bitmap = target
-                .as_bitmap_data()
-                .unwrap()
-                .sync(activation.context.renderer);
-            let mut target_bitmap_data = target_bitmap.borrow_mut(activation.gc());
-            let width = target_bitmap_data.width();
-            let height = target_bitmap_data.height();
-            target_bitmap_data.set_gpu_dirty(
+            let bitmap = target.as_bitmap_data().unwrap();
+            bitmap.mark_gpu_dirty(
                 activation.gc(),
                 sync_handle,
-                PixelRegion::for_whole_size(width, height),
+                PixelRegion::for_whole_size(bitmap.width(), bitmap.height()),
             );
         }
         PixelBenderOutput::Bytes(pixels) => {

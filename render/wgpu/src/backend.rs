@@ -391,10 +391,15 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             .map(|d| d.finish(&self.descriptors, &uniform_buffer, &gradients))
             .collect();
 
+        let allocation = ruffle_render::profile::GpuMesh::new(
+            uniform_buffer.size() + vertex_buffer.size() + index_buffer.size(),
+        );
+
         Mesh {
             draws,
             vertex_buffer,
             index_buffer,
+            _allocation: allocation,
         }
     }
 
@@ -890,6 +895,82 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
 
         Ok(())
+    }
+
+    fn copy_bitmap_region(
+        &mut self,
+        source: BitmapHandle,
+        source_region: PixelRegion,
+        destination: BitmapHandle,
+        destination_region: PixelRegion,
+    ) -> Result<Option<Box<dyn SyncHandle>>, BitmapError> {
+        if source == destination
+            || source_region.is_empty()
+            || source_region.width() != destination_region.width()
+            || source_region.height() != destination_region.height()
+        {
+            return Ok(None);
+        }
+
+        let source_texture = as_texture(&source);
+        let destination_texture = as_texture(&destination);
+        if source_region.x_max > source_texture.texture.width()
+            || source_region.y_max > source_texture.texture.height()
+            || destination_region.x_max > destination_texture.texture.width()
+            || destination_region.y_max > destination_texture.texture.height()
+        {
+            return Ok(None);
+        }
+
+        let target = TextureTarget {
+            size: wgpu::Extent3d {
+                width: destination_texture.texture.width(),
+                height: destination_texture.texture.height(),
+                depth_or_array_layers: 1,
+            },
+            texture: destination_texture.texture.clone(),
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            buffer: None,
+        };
+
+        self.active_frame
+            .command_encoder
+            .record()
+            .copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &source_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: source_region.x_min,
+                        y: source_region.y_min,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &destination_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: destination_region.x_min,
+                        y: destination_region.y_min,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: source_region.width(),
+                    height: source_region.height(),
+                    depth_or_array_layers: 1,
+                },
+            );
+
+        self.active_frame.maybe_flush(&self.descriptors);
+        Ok(Some(self.make_queue_sync_handle(
+            target,
+            None,
+            destination,
+            destination_region,
+        )))
     }
 
     #[instrument(level = "debug", skip_all)]

@@ -90,12 +90,18 @@ impl<K: DynamicMapKey, V> DynamicMap<K, V> {
     }
 
     pub fn get(&self, key: &K) -> Option<&DynamicProperty<V>> {
+        if self.table.is_empty() {
+            return None;
+        }
         let hash = self.hash_key(key);
 
         self.table.find(hash, |(k, _)| k == key).map(|(_, v)| v)
     }
 
     pub fn contains_key(&self, key: &K) -> bool {
+        if self.table.is_empty() {
+            return false;
+        }
         let hash = self.hash_key(key);
 
         self.table.find(hash, |(k, _)| k == key).is_some()
@@ -257,7 +263,23 @@ impl<K: DynamicMapKey, V> DynamicMap<K, V> {
 #[cfg(test)]
 mod tests {
 
-    use super::DynamicMap;
+    use super::{DynamicMap, DynamicMapKey};
+    use fnv::FnvBuildHasher;
+
+    #[derive(Eq, PartialEq)]
+    struct PanicKey;
+
+    impl DynamicMapKey for PanicKey {
+        fn hash_with(&self, _hasher: &FnvBuildHasher) -> u64 {
+            panic!("empty dynamic maps should not hash lookup keys");
+        }
+    }
+
+    #[test]
+    fn empty_lookup_skips_key_hashing() {
+        let map: DynamicMap<PanicKey, i32> = DynamicMap::new();
+        assert!(map.get(&PanicKey).is_none());
+    }
 
     #[test]
     fn test_dynamic_map() {

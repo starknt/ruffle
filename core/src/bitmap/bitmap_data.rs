@@ -288,6 +288,15 @@ impl<'gc> BitmapData<'gc> {
         self.0.bitmap_handle(gc_context, renderer)
     }
 
+    pub fn mark_gpu_dirty(
+        &self,
+        gc_context: &Mutation<'gc>,
+        sync_handle: Box<dyn SyncHandle>,
+        region: PixelRegion,
+    ) {
+        self.0.mark_gpu_dirty(gc_context, sync_handle, region);
+    }
+
     pub fn overwrite_cpu_pixels_from_gpu(
         &self,
         mc: &Mutation<'gc>,
@@ -435,9 +444,10 @@ mod wrapper {
     use gc_arena::lock::GcRefLock;
     use gc_arena::{Collect, Gc, Mutation};
     use ruffle_render::backend::RenderBackend;
-    use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
+    use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping, SyncHandle};
     use ruffle_render::commands::CommandHandler;
     use std::cell::Ref;
+    use web_time::Instant;
 
     use super::{BitmapRawData, DirtyState, copy_pixels_to_bitmapdata};
 
@@ -536,6 +546,7 @@ mod wrapper {
                 .borrow_mut();
             match std::mem::replace(&mut write.dirty_state, DirtyState::Clean) {
                 DirtyState::GpuModified(sync_handle, bounds) => {
+                    let readback_started = Instant::now();
                     renderer
                         .resolve_sync_handle(
                             sync_handle,
@@ -544,6 +555,12 @@ mod wrapper {
                             }),
                         )
                         .expect("Failed to sync BitmapData");
+                    ruffle_render::profile::bitmap_readback(
+                        u64::from(bounds.width())
+                            .saturating_mul(u64::from(bounds.height()))
+                            .saturating_mul(4),
+                        readback_started.elapsed().as_nanos() as u64,
+                    );
                     write.dirty_state = DirtyState::Clean;
                     #[cfg(feature = "egui")]
                     write.egui_texture.borrow_mut().take();
@@ -567,6 +584,22 @@ mod wrapper {
             let mut bitmap_data = self.0.borrow_mut(gc_context);
             bitmap_data.update_dirty_texture(renderer);
             bitmap_data.bitmap_handle(renderer)
+        }
+
+        pub fn mark_gpu_dirty(
+            &self,
+            gc_context: &Mutation<'gc>,
+            sync_handle: Box<dyn SyncHandle>,
+            region: PixelRegion,
+        ) {
+            let mut bitmap_data = self.0.borrow_mut(gc_context);
+            let mut readback_region = region;
+            if let DirtyState::GpuModified(_, old_region) =
+                std::mem::replace(&mut bitmap_data.dirty_state, DirtyState::Clean)
+            {
+                readback_region.union(old_region);
+            }
+            bitmap_data.set_gpu_dirty(gc_context, sync_handle, readback_region);
         }
 
         /// Provides access to the underlying `BitmapData`.

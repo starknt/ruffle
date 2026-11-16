@@ -242,6 +242,9 @@ pub fn run_inner_goto_frame<'gc>(
 
 /// Broadcast a `enterFrame` event to all `DisplayObject`s.
 pub fn broadcast_frame_entered<'gc>(context: &mut UpdateContext<'gc>) {
+    if !context.avm2.has_broadcast_listeners(b"enterFrame") {
+        return;
+    }
     let enter_frame_evt = EventObject::bare_default_event(context, "enterFrame");
     let dobject_constr = context.avm2.classes().display_object;
     Avm2::broadcast_event(context, enter_frame_evt, dobject_constr);
@@ -249,6 +252,9 @@ pub fn broadcast_frame_entered<'gc>(context: &mut UpdateContext<'gc>) {
 
 /// Broadcast a `frameConstructed` event to all `DisplayObject`s.
 pub fn broadcast_frame_constructed<'gc>(context: &mut UpdateContext<'gc>) {
+    if !context.avm2.has_broadcast_listeners(b"frameConstructed") {
+        return;
+    }
     let frame_constructed_evt = EventObject::bare_default_event(context, "frameConstructed");
     let dobject_constr = context.avm2.classes().display_object;
     Avm2::broadcast_event(context, frame_constructed_evt, dobject_constr);
@@ -256,10 +262,11 @@ pub fn broadcast_frame_constructed<'gc>(context: &mut UpdateContext<'gc>) {
 
 /// Broadcast a `exitFrame` event to all `DisplayObject`s.
 pub fn broadcast_frame_exited<'gc>(context: &mut UpdateContext<'gc>) {
-    let exit_frame_evt = EventObject::bare_default_event(context, "exitFrame");
-    let dobject_constr = context.avm2.classes().display_object;
-    Avm2::broadcast_event(context, exit_frame_evt, dobject_constr);
-
+    if context.avm2.has_broadcast_listeners(b"exitFrame") {
+        let exit_frame_evt = EventObject::bare_default_event(context, "exitFrame");
+        let dobject_constr = context.avm2.classes().display_object;
+        Avm2::broadcast_event(context, exit_frame_evt, dobject_constr);
+    }
     LoadManager::run_exit_frame(context);
 }
 

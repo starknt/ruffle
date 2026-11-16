@@ -110,3 +110,50 @@ impl TessellationCache {
         entry.1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TessellationCache;
+    use ruffle_render::backend::{ShapeHandle, ShapeHandleImpl};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct TestShape;
+
+    impl ShapeHandleImpl for TestShape {}
+
+    fn shape(id: usize) -> ShapeHandle {
+        let _ = id;
+        ShapeHandle(Arc::new(TestShape))
+    }
+
+    #[test]
+    fn reuses_nearby_scale_and_promotes_entry() {
+        let first = shape(1);
+        let second = shape(2);
+        let mut cache = TessellationCache::new();
+        cache.insert(1.0, first.clone());
+        cache.insert(4.0, second);
+
+        let reused = cache.find_near_and_touch(1.5).unwrap();
+        assert!(Arc::ptr_eq(&reused.0, &first.0));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn evicts_least_recently_used_scale() {
+        let mut cache = TessellationCache::new();
+        let first = shape(0);
+        let second = shape(1);
+        cache.insert(1.0, first);
+        cache.insert(2.0, second.clone());
+        cache.insert(3.0, shape(2));
+        cache.insert(4.0, shape(3));
+        let _ = cache.find_near_and_touch(1.0);
+        cache.insert(8.0, shape(8));
+
+        let nearby = cache.find_near_and_touch(2.0).unwrap();
+        assert!(!Arc::ptr_eq(&nearby.0, &second.0));
+        assert!(cache.find_near_and_touch(8.0).is_some());
+    }
+}

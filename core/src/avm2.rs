@@ -405,6 +405,16 @@ impl<'gc> Avm2<'gc> {
         bucket.push(object.downgrade());
     }
 
+    /// Returns whether a broadcast bucket currently contains any registered object.
+    ///
+    /// The check deliberately keeps dead weak references conservative. The normal
+    /// dispatch path will clean those entries while preserving its existing order.
+    pub fn has_broadcast_listeners(&self, event_name: &[u8]) -> bool {
+        self.broadcast_list
+            .iter()
+            .any(|(name, bucket)| name.as_wstr() == event_name && !bucket.is_empty())
+    }
+
     /// Dispatch an event on all objects in the current execution list.
     ///
     /// `on_type` specifies a class or interface constructor whose instances,
@@ -427,12 +437,10 @@ impl<'gc> Avm2<'gc> {
             return;
         }
 
-        let el_length = context
-            .avm2
-            .broadcast_list
-            .entry(event_name)
-            .or_default()
-            .len();
+        let Some(bucket) = context.avm2.broadcast_list.get(&event_name) else {
+            return;
+        };
+        let el_length = bucket.len();
 
         for i in 0..el_length {
             let object = context
@@ -720,4 +728,28 @@ pub trait Avm2StrRepresentable: Sized {
         &self,
         context: &impl crate::string::HasStringContext<'gc>,
     ) -> AvmString<'gc>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Avm2, EventObject};
+    use crate::PlayerBuilder;
+    use crate::tag_utils::SwfMovieData;
+
+    #[test]
+    fn empty_broadcast_does_not_materialize_a_listener_bucket() {
+        let player = PlayerBuilder::new()
+            .with_movie(SwfMovieData::empty(10, None))
+            .build();
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                assert!(!context.avm2.has_broadcast_listeners(b"frameConstructed"));
+                let event = EventObject::bare_default_event(context, "frameConstructed");
+                let display_object = context.avm2.classes().display_object;
+                Avm2::broadcast_event(context, event, display_object);
+                assert!(context.avm2.broadcast_list.is_empty());
+            });
+    }
 }

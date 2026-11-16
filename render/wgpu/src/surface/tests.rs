@@ -388,3 +388,51 @@ fn immutable_bitmap_cache_is_opt_in_and_stock_stays_unmanaged() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires a real Vulkan adapter"]
+fn bitmap_gpu_copy_preserves_the_requested_region() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
+
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (1, 1)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, true, false).unwrap();
+
+    let source_pixels = vec![
+        0x10, 0x20, 0x30, 0x40, // source (0, 0)
+        0x50, 0x60, 0x70, 0x80, // source (1, 0)
+        0x90, 0xA0, 0xB0, 0xC0, // source (0, 1)
+        0xD0, 0xE0, 0xF0, 0xFF, // source (1, 1)
+    ];
+    let source = renderer
+        .register_bitmap(Bitmap::new(2, 2, BitmapFormat::Rgba, source_pixels.clone()))
+        .unwrap();
+    let destination = renderer
+        .register_bitmap(Bitmap::new(4, 4, BitmapFormat::Rgba, vec![0; 4 * 4 * 4]))
+        .unwrap();
+
+    let sync = renderer
+        .copy_bitmap_region(
+            source,
+            PixelRegion::for_region(0, 0, 2, 2),
+            destination,
+            PixelRegion::for_region(1, 1, 2, 2),
+        )
+        .unwrap()
+        .expect("the wgpu backend should provide a GPU copy sync handle");
+
+    let mut copied = Vec::new();
+    renderer
+        .resolve_sync_handle(
+            sync,
+            Box::new(|bytes, row_pitch| {
+                for row in 0..2 {
+                    let start = row as usize * row_pitch as usize;
+                    copied.extend_from_slice(&bytes[start..start + 2 * 4]);
+                }
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(copied, source_pixels);
+}
