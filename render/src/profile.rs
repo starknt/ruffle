@@ -1,9 +1,6 @@
 //! Per-player instrumentation. A host scopes synchronous AVM/renderer work to its own
 //! session. Allocation guards retain the owning counters across GC and delayed drops.
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-};
+use std::{cell::RefCell, rc::Rc};
 use web_time::Instant;
 
 #[cfg(feature = "lifecycle_counts")]
@@ -140,44 +137,17 @@ pub fn record_bitmap_residency(stats: BitmapResidencyStats) {
 pub struct RenderMetrics(Rc<RefCell<Counters>>);
 thread_local! {
     static CURRENT: RefCell<Option<RenderMetrics>> = const { RefCell::new(None) };
-    static OPTIMIZED: Cell<bool> = const { Cell::new(false) };
-    static ENGINE_OPTIMIZED: Cell<Option<bool>> = const { Cell::new(None) };
-}
-pub fn optimized() -> bool {
-    OPTIMIZED.get()
-}
-pub fn engine_optimized() -> bool {
-    ENGINE_OPTIMIZED.get().unwrap_or_else(optimized)
-}
-
-pub struct EngineScope(Option<bool>, std::marker::PhantomData<Rc<()>>);
-
-pub fn enter_engine(enabled: bool) -> EngineScope {
-    EngineScope(
-        ENGINE_OPTIMIZED.replace(Some(enabled)),
-        std::marker::PhantomData,
-    )
-}
-
-impl Drop for EngineScope {
-    fn drop(&mut self) {
-        ENGINE_OPTIMIZED.set(self.0);
-    }
 }
 pub fn enabled() -> bool {
     CURRENT.with_borrow(Option::is_some)
 }
-pub struct Scope(Option<RenderMetrics>, bool);
-pub fn enter(metrics: Option<&RenderMetrics>, optimized: bool) -> Scope {
-    Scope(
-        CURRENT.replace(metrics.cloned()),
-        OPTIMIZED.replace(optimized),
-    )
+pub struct Scope(Option<RenderMetrics>);
+pub fn enter(metrics: Option<&RenderMetrics>) -> Scope {
+    Scope(CURRENT.replace(metrics.cloned()))
 }
 impl Drop for Scope {
     fn drop(&mut self) {
         CURRENT.set(self.0.take());
-        OPTIMIZED.set(self.1);
     }
 }
 impl RenderMetrics {
@@ -470,7 +440,7 @@ mod tests {
     #[test]
     fn executor_queue_depth_is_recorded_in_the_current_metrics() {
         let metrics = RenderMetrics::default();
-        let _scope = enter(Some(&metrics), true);
+        let _scope = enter(Some(&metrics));
 
         executor_queue_depth(3);
 
@@ -482,7 +452,7 @@ mod tests {
         assert!(!enabled());
         let metrics = RenderMetrics::default();
         {
-            let _scope = enter(Some(&metrics), false);
+            let _scope = enter(Some(&metrics));
             assert!(enabled());
         }
         assert!(!enabled());
@@ -492,7 +462,7 @@ mod tests {
     fn bitmap_readback_records_count_bytes_and_time() {
         let metrics = RenderMetrics::default();
         {
-            let _scope = enter(Some(&metrics), false);
+            let _scope = enter(Some(&metrics));
             bitmap_readback(4096, 12);
             bitmap_readback(1024, 7);
         }
@@ -507,7 +477,7 @@ mod tests {
     fn bitmap_gpu_copy_records_success_and_fallbacks() {
         let metrics = RenderMetrics::default();
         {
-            let _scope = enter(Some(&metrics), false);
+            let _scope = enter(Some(&metrics));
             bitmap_gpu_copy(true);
             bitmap_gpu_copy(false);
             bitmap_gpu_copy(true);
@@ -522,7 +492,7 @@ mod tests {
     fn gpu_mesh_allocation_tracks_live_and_peak_bytes() {
         let metrics = RenderMetrics::default();
         {
-            let _scope = enter(Some(&metrics), false);
+            let _scope = enter(Some(&metrics));
             let first = super::GpuMesh::new(128);
             let second = super::GpuMesh::new(256);
             let snapshot = metrics.snapshot();
@@ -547,7 +517,7 @@ mod tests {
         // No active player means no counter is retained.
         add(Count::ConstructVisit, 100);
         {
-            let _player = enter(Some(&first), true);
+            let _player = enter(Some(&first));
             let _phase = scope(Phase::OrphanConstruct);
             add(Count::ConstructVisit, 1);
             {
@@ -555,7 +525,7 @@ mod tests {
                 add(Count::ScriptsVisit, 2);
             }
             {
-                let _other_player = enter(Some(&second), true);
+                let _other_player = enter(Some(&second));
                 add(Count::ConstructVisit, 4);
             }
             add(Count::ConstructVisit, 8);

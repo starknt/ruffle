@@ -9,16 +9,12 @@ pub struct VerifiedCode<'gc> {
 }
 
 impl<'gc> VerifiedCode<'gc> {
-    pub fn new(mut ops: Vec<Op<'gc>>, optimized: bool) -> Self {
+    pub fn new(mut ops: Vec<Op<'gc>>) -> Self {
         let input_bytes = std::mem::size_of_val(&ops) + ops.capacity() * std::mem::size_of::<Op>();
-        let roots = if optimized {
-            ops.shrink_to_fit();
-            let mut roots = RootIndex::default();
-            ops.trace(&mut roots);
-            roots.finish()
-        } else {
-            None
-        };
+        ops.shrink_to_fit();
+        let mut roots = RootIndex::default();
+        ops.trace(&mut roots);
+        let roots = roots.finish();
         let code = Self { ops, roots };
         ruffle_render::profile::code_published(
             input_bytes,
@@ -125,7 +121,7 @@ mod tests {
             ops.push(Op::PushInt { value: i });
         }
         let baseline_bytes = size_of::<Vec<Op>>() + ops.capacity() * size_of::<Op>();
-        let code = VerifiedCode::new(ops, true);
+        let code = VerifiedCode::new(ops);
         assert_eq!(code.as_slice().len(), 512);
         for (i, op) in code.as_slice().iter().enumerate() {
             assert!(matches!(op, Op::PushInt { value } if *value == i as i32));
@@ -153,17 +149,9 @@ mod tests {
                 },
             );
             let ops = vec![Op::LookupSwitch(switch); 1024];
-            let stock = VerifiedCode::new(ops.clone(), false);
-            let optimized = VerifiedCode::new(ops, true);
-            let mut original = Edges::default();
-            stock.trace(&mut original);
+            let optimized = VerifiedCode::new(ops);
             let mut indexed = Edges::default();
             optimized.trace(&mut indexed);
-            assert_eq!(indexed.ids, original.ids, "GC edge set changed");
-            assert_eq!(
-                original.visits, 1024,
-                "stock must trace instructions directly"
-            );
             assert_eq!(
                 indexed.visits, 1,
                 "repeated opcode GC references must be deduplicated"
@@ -182,7 +170,7 @@ mod tests {
                         case_offsets: vec![Cell::new(7), Cell::new(19)].into_boxed_slice(),
                     },
                 );
-                let code = VerifiedCode::new(vec![Op::LookupSwitch(switch); 32], true);
+                let code = VerifiedCode::new(vec![Op::LookupSwitch(switch); 32]);
                 (Some(code), Gc::downgrade(switch))
             });
         arena.finish_cycle();
@@ -231,10 +219,7 @@ mod tests {
             let mut context = StringContext::from_parts(mc, interner);
             let name = AvmString::new_utf8(mc, String::from("owned-method-namespace"));
             let namespace = Namespace::internal(name, &mut context);
-            *code = Some(VerifiedCode::new(
-                vec![Op::PushNamespace { namespace }; 32],
-                true,
-            ));
+            *code = Some(VerifiedCode::new(vec![Op::PushNamespace { namespace }; 32]));
         });
         arena.finish_cycle();
         arena.mutate(|_, (_, code)| {
@@ -266,61 +251,50 @@ mod tests {
     #[ignore = "optional construction/GC benchmark; emits measurements without timing thresholds"]
     fn benchmark_published_code_construction_and_gc() {
         use std::time::Instant;
-        let mut construction = [Vec::new(), Vec::new()];
-        let mut collection = [Vec::new(), Vec::new()];
-        let mut bytes = [0; 2];
+        let mut construction = Vec::new();
+        let mut collection = Vec::new();
+        let mut bytes = 0;
         for round in 0..34 {
-            // Alternate order to avoid assigning every cold/warm run to one mode.
-            for optimized in [round % 2 == 0, round % 2 != 0] {
-                let mode = usize::from(optimized);
-                let start = Instant::now();
-                let mut arena = Arena::<Rootable![Vec<VerifiedCode<'_>>]>::new(|mc| {
-                    let switch = Gc::new(
-                        mc,
-                        LookupSwitch {
-                            default_offset: Cell::new(7),
-                            case_offsets: vec![Cell::new(3), Cell::new(5)].into_boxed_slice(),
-                        },
-                    );
-                    (0..512)
-                        .map(|_| {
-                            let mut ops = Vec::with_capacity(1024);
-                            for i in 0..512 {
-                                ops.push(if i % 8 == 0 {
-                                    Op::LookupSwitch(switch)
-                                } else {
-                                    Op::PushInt { value: i }
-                                });
-                            }
-                            VerifiedCode::new(ops, optimized)
-                        })
-                        .collect()
-                });
-                let built = start.elapsed().as_secs_f64() * 1000.0;
-                arena.mutate(|_, code| {
-                    bytes[mode] = code.iter().map(VerifiedCode::storage_bytes).sum::<usize>()
-                });
-                let start = Instant::now();
-                arena.finish_cycle();
-                let collected = start.elapsed().as_secs_f64() * 1000.0;
-                if round >= 3 {
-                    construction[mode].push(built);
-                    collection[mode].push(collected);
-                }
+            let start = Instant::now();
+            let mut arena = Arena::<Rootable![Vec<VerifiedCode<'_>>]>::new(|mc| {
+                let switch = Gc::new(
+                    mc,
+                    LookupSwitch {
+                        default_offset: Cell::new(7),
+                        case_offsets: vec![Cell::new(3), Cell::new(5)].into_boxed_slice(),
+                    },
+                );
+                (0..512)
+                    .map(|_| {
+                        let mut ops = Vec::with_capacity(1024);
+                        for i in 0..512 {
+                            ops.push(if i % 8 == 0 {
+                                Op::LookupSwitch(switch)
+                            } else {
+                                Op::PushInt { value: i }
+                            });
+                        }
+                        VerifiedCode::new(ops)
+                    })
+                    .collect()
+            });
+            let built = start.elapsed().as_secs_f64() * 1000.0;
+            arena.mutate(|_, code| {
+                bytes = code.iter().map(VerifiedCode::storage_bytes).sum::<usize>()
+            });
+            let start = Instant::now();
+            arena.finish_cycle();
+            let collected = start.elapsed().as_secs_f64() * 1000.0;
+            if round >= 3 {
+                construction.push(built);
+                collection.push(collected);
             }
         }
-        for mode in 0..2 {
-            construction[mode].sort_by(f64::total_cmp);
-            collection[mode].sort_by(f64::total_cmp);
-            println!(
-                "verifiedCodeBenchmark optimized={} samples=31 storageBytes={} constructP50Ms={:.3} constructP95Ms={:.3} gcP50Ms={:.3} gcP95Ms={:.3}",
-                mode == 1,
-                bytes[mode],
-                construction[mode][15],
-                construction[mode][29],
-                collection[mode][15],
-                collection[mode][29]
-            );
-        }
+        construction.sort_by(f64::total_cmp);
+        collection.sort_by(f64::total_cmp);
+        println!(
+            "verifiedCodeBenchmark optimized=true samples=31 storageBytes={} constructP50Ms={:.3} constructP95Ms={:.3} gcP50Ms={:.3} gcP95Ms={:.3}",
+            bytes, construction[15], construction[29], collection[15], collection[29]
+        );
     }
 }

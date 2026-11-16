@@ -48,10 +48,7 @@ pub(super) fn try_exec<'gc>(
     arguments: FunctionArgs<'_, 'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Option<Result<Value<'gc>, Error<'gc>>> {
-    if cfg!(feature = "avm_debug")
-        || !ruffle_render::profile::engine_optimized()
-        || !arguments.is_empty()
-    {
+    if cfg!(feature = "avm_debug") || !arguments.is_empty() {
         return None;
     }
     let MethodKind::Bytecode { verified_info } = method.method_kind() else {

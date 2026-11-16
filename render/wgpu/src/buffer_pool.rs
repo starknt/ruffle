@@ -13,28 +13,18 @@ type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> 
 pub struct TexturePool {
     clock: u64,
     budget: Budget,
-    blend_batching: bool,
     pools: FnvHashMap<TextureKey, BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>>,
     globals_cache: FnvHashMap<GlobalsKey, (u64, Arc<Globals>)>,
 }
 
 impl TexturePool {
-    pub fn new(budget: Budget, blend_batching: bool) -> Self {
+    pub fn new(budget: Budget) -> Self {
         Self {
             clock: 0,
-            blend_batching: blend_batching && budget.limited(),
             budget,
             pools: Default::default(),
             globals_cache: Default::default(),
         }
-    }
-
-    pub fn blend_batching(&self) -> bool {
-        self.blend_batching
-    }
-
-    pub fn set_blend_batching(&mut self, enabled: bool) {
-        self.blend_batching = enabled && self.budget.limited();
     }
 
     pub fn end_frame(&mut self) {

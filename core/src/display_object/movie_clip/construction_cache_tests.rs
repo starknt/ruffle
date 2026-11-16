@@ -41,7 +41,7 @@ fn with_tree(test: impl for<'gc> FnOnce(MovieClip<'gc>, MovieClip<'gc>, &mut Upd
     )
     .unwrap();
     let player = PlayerBuilder::new().with_movie(movie).build();
-    let _scope = ruffle_render::profile::enter(None, true);
+    let _scope = ruffle_render::profile::enter(None);
     player
         .lock()
         .unwrap()
@@ -97,7 +97,7 @@ fn settled_stage_avoids_revisiting_root_children() {
     )
     .unwrap();
     let player = PlayerBuilder::new().with_movie(movie).build();
-    let _scope = ruffle_render::profile::enter(None, true);
+    let _scope = ruffle_render::profile::enter(None);
     player
         .lock()
         .unwrap()
@@ -128,7 +128,6 @@ fn settled_stage_avoids_revisiting_root_children() {
 }
 
 #[test]
-#[cfg(feature = "scripted_construction_cache")]
 fn settled_stage_avoids_revisiting_frame_scripts() {
     let mut bytes = Vec::new();
     swf::write_swf(
@@ -148,7 +147,7 @@ fn settled_stage_avoids_revisiting_frame_scripts() {
     )
     .unwrap();
     let player = PlayerBuilder::new().with_movie(movie).build();
-    let _scope = ruffle_render::profile::enter(None, true);
+    let _scope = ruffle_render::profile::enter(None);
     player
         .lock()
         .unwrap()
@@ -181,7 +180,6 @@ fn settled_stage_avoids_revisiting_frame_scripts() {
 }
 
 #[test]
-#[cfg(feature = "orphan_worklist")]
 fn settled_orphan_worklist_avoids_even_root_callbacks() {
     use crate::orphan_manager::OrphanManager;
     with_tree(|root, _, context| {
@@ -196,17 +194,10 @@ fn settled_orphan_worklist_avoids_even_root_callbacks() {
             calls, 0,
             "settled roots must not reach the lifecycle callback"
         );
-        let _stock = ruffle_render::profile::enter_engine(false);
-        OrphanManager::each_orphan_obj(context, |_, _| calls += 1);
-        assert_eq!(
-            calls, 1,
-            "stock must still visit the original orphan snapshot"
-        );
     });
 }
 
 #[test]
-#[cfg(feature = "orphan_worklist")]
 fn observing_an_orphan_does_not_make_it_a_hidden_button_state() {
     with_tree(|root, _, _| {
         root.base().observe_orphan_worklist();
@@ -217,7 +208,6 @@ fn observing_an_orphan_does_not_make_it_a_hidden_button_state() {
 }
 
 #[test]
-#[cfg(feature = "orphan_worklist")]
 fn orphan_worklist_wakes_later_members_without_repeating_earlier_members() {
     use crate::orphan_manager::OrphanManager;
     with_tree(|root, _, context| {
@@ -250,7 +240,6 @@ fn orphan_worklist_wakes_later_members_without_repeating_earlier_members() {
 }
 
 #[test]
-#[cfg(feature = "orphan_worklist")]
 fn orphan_worklist_additions_wait_for_the_next_snapshot() {
     use crate::orphan_manager::OrphanManager;
     with_tree(|root, _, context| {
@@ -275,7 +264,6 @@ fn orphan_worklist_additions_wait_for_the_next_snapshot() {
 }
 
 #[test]
-#[cfg(feature = "orphan_worklist")]
 fn nested_orphan_cleanup_does_not_remove_members_from_an_outer_snapshot() {
     use crate::orphan_manager::OrphanManager;
     with_tree(|root, _, context| {
@@ -308,7 +296,6 @@ fn nested_orphan_cleanup_does_not_remove_members_from_an_outer_snapshot() {
 }
 
 #[test]
-#[cfg(feature = "orphan_worklist")]
 fn orphan_worklist_hidden_state_and_reload_wake_parked_roots() {
     use crate::orphan_manager::OrphanManager;
     with_button_tree(|root, hidden, _, context| {
@@ -345,10 +332,6 @@ fn settled_scriptless_subtree_avoids_frame_script_walks() {
             root.run_frame_scripts(context);
         }
         assert_eq!(SCRIPT_VISITS.get(), 0);
-
-        let _scope = ruffle_render::profile::enter_engine(false);
-        root.run_frame_scripts(context);
-        assert_eq!(SCRIPT_VISITS.get(), 2, "stock must retain the full walk");
     });
 }
 
@@ -366,10 +349,6 @@ fn stopped_subtree_avoids_enter_frame_walks() {
             0,
             "stopped settled subtrees have no tick work"
         );
-
-        let _scope = ruffle_render::profile::enter_engine(false);
-        root.enter_frame(context);
-        assert_eq!(ENTER_VISITS.get(), 2, "stock must retain the full walk");
     });
 }
 
@@ -421,10 +400,7 @@ fn playing_descendant_wakes_stopped_ancestors() {
         root.construct_frame(context);
         root.construct_frame(context);
         assert_eq!(child.current_frame(), 0);
-        {
-            let _scope = ruffle_render::profile::enter_engine(false);
-            child.play();
-        }
+        child.play();
         root.construct_frame(context);
         *context.frame_phase = FramePhase::Enter;
         ENTER_VISITS.set(0);
@@ -542,26 +518,20 @@ fn stopped_enter_frame_benchmark() {
         root.construct_frame(context);
         root.construct_frame(context);
         *context.frame_phase = FramePhase::Enter;
-        let mut samples = [Vec::new(), Vec::new()];
-        for sample in 0..31 {
-            for offset in 0..2 {
-                let mode = (sample + offset) % 2;
-                let _scope = ruffle_render::profile::enter_engine(mode == 1);
-                ENTER_VISITS.set(0);
-                let start = Instant::now();
-                for _ in 0..100 {
-                    black_box(root).enter_frame(context);
-                }
-                samples[mode].push(start.elapsed().as_nanos() / 100);
-                assert_eq!(ENTER_VISITS.get(), if mode == 1 { 0 } else { 110_200 });
+        let mut samples = Vec::new();
+        for _ in 0..62 {
+            ENTER_VISITS.set(0);
+            let start = Instant::now();
+            for _ in 0..100 {
+                black_box(root).enter_frame(context);
             }
+            samples.push(start.elapsed().as_nanos() / 100);
+            assert_eq!(ENTER_VISITS.get(), 0);
         }
-        for sample in &mut samples {
-            sample.sort_unstable();
-        }
+        samples.sort_unstable();
         println!(
-            "stock_ns_p50={} stock_ns_p95={} optimized_ns_p50={} optimized_ns_p95={}",
-            samples[0][15], samples[0][29], samples[1][15], samples[1][29]
+            "optimized_ns_p50={} optimized_ns_p95={}",
+            samples[31], samples[58]
         );
     });
 }
@@ -611,23 +581,19 @@ fn nested_insertion_constructs_new_child_after_tree_settles() {
 fn loader_style_mutation_outside_optimized_scope_invalidates_cached_tree() {
     with_tree(|root, child, context| {
         let leaf = Graphic::empty(context);
-        {
-            let _scope = ruffle_render::profile::enter_engine(false);
-            child.replace_at_depth(context, leaf.into(), 2);
-        }
+        child.replace_at_depth(context, leaf.into(), 2);
         root.construct_frame(context);
         assert!(leaf.object2().is_some());
     });
 }
 
 #[test]
-fn stock_traversal_does_not_use_an_existing_clean_cache() {
+fn clean_cache_is_reused_by_the_default_traversal() {
     with_tree(|root, _, context| {
-        let _scope = ruffle_render::profile::enter_engine(false);
         VISITS.set(0);
         root.construct_frame(context);
         root.construct_frame(context);
-        assert_eq!(VISITS.get(), 4);
+        assert_eq!(VISITS.get(), 0);
     });
 }
 
@@ -706,26 +672,20 @@ fn settled_frame_scripts_benchmark() {
         root.construct_frame(context);
         root.construct_frame(context);
         *context.frame_phase = FramePhase::FrameScripts;
-        let mut samples = [Vec::new(), Vec::new()];
-        for sample in 0..31 {
-            for offset in 0..2 {
-                let mode = (sample + offset) % 2;
-                let _scope = ruffle_render::profile::enter_engine(mode == 1);
-                SCRIPT_VISITS.set(0);
-                let start = Instant::now();
-                for _ in 0..100 {
-                    black_box(root).run_frame_scripts(context);
-                }
-                samples[mode].push(start.elapsed().as_nanos() / 100);
-                assert_eq!(SCRIPT_VISITS.get(), if mode == 1 { 0 } else { 110_200 });
+        let mut samples = Vec::new();
+        for _ in 0..62 {
+            SCRIPT_VISITS.set(0);
+            let start = Instant::now();
+            for _ in 0..100 {
+                black_box(root).run_frame_scripts(context);
             }
+            samples.push(start.elapsed().as_nanos() / 100);
+            assert_eq!(SCRIPT_VISITS.get(), 0);
         }
-        for sample in &mut samples {
-            sample.sort_unstable();
-        }
+        samples.sort_unstable();
         println!(
-            "stock_ns_p50={} stock_ns_p95={} optimized_ns_p50={} optimized_ns_p95={}",
-            samples[0][15], samples[0][29], samples[1][15], samples[1][29]
+            "optimized_ns_p50={} optimized_ns_p95={}",
+            samples[31], samples[58]
         );
     });
 }
@@ -746,37 +706,25 @@ fn settled_construction_benchmark() {
         }
         root.construct_frame(context);
         root.construct_frame(context);
-        let mut stock = Vec::new();
         let mut optimized = Vec::new();
-        for sample in 0..31 {
-            for offset in 0..2 {
-                let enabled = (sample + offset) % 2 == 0;
-                let _scope = ruffle_render::profile::enter_engine(enabled);
-                VISITS.set(0);
-                let start = Instant::now();
-                for _ in 0..100 {
-                    black_box(root).construct_frame(context);
-                }
-                let nanos = start.elapsed().as_nanos() / 100;
-                if enabled {
-                    assert_eq!(VISITS.get(), 0);
-                    optimized.push(nanos);
-                } else {
-                    assert_eq!(VISITS.get(), 10200);
-                    stock.push(nanos);
-                }
+        for _ in 0..62 {
+            VISITS.set(0);
+            let start = Instant::now();
+            for _ in 0..100 {
+                black_box(root).construct_frame(context);
             }
+            let nanos = start.elapsed().as_nanos() / 100;
+            assert_eq!(VISITS.get(), 0);
+            optimized.push(nanos);
         }
-        stock.sort_unstable();
         optimized.sort_unstable();
         println!(
-            "stock_ns_p50={} stock_ns_p95={} optimized_ns_p50={} optimized_ns_p95={}",
-            stock[15], stock[29], optimized[15], optimized[29]
+            "optimized_ns_p50={} optimized_ns_p95={}",
+            optimized[31], optimized[58]
         );
     });
 }
 
-#[cfg(feature = "scripted_construction_cache")]
 fn settle_scripted_tree<'gc>(
     root: MovieClip<'gc>,
     child: MovieClip<'gc>,
@@ -800,7 +748,6 @@ fn settle_scripted_tree<'gc>(
 }
 
 #[test]
-#[cfg(feature = "scripted_construction_cache")]
 fn consumed_scripted_subtree_avoids_repeated_nested_frame_walks() {
     with_tree(|root, child, context| {
         settle_scripted_tree(root, child, context);
@@ -822,22 +769,10 @@ fn consumed_scripted_subtree_avoids_repeated_nested_frame_walks() {
             0,
             "already consumed scripts have no remaining work"
         );
-        let _scope = ruffle_render::profile::enter_engine(false);
-        *context.frame_phase = FramePhase::Construct;
-        root.construct_frame(context);
-        *context.frame_phase = FramePhase::FrameScripts;
-        root.run_frame_scripts(context);
-        assert_eq!(VISITS.get(), 2, "stock still constructs both clips");
-        assert_eq!(
-            SCRIPT_VISITS.get(),
-            2,
-            "stock still visits both script nodes"
-        );
     });
 }
 
 #[test]
-#[cfg(feature = "scripted_construction_cache")]
 fn rearming_consumed_script_invalidates_ancestors_without_a_new_registration() {
     with_tree(|root, child, context| {
         settle_scripted_tree(root, child, context);
@@ -856,7 +791,6 @@ fn rearming_consumed_script_invalidates_ancestors_without_a_new_registration() {
 }
 
 #[test]
-#[cfg(feature = "scripted_construction_cache")]
 fn scripted_tree_constructed_outside_construct_still_checks_pending_scripts() {
     with_tree(|root, child, context| {
         child.register_frame_script(
@@ -886,7 +820,6 @@ fn scripted_tree_constructed_outside_construct_still_checks_pending_scripts() {
 
 #[test]
 #[ignore = "diagnostic settled scripted-subtree benchmark; no FPS assertion"]
-#[cfg(feature = "scripted_construction_cache")]
 fn settled_scripted_subtree_benchmark() {
     use std::hint::black_box;
     use std::time::Instant;
@@ -903,50 +836,38 @@ fn settled_scripted_subtree_benchmark() {
             );
         }
         settle_scripted_tree(root, child, context);
-        let mut stock = Vec::new();
         let mut optimized = Vec::new();
-        for sample in 0..31 {
-            for offset in 0..2 {
-                let enabled = (sample + offset) % 2 == 0;
-                let _scope = ruffle_render::profile::enter_engine(enabled);
-                VISITS.set(0);
-                SCRIPT_VISITS.set(0);
-                let start = Instant::now();
-                for _ in 0..100 {
-                    *context.frame_phase = FramePhase::Construct;
-                    black_box(root).construct_frame(context);
-                    *context.frame_phase = FramePhase::FrameScripts;
-                    black_box(root).run_frame_scripts(context);
-                }
-                let nanos = start.elapsed().as_nanos() / 100;
-                if enabled {
-                    assert_eq!(VISITS.get(), 0);
-                    assert_eq!(SCRIPT_VISITS.get(), 0);
-                    optimized.push(nanos);
-                } else {
-                    assert_eq!(VISITS.get(), 10200);
-                    assert_eq!(SCRIPT_VISITS.get(), 10200);
-                    stock.push(nanos);
-                }
+        for _ in 0..62 {
+            VISITS.set(0);
+            SCRIPT_VISITS.set(0);
+            let start = Instant::now();
+            for _ in 0..100 {
+                *context.frame_phase = FramePhase::Construct;
+                black_box(root).construct_frame(context);
+                *context.frame_phase = FramePhase::FrameScripts;
+                black_box(root).run_frame_scripts(context);
             }
+            let nanos = start.elapsed().as_nanos() / 100;
+            assert_eq!(VISITS.get(), 0);
+            assert_eq!(SCRIPT_VISITS.get(), 0);
+            optimized.push(nanos);
         }
-        stock.sort_unstable();
         optimized.sort_unstable();
         println!(
-            "stock_ns_p50={} stock_ns_p95={} optimized_ns_p50={} optimized_ns_p95={}",
-            stock[15], stock[29], optimized[15], optimized[29]
+            "optimized_ns_p50={} optimized_ns_p95={}",
+            optimized[31], optimized[58]
         );
     });
 }
 
 #[test]
-#[cfg(all(feature = "lifecycle_counts", feature = "scripted_construction_cache"))]
+#[cfg(feature = "lifecycle_counts")]
 fn lifecycle_counts_distinguish_cache_hits_from_pending_script_work() {
     use ruffle_render::profile::lifecycle::{Count, Phase, scope};
     use ruffle_render::profile::{RenderMetrics, enter};
     with_tree(|root, child, context| {
         let metrics = RenderMetrics::default();
-        let _player = enter(Some(&metrics), true);
+        let _player = enter(Some(&metrics));
         {
             let _phase = scope(Phase::OrphanConstruct);
             root.construct_frame(context);
@@ -979,7 +900,6 @@ fn lifecycle_counts_distinguish_cache_hits_from_pending_script_work() {
     });
 }
 
-#[cfg(feature = "button_lifecycle_cache")]
 fn with_button_tree(
     test: impl for<'gc> FnOnce(
         MovieClip<'gc>,
@@ -1017,7 +937,6 @@ fn with_button_tree(
 }
 
 #[test]
-#[cfg(feature = "button_lifecycle_cache")]
 fn settled_button_states_allow_ancestor_walks_to_stop() {
     with_button_tree(|root, _, _, context| {
         VISITS.set(0);
@@ -1034,16 +953,10 @@ fn settled_button_states_allow_ancestor_walks_to_stop() {
             "buttons must not permanently block settled ancestors"
         );
         assert_eq!(SCRIPT_VISITS.get(), 0);
-        let _stock = ruffle_render::profile::enter_engine(false);
-        root.construct_frame(context);
-        root.run_frame_scripts(context);
-        assert_eq!(VISITS.get(), 3);
-        assert_eq!(SCRIPT_VISITS.get(), 3);
     });
 }
 
 #[test]
-#[cfg(feature = "button_lifecycle_cache")]
 fn hidden_button_state_script_wakes_a_cached_ancestor() {
     with_button_tree(|root, hidden, _, context| {
         hidden.register_frame_script(
@@ -1064,7 +977,6 @@ fn hidden_button_state_script_wakes_a_cached_ancestor() {
 }
 
 #[test]
-#[cfg(feature = "button_lifecycle_cache")]
 fn hidden_button_state_play_wakes_cached_enter_frame() {
     with_button_tree(|root, hidden, _, context| {
         hidden.play();
@@ -1081,7 +993,6 @@ fn hidden_button_state_play_wakes_cached_enter_frame() {
 }
 
 #[test]
-#[cfg(feature = "button_lifecycle_cache")]
 fn replacing_an_inactive_button_state_keeps_its_pending_script() {
     with_button_tree(|root, _, button, context| {
         let replacement = MovieClip::new(root.movie(), context.gc());
@@ -1104,7 +1015,6 @@ fn replacing_an_inactive_button_state_keeps_its_pending_script() {
 }
 
 #[test]
-#[cfg(feature = "button_lifecycle_cache")]
 fn reloaded_hidden_button_state_still_invalidates_its_observers() {
     with_button_tree(|root, hidden, _, context| {
         hidden.replace_with_movie(context, Some(root.movie()), false, None);
@@ -1132,7 +1042,6 @@ fn reloaded_hidden_button_state_still_invalidates_its_observers() {
 }
 
 #[test]
-#[cfg(feature = "button_lifecycle_cache")]
 fn nested_shared_button_states_settle_and_wake_after_descendant_mutation() {
     with_button_tree(|root, hidden, button, context| {
         let nested = crate::display_object::Avm2Button::empty_button(context);

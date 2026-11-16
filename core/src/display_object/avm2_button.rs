@@ -87,7 +87,6 @@ pub struct Avm2ButtonData<'gc> {
 
     /// Unlike needs_frame_construction, this stays false during reentrant
     /// initial construction and its callbacks.
-    #[cfg(feature = "button_lifecycle_cache")]
     states_ready: Cell<bool>,
 
     /// Skip the next `run_frame` call.
@@ -136,7 +135,6 @@ impl<'gc> Avm2Button<'gc> {
                 class: Lock::new(context.avm2.classes().simplebutton),
                 object: Lock::new(None),
                 needs_frame_construction: Cell::new(construct_blank_states),
-                #[cfg(feature = "button_lifecycle_cache")]
                 states_ready: Cell::new(!construct_blank_states),
                 tracking: Cell::new(if button.is_track_as_menu {
                     ButtonTracking::Menu
@@ -250,7 +248,6 @@ impl<'gc> Avm2Button<'gc> {
         if children.len() == 1 {
             let child = children.first().cloned().unwrap().0;
 
-            #[cfg(feature = "button_lifecycle_cache")]
             child.base().mark_button_state_root();
 
             child.set_parent(context, Some(self.into()));
@@ -261,7 +258,6 @@ impl<'gc> Avm2Button<'gc> {
             (child, false)
         } else {
             let state_sprite = MovieClip::new(movie, context.gc());
-            #[cfg(feature = "button_lifecycle_cache")]
             state_sprite.base().mark_button_state_root();
             state_sprite.set_avm2_class(context.gc(), Some(sprite_class));
             state_sprite.set_parent(context, Some(self.into()));
@@ -293,7 +289,6 @@ impl<'gc> Avm2Button<'gc> {
 
     /// Change the rendered state of the button.
     pub fn set_state(self, context: &mut UpdateContext<'gc>, state: ButtonState) {
-        #[cfg(feature = "button_lifecycle_cache")]
         self.invalidate_construction();
         self.invalidate_cached_bitmap();
         self.0.state.set(state);
@@ -347,7 +342,6 @@ impl<'gc> Avm2Button<'gc> {
         state: swf::ButtonState,
         child: Option<DisplayObject<'gc>>,
     ) {
-        #[cfg(feature = "button_lifecycle_cache")]
         {
             self.invalidate_construction();
             if let Some(child) = child {
@@ -431,54 +425,32 @@ impl<'gc> Avm2Button<'gc> {
     }
 
     pub fn set_avm2_class(self, mc: &Mutation<'gc>, class: Avm2ClassObject<'gc>) {
-        #[cfg(feature = "button_lifecycle_cache")]
         self.invalidate_construction();
         unlock!(Gc::write(mc, self.0), Avm2ButtonData, class).set(class);
     }
 
     pub(super) fn construction_is_idle(self) -> bool {
-        #[cfg(feature = "button_lifecycle_cache")]
-        {
-            self.0.states_ready.get()
-                && !self.0.needs_frame_construction.get()
-                && !self.0.weird_framescript_order.get()
-                && self.0.object.get().is_some()
-                && self
-                    .all_state_children(false)
-                    .all(|state| state.construction_is_settled())
-        }
-        #[cfg(not(feature = "button_lifecycle_cache"))]
-        {
-            false
-        }
+        self.0.states_ready.get()
+            && !self.0.needs_frame_construction.get()
+            && !self.0.weird_framescript_order.get()
+            && self.0.object.get().is_some()
+            && self
+                .all_state_children(false)
+                .all(|state| state.construction_is_settled())
     }
 
     pub(super) fn enter_frame_is_idle(self) -> bool {
-        #[cfg(feature = "button_lifecycle_cache")]
-        {
-            self.construction_is_idle()
-                && self
-                    .all_state_children(false)
-                    .all(|state| state.enter_frame_is_idle())
-        }
-        #[cfg(not(feature = "button_lifecycle_cache"))]
-        {
-            false
-        }
+        self.construction_is_idle()
+            && self
+                .all_state_children(false)
+                .all(|state| state.enter_frame_is_idle())
     }
 
     pub(super) fn scripts_are_idle(self) -> bool {
-        #[cfg(feature = "button_lifecycle_cache")]
-        {
-            self.construction_is_idle()
-                && self
-                    .all_state_children(false)
-                    .all(|state| state.frame_scripts_are_idle())
-        }
-        #[cfg(not(feature = "button_lifecycle_cache"))]
-        {
-            false
-        }
+        self.construction_is_idle()
+            && self
+                .all_state_children(false)
+                .all(|state| state.frame_scripts_are_idle())
     }
 }
 
@@ -520,7 +492,6 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
         let class = self.0.class.get();
 
         if self.0.needs_frame_construction.get() {
-            #[cfg(feature = "button_lifecycle_cache")]
             {
                 self.0.states_ready.set(false);
                 self.invalidate_construction();
@@ -630,7 +601,6 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
                 // set the button object on a parent field (and we don't want to re-run a setter)
                 self.fire_added_events(context);
             }
-            #[cfg(feature = "button_lifecycle_cache")]
             {
                 self.0.states_ready.set(true);
                 self.invalidate_construction();
@@ -745,7 +715,6 @@ impl<'gc> TDisplayObject<'gc> for Avm2Button<'gc> {
     }
 
     fn set_object2(self, context: &mut UpdateContext<'gc>, to: Avm2StageObject<'gc>) {
-        #[cfg(feature = "button_lifecycle_cache")]
         self.invalidate_construction();
         let write = Gc::write(context.gc(), self.0);
         unlock!(write, Avm2ButtonData, object).set(Some(to));

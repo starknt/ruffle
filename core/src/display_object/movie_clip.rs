@@ -1,6 +1,5 @@
 //! `MovieClip` display object and support code.
 
-#[cfg(all(test, feature = "construction_cache"))]
 mod construction_cache_tests;
 #[cfg(test)]
 mod mouse_pick_tests;
@@ -220,7 +219,6 @@ pub struct MovieClipData<'gc> {
 
     has_pending_script: Cell<bool>,
 
-    #[cfg(feature = "button_lifecycle_cache")]
     button_state_revision: Cell<u64>,
 
     /// Force enable button mode, which causes all mouse-related events to
@@ -267,7 +265,6 @@ impl<'gc> MovieClipData<'gc> {
             last_queued_script_frame: Cell::new(None),
             queued_script_frame: Cell::new(0),
             has_pending_script: Cell::new(false),
-            #[cfg(feature = "button_lifecycle_cache")]
             button_state_revision: Cell::new(0),
             queued_goto: Cell::new(None),
             drop_target: Lock::new(None),
@@ -368,9 +365,7 @@ impl<'gc> MovieClip<'gc> {
 
     pub fn instantiate(self, mc: &Mutation<'gc>) -> Self {
         let instance = Self(Gc::new(mc, (*self.0).clone()));
-        if cfg!(feature = "construction_cache") {
-            instance.base().set_construction_clean(false);
-        }
+        instance.base().set_construction_clean(false);
         instance
     }
 
@@ -852,9 +847,7 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn set_last_queued_script_frame(self, frame: Option<FrameNumber>) {
-        if cfg!(feature = "scripted_construction_cache")
-            && frame != self.0.last_queued_script_frame.get()
-        {
+        if frame != self.0.last_queued_script_frame.get() {
             #[cfg(feature = "lifecycle_counts")]
             lifecycle::add(Count::LastQueuedChanged, 1);
             self.invalidate_construction();
@@ -2571,15 +2564,8 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub(super) fn button_cache_valid(self) -> bool {
-        #[cfg(feature = "button_lifecycle_cache")]
-        {
-            !self.base().subtree_has_button()
-                || self.0.button_state_revision.get() == super::button_state_revision()
-        }
-        #[cfg(not(feature = "button_lifecycle_cache"))]
-        {
-            true
-        }
+        !self.base().subtree_has_button()
+            || self.0.button_state_revision.get() == super::button_state_revision()
     }
 }
 
@@ -2600,21 +2586,13 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         // This proof includes every descendant, and is invalidated by play,
         // goto, queued tags, child changes and skip-frame propagation. Global
         // enterFrame broadcasts are still performed by the stage as usual.
-        if cfg!(feature = "construction_cache")
-            && ruffle_render::profile::engine_optimized()
-            && self.base().enter_frame_idle()
-            && self.button_cache_valid()
-        {
+        if self.base().enter_frame_idle() && self.button_cache_valid() {
             return;
         }
-        #[cfg(all(test, feature = "construction_cache"))]
         construction_cache_tests::record_enter_visit();
         let skip_frame = self.base().should_skip_next_enter_frame();
-        #[cfg(not(feature = "lifecycle_projection"))]
-        let children = self.iter_render_list();
         // Preserve propagation of the skip flag even to otherwise inert leaves.
-        #[cfg(feature = "lifecycle_projection")]
-        let children = if !skip_frame && ruffle_render::profile::engine_optimized() {
+        let children = if !skip_frame {
             self.iter_lifecycle_list()
         } else {
             self.iter_render_list().into()
@@ -2673,27 +2651,19 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
         #[cfg(feature = "lifecycle_counts")]
         lifecycle::add(Count::ConstructVisit, 1);
-        let optimized =
-            cfg!(feature = "construction_cache") && ruffle_render::profile::engine_optimized();
-        if optimized && !self.button_cache_valid() {
+        if !self.button_cache_valid() {
             self.base().clear_lifecycle_cache();
         }
-        if optimized && self.base().construction_clean() {
+        if self.base().construction_clean() {
             #[cfg(feature = "lifecycle_counts")]
             lifecycle::add(Count::ConstructHit, 1);
             return;
         }
-        #[cfg(all(test, feature = "construction_cache"))]
         construction_cache_tests::record_visit();
-        let revision = if optimized {
-            super::construction_revision()
-        } else {
-            0
-        };
+        let revision = super::construction_revision();
         let mut children_settled = false;
         let mut children_idle = false;
         let mut child_scripts_idle = false;
-        #[cfg(feature = "button_lifecycle_cache")]
         let button_revision = super::button_state_revision();
         // AVM1 code expects to execute in line with timeline instructions, so
         // it's exempted from frame construction.
@@ -2762,7 +2732,6 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                     }
 
                     child.construct_frame(context);
-                    #[cfg(feature = "button_lifecycle_cache")]
                     if matches!(child, DisplayObject::Avm2Button(_))
                         || child.base().subtree_has_button()
                     {
@@ -2781,13 +2750,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                             1,
                         );
                     }
-                    if optimized {
-                        children_settled &= child.construction_is_settled();
-                        children_idle &= child.enter_frame_is_idle();
-                        if cfg!(feature = "scripted_construction_cache") {
-                            child_scripts_idle &= child.frame_scripts_are_idle();
-                        }
-                    }
+                    children_settled &= child.construction_is_settled();
+                    children_idle &= child.enter_frame_is_idle();
+                    child_scripts_idle &= child.frame_scripts_are_idle();
                 }
             }
         }
@@ -2827,7 +2792,6 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
                     && self.header_frames() != 0,
             ),
             (Count::NotAvm2, !self.movie().is_action_script_3()),
-            (Count::NotOptimized, !optimized),
         ] {
             if applies {
                 lifecycle::add(count, 1);
@@ -2839,42 +2803,28 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         // Scripted subtrees may settle only after checking pending scripts in
         // Construct. Script execution has a separate proof, so construction
         // cannot hide a pending script or a reentrant queued goto.
-        let button_proof_fresh = {
-            #[cfg(feature = "button_lifecycle_cache")]
-            {
-                !self.base().subtree_has_button()
-                    || button_revision == super::button_state_revision()
-            }
-            #[cfg(not(feature = "button_lifecycle_cache"))]
-            {
-                true
-            }
-        };
-        if optimized
-            && button_proof_fresh
+        let button_proof_fresh =
+            !self.base().subtree_has_button() || button_revision == super::button_state_revision();
+        if button_proof_fresh
             && revision == super::construction_revision()
             && self.0.initialized()
             && self.0.object2.get().is_some()
             && self.0.queued_goto.get().is_none()
         {
-            #[cfg(feature = "button_lifecycle_cache")]
             self.0.button_state_revision.set(button_revision);
             if children_settled
                 && (self.0.cell.borrow().frame_scripts.is_empty()
-                    || (cfg!(feature = "scripted_construction_cache")
-                        && *context.frame_phase == FramePhase::Construct))
+                    || *context.frame_phase == FramePhase::Construct)
             {
                 self.base().set_construction_clean(true);
                 #[cfg(feature = "lifecycle_counts")]
                 lifecycle::add(Count::ConstructSettled, 1);
             }
-            if cfg!(feature = "scripted_construction_cache") {
-                self.base().set_frame_scripts_idle(
-                    self.base().construction_clean()
-                        && child_scripts_idle
-                        && self.local_frame_scripts_are_idle(),
-                );
-            }
+            self.base().set_frame_scripts_idle(
+                self.base().construction_clean()
+                    && child_scripts_idle
+                    && self.local_frame_scripts_are_idle(),
+            );
             self.base().set_enter_frame_idle(
                 children_idle
                     && !self.playing()
@@ -2887,43 +2837,25 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
         #[cfg(feature = "lifecycle_counts")]
         lifecycle::add(Count::ScriptsVisit, 1);
-        let optimized =
-            cfg!(feature = "construction_cache") && ruffle_render::profile::engine_optimized();
         // The original cache only admits scriptless trees. The candidate also
         // admits scripted trees and must use the independent script proof.
-        let idle = if cfg!(feature = "scripted_construction_cache") {
-            self.base().frame_scripts_idle()
-        } else {
-            self.base().construction_clean()
-        };
-        if optimized && idle && self.button_cache_valid() {
+        let idle = self.base().frame_scripts_idle();
+        if idle && self.button_cache_valid() {
             #[cfg(feature = "lifecycle_counts")]
             lifecycle::add(Count::ScriptsHit, 1);
             return;
         }
         let revision = super::construction_revision();
-        #[cfg(all(test, feature = "construction_cache"))]
         construction_cache_tests::record_script_visit();
         self.run_local_frame_scripts(context);
 
-        #[cfg(not(feature = "lifecycle_projection"))]
-        let children = self.iter_render_list();
-        #[cfg(feature = "lifecycle_projection")]
-        let children = if ruffle_render::profile::engine_optimized() {
-            self.iter_lifecycle_list()
-        } else {
-            self.iter_render_list().into()
-        };
+        let children = self.iter_lifecycle_list();
         let mut children_idle = true;
         for child in children {
             child.run_frame_scripts(context);
-            if cfg!(feature = "scripted_construction_cache") && optimized {
-                children_idle &= child.frame_scripts_are_idle();
-            }
+            children_idle &= child.frame_scripts_are_idle();
         }
-        if cfg!(feature = "scripted_construction_cache")
-            && optimized
-            && revision == super::construction_revision()
+        if revision == super::construction_revision()
             && self.base().construction_clean()
             && self.button_cache_valid()
         {
@@ -3564,7 +3496,7 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
             // Children have already been tested, including invisible button hit
             // areas. Without our own drawing there is nothing left to hit; do
             // not recursively measure those children again just to return Miss.
-            if (!ruffle_render::profile::engine_optimized() || self.0.drawing.get().is_some())
+            if self.0.drawing.get().is_some()
                 && self.world_bounds(BoundsMode::Engine).contains(point)
                 && let Some(drawing) = self.drawing()
                 && drawing.hit_test(local_matrix * point, &local_matrix)

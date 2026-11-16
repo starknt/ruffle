@@ -160,7 +160,7 @@ impl ByteArrayStorage {
 
     /// Create a new ByteArrayStorage using an already existing vector
     pub fn from_vec(context: &mut UpdateContext<'_>, bytes: Vec<u8>) -> ByteArrayStorage {
-        if ruffle_render::profile::engine_optimized() && bytes.len() >= 64 * 1024 {
+        if bytes.len() >= 64 * 1024 {
             context
                 .gc()
                 .metrics()

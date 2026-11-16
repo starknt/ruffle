@@ -3412,14 +3412,12 @@ impl PlayerBuilder {
 
                 // GC data
                 gc_arena: Rc::new(RefCell::new(GcArena::new(|gc_context| {
-                    if ruffle_render::profile::engine_optimized() {
-                        // SWF loading creates large buffers outside the arena. Wake the incremental
-                        // collector sooner instead of waiting for the number of small AVM objects to double.
-                        gc_context.metrics().set_pacing(gc_arena::metrics::Pacing {
-                            sleep_factor: 0.15,
-                            ..Default::default()
-                        });
-                    }
+                    // SWF loading creates large buffers outside the arena. Wake the incremental
+                    // collector sooner instead of waiting for the number of small AVM objects to double.
+                    gc_context.metrics().set_pacing(gc_arena::metrics::Pacing {
+                        sleep_factor: 0.15,
+                        ..Default::default()
+                    });
                     Self::create_gc_root(
                         gc_context,
                         player_version,

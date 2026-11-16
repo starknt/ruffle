@@ -1,7 +1,3 @@
-#[cfg(feature = "imgtests")]
-pub(crate) fn test_optimized() -> bool {
-    std::env::var("RUFFLE_TEST_RENDERER_MODE").as_deref() == Ok("optimized")
-}
 use ruffle_test_framework::environment::{CompileMode, Environment};
 
 #[cfg(feature = "imgtests")]
@@ -108,21 +104,10 @@ mod renderer {
 
         let adapter_info = descriptors.adapter.get_info();
         let name = format!("{}-{:?}", std::env::consts::OS, adapter_info.backend);
-        let mut renderer = WgpuRenderBackend::with_options(
-            descriptors,
-            target,
-            super::test_optimized(),
-            false,
-        )
-        .expect("WGPU Render backend creation must not fail, everything was checked ahead of time");
-        renderer.set_blend_batching(
-            std::env::var("RUFFLE_TEST_BLEND_BATCHES").as_deref() == Ok("bounded"),
+        let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).expect(
+            "WGPU Render backend creation must not fail, everything was checked ahead of time",
         );
-
-        renderer.set_immutable_bitmap_cache_limit(
-            (std::env::var("RUFFLE_TEST_SYMBOL_GPU_CACHE").as_deref() == Ok("bounded"))
-                .then_some(256 * 1024 * 1024),
-        );
+        renderer.set_immutable_bitmap_cache_limit(Some(256 * 1024 * 1024));
 
         Some((Box::new(NativeRenderInterface { name }), Box::new(renderer)))
     }

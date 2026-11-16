@@ -58,27 +58,16 @@ fn missing_drawings_do_not_repeat_descendant_bounds_walks() {
             parent.replace_at_depth(context, child.into(), 1);
             parent = child;
         }
-        for optimized in [false, true] {
-            let _scope = ruffle_render::profile::enter_engine(optimized);
-            BOUNDS_VISITS.set(0);
-            assert!(matches!(
-                root.mouse_pick_avm2(context, Point::ZERO, false),
-                Avm2MousePick::Miss
-            ));
-            if optimized {
-                assert_eq!(
-                    BOUNDS_VISITS.get(),
-                    0,
-                    "empty containers must not recursively measure descendants after a miss"
-                );
-            } else {
-                assert_eq!(
-                    BOUNDS_VISITS.get(),
-                    561,
-                    "stock control visits every ancestor's subtree"
-                );
-            }
-        }
+        BOUNDS_VISITS.set(0);
+        assert!(matches!(
+            root.mouse_pick_avm2(context, Point::ZERO, false),
+            Avm2MousePick::Miss
+        ));
+        assert_eq!(
+            BOUNDS_VISITS.get(),
+            0,
+            "empty containers must not recursively measure descendants after a miss"
+        );
     });
 }
 
@@ -89,35 +78,23 @@ fn nested_child_and_late_parent_graphics_remain_pickable() {
         root.replace_at_depth(context, child.into(), 1);
         rectangle(child);
         let point = Point::new(Twips::new(100), Twips::new(100));
-        for optimized in [false, true] {
-            let _scope = ruffle_render::profile::enter_engine(optimized);
-            assert!(
-                matches!(root.mouse_pick_avm2(context, point, false), Avm2MousePick::Hit(hit) if hit == child.into())
-            );
-        }
+        assert!(
+            matches!(root.mouse_pick_avm2(context, point, false), Avm2MousePick::Hit(hit) if hit == child.into())
+        );
         child.set_visible(context, false);
-        for optimized in [false, true] {
-            let _scope = ruffle_render::profile::enter_engine(optimized);
-            assert!(matches!(
-                root.mouse_pick_avm2(context, point, false),
-                Avm2MousePick::Miss
-            ));
-        }
+        assert!(matches!(
+            root.mouse_pick_avm2(context, point, false),
+            Avm2MousePick::Miss
+        ));
         rectangle(root);
-        for optimized in [false, true] {
-            let _scope = ruffle_render::profile::enter_engine(optimized);
-            assert!(
-                matches!(root.mouse_pick_avm2(context, point, false), Avm2MousePick::Hit(hit) if hit == root.into())
-            );
-        }
+        assert!(
+            matches!(root.mouse_pick_avm2(context, point, false), Avm2MousePick::Hit(hit) if hit == root.into())
+        );
         root.drawing_mut().clear();
-        for optimized in [false, true] {
-            let _scope = ruffle_render::profile::enter_engine(optimized);
-            assert!(matches!(
-                root.mouse_pick_avm2(context, point, false),
-                Avm2MousePick::Miss
-            ));
-        }
+        assert!(matches!(
+            root.mouse_pick_avm2(context, point, false),
+            Avm2MousePick::Miss
+        ));
     });
 }
 
@@ -135,29 +112,21 @@ fn empty_container_mouse_pick_benchmark() {
                 parent = child;
             }
         }
-        let mut stock = Vec::new();
-        let mut optimized = Vec::new();
+        let mut samples = Vec::new();
         for sample in 0..31 {
             for offset in 0..2 {
-                let enabled = (sample + offset) % 2 == 0;
-                let _scope = ruffle_render::profile::enter_engine(enabled);
                 let start = Instant::now();
                 for _ in 0..20 {
                     black_box(root.mouse_pick_avm2(context, Point::ZERO, false));
                 }
                 let ns = start.elapsed().as_nanos() / 20;
-                if enabled {
-                    optimized.push(ns);
-                } else {
-                    stock.push(ns);
-                }
+                samples.push(ns);
             }
         }
-        stock.sort_unstable();
-        optimized.sort_unstable();
+        samples.sort_unstable();
         println!(
-            "stock_ns_p50={} stock_ns_p95={} optimized_ns_p50={} optimized_ns_p95={}",
-            stock[15], stock[29], optimized[15], optimized[29]
+            "optimized_ns_p50={} optimized_ns_p95={}",
+            samples[15], samples[29]
         );
     });
 }

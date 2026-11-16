@@ -95,7 +95,6 @@ fn stale_load_bytes_parse_error_does_not_fail_a_new_loader_generation() {
 #[cfg(not(target_family = "wasm"))]
 #[test]
 fn worker_returns_shared_bytes_before_main_thread_installation() {
-    let _scope = ruffle_render::profile::enter_engine(true);
     let (_, movie) = futures::executor::block_on(prepare_swf_movie(
         movie_bytes(),
         "https://example.test/shared.swf".into(),
@@ -170,37 +169,34 @@ fn worker_parse_yields_before_work_can_run_on_a_single_thread_pool() {
 
 #[cfg(not(target_family = "wasm"))]
 #[test]
-fn inline_and_worker_preparation_preserve_bytes_metadata_and_stock_mode() {
+fn inline_and_worker_preparation_preserve_bytes_metadata_and_shared_storage() {
     use ruffle_common::sandbox::SandboxType;
-    for optimized in [false, true] {
-        let _scope = ruffle_render::profile::enter_engine(optimized);
-        for body in [movie_bytes(), swz(&movie_bytes())] {
-            let compressed_len = body.len();
-            let info = Some(LoadBytesInfo {
-                loader_sandbox_type: SandboxType::LocalWithFile,
-            });
-            let url = "https://example.test/movie.swf?mode=fixture".to_string();
-            let origin = Some("https://example.test/parent.swf".to_string());
-            let (worker_body, worker) = futures::executor::block_on(prepare_swf_movie(
-                body.clone(),
-                url.clone(),
-                origin.clone(),
-                info,
-            ))
-            .unwrap();
-            let (inline_body, inline) = prepare_swf_movie_inline(body, url, origin, info).unwrap();
-            let (worker, inline) = (worker.unwrap(), inline.unwrap());
-            assert_eq!(worker_body, inline_body);
-            assert!(worker_body.is_empty());
-            assert_eq!(worker.data(), inline.data());
-            assert_eq!(worker.url(), inline.url());
-            assert_eq!(worker.parameters(), inline.parameters());
-            assert_eq!(worker.sandbox_type(), SandboxType::LocalWithFile);
-            assert_eq!(worker.shared_file().is_some(), optimized);
-            assert_eq!(inline.shared_file().is_some(), optimized);
-            assert_eq!(worker.compressed_len(), compressed_len);
-            assert_eq!(inline.compressed_len(), compressed_len);
-        }
+    for body in [movie_bytes(), swz(&movie_bytes())] {
+        let compressed_len = body.len();
+        let info = Some(LoadBytesInfo {
+            loader_sandbox_type: SandboxType::LocalWithFile,
+        });
+        let url = "https://example.test/movie.swf?mode=fixture".to_string();
+        let origin = Some("https://example.test/parent.swf".to_string());
+        let (worker_body, worker) = futures::executor::block_on(prepare_swf_movie(
+            body.clone(),
+            url.clone(),
+            origin.clone(),
+            info,
+        ))
+        .unwrap();
+        let (inline_body, inline) = prepare_swf_movie_inline(body, url, origin, info).unwrap();
+        let (worker, inline) = (worker.unwrap(), inline.unwrap());
+        assert_eq!(worker_body, inline_body);
+        assert!(worker_body.is_empty());
+        assert_eq!(worker.data(), inline.data());
+        assert_eq!(worker.url(), inline.url());
+        assert_eq!(worker.parameters(), inline.parameters());
+        assert_eq!(worker.sandbox_type(), SandboxType::LocalWithFile);
+        assert!(worker.shared_file().is_some());
+        assert!(inline.shared_file().is_some());
+        assert_eq!(worker.compressed_len(), compressed_len);
+        assert_eq!(inline.compressed_len(), compressed_len);
     }
 }
 

@@ -5,7 +5,6 @@ use crate::display_object::{DisplayObject, DisplayObjectWeak, TDisplayObject};
 use gc_arena::{Collect, Mutation};
 use std::rc::Rc;
 
-#[cfg(feature = "orphan_worklist")]
 pub(crate) mod worklist;
 
 /// The list of 'orphan' objects - these objects have no parent,
@@ -21,7 +20,6 @@ pub(crate) mod worklist;
 #[collect(no_drop)]
 pub struct OrphanManager<'gc> {
     orphans: Rc<Vec<DisplayObjectWeak<'gc>>>,
-    #[cfg(feature = "orphan_worklist")]
     worklist: Option<Rc<worklist::Worklist<'gc>>>,
 }
 
@@ -51,8 +49,7 @@ impl<'gc> OrphanManager<'gc> {
         context: &mut UpdateContext<'gc>,
         mut f: impl FnMut(DisplayObject<'gc>, &mut UpdateContext<'gc>),
     ) {
-        #[cfg(feature = "orphan_worklist")]
-        if ruffle_render::profile::engine_optimized() && worklist::Worklist::each(context, &mut f) {
+        if worklist::Worklist::each(context, &mut f) {
             return;
         }
         // Clone the Rc before iterating over it. Any modifications must go through
@@ -90,7 +87,6 @@ impl<'gc> OrphanManager<'gc> {
     /// that have been garbage collected, or are no longer orphans
     /// (they've since acquired a parent).
     pub fn cleanup_dead_orphans(&mut self, mc: &Mutation<'gc>) {
-        #[cfg(feature = "orphan_worklist")]
         if self
             .orphans
             .iter()
@@ -134,7 +130,6 @@ impl<'gc> Default for OrphanManager<'gc> {
     fn default() -> Self {
         Self {
             orphans: Rc::new(Vec::new()),
-            #[cfg(feature = "orphan_worklist")]
             worklist: None,
         }
     }

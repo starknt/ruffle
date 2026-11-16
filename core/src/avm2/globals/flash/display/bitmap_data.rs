@@ -74,23 +74,7 @@ pub fn fill_bitmap_data_from_symbol<'gc>(
     activation: &mut Activation<'_, 'gc>,
     bd: &BitmapCharacter<'gc>,
 ) -> BitmapData<'gc> {
-    if ruffle_render::profile::engine_optimized() {
-        return BitmapData::from_symbol(activation.gc(), bd.symbol_image());
-    }
-    let bitmap = bd
-        .compressed()
-        .decode()
-        .expect("Failed to decode BitmapData");
-    BitmapData::new_with_pixels(
-        activation.context.gc_context,
-        bitmap.width(),
-        bitmap.height(),
-        true,
-        bitmap
-            .as_colors()
-            .map(crate::bitmap::bitmap_data::Color::from)
-            .collect(),
-    )
+    BitmapData::from_symbol(activation.gc(), bd.symbol_image())
 }
 
 /// Implements `flash.display.BitmapData`'s 'init' method (invoked from the AS3 constructor)

@@ -166,9 +166,7 @@ impl<'gc> ScriptObjectData<'gc> {
         ScriptObjectData {
             values: RefLock::new(Default::default()),
             slots,
-            bound_methods: RefLock::new(MethodCache::new(
-                ruffle_render::profile::engine_optimized(),
-            )),
+            bound_methods: RefLock::new(MethodCache::new(true)),
             proto: Lock::new(proto),
             instance_class,
             vtable: Lock::new(vtable),

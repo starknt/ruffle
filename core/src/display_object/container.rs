@@ -17,7 +17,6 @@ use crate::tag_utils::SwfMovieData;
 use gc_arena::{Collect, Mutation};
 use ruffle_macros::{enum_trait_object, istr};
 use ruffle_render::commands::CommandHandler;
-#[cfg(any(feature = "lifecycle_projection", test))]
 use std::cell::OnceCell;
 use std::cell::{Ref, RefMut};
 use std::cmp::Ordering;
@@ -462,7 +461,6 @@ pub trait TDisplayObjectContainer<'gc>:
     /// Snapshot of children with non-empty enter-frame or frame-script work.
     /// Construction and render traversal must still visit every child. This
     /// filters only immutable display-object types, never playback state.
-    #[cfg(any(feature = "lifecycle_projection", test))]
     #[no_dynamic]
     fn iter_lifecycle_list(self) -> LifecycleIter<'gc> {
         let container = self.raw_container();
@@ -670,7 +668,6 @@ pub struct ChildContainer<'gc> {
 
     // Indices only: no extra GC roots, and old iterators retain the matching
     // COW render-list snapshot. Every structural edit invalidates this cache.
-    #[cfg(any(feature = "lifecycle_projection", test))]
     #[collect(require_static)]
     lifecycle_indices: OnceCell<Option<Rc<Vec<usize>>>>,
 
@@ -708,7 +705,6 @@ impl<'gc> ChildContainer<'gc> {
     pub fn new(movie: &SwfMovieData) -> Self {
         Self {
             render_list: Rc::new(Vec::new()),
-            #[cfg(any(feature = "lifecycle_projection", test))]
             lifecycle_indices: OnceCell::new(),
             depth_list: BTreeMap::new(),
             has_pending_removals: false,
@@ -1183,7 +1179,6 @@ impl<'gc> ChildContainer<'gc> {
     }
 
     fn render_list_mut(&mut self) -> &mut Vec<DisplayObject<'gc>> {
-        #[cfg(any(feature = "lifecycle_projection", test))]
         self.lifecycle_indices.take();
         Rc::make_mut(&mut self.render_list)
     }
@@ -1245,7 +1240,6 @@ impl<'gc> DoubleEndedIterator for RenderIter<'gc> {
 impl ExactSizeIterator for RenderIter<'_> {}
 
 /// Lifecycle projection tied to one immutable render-list snapshot.
-#[cfg(any(feature = "lifecycle_projection", test))]
 pub enum LifecycleIter<'gc> {
     Direct(RenderIter<'gc>),
     Projected {
@@ -1255,14 +1249,12 @@ pub enum LifecycleIter<'gc> {
     },
 }
 
-#[cfg(any(feature = "lifecycle_projection", test))]
 impl<'gc> From<RenderIter<'gc>> for LifecycleIter<'gc> {
     fn from(iter: RenderIter<'gc>) -> Self {
         Self::Direct(iter)
     }
 }
 
-#[cfg(any(feature = "lifecycle_projection", test))]
 impl<'gc> LifecycleIter<'gc> {
     #[inline]
     pub fn is_projected(&self) -> bool {
@@ -1275,7 +1267,6 @@ impl<'gc> LifecycleIter<'gc> {
     }
 }
 
-#[cfg(any(feature = "lifecycle_projection", test))]
 impl<'gc> Iterator for LifecycleIter<'gc> {
     type Item = DisplayObject<'gc>;
 
@@ -1301,7 +1292,6 @@ impl<'gc> Iterator for LifecycleIter<'gc> {
     }
 }
 
-#[cfg(any(feature = "lifecycle_projection", test))]
 impl<'gc> DoubleEndedIterator for LifecycleIter<'gc> {
     fn next_back(&mut self) -> Option<Self::Item> {
         match self {
@@ -1318,7 +1308,6 @@ impl<'gc> DoubleEndedIterator for LifecycleIter<'gc> {
     }
 }
 
-#[cfg(any(feature = "lifecycle_projection", test))]
 impl ExactSizeIterator for LifecycleIter<'_> {}
 
 #[cfg(test)]

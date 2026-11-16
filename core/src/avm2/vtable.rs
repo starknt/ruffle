@@ -45,7 +45,7 @@ mod tests {
 
     #[test]
     fn published_trait_names_do_not_rescan_properties_per_inheritor() {
-        let _scope = ruffle_render::profile::enter(None, true);
+        let _scope = ruffle_render::profile::enter(None);
         let player = crate::player::PlayerBuilder::new().build();
         player
             .lock()
@@ -64,7 +64,7 @@ mod tests {
 
     #[test]
     fn published_trait_overrides_stay_isolated_across_collection() {
-        let _scope = ruffle_render::profile::enter(None, true);
+        let _scope = ruffle_render::profile::enter(None);
         let mut arena = Arena::<Rootable![Vec<TraitNames<'_>>]>::new(|mc| {
             let name = QName::new(Namespace::any(), AvmString::new_utf8(mc, "inherited"));
             let mut parent = TraitNames::default();
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn shared_trait_node_lives_until_its_last_inheritor_is_removed() {
         type WeakNames<'gc> = GcWeak<'gc, std::rc::Rc<PropertyMap<'gc, Property>>>;
-        let _scope = ruffle_render::profile::enter(None, true);
+        let _scope = ruffle_render::profile::enter(None);
         let mut arena = Arena::<Rootable![(Vec<TraitNames<'_>>, WeakNames<'_>)]>::new(|mc| {
             let mut names = TraitNames::default();
             names.insert(
@@ -143,7 +143,7 @@ mod tests {
         for sample in 0..31 {
             for offset in 0..2 {
                 let mode = (sample + offset) % 2;
-                let _scope = ruffle_render::profile::enter(None, mode == 1);
+                let _scope = ruffle_render::profile::enter(None);
                 let mut arena = Arena::<Rootable![Vec<TraitNames<'_>>]>::new(|mc| {
                     let mut names = TraitNames::default();
                     for index in 0..512 {
@@ -261,9 +261,7 @@ impl Default for TraitNames<'_> {
 
 impl<'gc> TraitNames<'gc> {
     fn publish(&mut self, mc: &Mutation<'gc>) {
-        if ruffle_render::profile::engine_optimized()
-            && let Self::Building(names) = self
-        {
+        if let Self::Building(names) = self {
             *self = Self::Shared(Gc::new(mc, names.clone()));
         }
     }
@@ -612,13 +610,7 @@ impl<'gc> VTable<'gc> {
         let mut force_auto_assign_slots = false;
 
         if let Some(superclass_vtable) = superclass_vtable {
-            resolved_traits = if ruffle_render::profile::engine_optimized() {
-                superclass_vtable.0.resolved_traits.clone()
-            } else {
-                TraitNames::Building(std::rc::Rc::new(
-                    superclass_vtable.resolved_traits().clone(),
-                ))
-            };
+            resolved_traits = superclass_vtable.0.resolved_traits.clone();
             slot_metadata_table = superclass_vtable.0.slot_metadata_table.clone();
             disp_metadata_table = superclass_vtable.0.disp_metadata_table.clone();
             slot_table.extend_from_slice(&superclass_vtable.0.slot_table);

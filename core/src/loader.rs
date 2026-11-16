@@ -700,11 +700,9 @@ async fn prepare_swf_movie(
     loader_url: Option<String>,
     load_bytes_info: Option<LoadBytesInfo>,
 ) -> Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error> {
-    // Profiling mode is thread-local: capture it before entering rayon.
-    let shared_bytes = ruffle_render::profile::engine_optimized();
     let (sender, receiver) = async_channel::bounded(1);
     rayon::spawn_fifo(move || {
-        let result = prepare_swf_movie_data(body, url, loader_url, load_bytes_info, shared_bytes);
+        let result = prepare_swf_movie_data(body, url, loader_url, load_bytes_info);
         let _ = sender.send_blocking(result);
     });
     receiver
@@ -720,7 +718,6 @@ fn prepare_swf_movie_data(
     url: String,
     loader_url: Option<String>,
     load_bytes_info: Option<LoadBytesInfo>,
-    shared_bytes: bool,
 ) -> Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error> {
     let transport = body;
     let uncompressed = if ContentType::sniff(&transport) == ContentType::Swf {
@@ -733,7 +730,7 @@ fn prepare_swf_movie_data(
         return Ok((transport, None));
     }
     let movie = SwfMovieData::from_data(parse_body, url, loader_url, load_bytes_info)?
-        .with_shared_bytes(shared_bytes)
+        .with_shared_bytes(true)
         .with_compressed_len(transport.len());
     // The movie records the original transport length for progress/bytesTotal;
     // do not send the transport buffer back through the loader channel.
@@ -746,13 +743,7 @@ fn prepare_swf_movie_inline(
     loader_url: Option<String>,
     load_bytes_info: Option<LoadBytesInfo>,
 ) -> Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error> {
-    prepare_swf_movie_data(
-        body,
-        url,
-        loader_url,
-        load_bytes_info,
-        ruffle_render::profile::engine_optimized(),
-    )
+    prepare_swf_movie_data(body, url, loader_url, load_bytes_info)
 }
 
 fn use_inline_movie_parse(url: &str) -> bool {
@@ -2271,7 +2262,7 @@ impl<'gc> MovieLoader<'gc> {
                         loader_url.clone(),
                         load_bytes_info,
                     )?
-                    .with_shared_bytes(ruffle_render::profile::engine_optimized()),
+                    .with_shared_bytes(true),
                 };
 
                 if matches!(vm_data, MovieLoaderVMData::Avm1 { .. }) {

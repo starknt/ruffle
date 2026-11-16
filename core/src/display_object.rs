@@ -40,12 +40,10 @@ fn construction_revision() -> u64 {
 
 // Hidden button states have no parent link to their button. A separate epoch
 // invalidates proofs that include buttons without retaining foreign GC roots.
-#[cfg(feature = "button_lifecycle_cache")]
 thread_local! {
     static BUTTON_STATE_REVISION: Cell<u64> = const { Cell::new(0) };
 }
 
-#[cfg(feature = "button_lifecycle_cache")]
 pub(crate) fn button_state_revision() -> u64 {
     BUTTON_STATE_REVISION.get()
 }
@@ -137,20 +135,17 @@ pub struct BitmapCache {
     warned_for_oversize: bool,
 }
 
-const STOCK_MAX_CACHE_PIXELS_AVM1: u64 = 2880 * 2880;
-const STOCK_MAX_CACHE_PIXELS_AVM2: u64 = 16_777_215;
 // cacheAsBitmap is an optimization. Keep the optimized path bounded so a
 // long-lived SWF cannot retain an unbounded set of large offscreen textures.
 const OPTIMIZED_MAX_CACHE_PIXELS_AVM1: u64 = 2_000_000;
 const OPTIMIZED_MAX_CACHE_PIXELS_AVM2: u64 = 4_000_000;
 
-fn cache_size_is_acceptable(swf_version: u8, width: u32, height: u32, optimized: bool) -> bool {
+fn cache_size_is_acceptable(swf_version: u8, width: u32, height: u32) -> bool {
     let max_dimension = if swf_version > 9 { 8191 } else { 2880 };
-    let max_pixels = match (optimized, swf_version > 9) {
-        (true, true) => OPTIMIZED_MAX_CACHE_PIXELS_AVM2,
-        (true, false) => OPTIMIZED_MAX_CACHE_PIXELS_AVM1,
-        (false, true) => STOCK_MAX_CACHE_PIXELS_AVM2,
-        (false, false) => STOCK_MAX_CACHE_PIXELS_AVM1,
+    let max_pixels = if swf_version > 9 {
+        OPTIMIZED_MAX_CACHE_PIXELS_AVM2
+    } else {
+        OPTIMIZED_MAX_CACHE_PIXELS_AVM1
     };
     width < max_dimension
         && height < max_dimension
@@ -202,12 +197,7 @@ impl BitmapCache {
         {
             return; // No need to resize it
         }
-        let acceptable_size = cache_size_is_acceptable(
-            swf_version,
-            actual_width,
-            actual_height,
-            ruffle_render::profile::engine_optimized(),
-        );
+        let acceptable_size = cache_size_is_acceptable(swf_version, actual_width, actual_height);
 
         if renderer.is_offscreen_supported()
             && let Some(actual_width) = NonZero::new(actual_width)
@@ -243,16 +233,10 @@ mod bitmap_cache_tests {
 
     #[test]
     fn optimized_cache_budget_rejects_large_gpu_surfaces() {
-        assert!(cache_size_is_acceptable(10, 1999, 1999, true));
-        assert!(!cache_size_is_acceptable(10, 2000, 2000, true));
-        assert!(cache_size_is_acceptable(9, 1400, 1400, true));
-        assert!(!cache_size_is_acceptable(9, 1500, 1500, true));
-    }
-
-    #[test]
-    fn stock_cache_budget_keeps_legacy_limit() {
-        assert!(cache_size_is_acceptable(10, 4095, 4095, false));
-        assert!(!cache_size_is_acceptable(10, 4096, 4096, false));
+        assert!(cache_size_is_acceptable(10, 1999, 1999));
+        assert!(!cache_size_is_acceptable(10, 2000, 2000));
+        assert!(cache_size_is_acceptable(9, 1400, 1400));
+        assert!(!cache_size_is_acceptable(9, 1500, 1500));
     }
 }
 
@@ -445,9 +429,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let retained = DisplayObjectFlags::LOCK_ROOT;
         // Other buttons may still reference this object as an inactive state.
         // Movie replacement resets its contents, not those foreign references.
-        #[cfg(feature = "button_lifecycle_cache")]
         let retained = retained | DisplayObjectFlags::BUTTON_STATE_ROOT;
-        #[cfg(feature = "orphan_worklist")]
         let retained = retained | DisplayObjectFlags::ORPHAN_WORKLIST_OBSERVED;
         let flags_to_keep = self.flags.get() & retained;
         self.flags.set(flags_to_keep | DisplayObjectFlags::VISIBLE);
@@ -748,7 +730,6 @@ impl<'gc> DisplayObjectBase<'gc> {
     /// You should almost always use `DisplayObject.set_parent` instead, which
     /// properly handles 'orphan' movie clips
     fn set_parent_ignoring_orphan_list(this: &Write<Self>, parent: Option<DisplayObject<'gc>>) {
-        #[cfg(feature = "orphan_worklist")]
         this.wake_orphan_worklists();
         unlock!(this, Self, parent).set(parent)
     }
@@ -766,7 +747,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     pub fn set_skip_next_enter_frame(&self, skip: bool) {
-        if skip && cfg!(feature = "construction_cache") {
+        if skip {
             // A cached stopped ancestor must still visit us to consume and
             // propagate this flag. This also covers SWF9 nested gotos and
             // loader completions outside the player's optimized scope.
@@ -910,7 +891,6 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.set_flag(DisplayObjectFlags::CONSTRUCTION_CLEAN, clean);
         if !clean {
             self.clear_lifecycle_cache();
-            #[cfg(feature = "button_lifecycle_cache")]
             if self.contains_flag(DisplayObjectFlags::BUTTON_STATE_ROOT) {
                 BUTTON_STATE_REVISION.set(BUTTON_STATE_REVISION.get().wrapping_add(1));
             }
@@ -920,29 +900,23 @@ impl<'gc> DisplayObjectBase<'gc> {
     /// Clear a stale proof without announcing another mutation. In particular,
     /// epoch validation must not perpetually invalidate other hidden states.
     fn clear_lifecycle_cache(&self) {
-        #[cfg(feature = "orphan_worklist")]
         self.wake_orphan_worklists();
         self.set_flag(DisplayObjectFlags::CONSTRUCTION_CLEAN, false);
         self.set_enter_frame_idle(false);
-        if cfg!(feature = "scripted_construction_cache") {
-            self.set_frame_scripts_idle(false);
-        }
+        self.set_frame_scripts_idle(false);
     }
 
-    #[cfg(feature = "orphan_worklist")]
     pub(crate) fn observe_orphan_worklist(&self) -> usize {
         self.set_flag(DisplayObjectFlags::ORPHAN_WORKLIST_OBSERVED, true);
         self as *const Self as usize
     }
 
-    #[cfg(feature = "orphan_worklist")]
     fn wake_orphan_worklists(&self) {
         if self.contains_flag(DisplayObjectFlags::ORPHAN_WORKLIST_OBSERVED) {
             crate::orphan_manager::worklist::wake(self as *const Self as usize);
         }
     }
 
-    #[cfg(feature = "button_lifecycle_cache")]
     fn mark_button_state_root(&self) {
         // Sticky even after reassignment: retaining an old marker only causes
         // conservative invalidation, including for shared or reparented states.
@@ -950,7 +924,6 @@ impl<'gc> DisplayObjectBase<'gc> {
         BUTTON_STATE_REVISION.set(BUTTON_STATE_REVISION.get().wrapping_add(1));
     }
 
-    #[cfg(feature = "button_lifecycle_cache")]
     fn subtree_has_button(&self) -> bool {
         self.contains_flag(DisplayObjectFlags::SUBTREE_HAS_BUTTON)
     }
@@ -2542,9 +2515,6 @@ pub trait TDisplayObject<'gc>:
     /// ancestors dirty.
     #[no_dynamic]
     fn invalidate_construction(self) {
-        if !cfg!(feature = "construction_cache") {
-            return;
-        }
         #[cfg(feature = "lifecycle_counts")]
         ruffle_render::profile::lifecycle::add(
             ruffle_render::profile::lifecycle::Count::Invalidations,
@@ -2560,8 +2530,7 @@ pub trait TDisplayObject<'gc>:
             );
             let was_clean = current.base().construction_clean();
             let was_idle = current.base().enter_frame_idle();
-            let scripts_were_idle = cfg!(feature = "scripted_construction_cache")
-                && current.base().frame_scripts_idle();
+            let scripts_were_idle = current.base().frame_scripts_idle();
             current.base().set_construction_clean(false);
             if current.as_movie_clip().is_some() && !was_clean && !was_idle && !scripts_were_idle {
                 break;
@@ -3366,7 +3335,6 @@ bitflags! {
 
         /// Sticky markers used only by the button lifecycle candidate.
         const SUBTREE_HAS_BUTTON = 1 << 21;
-        #[cfg(feature = "orphan_worklist")]
         const ORPHAN_WORKLIST_OBSERVED = 1 << 23;
         const BUTTON_STATE_ROOT = 1 << 22;
     }

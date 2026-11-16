@@ -132,12 +132,7 @@ impl Surface {
         );
 
         let mut mask_state = MaskState::empty();
-        for commands in CommandBatches::new(
-            commands,
-            target.width(),
-            target.height(),
-            texture_pool.blend_batching(),
-        ) {
+        for commands in CommandBatches::new(commands, target.width(), target.height()) {
             let chunks = chunk_blends(
                 commands,
                 descriptors,

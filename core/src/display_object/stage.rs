@@ -870,52 +870,35 @@ impl<'gc> TDisplayObject<'gc> for Stage<'gc> {
     }
 
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
-        let optimized =
-            cfg!(feature = "construction_cache") && ruffle_render::profile::engine_optimized();
-        if optimized && self.base().construction_clean() {
+        if self.base().construction_clean() {
             return;
         }
 
-        let revision = if optimized {
-            super::construction_revision()
-        } else {
-            0
-        };
+        let revision = super::construction_revision();
         let mut children_settled = true;
         for child in self.iter_render_list() {
             child.construct_frame(context);
-            if optimized {
-                children_settled &= child.construction_is_settled();
-            }
+            children_settled &= child.construction_is_settled();
         }
 
-        if optimized && children_settled && revision == super::construction_revision() {
+        if children_settled && revision == super::construction_revision() {
             self.base().set_construction_clean(true);
         }
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
-        let optimized = cfg!(feature = "scripted_construction_cache")
-            && ruffle_render::profile::engine_optimized();
-        if optimized && self.base().frame_scripts_idle() {
+        if self.base().frame_scripts_idle() {
             return;
         }
 
-        let revision = if optimized {
-            super::construction_revision()
-        } else {
-            0
-        };
+        let revision = super::construction_revision();
         let mut children_idle = true;
         for child in self.iter_render_list() {
             child.run_frame_scripts(context);
-            if optimized {
-                children_idle &= child.frame_scripts_are_idle();
-            }
+            children_idle &= child.frame_scripts_are_idle();
         }
 
-        if optimized
-            && children_idle
+        if children_idle
             && self.base().construction_clean()
             && revision == super::construction_revision()
         {

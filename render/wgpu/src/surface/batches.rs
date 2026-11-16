@@ -10,18 +10,17 @@ pub(super) struct CommandBatches {
 }
 
 impl CommandBatches {
-    pub fn new(commands: CommandList, width: u32, height: u32, optimized: bool) -> Self {
+    pub fn new(commands: CommandList, width: u32, height: u32) -> Self {
         // Alpha/Erase can read an enclosing Layer while child commands are being
         // prepared. Keep the original preparation order for that entire list.
         // Shader blends receive their foreground/background at consumption time.
         let rgba_bytes = u64::from(width).max(1) * u64::from(height).max(1) * 4;
         let limit = ((32 * 1024 * 1024 / rgba_bytes) as usize).clamp(1, 8);
         let mut inputs = 0;
-        let needs_batches = optimized
-            && commands.commands.iter().any(|command| {
-                inputs += temporary_inputs(command);
-                inputs > limit
-            });
+        let needs_batches = commands.commands.iter().any(|command| {
+            inputs += temporary_inputs(command);
+            inputs > limit
+        });
         let fallback = needs_batches && samples_ancestor_layer(&commands);
         let max_inputs = if needs_batches && !fallback {
             limit

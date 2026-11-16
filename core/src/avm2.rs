@@ -54,9 +54,8 @@ mod e4x;
 pub mod error;
 pub mod error_messages;
 mod events;
-#[cfg(feature = "avm2_fast_accessors")]
 mod fast_accessor;
-#[cfg(all(test, feature = "avm2_fast_accessors", feature = "lifecycle_counts"))]
+#[cfg(all(test, feature = "lifecycle_counts"))]
 mod fast_accessor_tests;
 mod filters;
 mod flv;
@@ -85,7 +84,6 @@ mod stubs;
 mod traits;
 mod value;
 pub mod vector;
-#[cfg(feature = "verified_code_index")]
 mod verified_code;
 mod verify;
 mod vtable;

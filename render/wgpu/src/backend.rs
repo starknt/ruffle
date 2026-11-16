@@ -40,6 +40,8 @@ use tracing::instrument;
 use wgpu::SubmissionIndex;
 use wgpu_profiler::{GpuProfiler, GpuProfilerSettings};
 
+pub const DEFAULT_IMMUTABLE_BITMAP_CACHE_LIMIT: u64 = 256 * 1024 * 1024;
+
 /// Creates a wgpu instance with Ruffle's required configuration.
 ///
 /// This disables indirect call validation because wgpu's validation runs a compute
@@ -71,7 +73,6 @@ pub fn create_wgpu_instance(
 
 pub struct WgpuRenderBackend<T: RenderTarget> {
     pub(crate) descriptors: Arc<Descriptors>,
-    optimized: bool,
     budget: crate::idle_pool::Budget,
     target: T,
     surface: Surface,
@@ -222,13 +223,12 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
 
 impl<T: RenderTarget> WgpuRenderBackend<T> {
     pub fn new(descriptors: Arc<Descriptors>, target: T) -> Result<Self, Error> {
-        Self::with_options(descriptors, target, false, false)
+        Self::with_options(descriptors, target, false)
     }
 
     pub fn with_options(
         descriptors: Arc<Descriptors>,
         target: T,
-        optimized: bool,
         measure_gpu: bool,
     ) -> Result<Self, Error> {
         if target.width() > descriptors.limits.max_texture_dimension_2d
@@ -251,8 +251,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             target.format(),
         );
 
-        let budget =
-            crate::idle_pool::Budget::new(optimized.then_some(crate::idle_pool::IDLE_LIMIT));
+        let budget = crate::idle_pool::Budget::new(Some(crate::idle_pool::IDLE_LIMIT));
         let offscreen_buffer_pool = BufferPool::new(
             budget.clone(),
             1,
@@ -291,7 +290,6 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         let profiler = GpuProfiler::new(&descriptors.device, profiler_settings)?;
 
         Ok(Self {
-            optimized,
             budget: budget.clone(),
             descriptors,
             target,
@@ -299,30 +297,25 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             meshes: Vec::new(),
             shape_tessellator: ShapeTessellator::new(),
             viewport_scale_factor: 1.0,
-            texture_pool: TexturePool::new(budget.clone(), false),
-            offscreen_texture_pool: TexturePool::new(budget, false),
+            texture_pool: TexturePool::new(budget.clone()),
+            offscreen_texture_pool: TexturePool::new(budget),
             offscreen_buffer_pool: Arc::new(offscreen_buffer_pool),
             chunk_buffers,
             active_frame,
             profiler,
-            bitmap_residency: None,
+            bitmap_residency: Some(crate::bitmap_residency::BitmapResidency::new(
+                DEFAULT_IMMUTABLE_BITMAP_CACHE_LIMIT,
+            )),
         })
     }
 
     /// Limit retained, reconstructible symbol uploads. In-flight commands and
     /// writable bitmaps are separate owners and are not constrained by this cache.
-    /// None and stock rendering retain the original ownership policy.
+    /// A zero or absent limit disables the cache for focused renderer tests.
     pub fn set_immutable_bitmap_cache_limit(&mut self, limit: Option<u64>) {
         self.bitmap_residency = limit
-            .filter(|limit| self.optimized && *limit > 0)
+            .filter(|limit| *limit > 0)
             .map(crate::bitmap_residency::BitmapResidency::new);
-    }
-
-    /// Opt into experimental intermediate-texture batching. This reduces live
-    /// allocations but can increase submission/GPU latency. Stock stays unbatched.
-    pub fn set_blend_batching(&mut self, enabled: bool) {
-        self.texture_pool.set_blend_batching(enabled);
-        self.offscreen_texture_pool.set_blend_batching(enabled);
     }
 
     fn register_shape_internal(
@@ -512,8 +505,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
 
         self.viewport_scale_factor = dimensions.scale_factor;
-        self.texture_pool =
-            TexturePool::new(self.budget.clone(), self.texture_pool.blend_batching());
+        self.texture_pool = TexturePool::new(self.budget.clone());
     }
 
     fn create_context3d(
@@ -733,15 +725,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         self.active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
-        if !self.optimized {
-            self.offscreen_texture_pool = TexturePool::new(self.budget.clone(), false);
-        }
         let (idle, peak, combined) = self.budget.stats();
         ruffle_render::profile::pool(idle, peak, combined);
-        if self.optimized {
-            self.texture_pool.end_frame();
-            self.offscreen_texture_pool.end_frame();
-        }
+        self.texture_pool.end_frame();
+        self.offscreen_texture_pool.end_frame();
         self.profiler
             .end_frame()
             .expect("Frame should end successfully");
@@ -869,7 +856,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             depth_or_array_layers: 1,
         };
 
-        if !self.optimized || self.active_frame.command_encoder.dirty {
+        if self.active_frame.command_encoder.dirty {
             self.active_frame.submit_direct(&self.descriptors);
         }
         ruffle_render::profile::uploaded(u64::from(extent.width) * u64::from(extent.height) * 4);
