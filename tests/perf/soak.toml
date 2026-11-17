@@ -1,0 +1,3 @@
+[[case]]
+name = "cache_soak"
+path = "../tests/swfs/native_perf/cache_soak"

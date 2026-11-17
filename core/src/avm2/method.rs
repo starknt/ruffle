@@ -158,26 +158,56 @@ impl core::fmt::Debug for Method<'_> {
 
 impl<'gc> Method<'gc> {
     #[inline]
-    pub fn cached_trait(
+    pub fn lookup_trait(
         self,
         opcode: usize,
         receiver: Value<'gc>,
+        vtable: super::vtable::VTable<'gc>,
         name: &Multiname<'gc>,
         activation: &mut Activation<'_, 'gc>,
         counters: &mut super::call_site::Counters,
     ) -> Option<super::property::Property> {
         use super::object::{Object, TObject};
-        if name.has_lazy_component() || name.is_attribute() || name.local_name().is_none() {
-            return None;
+        // Resolve the receiver's vtable once for both cached and generic paths.
+        // Reject dynamic/builtin receivers before inspecting name components.
+        let eligible = matches!(receiver, Value::Object(Object::ScriptObject(object))
+            if object.base().is_sealed());
+        if !eligible
+            || name.has_lazy_component()
+            || name.is_attribute()
+            || name.local_name().is_none()
+        {
+            return vtable.get_trait(name);
         }
-        let Value::Object(Object::ScriptObject(object)) = receiver else {
-            return None;
-        };
-        if !object.base().is_sealed() {
-            return None;
+        if let Some(table) = self.0.pic.get() {
+            let data = table.data.borrow();
+            if let Some(site) = data.sites.get(opcode) {
+                if site.megamorphic {
+                    counters.megamorphic += 1;
+                    return vtable.get_trait(name);
+                }
+                if let Some(property) = site.get(vtable) {
+                    activation.avm2().pic_budget.touch(*table);
+                    counters.hits += 1;
+                    return Some(property);
+                }
+            }
         }
+        self.lookup_trait_miss(opcode, vtable, name, activation, counters)
+    }
+
+    // Keep allocation, GC barriers and LRU eviction out of the interpreter's
+    // hot instruction footprint, including the dynamic-object bypass path.
+    #[cold]
+    fn lookup_trait_miss(
+        self,
+        opcode: usize,
+        vtable: super::vtable::VTable<'gc>,
+        name: &Multiname<'gc>,
+        activation: &mut Activation<'_, 'gc>,
+        counters: &mut super::call_site::Counters,
+    ) -> Option<super::property::Property> {
         let mc = activation.gc();
-        let vtable = object.vtable();
         let table = if let Some(table) = self.0.pic.get() {
             *table
         } else {
@@ -185,21 +215,7 @@ impl<'gc> Method<'gc> {
             let _ = unlock!(Gc::write(mc, self.0), MethodData, pic).set(table);
             table
         };
-        activation.avm2().pic_budget.touch(table);
-        let initialized = {
-            let data = table.data.borrow();
-            if let Some(site) = data.sites.get(opcode) {
-                if site.megamorphic {
-                    counters.megamorphic += 1;
-                    return None;
-                }
-                if let Some(property) = site.get(vtable) {
-                    counters.hits += 1;
-                    return Some(property);
-                }
-            }
-            !data.sites.is_empty()
-        };
+        let initialized = !table.data.borrow().sites.is_empty();
         if !initialized
             && !activation.avm2().pic_budget.allocate(
                 table,
@@ -207,8 +223,9 @@ impl<'gc> Method<'gc> {
                 mc,
             )
         {
-            return None;
+            return vtable.get_trait(name);
         }
+        activation.avm2().pic_budget.touch(table);
         counters.misses += 1;
         let property = vtable.get_trait(name)?;
         // The side table is traced independently of VerifiedCode. Trigger its

@@ -1153,6 +1153,24 @@ pub fn render_base<'gc>(
     context: &mut RenderContext<'_, 'gc>,
     options: RenderOptions,
 ) {
+    // Most continuously changing trees never record a block. Keep leaf draws
+    // on the original small path in that case. Containers still check their
+    // eligibility so unsupported ancestors cannot admit descendant snapshots.
+    if !context.snapshot_allowed
+        || (!context.snapshot_recording
+            && this.as_container().is_none_or(|c| c.num_children() == 0))
+    {
+        render_base_inner(this, context, options);
+    } else {
+        render_snapshot(this, context, options);
+    }
+}
+
+fn render_snapshot<'gc>(
+    this: DisplayObject<'gc>,
+    context: &mut RenderContext<'_, 'gc>,
+    options: RenderOptions,
+) {
     let base = this.base();
     let eligible = matches!(
         this,
@@ -1245,7 +1263,10 @@ pub fn render_base<'gc>(
     } else {
         None
     };
+    let recording = context.snapshot_recording;
+    context.snapshot_recording |= prepared.is_some();
     render_base_inner(this, context, options);
+    context.snapshot_recording = recording;
     if let Some((node, key, original, barriers)) = prepared {
         let commands = std::rc::Rc::new(std::mem::replace(&mut context.commands, original));
         let stored = context.snapshot_barriers == barriers
@@ -1403,6 +1424,7 @@ fn render_base_inner<'gc>(
                 snapshots: None,
                 snapshot_allowed: false,
                 snapshot_barriers: 0,
+                snapshot_recording: false,
                 renderer: context.renderer,
                 commands: CommandList::new(),
                 cache_draws: context.cache_draws,

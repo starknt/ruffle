@@ -1105,20 +1105,13 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let multiname = multiname.fill_with_runtime_params(self)?;
         let receiver = self.pop_stack().null_check(self, Some(&multiname))?;
 
-        let value = if let Some(property) = static_name
-            .then(|| method.cached_trait(opcode, receiver, &multiname, self, counters))
-            .flatten()
-        {
-            receiver.call_property_with_trait(
-                &multiname,
-                receiver.vtable(self),
-                Some(property),
-                args,
-                self,
-            )?
+        let vtable = receiver.vtable(self);
+        let property = if static_name {
+            method.lookup_trait(opcode, receiver, vtable, &multiname, self, counters)
         } else {
-            receiver.call_property(&multiname, args, self)?
+            vtable.get_trait(&multiname)
         };
+        let value = receiver.call_property_with_trait(&multiname, vtable, property, args, self)?;
 
         self.push_stack(value);
 
@@ -1154,20 +1147,13 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let multiname = multiname.fill_with_runtime_params(self)?;
         let receiver = self.pop_stack().null_check(self, Some(&multiname))?;
 
-        if let Some(property) = static_name
-            .then(|| method.cached_trait(opcode, receiver, &multiname, self, counters))
-            .flatten()
-        {
-            receiver.call_property_with_trait(
-                &multiname,
-                receiver.vtable(self),
-                Some(property),
-                args,
-                self,
-            )?
+        let vtable = receiver.vtable(self);
+        let property = if static_name {
+            method.lookup_trait(opcode, receiver, vtable, &multiname, self, counters)
         } else {
-            receiver.call_property(&multiname, args, self)?
+            vtable.get_trait(&multiname)
         };
+        receiver.call_property_with_trait(&multiname, vtable, property, args, self)?;
 
         Ok(())
     }
@@ -1264,13 +1250,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         // default path for static names
         let object = self.pop_stack().null_check(self, Some(&multiname))?;
 
-        let value = if let Some(property) =
-            method.cached_trait(opcode, object, &multiname, self, counters)
-        {
-            object.get_property_with_trait(&multiname, object.vtable(self), Some(property), self)?
-        } else {
-            object.get_property(&multiname, self)?
-        };
+        let vtable = object.vtable(self);
+        let property = method.lookup_trait(opcode, object, vtable, &multiname, self, counters);
+        let value = object.get_property_with_trait(&multiname, vtable, property, self)?;
         self.push_stack(value);
 
         Ok(())
@@ -1376,17 +1358,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let object = self.pop_stack().null_check(self, Some(&multiname))?;
 
-        if let Some(property) = method.cached_trait(opcode, object, &multiname, self, counters) {
-            object.set_property_with_trait(
-                &multiname,
-                object.vtable(self),
-                Some(property),
-                value,
-                self,
-            )?;
-        } else {
-            object.set_property(&multiname, value, self)?;
-        }
+        let vtable = object.vtable(self);
+        let property = method.lookup_trait(opcode, object, vtable, &multiname, self, counters);
+        object.set_property_with_trait(&multiname, vtable, property, value, self)?;
 
         Ok(())
     }

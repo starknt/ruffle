@@ -2356,6 +2356,7 @@ impl Player {
                     .iter()
                     .all(|s| !s.visible() || s.context3d().is_none()),
                 snapshot_barriers: 0,
+                snapshot_recording: false,
                 renderer: this.renderer.deref_mut(),
                 commands: CommandList::new(),
                 cache_draws: &mut cache_draws,

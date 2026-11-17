@@ -1526,6 +1526,7 @@ pub fn draw<'gc>(
         snapshots: None,
         snapshot_allowed: false,
         snapshot_barriers: 0,
+        snapshot_recording: false,
         renderer: context.renderer,
         commands: CommandList::new(),
         cache_draws: &mut cache_draws,

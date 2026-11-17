@@ -587,6 +587,9 @@ impl Default for ActionQueue<'_> {
 pub struct RenderContext<'a, 'gc> {
     pub snapshots: Option<&'a mut crate::display_object::snapshot::Cache>,
     pub snapshot_allowed: bool,
+    /// An ancestor is currently recording a block, so leaf eligibility must
+    /// contribute barriers even when the leaf cannot own a snapshot itself.
+    pub snapshot_recording: bool,
     pub snapshot_barriers: u64,
     /// The renderer, used by the display objects to register themselves.
     pub renderer: &'a mut dyn RenderBackend,
