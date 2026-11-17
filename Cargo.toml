@@ -39,6 +39,7 @@ members = [
     "tools/fuzzer",
     "tools/stub-report",
 ]
+exclude = ["render/wgpu/vendor/wgpu-hal"]
 default-members = ["desktop"]
 resolver = "2"
 
@@ -205,3 +206,7 @@ lto = "off"
 incremental = true
 # Right between the defaults of 16 and 256, for crate fragment caching.
 codegen-units = 64
+
+# Native GL 3.3 binding negotiation; see the vendored patch note.
+[patch.crates-io]
+wgpu-hal = { path = "render/wgpu/vendor/wgpu-hal" }

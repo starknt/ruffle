@@ -534,6 +534,7 @@ impl PreparedSnapshot {
         let preparation = backend.descriptors.runtime.preparation().clone();
         let generation = backend.preparation_generation.capture();
         let mut graph = None;
+        let mut oversized = Vec::new();
         let current = preparation.for_each_batch(
             &generation,
             parallel,
@@ -562,8 +563,7 @@ impl PreparedSnapshot {
                             Err(error) if error.kind() == RenderFailureKind::BudgetExceeded => {
                                 // The partition estimate was too small. Publish
                                 // completed meshes, then prepare the remainder
-                                // individually on the owner without retaining a
-                                // second wave of oversized results.
+                                // after every wave has released its outputs.
                                 return Ok(Output::Shapes(
                                     prepared,
                                     std::iter::once((resource, input))
@@ -597,15 +597,7 @@ impl PreparedSnapshot {
                             for (resource, mesh) in meshes {
                                 publish(resource, mesh)?;
                             }
-                            for (resource, input) in deferred {
-                                let mesh = {
-                                    let _timer = ruffle_render::profile::native_time(
-                                        ruffle_render::profile::NativePhase::Preparation,
-                                    );
-                                    input.prepare_bounded(output_budget)?
-                                };
-                                publish(resource, mesh)?;
-                            }
+                            oversized.extend(deferred);
                         }
                     }
                 }
@@ -617,6 +609,28 @@ impl PreparedSnapshot {
                 RenderFailureKind::Validation,
                 "stale native preparation generation",
             ));
+        }
+        for (resource, input) in oversized {
+            let current = preparation.run_exclusive(
+                &generation,
+                |budget| input.prepare_bounded(budget),
+                |mesh| {
+                    self.validate(backend)?;
+                    let Handle::Shape(handle) = self.handle(resource)? else {
+                        return Err(foreign());
+                    };
+                    let recipe = (&*handle.0 as &dyn Any)
+                        .downcast_ref::<ShapeRecipe>()
+                        .ok_or_else(foreign)?;
+                    recipe.publish(backend, mesh)
+                },
+            )?;
+            if !current {
+                return Err(RenderFailure::new(
+                    RenderFailureKind::Validation,
+                    "stale native preparation generation",
+                ));
+            }
         }
         for (_, handle) in &self.resources {
             if let Handle::Bitmap(handle) = handle {

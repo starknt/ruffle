@@ -105,7 +105,7 @@ impl NativePreparation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-    fn admit(&self, bytes: u64) -> Option<Permit> {
+    fn admit(&self, bytes: u64, dispatched: bool) -> Option<Permit> {
         let mut stats = self
             .0
             .stats
@@ -119,8 +119,50 @@ impl NativePreparation {
         stats.bytes += bytes;
         stats.peak_active = stats.peak_active.max(stats.active);
         stats.peak_bytes = stats.peak_bytes.max(stats.bytes);
-        stats.submitted += 1;
+        stats.submitted += u64::from(dispatched);
         Some(Permit(self.0.clone(), bytes))
+    }
+    fn admit_serial(&self, bytes: u64) -> Result<Permit, RenderFailure> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            self.0.health.check()?;
+            if let Some(permit) = self.admit(bytes.min(self.0.scratch_limit), false) {
+                return Ok(permit);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(RenderFailure::new(
+                    RenderFailureKind::Timeout,
+                    "native preparation scratch remains in use",
+                ));
+            }
+            // Another renderer can own the shared pool. Never wait with its
+            // accounting lock held, or overlap its retained output uncharged.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    /// Large mandatory shapes may borrow the whole preparation allowance, after
+    /// all regular waves have been consumed. Keep the exclusive reservation
+    /// through owner-thread publication, just like a normal worker result.
+    pub fn run_exclusive<R>(
+        &self,
+        generation: &GenerationToken,
+        prepare: impl FnOnce(u64) -> Result<R, RenderFailure>,
+        consume: impl FnOnce(R) -> Result<(), RenderFailure>,
+    ) -> Result<bool, RenderFailure> {
+        let _permit = self.admit_serial(self.0.scratch_limit)?;
+        if !generation.is_current() {
+            return Ok(false);
+        }
+        let timer =
+            ruffle_render::profile::native_time(ruffle_render::profile::NativePhase::Preparation);
+        let output = prepare(self.0.scratch_limit)?;
+        drop(timer);
+        self.0.health.check()?;
+        if !generation.is_current() {
+            return Ok(false);
+        }
+        consume(output)?;
+        Ok(true)
     }
     /// Join each bounded wave, then consume it on the caller thread before
     /// admitting another wave. GC/GPU ownership never enters the Rayon closure.
@@ -147,7 +189,7 @@ impl NativePreparation {
                 let Some(next) = work.peek() else {
                     break;
                 };
-                let Some(permit) = self.admit(next.bytes) else {
+                let Some(permit) = self.admit(next.bytes, true) else {
                     break;
                 };
                 permits.push(permit);
@@ -159,6 +201,10 @@ impl NativePreparation {
                 };
                 // A serial fallback is consumed alone. In particular, multiple
                 // oversized outputs must never accumulate in a parallel wave.
+                let _permit = self.admit_serial(item.bytes)?;
+                if !generation.is_current() {
+                    return Ok(false);
+                }
                 let result = prepare(item.value)?;
                 self.0.health.check()?;
                 if !generation.is_current() {
@@ -381,4 +427,65 @@ fn native_preparation_accounts_outputs_through_publication_and_consumes_oversize
     )
     .unwrap();
     assert_eq!(pool.stats().bytes, 0);
+}
+
+#[cfg(test)]
+#[test]
+fn native_preparation_serial_reserves_scratch_through_publication() {
+    let pool = NativePreparation::new(2, 128, RendererHealth::default());
+    pool.for_each_batch(
+        &PreparationGeneration::default().capture(),
+        false,
+        [Work {
+            value: 42,
+            bytes: 64,
+        }],
+        |value| {
+            assert_eq!(pool.stats().bytes, 64);
+            Ok(value)
+        },
+        |batch| {
+            assert_eq!(batch, [42]);
+            assert_eq!(pool.stats().bytes, 64);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!((pool.stats().active, pool.stats().bytes), (0, 0));
+}
+
+#[cfg(test)]
+#[test]
+fn native_preparation_exclusive_output_stays_reserved_and_rejects_stale_publication() {
+    let pool = NativePreparation::new(2, 128, RendererHealth::default());
+    let generation = PreparationGeneration::default();
+    assert!(
+        pool.run_exclusive(
+            &generation.capture(),
+            |budget| {
+                assert_eq!(budget, 128);
+                assert_eq!(pool.stats().bytes, 128);
+                Ok(42)
+            },
+            |value| {
+                assert_eq!(value, 42);
+                assert_eq!(pool.stats().bytes, 128);
+                Ok(())
+            },
+        )
+        .unwrap()
+    );
+    assert!(
+        !pool
+            .run_exclusive(
+                &generation.capture(),
+                |_| {
+                    generation.invalidate();
+                    Ok(42)
+                },
+                |_| panic!("stale mesh must not publish"),
+            )
+            .unwrap()
+    );
+    assert_eq!((pool.stats().active, pool.stats().bytes), (0, 0));
 }

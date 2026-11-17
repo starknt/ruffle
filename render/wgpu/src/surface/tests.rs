@@ -155,21 +155,34 @@ fn gpu() -> Arc<Descriptors> {
 }
 
 fn gpu_with_watermark(watermark: Option<u64>) -> Arc<Descriptors> {
-    let mut options = wgpu::InstanceDescriptor::new_without_display_handle();
-    options.backends = wgpu::Backends::VULKAN;
-    let instance = wgpu::Instance::new(options);
+    gpu_with_budgets(watermark, None)
+}
+
+fn gpu_with_budgets(watermark: Option<u64>, staging: Option<u64>) -> Arc<Descriptors> {
+    gpu_with_backend(wgpu::Backends::VULKAN, watermark, staging)
+}
+
+fn gpu_with_backend(
+    backends: wgpu::Backends,
+    watermark: Option<u64>,
+    staging: Option<u64>,
+) -> Arc<Descriptors> {
+    let instance = crate::backend::create_wgpu_instance(backends, Default::default(), None);
     let (adapter, device, queue) = futures::executor::block_on(request_adapter_and_device(
-        wgpu::Backends::VULKAN,
+        backends,
         &instance,
         None,
         wgpu::PowerPreference::HighPerformance,
     ))
-    .expect("explicit GPU regressions require a Vulkan adapter");
+    .expect("explicit GPU regressions require the requested native adapter");
     eprintln!("native GPU regression adapter: {:?}", adapter.get_info());
     let mut config =
         crate::gpu_runtime::GpuBudgetConfig::for_adapter(adapter.get_info().device_type, false);
     if let Some(watermark) = watermark {
         config.transient_watermark = watermark;
+    }
+    if let Some(staging) = staging {
+        config.staging_limit = staging;
     }
     let runtime = crate::gpu_runtime::GpuRuntime::new(config).unwrap();
     runtime.install_device_callbacks(&device);
@@ -1991,6 +2004,47 @@ fn native_preparation_parallel_shapes_match_serial_pixels_and_join_before_encodi
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn native_preparation_large_shape_uses_idle_worker_capacity_without_changing_pixels() {
+    let bytes = include_bytes!(
+        "../../../../tests/tests/swfs/visual/simple_shapes/heavy_tesselation/test.swf"
+    );
+    let stream = swf::decompress_swf(&bytes[..]).unwrap();
+    let movie = swf::parse_swf(&stream).unwrap();
+    let mut images = Vec::new();
+    for staging in [64, 32, 16] {
+        let descriptors = gpu_with_budgets(None, Some(staging * 1024 * 1024));
+        let target = TextureTarget::new(&descriptors.device, (128, 128)).unwrap();
+        let mut renderer =
+            WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+        renderer.set_quality(StageQuality::Low).unwrap();
+        let mut commands = CommandList::new();
+        for tag in &movie.tags {
+            if let swf::Tag::DefineShape(shape) = tag {
+                let distilled = ruffle_render::shape_utils::DistilledShape::from(shape.as_ref());
+                let handle = renderer
+                    .register_shape(
+                        distilled,
+                        &crate::shape_recipe::FrozenBitmapSource::default(),
+                    )
+                    .unwrap();
+                commands.render_shape(handle, Default::default());
+            }
+        }
+        renderer
+            .submit_frame(Color::WHITE, commands, vec![])
+            .unwrap();
+        let stats = descriptors.runtime.preparation().stats();
+        assert_eq!((stats.active, stats.bytes), (0, 0));
+        assert!(stats.peak_bytes <= staging * 1024 * 1024);
+        images.push(renderer.capture_frame().unwrap().unwrap().into_raw());
+    }
+    assert_eq!(images[0], images[1]);
+    assert_eq!(images[0], images[2]);
+    assert!(images[0].chunks_exact(4).any(|p| p != [255, 255, 255, 255]));
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn native_preparation_resize_and_unload_cancel_captured_generations() {
     let descriptors = gpu();
     let target = TextureTarget::new_without_readback(&descriptors.device, (16, 16)).unwrap();
@@ -2087,4 +2141,106 @@ fn one_hundred_renderer_unloads_release_all_transient_resource_identities() {
         assert_eq!(descriptors.runtime.stats().retiring_bytes, 0);
         assert_eq!(descriptors.runtime.stats().reserved_bytes, 0);
     }
+}
+
+#[test]
+#[ignore = "requires a native GL adapter"]
+fn native_gl_renders_geometry_and_uploaded_bitmaps_with_exact_pixels() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    let descriptors = gpu_with_backend(wgpu::Backends::GL, None, None);
+    let target = TextureTarget::new(&descriptors.device, (4, 2)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    renderer.set_quality(StageQuality::Low).unwrap();
+    let bitmap = renderer
+        .register_bitmap(Bitmap::new(
+            2,
+            2,
+            BitmapFormat::Rgba,
+            [0, 0, 255, 255].repeat(4),
+        ))
+        .unwrap();
+    for _ in 0..4 {
+        let mut commands = CommandList::new();
+        rect(&mut commands, 0.0, 0.0, 2.0, 2.0, Color::RED);
+        let mut transform = ruffle_render::transform::Transform::default();
+        transform.matrix.tx = Twips::from_pixels(2.0);
+        commands.render_bitmap(
+            bitmap.clone(),
+            transform,
+            false,
+            PixelSnapping::Never,
+            PixelRegion::for_whole_size(2, 2),
+        );
+        renderer
+            .submit_frame(Color::WHITE, commands, vec![])
+            .unwrap();
+        let image = renderer.capture_frame().unwrap().unwrap();
+        assert_eq!(
+            image.get_pixel(0, 0).0,
+            [255, 0, 0, 255],
+            "geometry must reach the final attachment"
+        );
+        assert_eq!(
+            image.get_pixel(2, 0).0,
+            [0, 0, 255, 255],
+            "uploaded bitmap must reach the final attachment"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a native GL adapter"]
+fn native_gl_initialized_and_staged_buffers_preserve_bytes() {
+    let descriptors = gpu_with_backend(wgpu::Backends::GL, None, None);
+    let device = &descriptors.device;
+    let initialized = device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: &[42; 16],
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::UNIFORM,
+        })
+        .unwrap();
+    let output = device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 32,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
+    encoder.copy_buffer_to_buffer(&initialized, 0, &output, 0, 16);
+    let mut arena = crate::frame_upload::FrameUploadArena::new(device.clone(), 64);
+    arena
+        .write_buffer(
+            &mut encoder,
+            &output,
+            16,
+            wgpu::BufferSize::new(16).unwrap(),
+        )
+        .unwrap()
+        .copy_from_slice(&[73; 16]);
+    arena.finish();
+    let index = descriptors
+        .queue
+        .submit([encoder.finish().unwrap()])
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    output.map_async(wgpu::MapMode::Read, .., move |result| {
+        tx.send(result).unwrap();
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: Some(std::time::Duration::from_secs(2)),
+        })
+        .unwrap();
+    rx.recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    let bytes = output.get_mapped_range(..).unwrap();
+    assert_eq!(&bytes[..16], &[42; 16]);
+    assert_eq!(&bytes[16..], &[73; 16]);
+    drop(bytes);
+    output.unmap();
 }
