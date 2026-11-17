@@ -829,16 +829,12 @@ impl CommandEncoder {
         };
         self.device.runtime().check_health()?;
         let raw = self.device.scoped(|_| Ok(self.raw.finish()))?;
-        Ok(CommandBuffer {
-            raw,
-            uses: uses.into_values().collect(),
-            pending,
-        })
+        Ok(CommandBuffer { raw, uses, pending })
     }
 }
 pub struct CommandBuffer {
     raw: wgpu::CommandBuffer,
-    uses: Vec<ResourceLease>,
+    uses: UseSet,
     pending: Vec<crate::gpu_runtime::UnsubmittedUse>,
 }
 
@@ -1128,7 +1124,7 @@ impl Queue {
                     lock.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                 });
-                let mut raw = Vec::new();
+                let mut raw = smallvec::SmallVec::<[wgpu::CommandBuffer; 1]>::new();
                 let mut uses = std::mem::take(
                     &mut *self
                         .0
@@ -1142,10 +1138,13 @@ impl Queue {
                 for command in commands {
                     pending.extend(command.pending);
                     raw.push(command.raw);
-                    uses.extend(command.uses.into_iter().map(|lease| (lease.id(), lease)));
+                    if uses.is_empty() {
+                        uses = command.uses;
+                    } else {
+                        uses.extend(command.uses);
+                    }
                 }
-                let leases: Vec<_> = uses.into_values().collect();
-                let serial = self.0.runtime().register_submission(&leases)?;
+                let serial = self.0.runtime().register_submission(uses.values())?;
                 drop(pending);
                 let index = self.raw().submit(raw);
                 {

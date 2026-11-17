@@ -512,19 +512,21 @@ impl GpuRuntime {
 
     /// Call under the queue's submission ordering gate. Include all resources
     /// recorded in the encoder; binding dependencies are visited transitively.
-    pub fn register_submission(
+    pub fn register_submission<'a>(
         &self,
-        resources: &[ResourceLease],
+        resources: impl IntoIterator<Item = &'a ResourceLease>,
     ) -> Result<SubmissionSerial, RenderFailure> {
         self.0.healthy()?;
-        if resources
-            .iter()
-            .any(|r| !Arc::ptr_eq(&r.0.runtime.0, &self.0))
-        {
-            return Err(failure(
-                RenderFailureKind::Validation,
-                "submission references another device",
-            ));
+        let resources = resources.into_iter();
+        let mut pending = Vec::with_capacity(resources.size_hint().0);
+        for resource in resources {
+            if !Arc::ptr_eq(&resource.0.runtime.0, &self.0) {
+                return Err(failure(
+                    RenderFailureKind::Validation,
+                    "submission references another device",
+                ));
+            }
+            pending.push(resource.id());
         }
         let mut ledger = self.0.ledger();
         if ledger.stats.submitted - ledger.stats.completed >= 2 {
@@ -550,7 +552,6 @@ impl GpuRuntime {
             )
         })?;
         let visit = ledger.visit;
-        let mut pending: Vec<_> = resources.iter().map(ResourceLease::id).collect();
         while let Some(id) = pending.pop() {
             let record = ledger.records.get_mut(&id).ok_or_else(|| {
                 failure(

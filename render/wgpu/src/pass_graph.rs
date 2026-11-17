@@ -137,7 +137,10 @@ impl PassGraph {
         }
         let mut graph = Self {
             passes: Vec::new(),
-            states: HashMap::default(),
+            states: HashMap::with_capacity_and_hasher(
+                snapshot.recipes.len().saturating_add(2),
+                Default::default(),
+            ),
             textures: HashMap::default(),
             shape_inputs: HashMap::default(),
             next_temporary: 0,
@@ -447,10 +450,11 @@ impl PassGraph {
         ancestor: Option<GraphResource>,
     ) -> Result<(), RenderFailure> {
         for node in commands {
+            let clipped = node.region.clip(attachment.bounds);
             if !matches!(
                 node.command,
                 SnapshotCommand::Mask(_) | SnapshotCommand::Shared(_)
-            ) && node.region.clip(attachment.bounds).is_none()
+            ) && clipped.is_none()
             {
                 continue;
             }
@@ -459,10 +463,7 @@ impl PassGraph {
             let mut writes = smallvec::SmallVec::<[GraphResource; 1]>::new();
             reads.push(target);
             writes.push(target);
-            let mut bounds = node
-                .region
-                .clip(attachment.bounds)
-                .unwrap_or(attachment.bounds);
+            let mut bounds = clipped.unwrap_or(attachment.bounds);
             let kind = match &node.command {
                 SnapshotCommand::Shared(children) => {
                     self.commands_in(children, attachment, stencil, ancestor)?;

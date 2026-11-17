@@ -5,7 +5,7 @@ use crate::{
     gpu_runtime::{RenderFailure, RenderFailureKind, ResourceId, ResourceOwner},
     shape_recipe::ShapeRecipe,
 };
-use fnv::{FnvHashMap as HashMap, FnvHashSet as HashSet};
+use fnv::FnvHashMap as HashMap;
 use ruffle_render::{
     backend::ShapeHandle,
     bitmap::{Bitmap, BitmapHandle, PixelRegion, PixelSnapping},
@@ -194,18 +194,20 @@ pub struct PreparedSnapshot {
 }
 #[derive(Default)]
 struct Capture {
-    known: HashSet<ResourceVersion>,
+    known: HashMap<ResourceVersion, usize>,
     resources: Vec<(ResourceVersion, Handle)>,
     recipes: Vec<ResourceRecipe>,
 }
 impl Capture {
     fn resource(&mut self, handle: Handle) -> Result<ResourceVersion, RenderFailure> {
         let resource = handle.version()?;
-        if self.known.contains(&resource) {
-            return Ok(resource);
-        }
         // Register before dependencies to make cyclic references bounded.
-        self.known.insert(resource);
+        match self.known.entry(resource) {
+            std::collections::hash_map::Entry::Occupied(_) => return Ok(resource),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(usize::MAX);
+            }
+        }
         let recipe = match &handle {
             Handle::Bitmap(handle) => (&*handle.0 as &dyn Any)
                 .downcast_ref::<BitmapRecipe>()
@@ -245,71 +247,72 @@ impl Capture {
             Handle::Shader(_) => ResourceRecipe::Resident(resource),
         };
         self.recipes.push(recipe);
+        *self.known.get_mut(&resource).unwrap() = self.resources.len();
         self.resources.push((resource, handle));
         Ok(resource)
     }
     fn commands(&mut self, commands: &CommandList) -> Result<Arc<[SnapshotNode]>, RenderFailure> {
-        commands
-            .iter()
-            .map(|command| {
-                let region = command.region();
-                let command = match command {
-                    Command::RenderBitmap {
-                        bitmap,
-                        transform,
-                        smoothing,
-                        pixel_snapping,
-                        region,
-                    } => SnapshotCommand::Bitmap {
-                        resource: self.resource(Handle::Bitmap(bitmap.clone()))?,
-                        transform: transform.clone(),
-                        smoothing: *smoothing,
-                        pixel_snapping: *pixel_snapping,
-                        region: *region,
-                    },
-                    Command::RenderShape { shape, transform } => SnapshotCommand::Shape {
-                        resource: self.resource(Handle::Shape(shape.clone()))?,
-                        transform: transform.clone(),
-                    },
-                    Command::RenderStage3D { bitmap, transform } => SnapshotCommand::Stage3D {
-                        resource: self.resource(Handle::Bitmap(bitmap.clone()))?,
-                        transform: transform.clone(),
-                    },
-                    Command::DrawRect { color, matrix } => SnapshotCommand::Rect {
-                        color: *color,
-                        matrix: *matrix,
-                    },
-                    Command::DrawLine { color, matrix }
-                    | Command::DrawLineRect { color, matrix } => SnapshotCommand::Line {
+        let mut nodes = Vec::with_capacity(commands.iter().len());
+        for command in commands.iter() {
+            let region = command.region();
+            let command = match command {
+                Command::RenderBitmap {
+                    bitmap,
+                    transform,
+                    smoothing,
+                    pixel_snapping,
+                    region,
+                } => SnapshotCommand::Bitmap {
+                    resource: self.resource(Handle::Bitmap(bitmap.clone()))?,
+                    transform: transform.clone(),
+                    smoothing: *smoothing,
+                    pixel_snapping: *pixel_snapping,
+                    region: *region,
+                },
+                Command::RenderShape { shape, transform } => SnapshotCommand::Shape {
+                    resource: self.resource(Handle::Shape(shape.clone()))?,
+                    transform: transform.clone(),
+                },
+                Command::RenderStage3D { bitmap, transform } => SnapshotCommand::Stage3D {
+                    resource: self.resource(Handle::Bitmap(bitmap.clone()))?,
+                    transform: transform.clone(),
+                },
+                Command::DrawRect { color, matrix } => SnapshotCommand::Rect {
+                    color: *color,
+                    matrix: *matrix,
+                },
+                Command::DrawLine { color, matrix } | Command::DrawLineRect { color, matrix } => {
+                    SnapshotCommand::Line {
                         color: *color,
                         matrix: *matrix,
                         rectangle: matches!(command, Command::DrawLineRect { .. }),
+                    }
+                }
+                Command::Shared(children) => SnapshotCommand::Shared(self.commands(children)?),
+                Command::Blend(children, mode) => SnapshotCommand::Blend {
+                    children: self.commands(children)?,
+                    mode: match mode {
+                        RenderBlendMode::Builtin(mode) => SnapshotBlend::Builtin(*mode),
+                        RenderBlendMode::Shader(shader) => {
+                            SnapshotBlend::Shader(self.resource(Handle::Shader(shader.clone()))?)
+                        }
                     },
-                    Command::Shared(children) => SnapshotCommand::Shared(self.commands(children)?),
-                    Command::Blend(children, mode) => SnapshotCommand::Blend {
-                        children: self.commands(children)?,
-                        mode: match mode {
-                            RenderBlendMode::Builtin(mode) => SnapshotBlend::Builtin(*mode),
-                            RenderBlendMode::Shader(shader) => SnapshotBlend::Shader(
-                                self.resource(Handle::Shader(shader.clone()))?,
-                            ),
-                        },
-                    },
-                    Command::RenderAlphaMask {
-                        maskee_commands,
-                        mask_commands,
-                    } => SnapshotCommand::AlphaMask {
-                        maskee: self.commands(maskee_commands)?,
-                        mask: self.commands(mask_commands)?,
-                    },
-                    Command::PushMask => SnapshotCommand::Mask(MaskCommand::Push),
-                    Command::ActivateMask => SnapshotCommand::Mask(MaskCommand::Activate),
-                    Command::DeactivateMask => SnapshotCommand::Mask(MaskCommand::Deactivate),
-                    Command::PopMask => SnapshotCommand::Mask(MaskCommand::Pop),
-                };
-                Ok(SnapshotNode { command, region })
-            })
-            .collect()
+                },
+                Command::RenderAlphaMask {
+                    maskee_commands,
+                    mask_commands,
+                } => SnapshotCommand::AlphaMask {
+                    maskee: self.commands(maskee_commands)?,
+                    mask: self.commands(mask_commands)?,
+                },
+                Command::PushMask => SnapshotCommand::Mask(MaskCommand::Push),
+                Command::ActivateMask => SnapshotCommand::Mask(MaskCommand::Activate),
+                Command::DeactivateMask => SnapshotCommand::Mask(MaskCommand::Deactivate),
+                Command::PopMask => SnapshotCommand::Mask(MaskCommand::Pop),
+            };
+            nodes.push(SnapshotNode { command, region });
+        }
+        Ok(nodes.into())
     }
 }
 impl PreparedSnapshot {
@@ -402,19 +405,19 @@ impl PreparedSnapshot {
     }
 
     pub fn capture(commands: &CommandList) -> Result<Self, RenderFailure> {
-        let mut capture = Capture::default();
+        let capacity = commands.iter().len().min(64);
+        let mut capture = Capture {
+            known: HashMap::with_capacity_and_hasher(capacity, Default::default()),
+            resources: Vec::with_capacity(capacity),
+            recipes: Vec::with_capacity(capacity),
+        };
         let commands = capture.commands(commands)?;
         Ok(Self {
             snapshot: RenderSnapshot {
                 commands,
                 recipes: capture.recipes,
             },
-            resource_indices: capture
-                .resources
-                .iter()
-                .enumerate()
-                .map(|(index, (version, _))| (*version, index))
-                .collect(),
+            resource_indices: capture.known,
             resources: capture.resources,
         })
     }
@@ -449,8 +452,8 @@ impl PreparedSnapshot {
             mesh::{ShapeInput, input_vertices},
         };
         self.validate(backend)?;
-        enum Input {
-            Graph(RenderSnapshot),
+        enum Input<'a> {
+            Graph(&'a RenderSnapshot),
             Shapes(Vec<(ResourceVersion, ShapeInput)>, u64),
         }
         enum Output {
@@ -510,7 +513,7 @@ impl PreparedSnapshot {
         });
         let jobs = std::iter::once(Work {
             bytes: (commands as u64).saturating_mul(4096).saturating_add(4096),
-            value: Input::Graph(self.snapshot.clone()),
+            value: Input::Graph(&self.snapshot),
         })
         .chain(std::iter::from_fn(|| {
             let partition: Vec<_> = shapes
@@ -542,7 +545,7 @@ impl PreparedSnapshot {
             jobs,
             |input| match input {
                 Input::Graph(snapshot) => {
-                    PassGraph::compile(&snapshot, bounds, samples, load).map(Output::Graph)
+                    PassGraph::compile(snapshot, bounds, samples, load).map(Output::Graph)
                 }
                 Input::Shapes(inputs, mut budget) => {
                     let mut prepared = Vec::with_capacity(inputs.len());
