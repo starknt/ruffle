@@ -454,11 +454,14 @@ impl PreparedSnapshot {
         self.validate(backend)?;
         enum Input {
             Graph(RenderSnapshot),
-            Shape(ResourceVersion, ShapeInput, u64),
+            Shapes(Vec<(ResourceVersion, ShapeInput)>, u64),
         }
         enum Output {
             Graph(PassGraph),
-            Shape(ResourceVersion, crate::prepare::mesh::PreparedMesh),
+            Shapes(
+                Vec<(ResourceVersion, crate::prepare::mesh::PreparedMesh)>,
+                Vec<(ResourceVersion, ShapeInput)>,
+            ),
         }
         fn command_count(nodes: &[SnapshotNode]) -> usize {
             nodes
@@ -491,34 +494,42 @@ impl PreparedSnapshot {
         let parallel = crate::prepare::parallel_workload(commands, vertices);
         let output_budget =
             (backend.descriptors.runtime.config().staging_limit / 4).clamp(4096, 16 * 1024 * 1024);
+        let mut shapes = self.snapshot.recipes.iter().filter_map(|r| match r {
+            ResourceRecipe::Shape {
+                resource,
+                geometry: Some(geometry),
+                scale,
+                bitmap_sizes,
+                ..
+            } => Some((
+                *resource,
+                ShapeInput {
+                    geometry: geometry.clone(),
+                    scale: *scale,
+                    bitmap_sizes: bitmap_sizes.clone(),
+                },
+            )),
+            _ => None,
+        });
         let jobs = std::iter::once(Work {
             bytes: (commands as u64).saturating_mul(4096).saturating_add(4096),
             value: Input::Graph(self.snapshot.clone()),
         })
-        .chain(self.snapshot.recipes.iter().filter_map(|r| {
-            match r {
-                ResourceRecipe::Shape {
-                    resource,
-                    geometry: Some(geometry),
-                    scale,
-                    bitmap_sizes,
-                    ..
-                } => Some(Work {
-                    bytes: (input_vertices(geometry) as u64)
-                        .saturating_mul(1024)
-                        .saturating_add(output_budget),
-                    value: Input::Shape(
-                        *resource,
-                        ShapeInput {
-                            geometry: geometry.clone(),
-                            scale: *scale,
-                            bitmap_sizes: bitmap_sizes.clone(),
-                        },
-                        output_budget,
-                    ),
-                }),
-                _ => None,
+        .chain(std::iter::from_fn(|| {
+            let partition: Vec<_> = shapes
+                .by_ref()
+                .take(if parallel { 16 } else { 1 })
+                .collect();
+            if partition.is_empty() {
+                return None;
             }
+            let input = partition.iter().fold(0u64, |bytes, (_, input)| {
+                bytes.saturating_add((input_vertices(&input.geometry) as u64).saturating_mul(1024))
+            });
+            Some(Work {
+                bytes: input.saturating_add(output_budget),
+                value: Input::Shapes(partition, output_budget),
+            })
         }));
         let preparation = backend.descriptors.runtime.preparation().clone();
         let generation = backend.preparation_generation.capture();
@@ -531,9 +542,40 @@ impl PreparedSnapshot {
                 Input::Graph(snapshot) => {
                     PassGraph::compile(&snapshot, bounds, samples, load).map(Output::Graph)
                 }
-                Input::Shape(resource, input, budget) => input
-                    .prepare_bounded(budget)
-                    .map(|mesh| Output::Shape(resource, mesh)),
+                Input::Shapes(inputs, mut budget) => {
+                    let mut prepared = Vec::with_capacity(inputs.len());
+                    let mut remaining = inputs.into_iter();
+                    while let Some((resource, input)) = remaining.next() {
+                        match input.clone().prepare_bounded(budget) {
+                            Ok(mesh) if mesh.retained_bytes() <= budget => {
+                                budget -= mesh.retained_bytes();
+                                prepared.push((resource, mesh));
+                            }
+                            Ok(_) => {
+                                return Ok(Output::Shapes(
+                                    prepared,
+                                    std::iter::once((resource, input))
+                                        .chain(remaining)
+                                        .collect(),
+                                ));
+                            }
+                            Err(error) if error.kind() == RenderFailureKind::BudgetExceeded => {
+                                // The partition estimate was too small. Publish
+                                // completed meshes, then prepare the remainder
+                                // individually on the owner without retaining a
+                                // second wave of oversized results.
+                                return Ok(Output::Shapes(
+                                    prepared,
+                                    std::iter::once((resource, input))
+                                        .chain(remaining)
+                                        .collect(),
+                                ));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Ok(Output::Shapes(prepared, Vec::new()))
+                }
             },
             |batch| {
                 // Recheck after join before GPU publication; only this closure
@@ -542,14 +584,28 @@ impl PreparedSnapshot {
                 for result in batch {
                     match result {
                         Output::Graph(value) => graph = Some(value),
-                        Output::Shape(resource, mesh) => {
-                            let Handle::Shape(handle) = self.handle(resource)? else {
-                                return Err(foreign());
+                        Output::Shapes(meshes, deferred) => {
+                            let mut publish = |resource, mesh| {
+                                let Handle::Shape(handle) = self.handle(resource)? else {
+                                    return Err(foreign());
+                                };
+                                let recipe = (&*handle.0 as &dyn Any)
+                                    .downcast_ref::<ShapeRecipe>()
+                                    .ok_or_else(foreign)?;
+                                recipe.publish(backend, mesh)
                             };
-                            let recipe = (&*handle.0 as &dyn Any)
-                                .downcast_ref::<ShapeRecipe>()
-                                .ok_or_else(foreign)?;
-                            recipe.publish(backend, mesh)?;
+                            for (resource, mesh) in meshes {
+                                publish(resource, mesh)?;
+                            }
+                            for (resource, input) in deferred {
+                                let mesh = {
+                                    let _timer = ruffle_render::profile::native_time(
+                                        ruffle_render::profile::NativePhase::Preparation,
+                                    );
+                                    input.prepare_bounded(output_budget)?
+                                };
+                                publish(resource, mesh)?;
+                            }
                         }
                     }
                 }

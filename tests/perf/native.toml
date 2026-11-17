@@ -45,3 +45,7 @@ path = "../tests/swfs/native_perf/traits_4"
 [[case]]
 name = "traits_5"
 path = "../tests/swfs/native_perf/traits_5"
+
+[[case]]
+name = "worker_prepare"
+path = "../tests/swfs/native_perf/worker_prepare"

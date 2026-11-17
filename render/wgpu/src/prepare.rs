@@ -138,6 +138,9 @@ impl NativePreparation {
             if !generation.is_current() {
                 return Ok(false);
             }
+            let timer = ruffle_render::profile::native_time(
+                ruffle_render::profile::NativePhase::Preparation,
+            );
             let mut pending = Vec::new();
             let mut permits = Vec::new();
             while parallel && pending.len() < self.0.limit {
@@ -161,6 +164,7 @@ impl NativePreparation {
                 if !generation.is_current() {
                     return Ok(false);
                 }
+                drop(timer);
                 consume(vec![result])?;
                 continue;
             }
@@ -198,6 +202,7 @@ impl NativePreparation {
                         })?
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            drop(timer);
             consume(output)?;
             // Reservations include completed, unpublished output, not just the
             // worker's running interval. Another renderer shares these permits.

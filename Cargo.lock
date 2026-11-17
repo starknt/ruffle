@@ -5957,6 +5957,7 @@ dependencies = [
  "ruffle_test_framework",
  "serde",
  "serde_json",
+ "sha2",
  "temp-dir",
  "toml",
  "tracing",

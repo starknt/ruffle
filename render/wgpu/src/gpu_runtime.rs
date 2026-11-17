@@ -71,6 +71,25 @@ pub enum ResourceKind {
 
 impl ResourceKind {
     pub const COUNT: usize = 17;
+    pub const NAMES: [&'static str; Self::COUNT] = [
+        "texture",
+        "buffer",
+        "textureView",
+        "bindGroup",
+        "sampler",
+        "pipeline",
+        "shapeMesh",
+        "glyphMesh",
+        "offscreenTarget",
+        "readbackBuffer",
+        "stagingBuffer",
+        "stage3d",
+        "shader",
+        "hostTarget",
+        "querySet",
+        "commandEncoder",
+        "dynamicBuffer",
+    ];
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -178,6 +197,8 @@ pub struct GpuMemoryStats {
     pub pressure: MemoryPressure,
     pub submitted: u64,
     pub completed: u64,
+    pub budget_rejections: u64,
+    pub creation_retries: u64,
 }
 
 #[derive(Default)]
@@ -359,6 +380,7 @@ impl GpuRuntime {
             .checked_add(bytes)
             .filter(|total| *total <= self.0.config.hard_limit);
         if total.is_none() || ledger.stats.resources >= self.0.config.resource_limit {
+            ledger.stats.budget_rejections += 1;
             return Err(failure(
                 RenderFailureKind::BudgetExceeded,
                 format!(
@@ -375,6 +397,7 @@ impl GpuRuntime {
                 .checked_add(bytes)
                 .is_none_or(|size| size > self.0.config.staging_limit)
         {
+            ledger.stats.budget_rejections += 1;
             return Err(failure(
                 RenderFailureKind::BudgetExceeded,
                 "GPU staging budget exceeded",
@@ -407,6 +430,41 @@ impl GpuRuntime {
             runtime: self.clone(),
             id: Some(id),
         })
+    }
+
+    pub(crate) fn record_creation_retry(&self) {
+        self.0.ledger().stats.creation_retries += 1;
+    }
+    pub fn diagnostic_snapshot(&self) -> ruffle_render::profile::NativeResources {
+        let stats = self.stats();
+        let work = self.preparation().stats();
+        ruffle_render::profile::NativeResources {
+            device_generation: self.generation(),
+            logical_bytes: stats.total_bytes,
+            active_bytes: stats.active_bytes,
+            reserved_bytes: stats.reserved_bytes,
+            idle_bytes: stats.idle_bytes,
+            retiring_bytes: stats.retiring_bytes,
+            peak_bytes: stats.peak_bytes,
+            cache_retained_bytes: stats.cache_retained_bytes,
+            pool_retained_bytes: stats.pool_retained_bytes,
+            resources: stats.resources,
+            classes: ResourceKind::NAMES
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (*name, stats.kind_bytes[i], stats.kind_counts[i]))
+                .collect(),
+            submitted: stats.submitted,
+            completed: stats.completed,
+            budget_rejections: stats.budget_rejections,
+            creation_retries: stats.creation_retries,
+            terminal_failure: self.failure().map(|error| format!("{:?}", error.kind())),
+            worker_active: work.active,
+            worker_bytes: work.bytes,
+            worker_peak_active: work.peak_active,
+            worker_peak_bytes: work.peak_bytes,
+            worker_submitted: work.submitted,
+        }
     }
 
     pub fn stats(&self) -> GpuMemoryStats {

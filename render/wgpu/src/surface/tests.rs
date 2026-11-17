@@ -42,6 +42,17 @@ fn measurement_counts_encoded_draws_and_passes() {
         .submit_frame(Color::BLACK, commands, vec![])
         .expect("GPU operation failed");
     let work = metrics.snapshot().work;
+    let snapshot = metrics.snapshot();
+    let resources = snapshot
+        .native_resources
+        .as_ref()
+        .expect("native resources published");
+    assert!(resources.logical_bytes > 0);
+    assert_eq!(resources.worker_active, 0);
+    assert!(
+        snapshot.native_timings[ruffle_render::profile::NativePhase::Preparation as usize].samples
+            > 0
+    );
     // One direct shape pass, with no surface-copy or capture pass.
     assert_eq!(work.draw_calls, 1);
     assert_eq!(work.render_passes, 1);
@@ -1936,6 +1947,10 @@ fn native_preparation_parallel_shapes_match_serial_pixels_and_join_before_encodi
         assert_eq!(stats.active, 0, "all CPU tasks joined in this frame");
         assert_eq!(stats.bytes, 0, "scratch permits returned after publication");
         assert_eq!(stats.submitted > before, parallel);
+        assert!(
+            stats.submitted - before <= 3,
+            "small shapes share deterministic preparation partitions"
+        );
         images.push(renderer.capture_frame().unwrap().unwrap().into_raw());
     }
     assert_eq!(images[0], images[1]);

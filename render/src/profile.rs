@@ -48,13 +48,22 @@ work_counters!(
     pic_megamorphic,
     catch_up_frames,
     discarded_frame_debt_us,
+    native_pipeline_changes,
+    native_bind_groups,
+    native_vertex_buffers,
+    native_index_buffers,
+    native_scissors,
+    native_stencil_references,
+    native_viewports,
 );
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct GpuSample {
     pub frame: Option<u64>,
     pub nanos: u64,
+    /// Inclusive named query durations. Nested names must not be summed as total frame time.
+    pub phases: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,15 +74,17 @@ pub enum NativePhase {
     SurfaceAcquire,
     Present,
     QueueThrottle,
+    Preparation,
 }
 impl NativePhase {
-    pub const NAMES: [&'static str; 6] = [
+    pub const NAMES: [&'static str; 7] = [
         "encoderFinish",
         "submitLock",
         "queueSubmit",
         "surfaceAcquire",
         "present",
         "queueThrottle",
+        "preparation",
     ];
 }
 
@@ -218,7 +229,8 @@ pub struct PublishedCodeStats {
 #[derive(Debug, Default, Clone)]
 pub struct Counters {
     pub work: RenderWork,
-    pub native_timings: [Timing; 6],
+    pub native_timings: [Timing; 7],
+    pub native_resources: Option<NativeResources>,
     pub gpu_samples: Vec<GpuSample>,
     pub dropped_gpu_samples: u64,
     #[cfg(feature = "lifecycle_counts")]
@@ -255,6 +267,41 @@ pub struct Counters {
     /// Cumulative publication totals, not currently live allocations or RSS.
     pub published_code: PublishedCodeStats,
     pub async_events: Vec<AsyncEvent>,
+}
+
+/// Device-wide logical accounting. Driver allocations and process RSS are
+/// different measurements and are deliberately not folded into these bytes.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct NativeResources {
+    pub device_generation: u64,
+    pub logical_bytes: u64,
+    pub active_bytes: u64,
+    pub reserved_bytes: u64,
+    pub idle_bytes: u64,
+    pub retiring_bytes: u64,
+    pub peak_bytes: u64,
+    pub cache_retained_bytes: u64,
+    pub pool_retained_bytes: u64,
+    pub resources: usize,
+    pub classes: Vec<(&'static str, u64, usize)>,
+    pub submitted: u64,
+    pub completed: u64,
+    pub budget_rejections: u64,
+    pub creation_retries: u64,
+    pub terminal_failure: Option<String>,
+    pub worker_active: usize,
+    pub worker_bytes: u64,
+    pub worker_peak_active: usize,
+    pub worker_peak_bytes: u64,
+    pub worker_submitted: u64,
+}
+pub fn record_native_resources(stats: NativeResources) {
+    CURRENT.with_borrow(|current| {
+        if let Some(metrics) = current {
+            metrics.0.borrow_mut().native_resources = Some(stats);
+        }
+    });
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -324,13 +371,21 @@ pub fn next_frame() -> Option<u64> {
     CURRENT.with_borrow(|m| m.as_ref().map(|m| m.0.borrow().stage_submissions + 1))
 }
 pub fn record_gpu(nanos: u64, frame: Option<u64>) {
+    record_gpu_sample(GpuSample {
+        frame,
+        nanos,
+        phases: Vec::new(),
+    });
+}
+pub fn record_gpu_sample(sample: GpuSample) {
+    let (frame, nanos) = (sample.frame, sample.nanos);
     CURRENT.with_borrow(|m| {
         if let Some(m) = m {
             m.record(Phase::Gpu, nanos);
             let mut counters = m.0.borrow_mut();
             counters.gpu_frame = frame;
             if counters.gpu_samples.len() < 256 {
-                counters.gpu_samples.push(GpuSample { frame, nanos });
+                counters.gpu_samples.push(sample);
             } else {
                 counters.dropped_gpu_samples += 1;
             }

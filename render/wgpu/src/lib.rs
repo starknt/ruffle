@@ -40,6 +40,7 @@ mod bitmaps;
 mod context3d;
 mod frame_upload;
 mod globals;
+mod gpu_metrics;
 pub mod gpu_profiler;
 pub mod gpu_resources;
 pub mod gpu_runtime;

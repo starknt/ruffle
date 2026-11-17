@@ -987,8 +987,6 @@ struct PendingFrame {
     mapped_buffers: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
-impl Drop for QueryPool {
-    fn drop(&mut self) {
-        self.read_buffer.unmap();
-    }
-}
+// A recycled pool has already been unmapped by reset(). Dropping its managed
+// buffers also releases a still-mapped or pending-map buffer on early teardown;
+// unconditionally calling unmap here would invalidate an already-reset pool.

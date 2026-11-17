@@ -192,6 +192,20 @@ pub struct RenderPass<'a> {
     state: PassState,
     changes: StateChanges,
 }
+impl Drop for RenderPass<'_> {
+    fn drop(&mut self) {
+        let c = self.state_changes();
+        ruffle_render::profile::work(|w| {
+            w.native_pipeline_changes += c.pipelines;
+            w.native_bind_groups += c.bind_groups;
+            w.native_vertex_buffers += c.vertex_buffers;
+            w.native_index_buffers += c.index_buffers;
+            w.native_scissors += c.scissors;
+            w.native_stencil_references += c.stencil_references;
+            w.native_viewports += c.viewports;
+        });
+    }
+}
 impl RenderPass<'_> {
     pub fn state_changes(&self) -> StateChanges {
         self.changes

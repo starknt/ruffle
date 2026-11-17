@@ -448,22 +448,27 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
 
     /// Collect completed timestamp queries without blocking or inventing missing samples.
     pub fn collect_gpu_samples(&mut self) {
+        if ruffle_render::profile::enabled() {
+            ruffle_render::profile::record_native_resources(
+                self.descriptors.runtime.diagnostic_snapshot(),
+            );
+        }
         let timestamp_period = self.descriptors.queue.get_timestamp_period();
         while let Some(queries) = self.profiler.process_finished_frame(timestamp_period) {
-            let mut ranges = queries.iter().filter_map(|q| q.time.as_ref());
-            if let Some(first) = ranges.next() {
-                let (lo, hi) = ranges.fold((first.start, first.end), |(a, b), t| {
-                    (a.min(t.start), b.max(t.end))
-                });
-                let frame = queries
-                    .iter()
-                    .find_map(|q| q.label.strip_prefix("Stage ")?.parse().ok());
-                ruffle_render::profile::record_gpu(((hi - lo) * 1e9) as u64, frame);
+            if let Some(sample) = crate::gpu_metrics::sample_queries(&queries) {
+                ruffle_render::profile::record_gpu_sample(sample);
             }
         }
     }
     pub fn descriptors(&self) -> &Arc<Descriptors> {
         &self.descriptors
+    }
+
+    pub fn sample_count(&self) -> u32 {
+        self.surface.sample_count()
+    }
+    pub fn quality(&self) -> StageQuality {
+        self.surface.quality()
     }
 
     pub fn last_submission(&self) -> Option<SubmissionIndex> {

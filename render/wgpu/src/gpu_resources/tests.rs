@@ -346,6 +346,10 @@ fn profiler_queries_and_readback_storage_obey_the_device_ledger() {
     assert_eq!(timings[0].label, "measured frame");
     assert!(timings[0].time.is_some());
     drop(profiler);
+    device
+        .runtime()
+        .check_health()
+        .expect("retiring recycled profiler buffers is valid");
     assert_eq!(device.runtime().stats().total_bytes, 0);
 }
 
@@ -677,6 +681,8 @@ fn render_pass_suppresses_identical_state_but_preserves_offsets_and_boundaries()
         .unwrap();
     let view = texture.create_view(&Default::default()).unwrap();
     let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
+    let metrics = ruffle_render::profile::RenderMetrics::default();
+    let _scope = ruffle_render::profile::enter(Some(&metrics));
     for _ in 0..2 {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -713,6 +719,11 @@ fn render_pass_suppresses_identical_state_but_preserves_offsets_and_boundaries()
         assert_eq!(pass.state_changes().scissors, 2);
         assert_eq!(pass.state_changes().stencil_references, 2);
     }
+    assert_eq!(metrics.snapshot().work.native_bind_groups, 4);
+    assert_eq!(metrics.snapshot().work.native_vertex_buffers, 4);
+    assert_eq!(metrics.snapshot().work.native_index_buffers, 4);
+    assert_eq!(metrics.snapshot().work.native_scissors, 4);
+    assert_eq!(metrics.snapshot().work.native_stencil_references, 4);
     assert!(encoder.finish().is_ok());
 }
 

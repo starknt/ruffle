@@ -4,6 +4,7 @@ use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
 use crate::{PosColorVertex, PosUvVertex};
 use ruffle_render::tessellator::{DrawType, Gradient, Mesh};
 
+#[derive(Clone)]
 pub struct ShapeInput {
     pub geometry: std::sync::Arc<ruffle_render::shape_utils::OwnedDistilledShape>,
     pub scale: f32,
@@ -75,6 +76,12 @@ pub enum PackedVertices {
     Texture(Vec<PosUvVertex>),
 }
 impl PackedVertices {
+    fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::Color(v) => (v.capacity() * std::mem::size_of::<PosColorVertex>()) as u64,
+            Self::Texture(v) => (v.capacity() * std::mem::size_of::<PosUvVertex>()) as u64,
+        }
+    }
     pub fn bytes(&self) -> &[u8] {
         match self {
             Self::Color(v) => bytemuck::cast_slice(v),
@@ -93,6 +100,25 @@ fn allocated<T>(size: usize) -> Result<Vec<T>, RenderFailure> {
     Ok(result)
 }
 impl PreparedMesh {
+    pub fn retained_bytes(&self) -> u64 {
+        let draws = (self.draws.capacity() * std::mem::size_of::<PackedDraw>()) as u64;
+        let gradients = (self.gradients.capacity() * std::mem::size_of::<Gradient>()) as u64;
+        self.draws
+            .iter()
+            .fold(draws.saturating_add(gradients), |bytes, draw| {
+                bytes
+                    .saturating_add(draw.vertices.retained_bytes())
+                    .saturating_add((draw.indices.capacity() * std::mem::size_of::<u32>()) as u64)
+            })
+            .saturating_add(
+                self.gradients
+                    .iter()
+                    .map(|g| {
+                        (g.records.capacity() * std::mem::size_of::<swf::GradientRecord>()) as u64
+                    })
+                    .sum::<u64>(),
+            )
+    }
     pub fn pack(mesh: Mesh) -> Result<Self, RenderFailure> {
         let mut draws = allocated(mesh.draws.len())?;
         let mut bounds: Option<[f64; 4]> = None;

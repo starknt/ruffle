@@ -335,6 +335,7 @@ impl Device {
     ) -> Result<T, RenderFailure> {
         match attempt() {
             Err(error) if retryable(&error) => {
+                self.runtime().record_creation_retry();
                 self.reclaim_and_drain()?;
                 attempt()
             }
@@ -377,7 +378,11 @@ impl Device {
                 timeout: Some(remaining),
             })
             .map_err(crate::utils::poll_failure)?;
-        self.runtime().check_health()
+        self.runtime().check_health()?;
+        // The wait can make idle pages eligible for the first time. Reclaim
+        // those completed pages before the single allocation retry.
+        self.runtime().scheduler().reclaim();
+        Ok(())
     }
     fn reserve_with_reclaim(
         &self,
@@ -387,6 +392,7 @@ impl Device {
         self.reclaim_soft(bytes);
         match self.runtime().reserve(kind, self.1, bytes) {
             Err(error) if retryable(&error) => {
+                self.runtime().record_creation_retry();
                 self.reclaim_and_drain()?;
                 self.runtime().reserve(kind, self.1, bytes)
             }

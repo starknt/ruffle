@@ -1,5 +1,6 @@
 //! Offline native frame service benchmark. Captures and trace comparison belong
 //! to the regression runner; this runner measures GPU-completed work, not FPS.
+#![recursion_limit = "256"]
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use ruffle_render::profile::{self, NativePhase, RenderMetrics};
@@ -14,6 +15,7 @@ use ruffle_test_framework::test::Test;
 use ruffle_test_framework::vfs::{PhysicalFS, VfsPath};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -148,6 +150,49 @@ fn resident_memory() -> Option<(u64, u64)> {
     Some((field("VmRSS:")?, field("VmHWM:")?))
 }
 
+fn workload_digest(path: &std::path::Path) -> Result<String> {
+    fn visit(root: &std::path::Path, path: &std::path::Path, hash: &mut Sha256) -> Result<()> {
+        let mut entries = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                visit(root, &path, hash)?;
+            } else if matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some(
+                    "swf"
+                        | "toml"
+                        | "json"
+                        | "jsonl"
+                        | "pbj"
+                        | "png"
+                        | "jpg"
+                        | "jpeg"
+                        | "mp3"
+                        | "flv"
+                        | "txt"
+                )
+            ) {
+                let name = path.strip_prefix(root)?.to_string_lossy();
+                let bytes = fs::read(&path)?;
+                hash.update((name.len() as u64).to_le_bytes());
+                hash.update(name.as_bytes());
+                hash.update((bytes.len() as u64).to_le_bytes());
+                hash.update(bytes);
+            }
+        }
+        Ok(())
+    }
+    let mut hash = Sha256::new();
+    visit(path, path, &mut hash)?;
+    Ok(format!("{:x}", hash.finalize()))
+}
+fn allocator_stats(device: &wgpu::Device) -> serde_json::Value {
+    device.generate_allocator_report().map_or(serde_json::Value::Null, |report|
+        json!({"allocatedBytes":report.total_allocated_bytes,"reservedBytes":report.total_reserved_bytes}))
+}
+
 fn main() -> Result<()> {
     let opt = Opt::parse();
     let total = validate_frames(opt.warmup, opt.frames)?;
@@ -187,7 +232,7 @@ fn main() -> Result<()> {
         .context("manifest parent")?
         .join(&case.path)
         .canonicalize()?;
-    let root: VfsPath = PhysicalFS::new(path).into();
+    let root: VfsPath = PhysicalFS::new(&path).into();
     let mut options = TestOptions::read(&root.join("test.toml")?)?;
     options.num_frames = Some(total);
     options.num_ticks = None;
@@ -217,14 +262,33 @@ fn main() -> Result<()> {
             .create_new(true)
             .open(&opt.output)?,
     );
+    let settings = {
+        let player = runner.player().lock().unwrap();
+        let renderer =
+            <dyn Any>::downcast_ref::<WgpuRenderBackend<TextureTarget>>(player.renderer()).unwrap();
+        use ruffle_render::backend::RenderBackend as _;
+        let viewport = renderer.viewport_dimensions();
+        json!({"quality":renderer.quality().to_string(), "samples":renderer.sample_count(),
+            "viewport":[viewport.width,viewport.height], "scaleFactor":viewport.scale_factor,
+            "readback":false,"inFlightLimit":2,"debugAssertions":cfg!(debug_assertions),"avmDebug":cfg!(feature="avm_debug"),
+            "timestampPeriod":environment.descriptors.queue.get_timestamp_period(),
+            "deviceFeatures":format!("{:?}", environment.descriptors.device.features())})
+    };
+    let run_id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
     writeln!(
         output,
         "{}",
-        json!({"event":"session", "schemaVersion":1, "case":case.name,
+        json!({"event":"session", "schemaVersion":2, "case":case.name,
         "backend":format!("{:?}", info.backend), "device":info.name, "driver":info.driver_info,
         "warmup":opt.warmup, "frames":opt.frames, "inFlightLimit":2, "readback":false, "paceFps":opt.pace_fps,
-        "profilingEnabled":!opt.profile_off,
-        "debugAssertions":cfg!(debug_assertions), "avmDebug":cfg!(feature="avm_debug")})
+        "profilingEnabled":!opt.profile_off, "runId":run_id, "settings":settings,
+        "workloadSha256":workload_digest(&path)?})
     )?;
     let mut inflight = VecDeque::new();
     let mut measured_start = None;
@@ -317,7 +381,8 @@ fn main() -> Result<()> {
                 "{}",
                 json!({"event":"frame", "frameId":if opt.profile_off { u64::from(frame)+1 } else { current.stage_submissions },
                 "cpuNs":cpu_ns,"phaseNs":phases,"nativeNs":native,"work":current.work.delta(previous.work),
-                "rssBytes":rss.map(|r|r.0)})
+                "rssBytes":rss.map(|r|r.0),"nativeResources":current.native_resources,
+                "allocator":rss.map(|_| allocator_stats(&environment.descriptors.device))})
             )?;
         }
         for sample in metrics.take_gpu_samples() {
@@ -325,7 +390,7 @@ fn main() -> Result<()> {
                 writeln!(
                     output,
                     "{}",
-                    json!({"event":"gpu","frameId":sample.frame,"ns":sample.nanos})
+                    json!({"event":"gpu","frameId":sample.frame,"ns":sample.nanos,"phaseNs":sample.phases})
                 )?;
             }
         }
@@ -349,7 +414,7 @@ fn main() -> Result<()> {
         writeln!(
             output,
             "{}",
-            json!({"event":"gpu","frameId":sample.frame,"ns":sample.nanos})
+            json!({"event":"gpu","frameId":sample.frame,"ns":sample.nanos,"phaseNs":sample.phases})
         )?;
     }
     let memory = resident_memory();
@@ -358,7 +423,9 @@ fn main() -> Result<()> {
         "{}",
         json!({"event":"summary","frames":opt.frames,"completedNs":completed_ns,
         "peakRssBytes":memory.map(|r|r.1),"rssBytes":memory.map(|r|r.0),
-        "droppedGpuSamples":metrics.snapshot().dropped_gpu_samples})
+        "droppedGpuSamples":metrics.snapshot().dropped_gpu_samples,
+        "resourcesAfterDrain":environment.descriptors.runtime.diagnostic_snapshot(),
+        "allocatorAfterDrain":allocator_stats(&environment.descriptors.device)})
     )?;
     output.flush()?;
     Ok(())

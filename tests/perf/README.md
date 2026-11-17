@@ -53,3 +53,21 @@ engine optimizations. Both binaries must use the same instrumentation mode.
 Comparing profiling on versus off measures enabled instrumentation cost; it
 does not prove the cost of disabled hooks. That requires an otherwise identical
 reference build with the hooks removed and both runners using `--profile-off`.
+
+Native WGPU acceptance uses schema 2 traces. The session records a unique process
+identity, driver, viewport, scale, quality/MSAA, timestamp features and a SHA-256
+of the executed workload assets and settings. Comparisons require matching
+identities/settings, release builds without AVM debug, at least120 warmup and1200
+measured frames, five fresh AB/BA pairs, complete GPU frame coverage and RSS.
+`--phase gpu` is the GPU target gate; `--phase preparation --case worker_prepare`
+is the worker gate. `--control` also rejects GPU P95/P99 or completed frame-time
+regressions over3%. Any pair whose total process peak RSS grows over5% fails.
+Absent, orphan or duplicate GPU identities never become zero-time measurements.
+
+`nativeNs.preparation` measures owner-thread CPU preparation and joining, excluding
+GPU publication; it does not sum worker durations. `nativeResources` reports the
+shared device's logical states, resource classes, retry/failure and worker counts.
+Driver allocator allocated/reserved bytes are sampled separately under `allocator`
+and `allocatorAfterDrain`; unsupported allocator reports remain null. Named GPU
+`phaseNs` query durations are inclusive, and nested scopes must not be summed as
+frame time. `work.native_*` counts calls actually forwarded after state suppression.
