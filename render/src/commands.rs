@@ -341,7 +341,7 @@ pub enum Command {
 }
 
 impl Command {
-    fn region(&self) -> RenderRegion {
+    pub fn region(&self) -> RenderRegion {
         match self {
             Self::Shared(commands) => commands.region(),
             Self::RenderBitmap {

@@ -124,7 +124,6 @@ impl WgpuContext3D {
                 view: dummy_texture.create_view(&Default::default())?,
                 texture: dummy_texture,
                 copy_count: Default::default(),
-                weak_self: Default::default(),
             })))
         };
 
@@ -688,7 +687,6 @@ impl Context3D for WgpuContext3D {
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         copy_count: Default::default(),
-                        weak_self: Default::default(),
                     }));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
                         _allocation: Default::default(),
@@ -699,7 +697,6 @@ impl Context3D for WgpuContext3D {
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         copy_count: Default::default(),
-                        weak_self: Default::default(),
                     }));
                 } else {
                     // In non-multisample mode, we don't have a separate resolve buffer,
@@ -714,7 +711,6 @@ impl Context3D for WgpuContext3D {
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         copy_count: Default::default(),
-                        weak_self: Default::default(),
                     }));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
                         _allocation: Default::default(),
@@ -725,7 +721,6 @@ impl Context3D for WgpuContext3D {
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         copy_count: Default::default(),
-                        weak_self: Default::default(),
                     }));
                     self.current_texture_resolve_view = None;
                 }

@@ -201,7 +201,7 @@ impl DisplacementMapFilter {
         let Some(map_handle) = filter.map_bitmap.clone() else {
             return Ok(None);
         };
-        let map_texture = as_texture(&map_handle);
+        let map_texture = as_texture(&map_handle, &descriptors.device)?;
         let map_view = map_texture.texture.create_view(&Default::default())?;
         staging_belt
             .write_buffer(draw_encoder, &self.uniform_buffer, 0, self.uniform_size)?

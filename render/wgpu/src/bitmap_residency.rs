@@ -9,10 +9,12 @@ use std::{
 };
 
 type Entry<T> = (Arc<T>, u64, u64, CacheTicket);
+#[derive(Debug)]
 struct State<T> {
     entries: LruCache<usize, Entry<T>>,
     stats: BitmapResidencyStats,
 }
+#[derive(Debug)]
 pub struct BitmapResidency<T: Send + Sync + 'static> {
     state: Arc<Mutex<State<T>>>,
     scheduler: ResourceScheduler,
@@ -38,7 +40,7 @@ impl<T: Send + Sync + 'static> BitmapResidency<T> {
             limit,
         }
     }
-    pub fn retain(&mut self, handle: &Arc<T>, bytes: u64) {
+    pub fn retain(&self, handle: &Arc<T>, bytes: u64) {
         let key = Arc::as_ptr(handle) as usize;
         {
             let mut state = self
@@ -118,7 +120,7 @@ mod tests {
 
     #[test]
     fn budget_evicts_the_oldest_upload_without_invalidating_a_recorded_draw() {
-        let mut cache = BitmapResidency::new(8);
+        let cache = BitmapResidency::new(8);
         let first = image();
         let second = image();
         let third = image();
@@ -151,7 +153,7 @@ mod tests {
 
     #[test]
     fn tiny_images_also_have_a_bounded_entry_count() {
-        let mut cache = BitmapResidency::new(u64::MAX);
+        let cache = BitmapResidency::new(u64::MAX);
         for _ in 0..5000 {
             cache.retain(&image(), 4);
         }

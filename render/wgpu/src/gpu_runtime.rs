@@ -105,6 +105,12 @@ pub struct ResourceId {
     index: u64,
 }
 
+impl ResourceId {
+    pub fn device_generation(self) -> u64 {
+        self.device
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SubmissionSerial {
     device: u64,

@@ -44,6 +44,10 @@ pub struct PixelBenderWgpuShader {
 }
 
 impl PixelBenderWgpuShader {
+    pub(crate) fn resource_id(&self) -> crate::gpu_runtime::ResourceId {
+        self.bind_group_layout.lease().id()
+    }
+
     /// Gets a `RenderPipeline` for the specified sample count
     fn get_pipeline(
         &self,
@@ -287,7 +291,9 @@ fn image_input_as_texture<'a>(
     input: &'a ImageInputTexture<'a>,
 ) -> Result<Cow<'a, crate::gpu_resources::Texture>, crate::gpu_runtime::RenderFailure> {
     Ok(match input {
-        ImageInputTexture::Bitmap(handle) => Cow::Borrowed(&as_texture(handle).texture),
+        ImageInputTexture::Bitmap(handle) => {
+            Cow::Borrowed(&as_texture(handle, &descriptors.device)?.texture)
+        }
         ImageInputTexture::TextureRef(raw_texture) => {
             Cow::Borrowed(raw_texture_as_texture(*raw_texture))
         }
@@ -498,7 +504,6 @@ pub(super) fn run_pixelbender_shader_impl(
                                     clamped_linear: Default::default(),
                                     clamped_nearest: Default::default(),
                                     copy_count: Default::default(),
-                                    weak_self: Default::default(),
                                 },
                             )))
                         })?;

@@ -126,6 +126,16 @@ pub struct Bitmap<'a> {
 }
 
 impl<'a> Bitmap<'a> {
+    /// Transfer owned pixels without copying; borrow-backed input is frozen once.
+    pub fn into_owned(self) -> Bitmap<'static> {
+        Bitmap {
+            width: self.width,
+            height: self.height,
+            format: self.format,
+            data: Cow::Owned(self.data.into_owned()),
+        }
+    }
+
     // Produces an zero-sized image with the given format.
     #[inline]
     pub fn empty(format: BitmapFormat) -> Self {
@@ -315,6 +325,34 @@ impl<'a> Bitmap<'a> {
     #[inline]
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Copy only the requested same-coordinate region, preserving every other pixel.
+    pub fn copy_region_from(&mut self, source: &Bitmap<'_>, region: PixelRegion) -> bool {
+        if self.width != source.width
+            || self.height != source.height
+            || self.format != source.format
+            || region.x_max > self.width
+            || region.y_max > self.height
+        {
+            return false;
+        }
+        let Some(bytes_per_pixel) = self.format.bytes_per_pixel() else {
+            return false;
+        };
+        let bpp = bytes_per_pixel.get() as usize;
+        for y in region.y_min..region.y_max {
+            let start = (y as usize * self.width as usize + region.x_min as usize) * bpp;
+            let end = (y as usize * self.width as usize + region.x_max as usize) * bpp;
+            let Some(source) = source.data.get(start..end) else {
+                return false;
+            };
+            let Some(destination) = self.data.to_mut().get_mut(start..end) else {
+                return false;
+            };
+            destination.copy_from_slice(source);
+        }
+        true
     }
 
     /// Copies the pixel data from `source` into this bitmap, placing its

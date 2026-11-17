@@ -672,3 +672,253 @@ fn transient_bytes_trigger_submission_at_an_operation_boundary() {
     frame.maybe_flush(&descriptors).unwrap();
     assert_eq!(descriptors.runtime.stats().submitted, 1);
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn bitmap_registration_is_lazy_and_first_visible_use_preserves_pixels() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (8, 8)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    let before = descriptors.runtime.stats().total_bytes;
+    let handle = renderer
+        .register_bitmap(Bitmap::new(
+            8,
+            8,
+            BitmapFormat::Rgba,
+            [255, 0, 0, 255].repeat(64),
+        ))
+        .unwrap();
+    assert_eq!(
+        descriptors.runtime.stats().total_bytes,
+        before,
+        "invisible registration cannot allocate or upload on the GPU"
+    );
+    let mut commands = CommandList::new();
+    commands.render_bitmap(
+        handle,
+        Transform::default(),
+        false,
+        PixelSnapping::Never,
+        PixelRegion::for_whole_size(8, 8),
+    );
+    renderer
+        .submit_frame(Color::BLACK, commands, vec![])
+        .unwrap();
+    let image = renderer.capture_frame().unwrap().unwrap();
+    assert!(image.pixels().all(|p| p.0 == [255, 0, 0, 255]));
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn deferred_partial_uploads_preserve_unwritten_and_gpu_written_pixels() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (4, 4)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let pixels = |color: [u8; 4]| Bitmap::new(4, 4, BitmapFormat::Rgba, color.repeat(16));
+    let handle = renderer.register_bitmap(pixels([255, 0, 0, 255])).unwrap();
+    renderer
+        .update_texture(
+            &handle,
+            pixels([0, 0, 255, 255]),
+            PixelRegion::for_pixel(1, 1),
+        )
+        .unwrap();
+    let draw = |renderer: &mut WgpuRenderBackend<TextureTarget>| {
+        let mut commands = CommandList::new();
+        commands.render_bitmap(
+            handle.clone(),
+            Transform::default(),
+            false,
+            PixelSnapping::Never,
+            PixelRegion::for_whole_size(4, 4),
+        );
+        renderer
+            .submit_frame(Color::BLACK, commands, vec![])
+            .unwrap();
+        renderer.capture_frame().unwrap().unwrap()
+    };
+    let image = draw(&mut renderer);
+    assert_eq!(image.get_pixel(1, 1).0, [0, 0, 255, 255]);
+    assert_eq!(image.get_pixel(2, 2).0, [255, 0, 0, 255]);
+    let green = renderer.register_bitmap(pixels([0, 255, 0, 255])).unwrap();
+    renderer
+        .copy_bitmap_region(
+            green,
+            PixelRegion::for_pixel(0, 0),
+            handle.clone(),
+            PixelRegion::for_pixel(2, 2),
+        )
+        .unwrap()
+        .unwrap();
+    renderer
+        .update_texture(
+            &handle,
+            pixels([255, 255, 255, 255]),
+            PixelRegion::for_pixel(0, 0),
+        )
+        .unwrap();
+    renderer
+        .update_texture(
+            &handle,
+            pixels([0, 0, 0, 255]),
+            PixelRegion::for_pixel(3, 3),
+        )
+        .unwrap();
+    let image = draw(&mut renderer);
+    assert_eq!(image.get_pixel(0, 0).0, [255, 255, 255, 255]);
+    assert_eq!(image.get_pixel(3, 3).0, [0, 0, 0, 255]);
+    assert_eq!(image.get_pixel(2, 2).0, [0, 255, 0, 255]);
+    assert_eq!(image.get_pixel(1, 1).0, [0, 0, 255, 255]);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn shape_registration_owns_styles_and_allocates_only_when_visible() {
+    use ruffle_render::{
+        bitmap::{BitmapHandle, BitmapSize, BitmapSource},
+        shape_utils::{DistilledShape, DrawCommand, DrawPath, FillRule},
+        transform::Transform,
+    };
+    struct NoBitmaps;
+    impl BitmapSource for NoBitmaps {
+        fn bitmap_size(&self, _: u16) -> Option<BitmapSize> {
+            None
+        }
+        fn bitmap_handle(&self, _: u16, _: &mut dyn RenderBackend) -> Option<BitmapHandle> {
+            None
+        }
+    }
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (8, 8)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    let before = descriptors.runtime.stats().total_bytes;
+    let handle = {
+        let style = swf::FillStyle::Color(Color::RED);
+        let point = |x, y| swf::Point::new(Twips::from_pixels(x), Twips::from_pixels(y));
+        renderer
+            .register_shape(
+                DistilledShape {
+                    id: 7,
+                    shape_bounds: Default::default(),
+                    edge_bounds: Default::default(),
+                    paths: vec![DrawPath::Fill {
+                        style: &style,
+                        winding_rule: FillRule::EvenOdd,
+                        commands: vec![
+                            DrawCommand::MoveTo(point(0.0, 0.0)),
+                            DrawCommand::LineTo(point(8.0, 0.0)),
+                            DrawCommand::LineTo(point(8.0, 8.0)),
+                            DrawCommand::LineTo(point(0.0, 8.0)),
+                            DrawCommand::LineTo(point(0.0, 0.0)),
+                        ],
+                    }],
+                },
+                &NoBitmaps,
+            )
+            .unwrap()
+    };
+    assert_eq!(descriptors.runtime.stats().total_bytes, before);
+    let mut commands = CommandList::new();
+    commands.render_shape(handle, Transform::default());
+    renderer
+        .submit_frame(Color::BLACK, commands, vec![])
+        .unwrap();
+    let image = renderer.capture_frame().unwrap().unwrap();
+    assert!(image.pixels().all(|p| p.0 == [255, 0, 0, 255]));
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn numeric_snapshot_freezes_pixels_and_rejects_a_changed_version_before_allocation() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<crate::render_snapshot::RenderSnapshot>();
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (4, 4)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    let handle = renderer
+        .register_bitmap(Bitmap::new(
+            4,
+            4,
+            BitmapFormat::Rgba,
+            [255, 0, 0, 255].repeat(16),
+        ))
+        .unwrap();
+    let before = descriptors.runtime.stats().total_bytes;
+    let mut commands = CommandList::new();
+    commands.render_bitmap(
+        handle.clone(),
+        Transform::default(),
+        false,
+        PixelSnapping::Never,
+        PixelRegion::for_whole_size(4, 4),
+    );
+    let frozen = crate::render_snapshot::PreparedSnapshot::capture(&commands).unwrap();
+    renderer
+        .update_texture(
+            &handle,
+            Bitmap::new(4, 4, BitmapFormat::Rgba, [0, 0, 255, 255].repeat(16)),
+            PixelRegion::for_whole_size(4, 4),
+        )
+        .unwrap();
+    let crate::render_snapshot::ResourceRecipe::Bitmap { pixels, .. } = &frozen.snapshot.recipes[0]
+    else {
+        panic!("expected owned pixel recipe");
+    };
+    assert_eq!(&pixels.data()[..4], &[255, 0, 0, 255]);
+    assert!(frozen.resolve(&mut renderer).is_err());
+    assert_eq!(descriptors.runtime.stats().total_bytes, before);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn numeric_snapshot_rejects_bitmap_changed_by_gpu_copy() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (4, 4)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let red = renderer
+        .register_bitmap(Bitmap::new(
+            4,
+            4,
+            BitmapFormat::Rgba,
+            [255, 0, 0, 255].repeat(16),
+        ))
+        .unwrap();
+    let blue = renderer
+        .register_bitmap(Bitmap::new(
+            4,
+            4,
+            BitmapFormat::Rgba,
+            [0, 0, 255, 255].repeat(16),
+        ))
+        .unwrap();
+    let mut commands = CommandList::new();
+    commands.render_bitmap(
+        red.clone(),
+        Transform::default(),
+        false,
+        PixelSnapping::Never,
+        PixelRegion::for_whole_size(4, 4),
+    );
+    let frozen = crate::render_snapshot::PreparedSnapshot::capture(&commands).unwrap();
+    renderer
+        .copy_bitmap_region(
+            blue,
+            PixelRegion::for_pixel(0, 0),
+            red,
+            PixelRegion::for_pixel(0, 0),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        frozen.resolve(&mut renderer).is_err(),
+        "a GPU write invalidates the captured content version"
+    );
+}

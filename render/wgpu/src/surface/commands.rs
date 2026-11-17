@@ -394,7 +394,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             return;
         }
         let result = (|| -> Result<(), crate::gpu_runtime::RenderFailure> {
-            let texture = as_texture(&bitmap);
+            let texture = as_texture(&bitmap, &self.descriptors.device)?;
 
             pixel_snapping.apply(&mut transform.matrix);
             transform.matrix *= Matrix::scale(region.width() as f32, region.height() as f32);
@@ -468,13 +468,13 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         }
         let result = (|| -> Result<(), crate::gpu_runtime::RenderFailure> {
             {
-                let texture = as_texture(&bitmap);
+                let texture = as_texture(&bitmap, &self.descriptors.device)?;
                 transform.matrix *= Matrix::scale(
                     texture.texture.width() as f32,
                     texture.texture.height() as f32,
                 );
             }
-            let texture = as_texture(&bitmap);
+            let texture = as_texture(&bitmap, &self.descriptors.device)?;
 
             let binds = texture.bind_group(
                 false,
@@ -508,7 +508,13 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
     }
 
     fn render_shape(&mut self, shape: ShapeHandle, transform: Transform) {
-        let mesh = as_mesh(&shape);
+        let mesh = match as_mesh(&shape) {
+            Ok(mesh) => mesh,
+            Err(error) => {
+                self.descriptors.runtime.fail(error);
+                return;
+            }
+        };
         let mut instance = None;
         for draw in &mesh.draws {
             let indices = if self.mask_state.mode != MaskMode::DrawMaskStencil

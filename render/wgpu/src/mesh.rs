@@ -66,8 +66,20 @@ mod accounting_tests {
     }
 }
 
-pub fn as_mesh(handle: &ShapeHandle) -> &Mesh {
-    <dyn Any>::downcast_ref(&*handle.0).expect("Shape handle must be a WGPU ShapeData")
+pub fn as_mesh(handle: &ShapeHandle) -> Result<&Mesh, crate::gpu_runtime::RenderFailure> {
+    let value = &*handle.0 as &dyn Any;
+    if let Some(mesh) = value.downcast_ref::<Mesh>() {
+        return Ok(mesh);
+    }
+    value
+        .downcast_ref::<crate::shape_recipe::ShapeRecipe>()
+        .and_then(|recipe| recipe.mesh.get())
+        .ok_or_else(|| {
+            crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::Internal,
+                "shape was not prepared before encoding",
+            )
+        })
 }
 
 #[derive(Debug)]
@@ -124,9 +136,12 @@ impl PendingDraw {
                     .into_iter()
                     .map(PosColorVertex::from)
                     .collect();
-                vertex_buffer
-                    .add(&vertices)
-                    .expect("Mesh vertex buffer was too large!")
+                vertex_buffer.add(&vertices).map_err(|_| {
+                    crate::gpu_runtime::RenderFailure::new(
+                        crate::gpu_runtime::RenderFailureKind::BudgetExceeded,
+                        "shape buffer exceeds the native device limit",
+                    )
+                })?
             }
             TessDrawType::Gradient { matrix, .. } => {
                 let vertices: Vec<_> = draw
@@ -134,9 +149,12 @@ impl PendingDraw {
                     .into_iter()
                     .map(|v| PosUvVertex::from_tessellator(v, matrix))
                     .collect();
-                vertex_buffer
-                    .add(&vertices)
-                    .expect("Mesh vertex buffer was too large!")
+                vertex_buffer.add(&vertices).map_err(|_| {
+                    crate::gpu_runtime::RenderFailure::new(
+                        crate::gpu_runtime::RenderFailureKind::BudgetExceeded,
+                        "shape buffer exceeds the native device limit",
+                    )
+                })?
             }
             TessDrawType::Bitmap(bitmap) => {
                 let vertices: Vec<_> = draw
@@ -144,15 +162,21 @@ impl PendingDraw {
                     .into_iter()
                     .map(|v| PosUvVertex::from_tessellator(v, &bitmap.matrix))
                     .collect();
-                vertex_buffer
-                    .add(&vertices)
-                    .expect("Mesh vertex buffer was too large!")
+                vertex_buffer.add(&vertices).map_err(|_| {
+                    crate::gpu_runtime::RenderFailure::new(
+                        crate::gpu_runtime::RenderFailureKind::BudgetExceeded,
+                        "shape buffer exceeds the native device limit",
+                    )
+                })?
             }
         };
 
-        index_buffer
-            .add(&draw.indices)
-            .expect("Mesh index buffer was too large!");
+        index_buffer.add(&draw.indices).map_err(|_| {
+            crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::BudgetExceeded,
+                "shape buffer exceeds the native device limit",
+            )
+        })?;
 
         let index_count = draw.indices.len() as u32;
         let index_offset = *indices_so_far;
@@ -226,7 +250,7 @@ impl PendingDrawType {
         let Some(handle) = source.bitmap_handle(bitmap.bitmap_id, backend) else {
             return Ok(None);
         };
-        let texture = as_texture(&handle);
+        let texture = as_texture(&handle, &backend.descriptors.device)?;
         let binds = texture.bind_group(
             bitmap.is_repeating,
             bitmap.is_smoothed,
@@ -314,6 +338,7 @@ pub struct CommonGradient {
 impl CommonGradient {
     pub fn new(
         descriptors: &Descriptors,
+        device: &crate::gpu_resources::Device,
         gradient: Gradient,
         uniform_buffers: &mut BufferBuilder,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
@@ -378,7 +403,7 @@ impl CommonGradient {
 
             colors
         };
-        let texture = descriptors.device.create_texture_with_data(
+        let texture = device.create_texture_with_data(
             &descriptors.queue,
             &wgpu::TextureDescriptor {
                 label: None,
@@ -401,7 +426,12 @@ impl CommonGradient {
 
         let buffer_offset = uniform_buffers
             .add(&[GradientUniforms::from(gradient)])
-            .expect("Mesh uniform buffer was too large!")
+            .map_err(|_| {
+                crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::BudgetExceeded,
+                    "shape buffer exceeds the native device limit",
+                )
+            })?
             .start;
 
         Ok(Self {

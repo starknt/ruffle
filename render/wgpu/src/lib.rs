@@ -33,6 +33,7 @@ type Error = Box<dyn std::error::Error>;
 #[macro_use]
 pub mod utils;
 
+mod bitmap_recipe;
 mod bitmap_residency;
 mod bitmaps;
 mod context3d;
@@ -42,7 +43,9 @@ pub mod gpu_resources;
 pub mod gpu_runtime;
 mod pipelines;
 mod pixel_bender;
+mod render_snapshot;
 mod resource_scheduler;
+mod shape_recipe;
 pub mod target;
 pub use ruffle_render::profile;
 mod idle_pool;
@@ -62,8 +65,29 @@ mod surface;
 
 impl BitmapHandleImpl for Texture {}
 
-pub fn as_texture(handle: &BitmapHandle) -> &Texture {
-    <dyn Any>::downcast_ref(&*handle.0).unwrap()
+pub fn as_texture<'a>(
+    handle: &'a BitmapHandle,
+    device: &crate::gpu_resources::Device,
+) -> Result<&'a Texture, crate::gpu_runtime::RenderFailure> {
+    let value = &*handle.0 as &dyn Any;
+    if let Some(recipe) = value.downcast_ref::<crate::bitmap_recipe::BitmapRecipe>() {
+        return recipe.resolve(device);
+    }
+    value.downcast_ref::<Texture>().ok_or_else(|| {
+        crate::gpu_runtime::RenderFailure::new(
+            crate::gpu_runtime::RenderFailureKind::Validation,
+            "bitmap handle belongs to another renderer",
+        )
+    })
+}
+
+fn record_bitmap_write(handle: &BitmapHandle) -> Result<(), crate::gpu_runtime::RenderFailure> {
+    if let Some(recipe) =
+        (&*handle.0 as &dyn Any).downcast_ref::<crate::bitmap_recipe::BitmapRecipe>()
+    {
+        recipe.record_gpu_write()?;
+    }
+    Ok(())
 }
 
 pub fn raw_texture_as_texture(handle: &dyn RawTexture) -> &crate::gpu_resources::Texture {
@@ -294,7 +318,7 @@ impl QueueSyncHandle {
                 descriptors,
                 pool,
             } => {
-                let texture = as_texture(&handle);
+                let texture = as_texture(&handle, &descriptors.device)?;
                 let dimensions = BufferDimensions::new(
                     copy_area.width() as usize,
                     copy_area.height() as usize,
@@ -357,7 +381,7 @@ impl QueueSyncHandle {
                 descriptors,
                 pool,
             } => {
-                let texture = as_texture(&handle);
+                let texture = as_texture(&handle, &descriptors.device)?;
 
                 let buffer_dimensions = BufferDimensions::new(
                     copy_area.width() as usize,
@@ -417,7 +441,6 @@ impl QueueSyncHandle {
 
 #[derive(Debug)]
 pub struct Texture {
-    weak_self: std::sync::Weak<Texture>,
     pub(crate) _allocation: ruffle_render::profile::GpuBitmap,
     pub(crate) texture: crate::gpu_resources::Texture,
     view: crate::gpu_resources::TextureView,
