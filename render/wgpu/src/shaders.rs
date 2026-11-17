@@ -13,6 +13,7 @@ pub struct Shaders {
     /// avoid changing initially-in-range rgb values (regadless of whether
     /// dividing by the alpha value would produce an out-of-range value).
     pub bitmap_shader: crate::gpu_resources::ShaderModule,
+    pub bitmap_batch_shader: crate::gpu_resources::ShaderModule,
     pub gradient_shader: crate::gpu_resources::ShaderModule,
     pub copy_shader: crate::gpu_resources::ShaderModule,
     pub alpha_mask_shader: crate::gpu_resources::ShaderModule,
@@ -39,6 +40,12 @@ impl Shaders {
             device,
             "bitmap.wgsl",
             include_str!("../shaders/bitmap.wgsl"),
+            max_transforms,
+        )?;
+        let bitmap_batch_shader = make_shader(
+            device,
+            "bitmap_batch.wgsl",
+            include_str!("../shaders/bitmap_batch.wgsl"),
             max_transforms,
         )?;
         let copy_shader = make_shader(
@@ -100,6 +107,7 @@ impl Shaders {
         Ok(Self {
             color_shader,
             bitmap_shader,
+            bitmap_batch_shader,
             gradient_shader,
             copy_shader,
             alpha_mask_shader,

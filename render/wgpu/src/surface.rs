@@ -186,10 +186,11 @@ impl Surface {
                 draw_encoder.flush_uploads_if_needed(staging_belt.page_size())?;
                 match chunk {
                     Chunk::Draw {
-                        chunk,
+                        mut chunk,
                         needs_stencil,
                         chunk_buffer_builder,
                     } => {
+                        chunk::batch_bitmap_textures(&mut chunk, descriptors)?;
                         target.restore_multisample_regions(descriptors, draw_encoder)?;
                         chunk_buffer_builder.copy_to(
                             staging_belt,

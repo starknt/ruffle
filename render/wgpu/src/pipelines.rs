@@ -55,6 +55,7 @@ pub struct Pipelines {
     /// or use it in any way.
     pub bitmap_opaque_dummy_stencil: crate::gpu_resources::RenderPipeline,
     pub bitmap: EnumMap<TrivialBlend, ShapePipeline>,
+    pub bitmap_batch: ShapePipeline,
     pub gradients: ShapePipeline,
     pub complex_blends: EnumMap<ComplexBlend, ShapePipeline>,
     pub alpha_mask: ShapePipeline,
@@ -243,6 +244,23 @@ impl Pipelines {
                 PrimitiveTopology::TriangleList,
             ))?;
 
+        let bitmap_batch = create_shape_pipeline(
+            "Adjacent bitmap textures",
+            device,
+            format,
+            &shaders.bitmap_batch_shader,
+            msaa_sample_count,
+            &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
+            &[
+                Some(bind_layouts.globals.raw()),
+                Some(bind_layouts.transforms.raw()),
+                Some(bind_layouts.bitmap_batch.raw()),
+            ],
+            BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+            0,
+            PrimitiveTopology::TriangleList,
+        )?;
+
         let alpha_mask_bindings = vec![
             Some(bind_layouts.globals.raw()),
             Some(bind_layouts.transforms.raw()),
@@ -263,6 +281,7 @@ impl Pipelines {
         )?;
 
         Ok(Self {
+            bitmap_batch,
             color: color_pipelines,
             lines: lines_pipelines,
             bitmap: bitmap_pipelines,

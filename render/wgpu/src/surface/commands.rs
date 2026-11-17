@@ -284,6 +284,12 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                     texture.view.clone(),
                 ))),
                 binds: binds.bind_group.clone(),
+                batch_sampler: (texture.texture.mip_level_count() == 1).then(|| {
+                    self.descriptors
+                        .bitmap_samplers
+                        .get_sampler(false, smoothing)
+                        .clone()
+                }),
                 draw_offsets,
                 blend_mode: TrivialBlend::Normal,
                 render_stage3d: false,
@@ -366,6 +372,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                     draw_offsets,
                     blend_mode: TrivialBlend::Normal,
                     render_stage3d: true,
+                    batch_sampler: None,
                     binds: binds.bind_group.clone(),
                 },
             );
@@ -423,6 +430,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                     self.add_to_current(&transform, &mut instance, vertices, |draw_offsets| {
                         DrawCommand::RenderTexture {
                             _texture: None,
+                            batch_sampler: None,
                             binds: binds.bind_group.clone(),
                             blend_mode: TrivialBlend::Normal,
                             render_stage3d: false,
@@ -610,6 +618,7 @@ impl WgpuCommandHandler<'_, '_> {
                         DrawVertices::PosUvQuad,
                         |draw_offsets| DrawCommand::RenderTexture {
                             _texture: Some(texture),
+                            batch_sampler: None,
                             binds: bind_group,
                             draw_offsets,
                             blend_mode,

@@ -32,8 +32,14 @@ pub enum DrawCommand {
         // We don't actually _need_ that texture though, thus the _
         _texture: Option<PoolOrArcTexture>,
         binds: crate::gpu_resources::BindGroup,
+        batch_sampler: Option<crate::gpu_resources::Sampler>,
         blend_mode: TrivialBlend,
         render_stage3d: bool,
+        draw_offsets: DrawOffsets,
+    },
+    RenderTextureBatch {
+        _textures: Vec<PoolOrArcTexture>,
+        binds: crate::gpu_resources::BindGroup,
         draw_offsets: DrawOffsets,
     },
     RenderAlphaMask {
@@ -56,9 +62,31 @@ pub enum DrawCommand {
 }
 
 impl DrawCommand {
+    fn bitmap_input(
+        &self,
+    ) -> Option<(
+        &PoolOrArcTexture,
+        &crate::gpu_resources::Sampler,
+        &DrawOffsets,
+    )> {
+        match self {
+            Self::RenderTexture {
+                _texture: Some(texture),
+                batch_sampler: Some(sampler),
+                blend_mode: TrivialBlend::Normal,
+                render_stage3d: false,
+                draw_offsets,
+                ..
+            } if draw_offsets.instances.end - draw_offsets.instances.start == 1 => {
+                Some((texture, sampler, draw_offsets))
+            }
+            _ => None,
+        }
+    }
     pub fn name(&self) -> &'static str {
         match self {
             DrawCommand::RenderTexture { .. } => "render texture",
+            DrawCommand::RenderTextureBatch { .. } => "render texture batch",
             DrawCommand::DrawColor { .. } => "draw color",
             DrawCommand::DrawLine { .. } => "draw line",
             DrawCommand::SetMask(_) => "set mask state",
@@ -79,7 +107,7 @@ impl DrawCommand {
                 ..
             } => BatchKey::Texture(binds.lease().id(), *blend_mode, *render_stage3d),
             Self::RenderAlphaMask { binds, .. } => BatchKey::AlphaMask(binds.lease().id()),
-            Self::SetMask(_) => return None,
+            Self::SetMask(_) | Self::RenderTextureBatch { .. } => return None,
         })
     }
     fn offsets_mut(&mut self) -> Option<&mut DrawOffsets> {
@@ -88,6 +116,7 @@ impl DrawCommand {
             | Self::DrawLine { draw_offsets }
             | Self::RenderGradient { draw_offsets, .. }
             | Self::RenderTexture { draw_offsets, .. }
+            | Self::RenderTextureBatch { draw_offsets, .. }
             | Self::RenderAlphaMask { draw_offsets, .. } => Some(draw_offsets),
             Self::SetMask(_) => None,
         }
@@ -109,12 +138,94 @@ impl DrawCommand {
             | Self::DrawLine { draw_offsets }
             | Self::RenderGradient { draw_offsets, .. }
             | Self::RenderTexture { draw_offsets, .. }
+            | Self::RenderTextureBatch { draw_offsets, .. }
             | Self::RenderAlphaMask { draw_offsets, .. } => draw_offsets,
             Self::SetMask(_) => return false,
         };
         self.offsets_mut()
             .is_some_and(|current| current.try_merge(offsets, primitive_size))
     }
+}
+
+/// Fixed-size, adjacent bitmap runs. Only one-instance quads with identical
+/// geometry and sampler are combined; all other commands remain barriers.
+pub(super) fn batch_bitmap_textures(
+    commands: &mut Vec<DrawCommand>,
+    descriptors: &crate::Descriptors,
+) -> Result<(), crate::gpu_runtime::RenderFailure> {
+    use crate::layouts::BITMAP_BATCH_TEXTURES as N;
+    let mut input = std::mem::take(commands).into_iter().peekable();
+    while let Some(first) = input.next() {
+        let Some((texture, sampler, offsets)) = first.bitmap_input() else {
+            commands.push(first);
+            continue;
+        };
+        let mut views: [_; N] = std::array::from_fn(|_| texture.view().clone());
+        let sampler = sampler.clone();
+        let mut offsets = offsets.clone();
+        let mut run = vec![first];
+        while run.len() < N {
+            let Some((_, next_sampler, next_offsets)) =
+                input.peek().and_then(DrawCommand::bitmap_input)
+            else {
+                break;
+            };
+            if *next_sampler != sampler || next_offsets.instances.start != offsets.instances.end {
+                break;
+            }
+            let mut merged = offsets.clone();
+            if !merged.try_merge(next_offsets, 3) {
+                break;
+            }
+            offsets = merged;
+            run.extend(input.next());
+        }
+        if run.len() == 1 {
+            commands.extend(run);
+            continue;
+        }
+        let mut textures = Vec::with_capacity(run.len());
+        for command in run {
+            let DrawCommand::RenderTexture {
+                _texture: Some(texture),
+                draw_offsets,
+                ..
+            } = command
+            else {
+                unreachable!()
+            };
+            // The first instance may start anywhere in a chunk's uniform window.
+            views[draw_offsets.instances.start as usize % N] = texture.view().clone();
+            textures.push(texture);
+        }
+        let mut entries: Vec<_> = views
+            .iter()
+            .enumerate()
+            .map(|(binding, view)| wgpu::BindGroupEntry {
+                binding: binding as u32,
+                resource: wgpu::BindingResource::TextureView(view),
+            })
+            .collect();
+        entries.push(wgpu::BindGroupEntry {
+            binding: N as u32,
+            resource: wgpu::BindingResource::Sampler(&sampler),
+        });
+        // A cross-frame material entry would retain evicted immutable uploads.
+        // The command owns this binding only through its submission lifetime.
+        let binds = descriptors
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Adjacent bitmap batch"),
+                layout: &descriptors.bind_layouts.bitmap_batch,
+                entries: &entries,
+            })?;
+        commands.push(DrawCommand::RenderTextureBatch {
+            _textures: textures,
+            binds,
+            draw_offsets: offsets,
+        });
+    }
+    Ok(())
 }
 
 /// Complete material/pipeline identity for adjacent draws. Vertex/index ranges
@@ -178,6 +289,7 @@ impl<'encoder> CommandRenderer<'encoder> {
                 blend_mode,
                 draw_offsets,
                 render_stage3d,
+                ..
             } => self.render_texture(
                 render_pass,
                 binds,
@@ -185,6 +297,24 @@ impl<'encoder> CommandRenderer<'encoder> {
                 *render_stage3d,
                 draw_offsets,
             ),
+            DrawCommand::RenderTextureBatch {
+                binds,
+                draw_offsets,
+                ..
+            } => {
+                self.set_pipeline(
+                    render_pass,
+                    if self.needs_stencil {
+                        self.pipelines
+                            .bitmap_batch
+                            .pipeline_for(self.mask_state.mode)
+                    } else {
+                        self.pipelines.bitmap_batch.stencilless_pipeline()
+                    },
+                );
+                self.set_material(render_pass, binds);
+                self.draw(render_pass, draw_offsets);
+            }
             DrawCommand::DrawColor { draw_offsets } => self.draw_color(render_pass, draw_offsets),
             DrawCommand::DrawLine { draw_offsets } => self.draw_lines(render_pass, draw_offsets),
             DrawCommand::SetMask(mask_state) => self.set_mask_state(*mask_state),

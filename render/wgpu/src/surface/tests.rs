@@ -82,6 +82,116 @@ fn measurement_counts_mask_passes_not_mask_inputs() {
 
 #[test]
 #[ignore = "requires a real native adapter"]
+fn adjacent_bitmap_textures_batch_without_reordering_translucent_pixels() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    for descriptors in [gpu(), gpu_with_backend(wgpu::Backends::GL, None, None)] {
+        for count in [32, 37] {
+            for quality in [StageQuality::Low, StageQuality::High] {
+                for smoothing in [false, true] {
+                    let mut results = Vec::new();
+                    for reference in [true, false] {
+                        let target = TextureTarget::new(&descriptors.device, (64, 40)).unwrap();
+                        let mut renderer =
+                            WgpuRenderBackend::with_options(descriptors.clone(), target, false)
+                                .unwrap();
+                        renderer.set_quality(quality).unwrap();
+                        let mut commands = CommandList::new();
+                        // The first bitmap's instance index deliberately starts above zero.
+                        rect(&mut commands, 0.0, 0.0, 1.0, 1.0, Color::TRANSPARENT);
+                        for i in 0..count {
+                            if count == 37 && i == 7 {
+                                commands.push_mask();
+                                rect(&mut commands, 3.5, 2.25, 23.0, 19.0, Color::WHITE);
+                                commands.activate_mask();
+                            } else if count == 37 && i == 26 {
+                                commands.deactivate_mask();
+                                rect(&mut commands, 3.5, 2.25, 23.0, 19.0, Color::WHITE);
+                                commands.pop_mask();
+                            }
+                            let alpha = 128 + i as u8;
+                            let bitmap = renderer
+                                .register_bitmap(Bitmap::new(
+                                    2,
+                                    2,
+                                    BitmapFormat::Rgba,
+                                    vec![
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        alpha / 2,
+                                        i as u8 * 2,
+                                        alpha,
+                                        alpha,
+                                        1,
+                                        0,
+                                        1,
+                                        1,
+                                        255,
+                                        128,
+                                        0,
+                                        255,
+                                    ],
+                                ))
+                                .unwrap();
+                            commands.render_bitmap(
+                                bitmap,
+                                Transform {
+                                    matrix: Matrix {
+                                        a: 3.5,
+                                        d: 3.0,
+                                        tx: Twips::from_pixels(1.25 + f64::from(i % 8) * 4.0),
+                                        ty: Twips::from_pixels(2.5 + f64::from(i / 8) * 4.0),
+                                        ..Matrix::IDENTITY
+                                    },
+                                    color_transform: swf::ColorTransform {
+                                        r_multiply: swf::Fixed8::from_f32(1.5),
+                                        g_multiply: swf::Fixed8::from_f32(0.75),
+                                        a_multiply: swf::Fixed8::from_f32(0.8),
+                                        r_add: -30,
+                                        b_add: 80,
+                                        a_add: i as i16 - 20,
+                                        ..swf::ColorTransform::IDENTITY
+                                    },
+                                    ..Default::default()
+                                },
+                                smoothing ^ (count == 37 && i >= 17),
+                                PixelSnapping::Never,
+                                PixelRegion::for_whole_size(2, 2),
+                            );
+                            if reference {
+                                rect(&mut commands, 0.0, 0.0, 1.0, 1.0, Color::TRANSPARENT);
+                            }
+                        }
+                        let metrics = ruffle_render::profile::RenderMetrics::default();
+                        let _scope = ruffle_render::profile::enter(Some(&metrics));
+                        renderer
+                            .submit_frame(Color::WHITE, commands, vec![])
+                            .unwrap();
+                        if !reference && count == 32 {
+                            assert_eq!(
+                                metrics.snapshot().work.draw_calls,
+                                3,
+                                "two bounded bitmap batches and one transparent rectangle"
+                            );
+                        }
+                        let image = renderer.capture_frame().unwrap().unwrap();
+                        assert_eq!(image.get_pixel(63, 39).0, [255, 255, 255, 255]);
+                        results.push(image);
+                    }
+                    assert_eq!(
+                        results[0], results[1],
+                        "{quality:?}, smoothing={smoothing}, count={count}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a real native adapter"]
 fn alpha_mask_samples_aligned_bitmap_content_without_an_intermediate_copy() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
     use ruffle_render::transform::Transform;
