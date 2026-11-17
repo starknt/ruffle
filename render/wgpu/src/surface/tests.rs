@@ -407,6 +407,55 @@ fn chunk_uniform_windows_reuse_the_same_buffer_binding() {
 
 #[test]
 #[ignore = "requires a real native adapter"]
+fn builtin_quad_draws_do_not_upload_immutable_vertices_again() {
+    use super::buffers::{ChunkBufferBuilder, ChunkBuffers, DrawVertices};
+    let descriptors = gpu();
+    let mut buffers = ChunkBuffers::new(&descriptors).unwrap();
+    let original_dynamic = buffers.vertex_buffer.lease().id();
+    let mut chunk = ChunkBufferBuilder::new(&buffers, &descriptors.limits);
+    let instance = chunk.add_transform(&Default::default()).unwrap();
+    for vertices in [
+        DrawVertices::PosUvQuad,
+        DrawVertices::PosColorQuad,
+        DrawVertices::PosQuad,
+        DrawVertices::Line,
+        DrawVertices::RectLine,
+    ] {
+        let draw = chunk
+            .add_draw(&descriptors.quad, instance, vertices)
+            .unwrap();
+        assert_eq!(
+            draw.vertex_buffer.as_ref().map(|b| b.lease().id()),
+            Some(descriptors.quad.vertex_buffer.lease().id()),
+            "built-in geometry already has immutable native storage"
+        );
+    }
+    let mut staging = crate::gpu_resources::StagingBelt::new(descriptors.device.clone(), 65536);
+    let mut encoder = descriptors
+        .device
+        .create_command_encoder(&Default::default())
+        .unwrap();
+    chunk
+        .copy_to(&mut staging, &descriptors, &mut encoder, &mut buffers)
+        .unwrap();
+    assert_eq!(
+        buffers.vertex_buffer.lease().id(),
+        original_dynamic,
+        "no custom vertices need a dynamic upload"
+    );
+    staging.finish();
+    descriptors
+        .queue
+        .submit([encoder.finish().unwrap()])
+        .unwrap();
+    descriptors
+        .device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires a real native adapter"]
 fn small_alpha_masks_share_a_pass_within_the_transient_byte_budget() {
     let split = gpu_with_watermark(Some(2048));
     let combined = gpu_with_watermark(Some(1024 * 1024));

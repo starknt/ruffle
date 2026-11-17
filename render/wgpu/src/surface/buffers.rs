@@ -1,7 +1,7 @@
+use crate::Transforms;
 use crate::buffer_builder::{BufferBuilder, BufferFull};
 use crate::descriptors::{Descriptors, Quad};
 use crate::gpu_resources::StagingBelt;
-use crate::{PosColorVertex, PosUvVertex, PosVertex, Transforms};
 use ruffle_render::transform::Transform;
 use std::ops::Range;
 
@@ -122,81 +122,16 @@ impl DrawOffsets {
 pub struct ChunkBufferBuilder {
     transforms: BufferBuilder,
     vertices: BufferBuilder,
-    quad_pos_vertices: Range<wgpu::BufferAddress>,
-    quad_pos_color_vertices: Range<wgpu::BufferAddress>,
-    quad_pos_uv_vertices: Range<wgpu::BufferAddress>,
 }
 
 impl ChunkBufferBuilder {
     pub fn new(chunk_buffers: &ChunkBuffers, limits: &wgpu::Limits) -> Self {
         let mut transforms = BufferBuilder::with_scratch(limits, 0, chunk_buffers.scratch.clone());
         transforms.set_buffer_limit(transforms_per_draw(limits) * size_of::<Transforms>() as u64);
-        let mut vertices = BufferBuilder::with_scratch(limits, 0, chunk_buffers.scratch.clone());
-
-        // It's extremely likely that every chunk will have a quad, so let's prime those eagerly and save some complexity later
-        let quad_pos_uv_vertices = vertices
-            .add(&[
-                PosUvVertex {
-                    position: [0.0, 0.0],
-                    uv: [0.0, 0.0, 1.0],
-                },
-                PosUvVertex {
-                    position: [1.0, 0.0],
-                    uv: [1.0, 0.0, 1.0],
-                },
-                PosUvVertex {
-                    position: [1.0, 1.0],
-                    uv: [1.0, 1.0, 1.0],
-                },
-                PosUvVertex {
-                    position: [0.0, 1.0],
-                    uv: [0.0, 1.0, 1.0],
-                },
-            ])
-            .expect("Buffer was just created, quad vertices should fit");
-        let quad_pos_vertices = vertices
-            .add(&[
-                PosVertex {
-                    position: [0.0, 0.0],
-                },
-                PosVertex {
-                    position: [1.0, 0.0],
-                },
-                PosVertex {
-                    position: [1.0, 1.0],
-                },
-                PosVertex {
-                    position: [0.0, 1.0],
-                },
-            ])
-            .expect("Buffer was just created, quad vertices should fit");
-        let quad_pos_color_vertices = vertices
-            .add(&[
-                PosColorVertex {
-                    position: [0.0, 0.0],
-                    color: [1.0, 1.0, 1.0, 1.0],
-                },
-                PosColorVertex {
-                    position: [1.0, 0.0],
-                    color: [1.0, 1.0, 1.0, 1.0],
-                },
-                PosColorVertex {
-                    position: [1.0, 1.0],
-                    color: [1.0, 1.0, 1.0, 1.0],
-                },
-                PosColorVertex {
-                    position: [0.0, 1.0],
-                    color: [1.0, 1.0, 1.0, 1.0],
-                },
-            ])
-            .expect("Buffer was just created, quad vertices should fit");
-
+        let vertices = BufferBuilder::with_scratch(limits, 0, chunk_buffers.scratch.clone());
         Self {
             transforms,
             vertices,
-            quad_pos_vertices,
-            quad_pos_color_vertices,
-            quad_pos_uv_vertices,
         }
     }
 
@@ -239,37 +174,37 @@ impl ChunkBufferBuilder {
                 instances,
             },
             DrawVertices::PosQuad => DrawOffsets {
-                vertex_buffer: None,
+                vertex_buffer: Some(quad.vertex_buffer.clone()),
                 index_buffer: quad.index_buffer.clone(),
-                vertices: self.quad_pos_vertices.clone(),
+                vertices: quad.vertices_pos.clone(),
                 indices: quad.indices_quad.clone(),
                 instances,
             },
             DrawVertices::PosColorQuad => DrawOffsets {
-                vertex_buffer: None,
+                vertex_buffer: Some(quad.vertex_buffer.clone()),
                 index_buffer: quad.index_buffer.clone(),
-                vertices: self.quad_pos_color_vertices.clone(),
+                vertices: quad.vertices_pos_color.clone(),
                 indices: quad.indices_quad.clone(),
                 instances,
             },
             DrawVertices::PosUvQuad => DrawOffsets {
-                vertex_buffer: None,
+                vertex_buffer: Some(quad.vertex_buffer.clone()),
                 index_buffer: quad.index_buffer.clone(),
-                vertices: self.quad_pos_uv_vertices.clone(),
+                vertices: quad.vertices_pos_uv.clone(),
                 indices: quad.indices_quad.clone(),
                 instances,
             },
             DrawVertices::Line => DrawOffsets {
-                vertex_buffer: None,
+                vertex_buffer: Some(quad.vertex_buffer.clone()),
                 index_buffer: quad.index_buffer.clone(),
-                vertices: self.quad_pos_color_vertices.clone(),
+                vertices: quad.vertices_pos_color.clone(),
                 indices: quad.indices_line.clone(),
                 instances,
             },
             DrawVertices::RectLine => DrawOffsets {
-                vertex_buffer: None,
+                vertex_buffer: Some(quad.vertex_buffer.clone()),
                 index_buffer: quad.index_buffer.clone(),
-                vertices: self.quad_pos_color_vertices.clone(),
+                vertices: quad.vertices_pos_color.clone(),
                 indices: quad.indices_line_rect.clone(),
                 instances,
             },
@@ -302,9 +237,15 @@ impl ChunkBufferBuilder {
             uniform_size,
             u64::from(descriptors.limits.min_uniform_buffer_offset_alignment),
         )?;
-        let vertices = chunk_buffers
-            .arena
-            .allocate_dynamic(self.vertices.len() as u64, 4)?;
+        let vertices = if self.vertices.len() == 0 {
+            None
+        } else {
+            Some(
+                chunk_buffers
+                    .arena
+                    .allocate_dynamic(self.vertices.len() as u64, 4)?,
+            )
+        };
         let transform_offset = u32::try_from(uniforms.offset).map_err(|_| {
             crate::gpu_runtime::RenderFailure::new(
                 crate::gpu_runtime::RenderFailureKind::Validation,
@@ -332,16 +273,18 @@ impl ChunkBufferBuilder {
             &uniforms.buffer,
             uniforms.offset,
         )?;
-        self.vertices.copy_to_at(
-            staging_belt,
-            draw_encoder,
-            &vertices.buffer,
-            vertices.offset,
-        )?;
+        if let Some(vertices) = vertices {
+            self.vertices.copy_to_at(
+                staging_belt,
+                draw_encoder,
+                &vertices.buffer,
+                vertices.offset,
+            )?;
+            chunk_buffers.vertex_buffer = vertices.buffer;
+            chunk_buffers.vertex_offset = vertices.offset;
+        }
         chunk_buffers.transforms = uniforms.buffer;
         chunk_buffers.transform_offset = transform_offset;
-        chunk_buffers.vertex_buffer = vertices.buffer;
-        chunk_buffers.vertex_offset = vertices.offset;
         chunk_buffers.bind_group = bind_group;
 
         Ok(())
