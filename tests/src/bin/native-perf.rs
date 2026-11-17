@@ -38,6 +38,12 @@ struct Opt {
     backend: String,
     #[arg(long)]
     compile: bool,
+    /// Pace a long-lived correctness/memory soak; never use for throughput comparisons.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    pace_fps: Option<u32>,
+    /// Measure instrumentation-disabled overhead. Optimizations stay enabled.
+    #[arg(long)]
+    profile_off: bool,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +83,7 @@ fn validate_frames(warmup: u32, frames: u32) -> Result<u32> {
 struct PerfEnvironment {
     descriptors: Arc<Descriptors>,
     compile: bool,
+    profiling: bool,
 }
 impl Environment for PerfEnvironment {
     fn is_render_supported(&self, _: &RenderOptions) -> bool {
@@ -97,7 +104,8 @@ impl Environment for PerfEnvironment {
         let target =
             TextureTarget::new_without_readback(&self.descriptors.device, (width, height)).ok()?;
         let renderer =
-            WgpuRenderBackend::with_options(self.descriptors.clone(), target, true).ok()?;
+            WgpuRenderBackend::with_options(self.descriptors.clone(), target, self.profiling)
+                .ok()?;
         Some((Box::new(NoCaptures), Box::new(renderer)))
     }
 }
@@ -171,6 +179,7 @@ fn main() -> Result<()> {
     let environment = PerfEnvironment {
         descriptors: Arc::new(Descriptors::new(instance, adapter, device, queue)),
         compile: opt.compile,
+        profiling: !opt.profile_off,
     };
     let path = opt
         .manifest
@@ -187,7 +196,7 @@ fn main() -> Result<()> {
     options.audio_assertions.clear();
     let test = Test::from_options(options, root, case.name.clone())?;
     let metrics = RenderMetrics::default();
-    let _scope = profile::enter(Some(&metrics));
+    let _scope = profile::enter((!opt.profile_off).then_some(&metrics));
     let mut runner = test.create_test_runner(&environment)?;
     while !runner.is_preloaded() {
         ensure!(setup.elapsed() < Duration::from_secs(60), "preload timeout");
@@ -213,7 +222,8 @@ fn main() -> Result<()> {
         "{}",
         json!({"event":"session", "schemaVersion":1, "case":case.name,
         "backend":format!("{:?}", info.backend), "device":info.name, "driver":info.driver_info,
-        "warmup":opt.warmup, "frames":opt.frames, "inFlightLimit":2, "readback":false,
+        "warmup":opt.warmup, "frames":opt.frames, "inFlightLimit":2, "readback":false, "paceFps":opt.pace_fps,
+        "profilingEnabled":!opt.profile_off,
         "debugAssertions":cfg!(debug_assertions), "avmDebug":cfg!(feature="avm_debug")})
     )?;
     let mut inflight = VecDeque::new();
@@ -221,6 +231,7 @@ fn main() -> Result<()> {
     let mut previous = metrics.snapshot();
     let mut last_rss = Instant::now();
     let mut frame = 0;
+    let pace_start = Instant::now();
     while frame < opt.warmup + opt.frames {
         ensure!(
             setup.elapsed() < Duration::from_secs(3600),
@@ -304,7 +315,7 @@ fn main() -> Result<()> {
             writeln!(
                 output,
                 "{}",
-                json!({"event":"frame", "frameId":current.stage_submissions,
+                json!({"event":"frame", "frameId":if opt.profile_off { u64::from(frame)+1 } else { current.stage_submissions },
                 "cpuNs":cpu_ns,"phaseNs":phases,"nativeNs":native,"work":current.work.delta(previous.work),
                 "rssBytes":rss.map(|r|r.0)})
             )?;
@@ -320,6 +331,10 @@ fn main() -> Result<()> {
         }
         previous = current;
         frame += 1;
+        if let Some(fps) = opt.pace_fps {
+            let deadline = pace_start + Duration::from_secs_f64(f64::from(frame) / f64::from(fps));
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        }
     }
     wait(&environment.descriptors, None)?;
     let completed_ns = measured_start

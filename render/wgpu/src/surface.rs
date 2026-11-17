@@ -323,6 +323,7 @@ impl Surface {
                         ruffle_render::profile::work(|w| {
                             w.render_passes += 1;
                             w.blend_passes += 1;
+                            w.mask_passes += u64::from(needs_stencil);
                             w.draw_calls += 1;
                             w.pipeline_changes += 1;
                             w.material_binds += 2;

@@ -34,6 +34,8 @@ def summarize(path):
     phase_names = {key for r in frames for key in r.get('phaseNs', {})}
     return {
         'case': session['case'], 'backend': session['backend'], 'device': session['device'],
+        'paceFps': session.get('paceFps'),
+        'profilingEnabled': session.get('profilingEnabled', True),
         'frames': len(frames), 'completedFrameMs': summary['completedNs']/len(frames)/1e6,
         'cpuP95Ms': percentile([r['cpuNs']/1e6 for r in frames], .95),
         'cpuP99Ms': percentile([r['cpuNs']/1e6 for r in frames], .99),
@@ -46,10 +48,12 @@ def summarize(path):
 
 
 def compare(baseline, candidate, phase, control=False):
+    if any(r.get('paceFps') is not None for r in baseline + candidate):
+        raise ValueError('paced soaks cannot be used for throughput acceptance')
     if len(baseline) != len(candidate) or len(baseline) < 5:
         raise ValueError('acceptance requires at least five complete pairs')
     for before, after in zip(baseline, candidate):
-        for key in ('case', 'backend', 'device', 'frames'):
+        for key in ('case', 'backend', 'device', 'frames', 'profilingEnabled'):
             if before.get(key) != after.get(key):
                 raise ValueError(f'mismatched pair {key}')
     median = statistics.median
@@ -79,6 +83,8 @@ def main():
     parser.add_argument('--pairs', type=int, default=5)
     parser.add_argument('--phase', default='renderBackend')
     parser.add_argument('--control', action='store_true')
+    parser.add_argument('--profile-off', action='store_true',
+                        help='disable measurement instrumentation in both binaries')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     cases = args.case or [r['name'] for r in tomllib.loads(args.manifest.read_text())['case']]
@@ -96,6 +102,8 @@ def main():
                 path = args.output/f'{case}-{pair+1}-{label}.jsonl'
                 command = [str(binaries[label]), '--manifest', str(args.manifest.resolve()), '--case',case,
                            '--output',str(path.resolve()),'--backend',args.backend,'--warmup',str(args.warmup),'--frames',str(args.frames)]
+                if args.profile_off:
+                    command.append('--profile-off')
                 with path.with_suffix('.log').open('w') as log:
                     subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=3600)
                 runs[label].append(summarize(path))

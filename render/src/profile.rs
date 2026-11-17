@@ -21,6 +21,9 @@ macro_rules! work_counters {
         }
     }
 }
+// `pass_pixels` sums color attachment areas per encoded pass (before scissor),
+// not shaded fragments. `snapshot_bytes` counts cumulative admissions, not
+// current resident bytes. `mask_passes` counts passes using stencil/alpha masks.
 work_counters!(
     draw_calls,
     render_passes,

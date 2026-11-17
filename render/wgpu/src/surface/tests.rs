@@ -44,6 +44,25 @@ fn measurement_counts_encoded_draws_and_passes() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn measurement_counts_mask_passes_not_mask_inputs() {
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (32, 32)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let metrics = ruffle_render::profile::RenderMetrics::default();
+    let _scope = ruffle_render::profile::enter(Some(&metrics));
+    let mut source = CommandList::new();
+    rect(&mut source, 2.0, 2.0, 12.0, 12.0, Color::RED);
+    let mut mask = CommandList::new();
+    rect(&mut mask, 2.0, 2.0, 12.0, 12.0, Color::WHITE);
+    let mut commands = CommandList::new();
+    commands.render_alpha_mask(source, mask);
+    renderer.submit_frame(Color::BLACK, commands, vec![]);
+    assert_eq!(metrics.snapshot().work.mask_passes, 1);
+    assert_eq!(metrics.snapshot().work.offscreen_targets, 2);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn bounded_compositing_matches_full_target_pixels() {
     let descriptors = gpu();
     for quality in [StageQuality::Low, StageQuality::High] {

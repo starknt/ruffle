@@ -1,5 +1,4 @@
-use ruffle_render::commands::{Command, CommandList, RenderBlendMode};
-use swf::BlendMode;
+use ruffle_render::commands::{Command, CommandList};
 
 /// Consume intermediate blend/mask textures before building the next batch.
 /// This bounds sibling intermediates, not recursion depth or an individual target.
@@ -16,12 +15,8 @@ impl CommandBatches {
         // Shader blends receive their foreground/background at consumption time.
         let rgba_bytes = u64::from(width).max(1) * u64::from(height).max(1) * 4;
         let limit = ((32 * 1024 * 1024 / rgba_bytes) as usize).clamp(1, 8);
-        let mut inputs = 0;
-        let needs_batches = commands.iter().any(|command| {
-            inputs += temporary_inputs(command);
-            inputs > limit
-        });
-        let fallback = needs_batches && samples_ancestor_layer(&commands);
+        let needs_batches = commands.temporary_inputs() > limit;
+        let fallback = needs_batches && commands.samples_ancestor_layer();
         let max_inputs = if needs_batches && !fallback {
             limit
         } else {
@@ -54,7 +49,7 @@ impl Iterator for CommandBatches {
         let mut batch = CommandList::new();
         let mut inputs: usize = 0;
         while let Some(command) = self.commands.peek() {
-            let cost = temporary_inputs(command);
+            let cost = command.temporary_inputs();
             if cost != 0 && inputs != 0 && inputs.saturating_add(cost) > self.max_inputs {
                 ruffle_render::profile::blend_batch_split();
                 break;
@@ -64,26 +59,4 @@ impl Iterator for CommandBatches {
         }
         (!batch.is_empty()).then_some(batch)
     }
-}
-
-fn temporary_inputs(command: &Command) -> usize {
-    match command {
-        Command::Shared(commands) => commands.iter().map(temporary_inputs).sum(),
-        Command::Blend(..) => 1,
-        Command::RenderAlphaMask { .. } => 2,
-        _ => 0,
-    }
-}
-
-fn samples_ancestor_layer(commands: &CommandList) -> bool {
-    commands.iter().any(|command| match command {
-        Command::Blend(_, RenderBlendMode::Builtin(BlendMode::Alpha | BlendMode::Erase)) => true,
-        Command::Shared(children) => samples_ancestor_layer(children),
-        Command::Blend(children, _) => samples_ancestor_layer(children),
-        Command::RenderAlphaMask {
-            maskee_commands,
-            mask_commands,
-        } => samples_ancestor_layer(maskee_commands) || samples_ancestor_layer(mask_commands),
-        _ => false,
-    })
 }

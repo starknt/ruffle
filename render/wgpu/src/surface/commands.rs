@@ -179,10 +179,15 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         vertices: DrawVertices,
         command_builder: impl FnOnce(DrawOffsets) -> DrawCommand,
     ) {
-        let mut local_transform = transform.clone();
-        local_transform.matrix.tx -= Twips::from_pixels(self.origin[0] as f64);
-        local_transform.matrix.ty -= Twips::from_pixels(self.origin[1] as f64);
-        let transform = &local_transform;
+        let mut local_transform;
+        let transform = if self.origin != [0, 0] {
+            local_transform = transform.clone();
+            local_transform.matrix.tx -= Twips::from_pixels(self.origin[0] as f64);
+            local_transform.matrix.ty -= Twips::from_pixels(self.origin[1] as f64);
+            &local_transform
+        } else {
+            transform
+        };
         let result = match *instance {
             Some(existing) => Ok(existing),
             None => self.chunk_buffer_builder.add_transform(transform),
@@ -601,7 +606,6 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         };
         ruffle_render::profile::work(|w| {
             w.offscreen_targets += 2;
-            w.mask_passes += 2;
             w.offscreen_pixels += 2 * u64::from(region.width) * u64::from(region.height);
         });
         let surface = Surface::new(

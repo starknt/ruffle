@@ -157,6 +157,7 @@ impl core::fmt::Debug for Method<'_> {
 }
 
 impl<'gc> Method<'gc> {
+    #[inline]
     pub fn cached_trait(
         self,
         opcode: usize,
@@ -184,7 +185,22 @@ impl<'gc> Method<'gc> {
             let _ = unlock!(Gc::write(mc, self.0), MethodData, pic).set(table);
             table
         };
-        if table.data.borrow().sites.is_empty()
+        activation.avm2().pic_budget.touch(table);
+        let initialized = {
+            let data = table.data.borrow();
+            if let Some(site) = data.sites.get(opcode) {
+                if site.megamorphic {
+                    counters.megamorphic += 1;
+                    return None;
+                }
+                if let Some(property) = site.get(vtable) {
+                    counters.hits += 1;
+                    return Some(property);
+                }
+            }
+            !data.sites.is_empty()
+        };
+        if !initialized
             && !activation.avm2().pic_budget.allocate(
                 table,
                 self.get_verified_info().parsed_code.as_slice().len(),
@@ -192,19 +208,6 @@ impl<'gc> Method<'gc> {
             )
         {
             return None;
-        }
-        activation.avm2().pic_budget.touch(table);
-        {
-            let data = table.data.borrow();
-            let site = &data.sites[opcode];
-            if site.megamorphic {
-                counters.megamorphic += 1;
-                return None;
-            }
-            if let Some(property) = site.get(vtable, mc) {
-                counters.hits += 1;
-                return Some(property);
-            }
         }
         counters.misses += 1;
         let property = vtable.get_trait(name)?;

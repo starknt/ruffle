@@ -48,6 +48,8 @@ pub enum RenderBlendMode {
 pub struct CommandList {
     commands: Vec<Command>,
     region: RenderRegion,
+    temporary_inputs: usize,
+    samples_ancestor_layer: bool,
 
     /// The number of mask regions in the process of being drawn.
     /// This is used to discard drawing commands of nested maskers, which Flash does not support.
@@ -55,9 +57,17 @@ pub struct CommandList {
 }
 
 impl CommandList {
+    pub fn temporary_inputs(&self) -> usize {
+        self.temporary_inputs
+    }
+    pub fn samples_ancestor_layer(&self) -> bool {
+        self.samples_ancestor_layer
+    }
     pub fn append(&mut self, mut other: CommandList) {
         debug_assert_eq!(other.maskers_in_progress, 0);
         self.region = self.region.union(other.region);
+        self.temporary_inputs = self.temporary_inputs.saturating_add(other.temporary_inputs);
+        self.samples_ancestor_layer |= other.samples_ancestor_layer;
         self.commands.append(&mut other.commands);
     }
 
@@ -81,9 +91,19 @@ impl CommandList {
 
     fn execute_ref(&self, handler: &mut (impl CommandHandler + ?Sized)) {
         for command in &self.commands {
-            // Eligible retained blocks contain only leaf draws or Shared
-            // blocks, so replay clones handles, never a subtree vector.
-            command.clone().execute(handler);
+            // Do not materialize a cloned (large) Command enum on the stack.
+            // Retained blocks contain only leaf draws or shared blocks.
+            match command {
+                Command::Shared(commands) => handler.render_shared(commands.clone()),
+                Command::RenderShape { shape, transform } => {
+                    handler.render_shape(shape.clone(), transform.clone())
+                }
+                Command::DrawRect { color, matrix } => handler.draw_rect(*color, *matrix),
+                Command::DrawLine { color, matrix } => handler.draw_line(*color, *matrix),
+                Command::DrawLineRect { color, matrix } => handler.draw_line_rect(*color, *matrix),
+                // Shared lists from other producers still preserve all commands.
+                other => other.clone().execute(handler),
+            }
         }
     }
     pub fn iter(&self) -> std::slice::Iter<'_, Command> {
@@ -97,6 +117,21 @@ impl CommandList {
     }
     pub fn push(&mut self, command: Command) {
         self.region = self.region.union(command.region());
+        self.temporary_inputs = self
+            .temporary_inputs
+            .saturating_add(command.temporary_inputs());
+        self.samples_ancestor_layer |= match &command {
+            Command::Blend(_, RenderBlendMode::Builtin(BlendMode::Alpha | BlendMode::Erase)) => {
+                true
+            }
+            Command::Blend(children, _) => children.samples_ancestor_layer,
+            Command::Shared(children) => children.samples_ancestor_layer,
+            Command::RenderAlphaMask {
+                maskee_commands,
+                mask_commands,
+            } => maskee_commands.samples_ancestor_layer || mask_commands.samples_ancestor_layer,
+            _ => false,
+        };
         self.commands.push(command);
     }
     #[inline]
@@ -121,6 +156,14 @@ impl CommandList {
 }
 
 impl Command {
+    pub fn temporary_inputs(&self) -> usize {
+        match self {
+            Self::Blend(..) => 1,
+            Self::RenderAlphaMask { .. } => 2,
+            Self::Shared(commands) => commands.temporary_inputs,
+            _ => 0,
+        }
+    }
     fn execute(self, handler: &mut (impl CommandHandler + ?Sized)) {
         match self {
             Command::Shared(commands) => handler.render_shared(commands),

@@ -21,11 +21,11 @@ pub struct Site<'gc> {
 }
 
 impl<'gc> Site<'gc> {
-    pub fn get(&self, table: VTable<'gc>, mc: &Mutation<'gc>) -> Option<Property> {
+    pub fn get(&self, table: VTable<'gc>) -> Option<Property> {
         self.entries
             .iter()
             .flatten()
-            .find(|e| e.table.upgrade(mc) == Some(table))
+            .find(|e| e.table.matches(table))
             .map(|e| e.property)
     }
     pub fn insert(&mut self, table: VTable<'gc>, property: Property, mc: &Mutation<'gc>) {
@@ -183,7 +183,7 @@ mod tests {
             let table = VTable::empty(mc);
             site.insert(table, Property::Slot { slot_id: 17 }, mc);
             assert!(matches!(
-                site.get(table, mc),
+                site.get(table),
                 Some(Property::Slot { slot_id: 17 })
             ));
             site
@@ -191,7 +191,9 @@ mod tests {
         arena.finish_cycle();
         arena.mutate_root(|mc, site| {
             assert!(site.entries[0].unwrap().table.upgrade(mc).is_none());
-            assert!(site.get(VTable::empty(mc), mc).is_none());
+            for _ in 0..1024 {
+                assert!(site.get(VTable::empty(mc)).is_none());
+            }
         });
     }
     #[test]

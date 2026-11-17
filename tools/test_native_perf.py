@@ -7,6 +7,18 @@ from native_perf import summarize, compare
 
 
 class NativePerfTest(unittest.TestCase):
+    def test_instrumentation_modes_must_match(self):
+        run = {'completedFrameMs': 10, 'cpuP95Ms': 10, 'cpuP99Ms': 10,
+               'peakRssBytes': 100, 'phaseP95Ms': {'logic': 8}, 'profilingEnabled': True}
+        with self.assertRaises(ValueError):
+            compare([run]*5, [dict(run, profilingEnabled=False)]*5, 'logic', control=True)
+
+    def test_paced_soak_cannot_be_counted_as_throughput_acceptance(self):
+        run = {'completedFrameMs': 10, 'cpuP95Ms': 10, 'cpuP99Ms': 10,
+               'peakRssBytes': 100, 'phaseP95Ms': {'logic': 8}, 'paceFps': 60}
+        with self.assertRaises(ValueError):
+            compare([run]*5, [run]*5, 'logic', control=True)
+
     def trace(self, directory, frames=2, complete=True):
         path = Path(directory) / 'run.jsonl'
         events = [{'event': 'session', 'frames': frames, 'case': 'small', 'backend': 'Vulkan', 'device': 'test'}]

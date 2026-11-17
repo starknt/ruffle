@@ -246,6 +246,11 @@ pub struct VTable<'gc>(Gc<'gc, VTableData<'gc>>);
 pub struct WeakVTable<'gc>(gc_arena::GcWeak<'gc, VTableData<'gc>>);
 
 impl<'gc> WeakVTable<'gc> {
+    /// Compare allocation identity with a receiver that already holds a live
+    /// strong reference. This never dereferences or resurrects the weak target.
+    pub fn matches(self, table: VTable<'gc>) -> bool {
+        gc_arena::GcWeak::ptr_eq(self.0, Gc::downgrade(table.0))
+    }
     pub fn upgrade(self, mc: &Mutation<'gc>) -> Option<VTable<'gc>> {
         self.0.upgrade(mc).map(VTable)
     }

@@ -169,7 +169,10 @@ impl<'encoder> CommandRenderer<'encoder> {
             chunk_buffers,
             current_pipeline: None,
             current_index_buffer: None,
-            work: ruffle_render::profile::enabled().then(Default::default),
+            work: ruffle_render::profile::enabled().then(|| ruffle_render::profile::RenderWork {
+                mask_passes: u64::from(needs_stencil),
+                ..Default::default()
+            }),
         }
     }
 
@@ -326,6 +329,11 @@ impl<'encoder> CommandRenderer<'encoder> {
         bind_group: &'encoder wgpu::BindGroup,
         draw_offsets: &'encoder DrawOffsets,
     ) {
+        if let Some(work) = &mut self.work {
+            // Count the pass once, even if it contains several alpha masks or
+            // also uses stencil masking.
+            work.mask_passes = 1;
+        }
         self.set_pipeline(
             render_pass,
             if self.needs_stencil {
