@@ -241,6 +241,16 @@ mod tests {
 #[collect(no_drop)]
 pub struct VTable<'gc>(Gc<'gc, VTableData<'gc>>);
 
+#[derive(Collect, Clone, Copy)]
+#[collect(no_drop)]
+pub struct WeakVTable<'gc>(gc_arena::GcWeak<'gc, VTableData<'gc>>);
+
+impl<'gc> WeakVTable<'gc> {
+    pub fn upgrade(self, mc: &Mutation<'gc>) -> Option<VTable<'gc>> {
+        self.0.upgrade(mc).map(VTable)
+    }
+}
+
 // Bitmap symbol subclasses commonly introduce no properties. Lookup tables are
 // immutable once published; private namespaces, overrides and interface aliases
 // detach on insertion. Method scopes and writable slot caches stay per class.
@@ -372,6 +382,9 @@ impl<'gc> ClassBoundMethod<'gc> {
 }
 
 impl<'gc> VTable<'gc> {
+    pub fn downgrade(self) -> WeakVTable<'gc> {
+        WeakVTable(Gc::downgrade(self.0))
+    }
     pub fn empty(mc: &Mutation<'gc>) -> Self {
         VTable(Gc::new(mc, VTableData::default()))
     }

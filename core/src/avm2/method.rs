@@ -100,6 +100,7 @@ pub struct Method<'gc>(Gc<'gc, MethodData<'gc>>);
 #[derive(Collect)]
 #[collect(no_drop)]
 struct MethodData<'gc> {
+    pic: OnceLock<Gc<'gc, super::call_site::Table<'gc>>>,
     /// The translation unit this function was defined in.
     txunit: TranslationUnit<'gc>,
 
@@ -156,6 +157,65 @@ impl core::fmt::Debug for Method<'_> {
 }
 
 impl<'gc> Method<'gc> {
+    pub fn cached_trait(
+        self,
+        opcode: usize,
+        receiver: Value<'gc>,
+        name: &Multiname<'gc>,
+        activation: &mut Activation<'_, 'gc>,
+        counters: &mut super::call_site::Counters,
+    ) -> Option<super::property::Property> {
+        use super::object::{Object, TObject};
+        if name.has_lazy_component() || name.is_attribute() || name.local_name().is_none() {
+            return None;
+        }
+        let Value::Object(Object::ScriptObject(object)) = receiver else {
+            return None;
+        };
+        if !object.base().is_sealed() {
+            return None;
+        }
+        let mc = activation.gc();
+        let vtable = object.vtable();
+        let table = if let Some(table) = self.0.pic.get() {
+            *table
+        } else {
+            let table = Gc::new(mc, super::call_site::Table::default());
+            let _ = unlock!(Gc::write(mc, self.0), MethodData, pic).set(table);
+            table
+        };
+        if table.data.borrow().sites.is_empty()
+            && !activation.avm2().pic_budget.allocate(
+                table,
+                self.get_verified_info().parsed_code.as_slice().len(),
+                mc,
+            )
+        {
+            return None;
+        }
+        activation.avm2().pic_budget.touch(table);
+        {
+            let data = table.data.borrow();
+            let site = &data.sites[opcode];
+            if site.megamorphic {
+                counters.megamorphic += 1;
+                return None;
+            }
+            if let Some(property) = site.get(vtable, mc) {
+                counters.hits += 1;
+                return Some(property);
+            }
+        }
+        counters.misses += 1;
+        let property = vtable.get_trait(name)?;
+        // The side table is traced independently of VerifiedCode. Trigger its
+        // write barrier before installing a weak receiver guard.
+        unlock!(Gc::write(mc, table), super::call_site::Table, data)
+            .borrow_mut()
+            .sites[opcode]
+            .insert(vtable, property, mc);
+        Some(property)
+    }
     /// Construct a `Method` from an `AbcFile` and method index.
     pub fn from_method_index(
         txunit: TranslationUnit<'gc>,
@@ -222,6 +282,7 @@ impl<'gc> Method<'gc> {
         Ok(Self(Gc::new(
             activation.gc(),
             MethodData {
+                pic: OnceLock::new(),
                 txunit,
                 abc: txunit.abc(),
                 abc_method: abc_method.0,

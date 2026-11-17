@@ -46,6 +46,9 @@ mod amf;
 pub mod api_version;
 mod array;
 pub mod bytearray;
+mod call_site;
+#[cfg(test)]
+mod call_site_tests;
 pub(crate) mod call_stack;
 mod class;
 mod domain;
@@ -118,6 +121,7 @@ const BROADCAST_WHITELIST: [&[u8]; 4] =
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct Avm2<'gc> {
+    pub(crate) pic_budget: call_site::Budget<'gc>,
     /// The Flash Player version we're emulating.
     player_version: u8,
 
@@ -214,6 +218,7 @@ impl<'gc> Avm2<'gc> {
 
         Self {
             player_version,
+            pic_budget: Default::default(),
             player_runtime,
             stack: Stack::new(mc),
             scope_stack: Vec::new(),
