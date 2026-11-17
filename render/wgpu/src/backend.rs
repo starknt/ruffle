@@ -335,7 +335,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             .draws
             .iter()
             .any(|d| matches!(d.draw_type, ruffle_render::tessellator::DrawType::Bitmap(_)));
-        let gradient_bytes = lyon_mesh.gradients.len() * 2048;
+        let gradient_count = lyon_mesh.gradients.len();
         let mut bounds: Option<[f64; 4]> = None;
         for vertex in lyon_mesh.draws.iter().flat_map(|draw| &draw.vertices) {
             let (x, y) = (f64::from(vertex.x), f64::from(vertex.y));
@@ -395,7 +395,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             wgpu::BufferUsages::INDEX,
         );
 
-        let draws = draws
+        let draws: Vec<_> = draws
             .into_iter()
             .map(|d| d.finish(&self.descriptors, &uniform_buffer, &gradients))
             .collect();
@@ -404,12 +404,15 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             uniform_buffer.size() + vertex_buffer.size() + index_buffer.size(),
         );
 
+        let retained_bytes = retainable.then_some(()).and_then(|()| {
+            let buffers = uniform_buffer
+                .size()
+                .checked_add(vertex_buffer.size())?
+                .checked_add(index_buffer.size())?;
+            crate::mesh::retained_mesh_bytes(buffers, gradient_count, draws.capacity())
+        });
         Mesh {
-            retained_bytes: retainable.then_some(
-                (uniform_buffer.size() + vertex_buffer.size() + index_buffer.size()) as usize
-                    + gradient_bytes
-                    + 4096,
-            ),
+            retained_bytes,
             bounds,
             draws,
             vertex_buffer,

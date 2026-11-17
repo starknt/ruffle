@@ -207,11 +207,19 @@ impl<'gc> Method<'gc> {
         activation: &mut Activation<'_, 'gc>,
         counters: &mut super::call_site::Counters,
     ) -> Option<super::property::Property> {
+        counters.misses += 1;
+        let property = vtable.get_trait(name)?;
         let mc = activation.gc();
         let table = if let Some(table) = self.0.pic.get() {
             *table
         } else {
-            let table = Gc::new(mc, super::call_site::Table::default());
+            let Some(table) = activation
+                .avm2()
+                .pic_budget
+                .new_table(self.get_verified_info().parsed_code.as_slice().len(), mc)
+            else {
+                return Some(property);
+            };
             let _ = unlock!(Gc::write(mc, self.0), MethodData, pic).set(table);
             table
         };
@@ -223,11 +231,9 @@ impl<'gc> Method<'gc> {
                 mc,
             )
         {
-            return vtable.get_trait(name);
+            return Some(property);
         }
         activation.avm2().pic_budget.touch(table);
-        counters.misses += 1;
-        let property = vtable.get_trait(name)?;
         // The side table is traced independently of VerifiedCode. Trigger its
         // write barrier before installing a weak receiver guard.
         unlock!(Gc::write(mc, table), super::call_site::Table, data)

@@ -421,10 +421,14 @@ impl Default for DisplayObjectBase<'_> {
 
 impl<'gc> DisplayObjectBase<'gc> {
     fn invalidate_render(&self) {
-        self.snapshots.invalidate();
+        if !self.snapshots.invalidate() {
+            return;
+        }
         let mut parent = self.parent();
         while let Some(object) = parent {
-            object.base().snapshots.invalidate();
+            if !object.base().snapshots.invalidate() {
+                break;
+            }
             parent = object.parent();
         }
     }
@@ -1225,7 +1229,14 @@ fn render_snapshot<'gc>(
             view: context.stage.view_bounds(),
             quality: context.stage.quality(),
         };
-        let node = base.snapshots.node();
+        let Some(node) = base
+            .snapshots
+            .node(context.snapshots.as_deref_mut().unwrap())
+        else {
+            render_base_inner(this, context, options);
+            context.snapshot_allowed = allowed;
+            return;
+        };
         let hit = node
             .entry
             .borrow()
@@ -1295,6 +1306,7 @@ fn render_base_inner<'gc>(
     context: &mut RenderContext<'_, 'gc>,
     options: RenderOptions,
 ) {
+    this.base().snapshots.visited();
     ruffle_render::profile::work(|w| w.tree_visits += 1);
     if options.skip_masks && this.maskee().is_some() {
         // Skip rendering masks (unless we are rendering one explicitly).
@@ -2943,6 +2955,8 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn pre_render(self, _context: &mut RenderContext<'_, 'gc>) {
         let this = self.base();
+        // Invisible children also participate in a parent's recorded block.
+        this.snapshots.visited();
         this.clear_invalidate_flag();
         this.scroll_rect
             .set(this.has_scroll_rect().then(|| this.next_scroll_rect.get()));
@@ -2998,7 +3012,7 @@ pub trait TDisplayObject<'gc>:
     }
 
     fn avm1_unload(self, context: &mut UpdateContext<'gc>) {
-        self.base().snapshots.invalidate();
+        self.base().snapshots.clear();
         // Unload children.
         if let Some(ctr) = self.as_container() {
             for child in ctr.iter_render_list() {
@@ -3319,7 +3333,7 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn clear_render_snapshots(self) {
-        self.base().snapshots.invalidate();
+        self.base().snapshots.clear();
         if let Some(container) = self.as_container() {
             for child in container.iter_render_list() {
                 child.clear_render_snapshots();

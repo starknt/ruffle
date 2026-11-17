@@ -27,12 +27,24 @@ pub struct Node {
     pub entry: RefCell<Option<Entry>>,
     pub used: Cell<u64>,
     pub observed: RefCell<Option<Key>>,
+    _charge: Option<NodeCharge>,
+}
+
+struct NodeCharge {
+    used: Rc<Cell<usize>>,
+    bytes: usize,
+}
+impl Drop for NodeCharge {
+    fn drop(&mut self) {
+        self.used.set(self.used.get() - self.bytes);
+    }
 }
 
 #[derive(Default)]
 pub struct State {
     pub generation: Cell<u64>,
     pub node: RefCell<Option<Rc<Node>>>,
+    invalidated: Cell<bool>,
 }
 
 // Instantiated display objects must never share a cache or invalidation state.
@@ -43,17 +55,31 @@ impl Clone for State {
 }
 
 impl State {
-    pub fn invalidate(&self) {
+    /// Coalesce until the next render traversal, not until the next frame.
+    /// A second mutation after a render in the same logical frame propagates.
+    pub fn invalidate(&self) -> bool {
+        if self.invalidated.replace(true) {
+            return false;
+        }
         self.generation.set(self.generation.get().wrapping_add(1));
         if let Some(node) = self.node.borrow().as_ref() {
             node.entry.borrow_mut().take();
         }
+        true
     }
-    pub fn node(&self) -> Rc<Node> {
-        self.node
-            .borrow_mut()
-            .get_or_insert_with(Default::default)
-            .clone()
+    pub fn visited(&self) {
+        self.invalidated.set(false);
+    }
+    pub fn clear(&self) {
+        self.invalidate();
+        self.node.borrow_mut().take();
+    }
+    pub fn node(&self, cache: &mut Cache) -> Option<Rc<Node>> {
+        let mut node = self.node.borrow_mut();
+        if node.is_none() {
+            *node = Some(cache.new_node()?);
+        }
+        node.clone()
     }
 }
 
@@ -67,6 +93,7 @@ pub struct Cache {
     records: Vec<Record>,
     limit: usize,
     bytes: usize,
+    node_bytes: Rc<Cell<usize>>,
     clock: u64,
 }
 
@@ -82,6 +109,7 @@ impl Cache {
             records: Vec::new(),
             limit,
             bytes: 0,
+            node_bytes: Rc::new(Cell::new(0)),
             clock: 0,
         }
     }
@@ -99,19 +127,27 @@ impl Cache {
             }
         });
     }
-    pub fn insert(&mut self, node: &Rc<Node>, entry: Entry) -> bool {
-        let Some(bytes) = entry
-            .commands
-            .retained_bytes()
-            .and_then(|b| b.checked_add(512))
-        else {
-            return false;
-        };
+    fn new_node(&mut self) -> Option<Rc<Node>> {
+        // Includes Rc/allocator overhead; observation keys live inside Node.
+        let bytes = std::mem::size_of::<Node>() + 128;
+        if !self.make_room(bytes) {
+            return None;
+        }
+        self.node_bytes.set(self.node_bytes.get() + bytes);
+        Some(Rc::new(Node {
+            _charge: Some(NodeCharge {
+                used: self.node_bytes.clone(),
+                bytes,
+            }),
+            ..Default::default()
+        }))
+    }
+    fn make_room(&mut self, bytes: usize) -> bool {
         if bytes > self.limit {
             return false;
         }
         self.prune();
-        while self.bytes + bytes > self.limit {
+        while self.bytes + self.node_bytes.get() + bytes > self.limit {
             let oldest = self
                 .records
                 .iter()
@@ -133,6 +169,21 @@ impl Cache {
             // A parent block or this frame may still pin the evicted block.
             // Keep charging it until the LAST strong reference disappears.
             self.prune();
+        }
+        true
+    }
+    pub fn insert(&mut self, node: &Rc<Node>, entry: Entry) -> bool {
+        // Charge vector spare capacity and weak/control-block overhead as well
+        // as command/resource storage. Candidate Node has a separate lifetime.
+        let Some(bytes) = entry
+            .commands
+            .retained_bytes()
+            .and_then(|b| b.checked_add(512))
+        else {
+            return false;
+        };
+        if !self.make_room(bytes) {
+            return false;
         }
         self.touch(node);
         self.bytes += bytes;
@@ -165,9 +216,44 @@ mod tests {
         }
     }
     #[test]
+    fn rejected_candidates_cannot_retain_unbounded_metadata() {
+        let mut cache = Cache::new(4096);
+        let states: Vec<_> = (0..200).map(|_| State::default()).collect();
+        for state in &states {
+            let Some(node) = state.node(&mut cache) else {
+                continue;
+            };
+            let mut block = entry();
+            let mut commands = CommandList::new();
+            for _ in 0..1000 {
+                commands.push(ruffle_render::commands::Command::DrawRect {
+                    color: swf::Color::RED,
+                    matrix: Default::default(),
+                });
+            }
+            block.commands = Rc::new(commands);
+            assert!(!cache.insert(&node, block));
+        }
+        let metadata = states.iter().filter(|s| s.node.borrow().is_some()).count()
+            * std::mem::size_of::<Node>();
+        assert!(
+            metadata <= cache.limit,
+            "metadata {metadata} exceeds {}",
+            cache.limit
+        );
+        assert!(cache.node_bytes.get() >= metadata);
+        // Removed objects may remain referenced by AS, but their cache state
+        // must release its observation allocation, not just its commands.
+        for state in &states {
+            state.clear();
+        }
+        assert_eq!(cache.node_bytes.get(), 0);
+    }
+    #[test]
     fn cloned_display_object_state_does_not_share_cache_or_generation() {
         let state = State::default();
-        let node = state.node();
+        let mut cache = Cache::default();
+        let node = state.node(&mut cache).unwrap();
         *node.entry.borrow_mut() = Some(entry());
         let copy = state.clone();
         copy.invalidate();

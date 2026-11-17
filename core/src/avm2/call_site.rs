@@ -73,6 +73,9 @@ pub struct Data<'gc> {
 pub struct Table<'gc> {
     pub data: RefLock<Data<'gc>>,
     used_at: Cell<u64>,
+    // Method's OnceLock keeps this allocation after its sites are evicted.
+    #[collect(require_static)]
+    _metadata_charge: Option<Charge>,
 }
 
 impl<'gc> Table<'gc> {
@@ -103,6 +106,37 @@ impl Default for Budget<'_> {
 }
 
 impl<'gc> Budget<'gc> {
+    fn metadata_bytes() -> usize {
+        // GC header, allocator overhead, weak registry and its spare capacity.
+        std::mem::size_of::<Table<'gc>>() + 512
+    }
+    fn site_bytes(count: usize) -> Option<usize> {
+        count
+            .checked_mul(std::mem::size_of::<Site<'gc>>())?
+            .checked_add(64)
+    }
+    pub fn new_table(&mut self, count: usize, mc: &Mutation<'gc>) -> Option<Gc<'gc, Table<'gc>>> {
+        let bytes = Self::metadata_bytes().checked_add(Self::site_bytes(count)?)?;
+        if !self.make_room(bytes, mc) {
+            return None;
+        }
+        let metadata = Self::metadata_bytes();
+        self.used.set(self.used.get() + metadata);
+        let table = Gc::new(
+            mc,
+            Table {
+                _metadata_charge: Some(Charge {
+                    used: self.used.clone(),
+                    bytes: metadata,
+                }),
+                ..Default::default()
+            },
+        );
+        self.tables.push(Gc::downgrade(table));
+        // Space for both lifetimes was reserved before allocating either one.
+        assert!(self.allocate(table, count, mc));
+        Some(table)
+    }
     pub fn touch(&mut self, table: Gc<'gc, Table<'gc>>) {
         self.clock = self.clock.wrapping_add(1);
         table.used_at.set(self.clock);
@@ -113,31 +147,11 @@ impl<'gc> Budget<'gc> {
         count: usize,
         mc: &Mutation<'gc>,
     ) -> bool {
-        let Some(bytes) = count
-            .checked_mul(std::mem::size_of::<Site<'gc>>())
-            .and_then(|n| n.checked_add(512))
-        else {
+        let Some(bytes) = Self::site_bytes(count) else {
             return false;
         };
-        if bytes > self.limit {
+        if !self.make_room(bytes, mc) {
             return false;
-        }
-        self.tables.retain(|w| {
-            w.upgrade(mc)
-                .is_some_and(|t| !t.data.borrow().sites.is_empty())
-        });
-        while self.used.get() + bytes > self.limit {
-            let oldest = self
-                .tables
-                .iter()
-                .enumerate()
-                .filter_map(|(i, w)| w.upgrade(mc).map(|t| (i, t)))
-                .min_by_key(|(_, t)| t.used_at.get());
-            let Some((index, old)) = oldest else {
-                return false;
-            };
-            Table::clear(old, mc);
-            self.tables.swap_remove(index);
         }
         self.used.set(self.used.get() + bytes);
         let data = Data {
@@ -148,8 +162,31 @@ impl<'gc> Budget<'gc> {
             }),
         };
         gc_arena::barrier::unlock!(Gc::write(mc, table), Table, data).replace(data);
-        self.tables.push(Gc::downgrade(table));
         self.touch(table);
+        true
+    }
+    fn make_room(&mut self, bytes: usize, mc: &Mutation<'gc>) -> bool {
+        if bytes > self.limit {
+            return false;
+        }
+        self.tables.retain(|w| w.upgrade(mc).is_some());
+        while self.used.get() + bytes > self.limit {
+            let oldest = self
+                .tables
+                .iter()
+                .enumerate()
+                .filter_map(|(i, w)| {
+                    w.upgrade(mc)
+                        .filter(|t| !t.data.borrow().sites.is_empty())
+                        .map(|t| (i, t))
+                })
+                .min_by_key(|(_, t)| t.used_at.get());
+            let Some((_, old)) = oldest else {
+                return false;
+            };
+            Table::clear(old, mc);
+            // Keep the weak registry and lifetime charge for the empty table.
+        }
         true
     }
 }
@@ -177,6 +214,32 @@ mod tests {
     use super::*;
     use gc_arena::{Arena, Rootable};
     #[test]
+    fn live_evicted_tables_keep_their_metadata_charged() {
+        let mut arena = Arena::<Rootable![(Budget<'_>, Vec<Gc<'_, Table<'_>>>)]>::new(|mc| {
+            let mut budget = Budget {
+                limit: 4096,
+                ..Default::default()
+            };
+            let mut tables = Vec::new();
+            for _ in 0..200 {
+                if let Some(table) = budget.new_table(1, mc) {
+                    tables.push(table);
+                }
+            }
+            (budget, tables)
+        });
+        arena.mutate_root(|mc, (budget, tables)| {
+            let metadata = tables.len() * std::mem::size_of::<Table>();
+            assert!(
+                budget.used.get() >= metadata,
+                "only {} bytes charged for {metadata} bytes of live tables",
+                budget.used.get()
+            );
+            assert!(budget.used.get() <= budget.limit);
+            assert!(budget.new_table(usize::MAX, mc).is_none());
+        });
+    }
+    #[test]
     fn weak_guards_do_not_retain_classes_or_match_new_allocations() {
         let mut arena = Arena::<Rootable![Site<'_>]>::new(|mc| {
             let mut site = Site::default();
@@ -202,14 +265,15 @@ mod tests {
         let mut arena = Arena::<Rootable![(Budget<'_>, Vec<Gc<'_, Table<'_>>>)]>::new(|mc| {
             let mut budget = Budget {
                 used: used.clone(),
-                limit: 2 * (std::mem::size_of::<Site>() + 512),
+                limit: 3 * Budget::metadata_bytes() + 2 * Budget::site_bytes(1).unwrap(),
                 ..Default::default()
             };
-            let tables: Vec<_> = (0..3).map(|_| Gc::new(mc, Table::default())).collect();
-            assert!(budget.allocate(tables[0], 1, mc));
-            assert!(budget.allocate(tables[1], 1, mc));
+            let mut tables = vec![
+                budget.new_table(1, mc).unwrap(),
+                budget.new_table(1, mc).unwrap(),
+            ];
             budget.touch(tables[0]);
-            assert!(budget.allocate(tables[2], 1, mc));
+            tables.push(budget.new_table(1, mc).unwrap());
             assert!(tables[1].data.borrow().sites.is_empty());
             assert!(!tables[0].data.borrow().sites.is_empty());
             assert!(used.get() <= budget.limit);

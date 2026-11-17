@@ -33,6 +33,40 @@ impl ShapeHandleImpl for Mesh {
     }
 }
 
+pub fn retained_mesh_bytes(
+    buffer_bytes: u64,
+    gradient_count: usize,
+    draw_capacity: usize,
+) -> Option<usize> {
+    // Charge variable CPU storage explicitly. The per-draw allowance covers
+    // backend bindings/handles; solid draws are intentionally overcounted.
+    usize::try_from(buffer_bytes)
+        .ok()?
+        .checked_add(gradient_count.checked_mul(2048)?)?
+        .checked_add(draw_capacity.checked_mul(std::mem::size_of::<Draw>() + 1024)?)?
+        .checked_add(4096)
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+
+    #[test]
+    fn retained_mesh_accounts_for_large_solid_draw_storage() {
+        let mut draws = Vec::with_capacity(8192);
+        for i in 0..8192 {
+            draws.push(Draw {
+                draw_type: DrawType::Color,
+                vertices: (i * 16)..((i + 1) * 16),
+                indices: 0..6,
+                mask_indices: 0..6,
+            });
+        }
+        let bytes = retained_mesh_bytes(1024, 0, draws.capacity()).unwrap();
+        assert!(bytes >= 1024 + draws.capacity() * std::mem::size_of::<Draw>());
+    }
+}
+
 pub fn as_mesh(handle: &ShapeHandle) -> &Mesh {
     <dyn Any>::downcast_ref(&*handle.0).expect("Shape handle must be a WGPU ShapeData")
 }
