@@ -526,7 +526,7 @@ impl PreparedSnapshot {
             // Reserve proportionally for small partitions so four tasks can
             // share the device allowance. An underestimated tessellation still
             // takes the existing exclusive, bounded path after the wave joins.
-            let budget = output_budget.min((input / 4).saturating_add(4096));
+            let budget = output_budget.min(input.saturating_add(4096));
             Some(Work {
                 bytes: input.saturating_add(budget),
                 value: Input::Shapes(partition, budget),
