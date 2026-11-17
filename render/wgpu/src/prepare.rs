@@ -189,7 +189,7 @@ impl NativePreparation {
                 let Some(next) = work.peek() else {
                     break;
                 };
-                let Some(permit) = self.admit(next.bytes, true) else {
+                let Some(permit) = self.admit(next.bytes, false) else {
                     break;
                 };
                 permits.push(permit);
@@ -214,22 +214,38 @@ impl NativePreparation {
                 consume(vec![result])?;
                 continue;
             }
-            let results: Vec<Mutex<Option<Result<R, RenderFailure>>>> =
-                (0..pending.len()).map(|_| Mutex::new(None)).collect();
-            rayon::scope(|scope| {
-                for (index, value) in pending.into_iter().enumerate() {
-                    let result = &results[index];
-                    let prepare = &prepare;
-                    scope.spawn(move |_| {
-                        if generation.is_current() {
-                            *result
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(prepare(value));
-                        }
-                    });
-                }
-            });
+            let mut results: Vec<Option<Result<R, RenderFailure>>> =
+                (0..pending.len()).map(|_| None).collect();
+            let mut pending = pending.into_iter();
+            let first = pending.next().expect("nonempty preparation wave");
+            let (first_result, worker_results) = results.split_first_mut().unwrap();
+            if worker_results.is_empty() {
+                // A graph-only frame has no independent work to overlap. Avoid
+                // starting the global Rayon pool just to move it to one worker.
+                *first_result = Some(prepare(first));
+            } else {
+                self.0
+                    .stats
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .submitted += worker_results.len() as u64;
+                rayon::in_place_scope(|scope| {
+                    for (value, result) in pending.zip(worker_results) {
+                        let prepare = &prepare;
+                        scope.spawn(move |_| {
+                            if generation.is_current() {
+                                *result = Some(prepare(value));
+                            }
+                        });
+                    }
+                    // The caller participates instead of handing the scope
+                    // itself to a worker and blocking. Each output slot has one
+                    // writer, and the join precedes every read/publication.
+                    if generation.is_current() {
+                        *first_result = Some(prepare(first));
+                    }
+                });
+            }
             self.0.health.check()?;
             if !generation.is_current() {
                 return Ok(false);
@@ -237,15 +253,12 @@ impl NativePreparation {
             let output = results
                 .into_iter()
                 .map(|result| {
-                    result
-                        .into_inner()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .ok_or_else(|| {
-                            RenderFailure::new(
-                                RenderFailureKind::Internal,
-                                "native preparation returned no result",
-                            )
-                        })?
+                    result.ok_or_else(|| {
+                        RenderFailure::new(
+                            RenderFailureKind::Internal,
+                            "native preparation returned no result",
+                        )
+                    })?
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             drop(timer);

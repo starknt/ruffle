@@ -127,6 +127,33 @@ fn encoded_resources_survive_handle_drop_until_recording_is_discarded() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn repeated_recorded_raw_resources_remain_resolvable_until_encoder_finish() {
+    let device = device(4096);
+    let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
+    let buffer = device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let raw = buffer.raw().clone();
+    encoder.clear_buffer(&buffer, 0, Some(128));
+    drop(buffer);
+    // The recording already owns this resource; repeating a use cannot lose
+    // its identity just because the caller released its original wrapper.
+    encoder.clear_buffer(&raw, 128, Some(128));
+    device.runtime().check_health().unwrap();
+    let commands = encoder.finish().unwrap();
+    drop(raw);
+    assert_eq!(device.runtime().stats().total_bytes, 256);
+    drop(commands);
+    assert_eq!(device.runtime().stats().total_bytes, 0);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn submitted_uploads_retire_only_after_gpu_completion() {
     let device = device(4096);
     let buffer = device

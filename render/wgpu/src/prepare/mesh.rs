@@ -49,13 +49,23 @@ pub fn input_vertices(shape: &ruffle_render::shape_utils::OwnedDistilledShape) -
 }
 impl ShapeInput {
     pub fn prepare_bounded(self, bytes: u64) -> Result<PreparedMesh, RenderFailure> {
-        let mesh = ruffle_render::tessellator::ShapeTessellator::new()
-            .tessellate_shape_with_scale_bounded(
-                self.geometry.as_distilled(),
-                &Sizes(self.bitmap_sizes),
-                self.scale,
-                bytes,
-            )?;
+        self.prepare_with(
+            &mut ruffle_render::tessellator::ShapeTessellator::new(),
+            bytes,
+        )
+    }
+
+    pub fn prepare_with(
+        self,
+        tessellator: &mut ruffle_render::tessellator::ShapeTessellator,
+        bytes: u64,
+    ) -> Result<PreparedMesh, RenderFailure> {
+        let mesh = tessellator.tessellate_shape_with_scale_bounded(
+            self.geometry.as_distilled(),
+            &Sizes(self.bitmap_sizes),
+            self.scale,
+            bytes,
+        )?;
         PreparedMesh::pack(mesh)
     }
 }

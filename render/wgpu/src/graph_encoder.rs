@@ -3,11 +3,11 @@
 use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
 use crate::pass_graph::{GraphResource, Load, PassGraph, PassKind};
 use crate::render_snapshot::{MaskCommand, PreparedSnapshot};
+use fnv::FnvHashMap as HashMap;
 use ruffle_render::{
     commands::{Command, CommandList},
     region::RenderRect,
 };
-use std::collections::HashMap;
 
 /// Native lowering retains graph-selected origins and lifetime costs through
 /// nested composition; the surface never recaptures a display command list.
@@ -92,19 +92,13 @@ impl GraphEncoder {
     /// The builder retains ownership of stencil/ancestor-Layer raster semantics;
     /// no GC traversal or recapture occurs here.
     pub fn into_commands(self) -> Result<PlannedList, RenderFailure> {
-        let mut targets = HashMap::<GraphResource, PlannedList>::new();
+        let mut targets = HashMap::<GraphResource, PlannedList>::default();
         let invalid = || {
             RenderFailure::new(
                 RenderFailureKind::Validation,
                 "invalid graph target dependency",
             )
         };
-        let costs: HashMap<_, _> = self
-            .graph
-            .lifetimes()
-            .into_iter()
-            .map(|life| (life.resource, life.bytes))
-            .collect();
         for (index, pass) in self.graph.passes.iter().enumerate() {
             if pass
                 .dependencies
@@ -128,7 +122,20 @@ impl GraphEncoder {
                     targets.entry(attachment.resource).or_default();
                     continue;
                 }
-                PassKind::Draw(node) | PassKind::Opaque(node) => {
+                PassKind::Draw(nodes) => {
+                    let target = targets.entry(attachment.resource).or_default();
+                    for node in nodes {
+                        target.push(PlannedCommand {
+                            op: PlannedOp::Leaf(self.prepared.leaf(node)?),
+                            region: node.region,
+                            transient_bytes: 0,
+                            inputs: 0,
+                            reads_layer: false,
+                        });
+                    }
+                    continue;
+                }
+                PassKind::Opaque(node) => {
                     region = node.region;
                     PlannedOp::Leaf(self.prepared.leaf(node)?)
                 }
@@ -155,7 +162,7 @@ impl GraphEncoder {
                                 swf::BlendMode::Alpha | swf::BlendMode::Erase
                             )
                         );
-                    transient_bytes = costs.get(&input.resource).copied().unwrap_or(0);
+                    transient_bytes = self.graph.texture_bytes(input.resource)?;
                     inputs = 1;
                     region = rect_region(pass.bounds);
                     PlannedOp::Blend(children, self.prepared.blend_mode(mode)?, pass.bounds)
@@ -171,11 +178,10 @@ impl GraphEncoder {
                     let mask_commands = targets.remove(&mask).ok_or_else(invalid)?;
                     reads_layer = content_commands.samples_ancestor_layer()
                         || mask_commands.samples_ancestor_layer();
-                    transient_bytes = costs
-                        .get(&content)
-                        .copied()
-                        .unwrap_or(0)
-                        .saturating_add(costs.get(&mask).copied().unwrap_or(0));
+                    transient_bytes = self
+                        .graph
+                        .texture_bytes(content)?
+                        .saturating_add(self.graph.texture_bytes(mask)?);
                     inputs = 2;
                     region = rect_region(pass.bounds);
                     PlannedOp::AlphaMask(content_commands, mask_commands, pass.bounds)

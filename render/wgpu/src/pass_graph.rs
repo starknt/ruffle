@@ -6,8 +6,8 @@ use crate::render_snapshot::{
     MaskCommand, RenderSnapshot, ResourceKey, ResourceRecipe, ResourceVersion, SnapshotBlend,
     SnapshotCommand, SnapshotNode,
 };
+use fnv::FnvHashMap as HashMap;
 use ruffle_render::region::RenderRect;
-use std::collections::{BTreeSet, HashMap};
 use swf::{BlendMode, Color};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -45,7 +45,7 @@ impl TextureKey {
         Ok(bytes)
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Attachment {
     pub resource: GraphResource,
     pub bounds: RenderRect,
@@ -61,7 +61,7 @@ pub enum PassKind {
     Upload(ResourceRecipe),
     Prepare(ResourceRecipe),
     Clear,
-    Draw(SnapshotNode),
+    Draw(smallvec::SmallVec<[SnapshotNode; 1]>),
     Mask(MaskCommand),
     Blend(SnapshotBlend),
     AlphaMask,
@@ -102,7 +102,7 @@ impl Lifetime {
 struct AccessState {
     version: u64,
     writer: Option<usize>,
-    readers: Vec<usize>,
+    readers: smallvec::SmallVec<[usize; 1]>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct PassGraph {
@@ -137,9 +137,9 @@ impl PassGraph {
         }
         let mut graph = Self {
             passes: Vec::new(),
-            states: HashMap::new(),
-            textures: HashMap::new(),
-            shape_inputs: HashMap::new(),
+            states: HashMap::default(),
+            textures: HashMap::default(),
+            shape_inputs: HashMap::default(),
             next_temporary: 0,
             next_stencil: 0,
             direct: true,
@@ -233,6 +233,11 @@ impl PassGraph {
     pub fn direct_attachment(&self) -> bool {
         self.direct
     }
+    pub fn texture_bytes(&self, resource: GraphResource) -> Result<u64, RenderFailure> {
+        self.textures
+            .get(&resource)
+            .map_or(Ok(0), |key| key.bytes())
+    }
     pub fn temporary(
         &mut self,
         bounds: RenderRect,
@@ -266,12 +271,78 @@ impl PassGraph {
         bounds: RenderRect,
         submit_after: bool,
     ) -> Result<usize, RenderFailure> {
+        if let PassKind::Draw(nodes) = &kind
+            && let Some(attachment) = &attachment
+            && writes == [attachment.resource]
+            && let Some(previous) = self.passes.last()
+            && previous.attachment.as_ref() == Some(attachment)
+            && matches!(previous.kind, PassKind::Draw(_))
+        {
+            let index = self.passes.len() - 1;
+            let previous = &mut self.passes[index];
+            // Adjacent leaf draws only write this attachment. Their input
+            // identities and versions are immutable across the run; preserve
+            // all external dependencies and every draw's original order.
+            for &resource in reads {
+                if resource == attachment.resource {
+                    continue;
+                }
+                let state = self.states.entry(resource).or_default();
+                if state.readers.last() == Some(&index) {
+                    continue;
+                }
+                state.readers.push(index);
+                previous.reads.push(Version {
+                    resource,
+                    version: state.version,
+                });
+                if let Some(writer) = state.writer
+                    && let Err(position) = previous.dependencies.binary_search(&writer)
+                {
+                    previous.dependencies.insert(position, writer);
+                }
+            }
+            let state = self.states.get_mut(&attachment.resource).unwrap();
+            state.version = state
+                .version
+                .checked_add(1)
+                .ok_or_else(|| invalid("graph content version exhausted"))?;
+            previous.writes[0].version = state.version;
+            let x = previous.bounds.x.min(bounds.x);
+            let y = previous.bounds.y.min(bounds.y);
+            let right = previous
+                .bounds
+                .x
+                .checked_add(previous.bounds.width)
+                .zip(bounds.x.checked_add(bounds.width))
+                .map(|(a, b)| a.max(b))
+                .ok_or_else(|| invalid("draw bounds overflow"))?;
+            let bottom = previous
+                .bounds
+                .y
+                .checked_add(previous.bounds.height)
+                .zip(bounds.y.checked_add(bounds.height))
+                .map(|(a, b)| a.max(b))
+                .ok_or_else(|| invalid("draw bounds overflow"))?;
+            previous.bounds = RenderRect {
+                x,
+                y,
+                width: right - x,
+                height: bottom - y,
+            };
+            previous.submit_after = submit_after;
+            let PassKind::Draw(previous_nodes) = &mut previous.kind else {
+                unreachable!()
+            };
+            previous_nodes.extend(nodes.iter().cloned());
+            return Ok(index);
+        }
         let index = self.passes.len();
-        let mut dependencies = BTreeSet::new();
+        let mut dependencies = smallvec::SmallVec::<[usize; 4]>::new();
         // Never material-sort independent Flash commands. The hazard edges are
         // recorded separately so later merging cannot erase a WAR or WAW edge.
         if index != 0 {
-            dependencies.insert(index - 1);
+            dependencies.push(index - 1);
         }
         let mut read_versions = Vec::new();
         for &resource in reads {
@@ -283,7 +354,7 @@ impl PassGraph {
             }
             let state = self.states.entry(resource).or_default();
             if let Some(writer) = state.writer {
-                dependencies.insert(writer);
+                dependencies.push(writer);
             }
             state.readers.push(index);
             read_versions.push(Version {
@@ -301,7 +372,7 @@ impl PassGraph {
             }
             let state = self.states.entry(resource).or_default();
             if let Some(writer) = state.writer {
-                dependencies.insert(writer);
+                dependencies.push(writer);
             }
             dependencies.extend(state.readers.drain(..).filter(|reader| *reader != index));
             state.version = state
@@ -314,11 +385,13 @@ impl PassGraph {
                 version: state.version,
             });
         }
+        dependencies.sort_unstable();
+        dependencies.dedup();
         self.passes.push(Pass {
             kind,
             reads: read_versions,
             writes: write_versions,
-            dependencies: dependencies.into_iter().collect(),
+            dependencies: dependencies.into_vec(),
             attachment,
             bounds,
             submit_after,
@@ -382,8 +455,10 @@ impl PassGraph {
                 continue;
             }
             let target = attachment.resource;
-            let mut reads = vec![target];
-            let mut writes = vec![target];
+            let mut reads = smallvec::SmallVec::<[GraphResource; 4]>::new();
+            let mut writes = smallvec::SmallVec::<[GraphResource; 1]>::new();
+            reads.push(target);
+            writes.push(target);
             let mut bounds = node
                 .region
                 .clip(attachment.bounds)
@@ -420,8 +495,10 @@ impl PassGraph {
                         format: wgpu::TextureFormat::Stencil8,
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     });
-                    reads = vec![stencil];
-                    writes = vec![stencil];
+                    reads.clear();
+                    reads.push(stencil);
+                    writes.clear();
+                    writes.push(stencil);
                     PassKind::Mask(*command)
                 }
                 SnapshotCommand::Blend { children, mode } => {
@@ -496,13 +573,13 @@ impl PassGraph {
                     if let Some(inputs) = self.shape_inputs.get(&resource.key) {
                         reads.extend(inputs.iter().map(|r| GraphResource::External(r.key)));
                     }
-                    PassKind::Draw(node.clone())
+                    PassKind::Draw(smallvec::smallvec![node.clone()])
                 }
                 SnapshotCommand::Stage3D { resource, .. } => {
                     reads.push(GraphResource::External(resource.key));
                     PassKind::Opaque(node.clone())
                 }
-                _ => PassKind::Draw(node.clone()),
+                _ => PassKind::Draw(smallvec::smallvec![node.clone()]),
             };
             if attachment.stencil.is_some() {
                 reads.push(stencil);
@@ -557,7 +634,7 @@ impl PassGraph {
         self.add(PassKind::Readback, &[source], &[], None, bounds, true)
     }
     pub fn lifetimes(&self) -> Vec<Lifetime> {
-        let mut slots = HashMap::new();
+        let mut slots = HashMap::default();
         let mut lives: Vec<Lifetime> = Vec::new();
         for (index, pass) in self.passes.iter().enumerate() {
             for version in pass.reads.iter().chain(&pass.writes) {
@@ -633,6 +710,85 @@ mod tests {
             width: 32,
             height: 32,
         }
+    }
+
+    #[test]
+    fn adjacent_draws_share_pass_metadata_without_crossing_opaque_or_mask_boundaries() {
+        let resource = ResourceVersion {
+            key: ResourceKey::Recipe {
+                device: 1,
+                owner: crate::gpu_runtime::ResourceOwner::new(
+                    crate::gpu_runtime::OwnerKind::Scene,
+                    1,
+                ),
+            },
+            version: 1,
+        };
+        let mask = |command| SnapshotNode {
+            command: SnapshotCommand::Mask(command),
+            region: RenderRegion::Empty,
+        };
+        let opaque = SnapshotNode {
+            command: SnapshotCommand::Stage3D {
+                resource,
+                transform: Default::default(),
+            },
+            region: RenderRegion::Full,
+        };
+        let snapshot = RenderSnapshot {
+            commands: Arc::from([
+                rect(),
+                rect(),
+                opaque,
+                rect(),
+                rect(),
+                mask(MaskCommand::Push),
+                rect(),
+                rect(),
+                mask(MaskCommand::Activate),
+                rect(),
+                rect(),
+                mask(MaskCommand::Deactivate),
+                rect(),
+                rect(),
+                mask(MaskCommand::Pop),
+                rect(),
+                rect(),
+            ]),
+            recipes: vec![ResourceRecipe::Resident(resource)],
+        };
+        let mut graph =
+            PassGraph::compile(&snapshot, viewport(), 4, Load::Clear(Color::BLACK)).unwrap();
+        let kinds: Vec<_> = graph
+            .passes
+            .iter()
+            .map(|pass| match pass.kind {
+                PassKind::Clear => "clear",
+                PassKind::Draw(_) => "draw",
+                PassKind::Opaque(_) => "opaque",
+                PassKind::Mask(_) => "mask",
+                _ => panic!("unexpected pass kind"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "clear", "draw", "opaque", "draw", "mask", "draw", "mask", "draw", "mask", "draw",
+                "mask", "draw"
+            ]
+        );
+        let last_draw = graph.passes.len() - 1;
+        let read = graph.readback(GraphResource::Output, viewport()).unwrap();
+        assert!(graph.passes[read].dependencies.contains(&last_draw));
+        // Clear + twelve ordered leaf draws + one opaque draw all write output.
+        assert_eq!(graph.passes[read].reads[0].version, 14);
+        assert!(
+            graph
+                .passes
+                .iter()
+                .enumerate()
+                .all(|(index, pass)| pass.dependencies.iter().all(|&previous| previous < index))
+        );
     }
 
     #[test]

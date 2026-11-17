@@ -39,19 +39,19 @@ type UseSet = FnvHashMap<ResourceId, ResourceLease>;
 #[derive(Default)]
 struct Recording {
     uses: UseSet,
+    objects: FnvHashMap<ObjectKey, smallvec::SmallVec<[Arc<dyn Indexed>; 1]>>,
     transient_bytes: u64,
     staging_bytes: u64,
     pending: Vec<crate::gpu_runtime::UnsubmittedUse>,
 }
 impl Recording {
-    fn retain(&mut self, lease: ResourceLease) {
+    fn retain(&mut self, lease: &ResourceLease) {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.uses.entry(lease.id()) {
             self.transient_bytes += lease.transient_bytes();
             self.staging_bytes += lease.staging_bytes();
             self.pending.extend(lease.recording_use());
-            let dependencies = lease.dependencies().to_vec();
-            entry.insert(lease);
-            for dependency in dependencies {
+            entry.insert(lease.clone());
+            for dependency in lease.dependencies() {
                 self.retain(dependency);
             }
         }
@@ -258,6 +258,12 @@ impl Device {
         &self,
         raw: &T,
     ) -> Result<ResourceLease, RenderFailure> {
+        self.lookup_object(raw).map(|object| object.lease().clone())
+    }
+    fn lookup_object<T: Any + Eq + Hash>(
+        &self,
+        raw: &T,
+    ) -> Result<Arc<dyn Indexed>, RenderFailure> {
         let index = self
             .0
             .inner()
@@ -271,7 +277,6 @@ impl Device {
                     .iter()
                     .filter_map(Weak::upgrade)
                     .find(|object| object.matches(raw))
-                    .map(|object| object.lease().clone())
             })
             .ok_or_else(|| {
                 RenderFailure::new(
@@ -718,6 +723,7 @@ impl Device {
         })?;
         let uses = Arc::new(Mutex::new(Recording {
             uses: UseSet::default(),
+            objects: Default::default(),
             transient_bytes: 0,
             staging_bytes: 0,
             pending: Vec::new(),
@@ -726,7 +732,7 @@ impl Device {
             let mut recording = uses
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            recording.retain(lease);
+            recording.retain(&lease);
         }
         Ok(CommandEncoder {
             raw,

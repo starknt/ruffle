@@ -5,6 +5,7 @@ use crate::{
     gpu_runtime::{RenderFailure, RenderFailureKind, ResourceId, ResourceOwner},
     shape_recipe::ShapeRecipe,
 };
+use fnv::{FnvHashMap as HashMap, FnvHashSet as HashSet};
 use ruffle_render::{
     backend::ShapeHandle,
     bitmap::{Bitmap, BitmapHandle, PixelRegion, PixelSnapping},
@@ -15,11 +16,7 @@ use ruffle_render::{
     shape_utils::OwnedDistilledShape,
     transform::Transform,
 };
-use std::{
-    any::Any,
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{any::Any, sync::Arc};
 use swf::{BlendMode, Color};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -518,7 +515,7 @@ impl PreparedSnapshot {
         .chain(std::iter::from_fn(|| {
             let partition: Vec<_> = shapes
                 .by_ref()
-                .take(if parallel { 16 } else { 1 })
+                .take(if parallel { 32 } else { 1 })
                 .collect();
             if partition.is_empty() {
                 return None;
@@ -526,9 +523,13 @@ impl PreparedSnapshot {
             let input = partition.iter().fold(0u64, |bytes, (_, input)| {
                 bytes.saturating_add((input_vertices(&input.geometry) as u64).saturating_mul(1024))
             });
+            // Reserve proportionally for small partitions so four tasks can
+            // share the device allowance. An underestimated tessellation still
+            // takes the existing exclusive, bounded path after the wave joins.
+            let budget = output_budget.min((input / 4).saturating_add(4096));
             Some(Work {
-                bytes: input.saturating_add(output_budget),
-                value: Input::Shapes(partition, output_budget),
+                bytes: input.saturating_add(budget),
+                value: Input::Shapes(partition, budget),
             })
         }));
         let preparation = backend.descriptors.runtime.preparation().clone();
@@ -546,8 +547,12 @@ impl PreparedSnapshot {
                 Input::Shapes(inputs, mut budget) => {
                     let mut prepared = Vec::with_capacity(inputs.len());
                     let mut remaining = inputs.into_iter();
+                    // The partition's scratch permit bounds this tessellator.
+                    // Reuse Lyon's internal work storage within the partition;
+                    // drop it before publishing/releasing that permit.
+                    let mut tessellator = ruffle_render::tessellator::ShapeTessellator::new();
                     while let Some((resource, input)) = remaining.next() {
-                        match input.clone().prepare_bounded(budget) {
+                        match input.clone().prepare_with(&mut tessellator, budget) {
                             Ok(mesh) if mesh.retained_bytes() <= budget => {
                                 budget -= mesh.retained_bytes();
                                 prepared.push((resource, mesh));

@@ -11,12 +11,31 @@ struct Uses {
 }
 impl Uses {
     fn retain<T: Any + Eq + Hash>(&self, resource: &T) {
-        match self.device.lookup(resource) {
-            Ok(lease) => self
+        let key = object_key(resource);
+        {
+            let recording = self
                 .recording
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retain(lease),
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if recording
+                .objects
+                .get(&key)
+                .is_some_and(|objects| objects.iter().any(|object| object.matches(resource)))
+            {
+                return;
+            }
+        }
+        match self.device.lookup_object(resource) {
+            Ok(object) => {
+                let mut recording = self
+                    .recording
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                recording.retain(object.lease());
+                // Keep exact native identities resolvable for repeated uses in
+                // this encoder. Hash collisions still compare native equality.
+                recording.objects.entry(key).or_default().push(object);
+            }
             Err(error) => {
                 self.device.runtime().fail(error);
             }
