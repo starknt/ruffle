@@ -4,37 +4,34 @@
 use super::*;
 use std::ops::Range;
 
-#[derive(Clone)]
-struct Uses {
+struct Uses<'a> {
     device: Device,
-    recording: Arc<Mutex<Recording>>,
+    recording: std::sync::MutexGuard<'a, Recording>,
 }
-impl Uses {
-    fn retain<T: Any + Eq + Hash>(&self, resource: &T) {
-        let key = object_key(resource);
-        {
-            let recording = self
-                .recording
+impl<'a> Uses<'a> {
+    fn new(device: Device, recording: &'a Mutex<Recording>) -> Self {
+        Self {
+            device,
+            recording: recording
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if recording
-                .objects
-                .get(&key)
-                .is_some_and(|objects| objects.iter().any(|object| object.matches(resource)))
-            {
-                return;
-            }
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
+    }
+    fn retain<T: Any + Eq + Hash>(&mut self, resource: &T) {
+        let key = object_key(resource);
+        if self
+            .recording
+            .objects
+            .get(&key)
+            .is_some_and(|objects| objects.iter().any(|object| object.matches(resource)))
+        {
+            return;
         }
         match self.device.lookup_object(resource) {
             Ok(object) => {
-                let mut recording = self
-                    .recording
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                recording.retain(object.lease());
-                // Keep exact native identities resolvable for repeated uses in
-                // this encoder. Hash collisions still compare native equality.
-                recording.objects.entry(key).or_default().push(object);
+                self.recording.retain(object.lease());
+                // Keep exact native identities resolvable until encoder finish.
+                self.recording.objects.entry(key).or_default().push(object);
             }
             Err(error) => {
                 self.device.runtime().fail(error);
@@ -43,14 +40,8 @@ impl Uses {
     }
 }
 impl CommandEncoder {
-    fn recorder(&self) -> Uses {
-        Uses {
-            device: self.device.clone(),
-            recording: self.uses.clone(),
-        }
-    }
     pub fn begin_render_pass(&mut self, desc: &wgpu::RenderPassDescriptor<'_>) -> RenderPass<'_> {
-        let uses = self.recorder();
+        let mut uses = Uses::new(self.device.clone(), &self.uses);
         for attachment in desc.color_attachments.iter().flatten() {
             uses.retain(attachment.view);
             if let Some(resolve) = attachment.resolve_target {
@@ -77,7 +68,7 @@ impl CommandEncoder {
         &mut self,
         desc: &wgpu::ComputePassDescriptor<'_>,
     ) -> ComputePass<'_> {
-        let uses = self.recorder();
+        let mut uses = Uses::new(self.device.clone(), &self.uses);
         if let Some(writes) = &desc.timestamp_writes {
             uses.retain(writes.query_set);
         }
@@ -94,7 +85,7 @@ impl CommandEncoder {
         destination_offset: u64,
         size: u64,
     ) {
-        let uses = self.recorder();
+        let mut uses = Uses::new(self.device.clone(), &self.uses);
         uses.retain(source);
         uses.retain(destination);
         self.raw.copy_buffer_to_buffer(
@@ -111,7 +102,7 @@ impl CommandEncoder {
         destination: wgpu::TexelCopyTextureInfo<'_>,
         size: wgpu::Extent3d,
     ) {
-        let uses = self.recorder();
+        let mut uses = Uses::new(self.device.clone(), &self.uses);
         uses.retain(source.texture);
         uses.retain(destination.texture);
         self.raw.copy_texture_to_texture(source, destination, size);
@@ -122,7 +113,7 @@ impl CommandEncoder {
         destination: wgpu::TexelCopyTextureInfo<'_>,
         size: wgpu::Extent3d,
     ) {
-        let uses = self.recorder();
+        let mut uses = Uses::new(self.device.clone(), &self.uses);
         uses.retain(source.buffer);
         uses.retain(destination.texture);
         self.raw.copy_buffer_to_texture(source, destination, size);
@@ -133,13 +124,13 @@ impl CommandEncoder {
         destination: wgpu::TexelCopyBufferInfo<'_>,
         size: wgpu::Extent3d,
     ) {
-        let uses = self.recorder();
+        let mut uses = Uses::new(self.device.clone(), &self.uses);
         uses.retain(source.texture);
         uses.retain(destination.buffer);
         self.raw.copy_texture_to_buffer(source, destination, size);
     }
     pub fn clear_buffer(&mut self, buffer: &wgpu::Buffer, offset: u64, size: Option<u64>) {
-        self.recorder().retain(buffer);
+        Uses::new(self.device.clone(), &self.uses).retain(buffer);
         self.raw.clear_buffer(buffer, offset, size);
     }
     pub fn resolve_query_set(
@@ -149,13 +140,13 @@ impl CommandEncoder {
         buffer: &wgpu::Buffer,
         offset: u64,
     ) {
-        let uses = self.recorder();
+        let mut uses = Uses::new(self.device.clone(), &self.uses);
         uses.retain(queries);
         uses.retain(buffer);
         self.raw.resolve_query_set(queries, range, buffer, offset);
     }
     pub fn write_timestamp(&mut self, queries: &wgpu::QuerySet, index: u32) {
-        self.recorder().retain(queries);
+        Uses::new(self.device.clone(), &self.uses).retain(queries);
         self.raw.write_timestamp(queries, index);
     }
     pub fn push_debug_group(&mut self, label: &str) {
@@ -207,7 +198,7 @@ struct PassState {
 
 pub struct RenderPass<'a> {
     raw: wgpu::RenderPass<'a>,
-    uses: Uses,
+    uses: Uses<'a>,
     state: PassState,
     changes: StateChanges,
 }
@@ -347,7 +338,7 @@ impl RenderPass<'_> {
 
 pub struct ComputePass<'a> {
     raw: wgpu::ComputePass<'a>,
-    uses: Uses,
+    uses: Uses<'a>,
 }
 impl ComputePass<'_> {
     pub fn write_timestamp(&mut self, queries: &wgpu::QuerySet, index: u32) {
