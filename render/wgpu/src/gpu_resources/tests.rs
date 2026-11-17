@@ -1158,6 +1158,7 @@ fn upload_page_reuse_waits_for_every_unsubmitted_encoder() {
         .copy_from_slice(&[22; 16]);
     arena.finish();
     let index = device.queue().submit([first.finish().unwrap()]).unwrap();
+    arena.recall();
     device
         .poll(wgpu::PollType::Wait {
             submission_index: Some(index),

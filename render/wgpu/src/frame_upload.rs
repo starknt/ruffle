@@ -9,6 +9,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+type MapResult = std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>;
+
 #[derive(Debug)]
 struct ActivePage {
     buffer: Buffer,
@@ -21,7 +23,17 @@ struct RetiredPage {
     buffer: Buffer,
     age: u64,
     after_serial: u64,
+    mapping: Option<MapResult>,
     _ticket: CacheTicket,
+}
+impl Drop for RetiredPage {
+    fn drop(&mut self) {
+        if self.mapping.is_some() {
+            // Eviction also cancels an outstanding speculative map. No callback
+            // owns the buffer or its lease after the page is discarded.
+            self.buffer.unmap();
+        }
+    }
 }
 #[derive(Debug)]
 struct Pages {
@@ -115,6 +127,7 @@ impl SealUploads for ActiveUploads {
                     after_serial: page.after_serial,
                     buffer: page.buffer,
                     age: self.runtime.scheduler().tick(),
+                    mapping: None,
                     _ticket: ticket,
                 });
             }
@@ -273,11 +286,11 @@ impl FrameUploadArena {
             });
             found.map(|(slot, index)| pages.slots[slot].swap_remove(index))
         };
-        let buffer = if let Some(page) = reused {
-            let buffer = page.buffer;
+        let buffer = if let Some(mut page) = reused {
+            let buffer = page.buffer.clone();
             buffer.lease().set_idle(false);
             if mapped {
-                self.map_page(&buffer)?;
+                self.map_page(&buffer, page.mapping.take())?;
             }
             buffer
         } else {
@@ -311,11 +324,15 @@ impl FrameUploadArena {
             size,
         })
     }
-    fn map_page(&self, buffer: &Buffer) -> Result<(), RenderFailure> {
+    fn request_map(buffer: &Buffer) -> MapResult {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         buffer.map_async(wgpu::MapMode::Write, .., move |result| {
             let _ = tx.send(result);
         });
+        rx
+    }
+    fn map_page(&self, buffer: &Buffer, pending: Option<MapResult>) -> Result<(), RenderFailure> {
+        let rx = pending.unwrap_or_else(|| Self::request_map(buffer));
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             self.device.runtime().check_health()?;
@@ -539,5 +556,97 @@ impl FrameUploadArena {
     pub fn recall(&mut self) {
         let slot = self.active.slot.load(Ordering::Relaxed);
         self.active.slot.store((slot + 1) % 3, Ordering::Relaxed);
+        // Start mapping after the final recorded encoder has been submitted.
+        // Native polling can then complete it alongside the preceding frame,
+        // rather than forcing a separate poll at the next small upload.
+        let mut pages = self
+            .pages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for page in pages.slots.iter_mut().flatten() {
+            if page.mapping.is_none()
+                && page.buffer.usage().contains(wgpu::BufferUsages::MAP_WRITE)
+                && page.buffer.lease().last_submission() > page.after_serial
+                && page.buffer.lease().unsubmitted_uses() == 0
+            {
+                page.mapping = Some(Self::request_map(&page.buffer));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a Vulkan adapter"]
+    fn recalled_upload_pages_are_mapped_before_the_next_write_and_remain_reclaimable() {
+        let mut options = wgpu::InstanceDescriptor::new_without_display_handle();
+        options.backends = wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(options);
+        let (_, raw, queue) =
+            futures::executor::block_on(crate::backend::request_adapter_and_device(
+                wgpu::Backends::VULKAN,
+                &instance,
+                None,
+                wgpu::PowerPreference::HighPerformance,
+            ))
+            .unwrap();
+        let runtime = GpuRuntime::new(crate::gpu_runtime::GpuBudgetConfig::for_adapter(
+            wgpu::DeviceType::DiscreteGpu,
+            false,
+        ))
+        .unwrap();
+        runtime.install_device_callbacks(&raw);
+        let device = Device::new(raw, queue, runtime);
+        let target = device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 16,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+            .unwrap();
+        let mut arena = FrameUploadArena::new(device.clone(), 64);
+        for value in 1..=8 {
+            let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
+            arena
+                .write_buffer(&mut encoder, &target, 0, wgpu::BufferSize::new(16).unwrap())
+                .unwrap()
+                .copy_from_slice(&[value; 16]);
+            arena.finish();
+            let index = device.queue().submit([encoder.finish().unwrap()]).unwrap();
+            arena.recall();
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(index),
+                    timeout: Some(Duration::from_secs(2)),
+                })
+                .unwrap();
+            let pages = arena.pages.lock().unwrap();
+            let page = pages.slots.iter().flatten().next().unwrap();
+            drop(page.buffer.get_mapped_range_mut(..).unwrap());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        target.map_async(wgpu::MapMode::Read, .., move |result| {
+            tx.send(result).unwrap();
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(2)),
+            })
+            .unwrap();
+        rx.recv().unwrap().unwrap();
+        let bytes = target.get_mapped_range(..).unwrap();
+        assert_eq!(&bytes[..], &[8; 16]);
+        drop(bytes);
+        target.unmap();
+        device.runtime().purge_idle_and_cached_resources();
+        assert_eq!(
+            device.runtime().stats().kind_counts[ResourceKind::StagingBuffer as usize],
+            0
+        );
     }
 }
