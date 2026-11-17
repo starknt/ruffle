@@ -38,6 +38,7 @@ mod bitmap_residency;
 mod bitmaps;
 mod context3d;
 mod globals;
+mod frame_upload;
 pub mod gpu_profiler;
 pub mod gpu_resources;
 pub mod gpu_runtime;

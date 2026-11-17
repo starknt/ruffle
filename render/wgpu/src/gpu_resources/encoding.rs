@@ -141,9 +141,11 @@ impl CommandEncoder {
     }
     pub fn push_debug_group(&mut self, label: &str) {
         self.raw.push_debug_group(label);
+        self.debug_groups.push(label.to_owned());
     }
     pub fn pop_debug_group(&mut self) {
         self.raw.pop_debug_group();
+        self.debug_groups.pop();
     }
 }
 

@@ -2,6 +2,10 @@ use super::*;
 use crate::gpu_runtime::{GpuBudgetConfig, ResourceKind};
 
 fn device(limit: u64) -> Device {
+    device_with_staging_budget(limit, 64 * 1024 * 1024)
+}
+
+fn device_with_staging_budget(limit: u64, staging: u64) -> Device {
     let mut options = wgpu::InstanceDescriptor::new_without_display_handle();
     options.backends = wgpu::Backends::VULKAN;
     let instance = wgpu::Instance::new(options);
@@ -15,6 +19,7 @@ fn device(limit: u64) -> Device {
     let mut config = GpuBudgetConfig::for_adapter(wgpu::DeviceType::DiscreteGpu, false);
     config.hard_limit = limit;
     config.soft_limit = limit;
+    config.staging_limit = staging;
     let runtime = GpuRuntime::new(config).unwrap();
     runtime.install_device_callbacks(&raw);
     Device::new(raw, queue, runtime)
@@ -277,7 +282,7 @@ fn staging_copy_is_charged_and_preserves_uploaded_bytes() {
         .copy_from_slice(&[42; 16]);
     assert_eq!(
         device.runtime().stats().kind_bytes[ResourceKind::StagingBuffer as usize],
-        16
+        64
     );
     belt.finish();
     let index = device.queue().submit([encoder.finish().unwrap()]).unwrap();
@@ -296,6 +301,12 @@ fn staging_copy_is_charged_and_preserves_uploaded_bytes() {
     assert_eq!(&*bytes, &[42; 16]);
     drop(bytes);
     buffer.unmap();
+    assert_eq!(
+        device.runtime().stats().kind_bytes[ResourceKind::StagingBuffer as usize],
+        64,
+        "completed page is available for reuse"
+    );
+    device.runtime().scheduler().reclaim();
     assert_eq!(
         device.runtime().stats().kind_bytes[ResourceKind::StagingBuffer as usize],
         0
@@ -703,4 +714,445 @@ fn render_pass_suppresses_identical_state_but_preserves_offsets_and_boundaries()
         assert_eq!(pass.state_changes().stencil_references, 2);
     }
     assert!(encoder.finish().is_ok());
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn upload_arena_pages_pack_slices_and_preserve_unsubmitted_encoders() {
+    let device = device(8192);
+    let target = device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let mut arena = crate::frame_upload::FrameUploadArena::new(device.clone(), 64);
+    let mut first = device.create_command_encoder(&Default::default()).unwrap();
+    for (offset, value) in [(0, 11), (16, 22)] {
+        arena
+            .write_buffer(
+                &mut first,
+                &target,
+                offset,
+                wgpu::BufferSize::new(16).unwrap(),
+            )
+            .unwrap()
+            .copy_from_slice(&[value; 16]);
+    }
+    assert_eq!(
+        device.runtime().stats().kind_counts[ResourceKind::StagingBuffer as usize],
+        1
+    );
+    assert_eq!(
+        device.runtime().stats().kind_bytes[ResourceKind::StagingBuffer as usize],
+        64
+    );
+    arena.finish();
+    let mut second = device.create_command_encoder(&Default::default()).unwrap();
+    arena
+        .write_buffer(&mut second, &target, 32, wgpu::BufferSize::new(16).unwrap())
+        .unwrap()
+        .copy_from_slice(&[33; 16]);
+    arena.finish();
+    assert_eq!(
+        device.runtime().stats().kind_counts[ResourceKind::StagingBuffer as usize],
+        2,
+        "unsent pages cannot be recycled"
+    );
+    let index = device
+        .queue()
+        .submit([first.finish().unwrap(), second.finish().unwrap()])
+        .unwrap();
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    arena.recall();
+    for value in 44..49u8 {
+        let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
+        for part in 0..4u8 {
+            arena
+                .write_buffer(
+                    &mut encoder,
+                    &target,
+                    u64::from(part) * 16,
+                    wgpu::BufferSize::new(16).unwrap(),
+                )
+                .unwrap()
+                .copy_from_slice(&[value + part; 16]);
+        }
+        arena.finish();
+        let index = device.queue().submit([encoder.finish().unwrap()]).unwrap();
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(index),
+                timeout: Some(Duration::from_secs(2)),
+            })
+            .unwrap();
+        arena.recall();
+    }
+    assert_eq!(
+        device.runtime().stats().kind_counts[ResourceKind::StagingBuffer as usize],
+        2,
+        "completed slots must reuse pages after wraparound"
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    target.map_async(wgpu::MapMode::Read, .., move |result| {
+        tx.send(result).unwrap();
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    rx.recv().unwrap().unwrap();
+    let mapped = target.get_mapped_range(..).unwrap();
+    for (range, value) in [(0..16, 48), (16..32, 49), (32..48, 50), (48..64, 51)] {
+        assert!(mapped[range].iter().all(|&byte| byte == value));
+    }
+    drop(mapped);
+    target.unmap();
+    device.runtime().scheduler().reclaim();
+    assert_eq!(
+        device.runtime().stats().kind_bytes[ResourceKind::StagingBuffer as usize],
+        0
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn large_texture_upload_slices_padded_layers_in_the_same_operation() {
+    let device = device_with_staging_budget(8192, 512);
+    let size = wgpu::Extent3d {
+        width: 4,
+        height: 5,
+        depth_or_array_layers: 2,
+    };
+    let texture = device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        })
+        .unwrap();
+    let mut data = vec![255; 16 + 2 * 7 * 32];
+    for z in 0..2 {
+        for y in 0..5 {
+            let start = 16 + z * 7 * 32 + y * 32;
+            data[start..start + 16].fill((z * 10 + y) as u8);
+        }
+    }
+    device
+        .queue()
+        .write_texture(
+            texture.as_image_copy(),
+            &data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 16,
+                bytes_per_row: Some(32),
+                rows_per_image: Some(7),
+            },
+            size,
+        )
+        .unwrap();
+    assert!(
+        device.runtime().stats().submitted > 0,
+        "mandatory upload must submit bounded slices"
+    );
+    assert!(device.runtime().stats().kind_bytes[ResourceKind::StagingBuffer as usize] <= 512);
+    let output = device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 2560,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &output,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(5),
+            },
+        },
+        size,
+    );
+    let index = device.queue().submit([encoder.finish().unwrap()]).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    output.map_async(wgpu::MapMode::Read, .., move |result| {
+        tx.send(result).unwrap();
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    rx.recv().unwrap().unwrap();
+    let mapped = output.get_mapped_range(..).unwrap();
+    for z in 0..2 {
+        for y in 0..5 {
+            let start = (z * 5 + y) * 256;
+            assert!(
+                mapped[start..start + 16]
+                    .iter()
+                    .all(|&value| value == (z * 10 + y) as u8)
+            );
+        }
+    }
+    drop(mapped);
+    output.unmap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter with BC textures"]
+fn compressed_mip_uploads_keep_physical_tail_blocks() {
+    let device = device_with_staging_budget(8192, 512);
+    assert!(
+        device
+            .features()
+            .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
+    );
+    let desc = wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 8,
+            height: 8,
+            depth_or_array_layers: 2,
+        },
+        mip_level_count: 4,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bc1RgbaUnorm,
+        usage: wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    };
+    let data: Vec<u8> = (0..112).collect();
+    let texture = device
+        .create_texture_with_data(
+            &device.queue(),
+            &desc,
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &data,
+        )
+        .unwrap();
+    let output = device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 3,
+            origin: wgpu::Origin3d { x: 0, y: 0, z: 1 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &output,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: None,
+            },
+        },
+        wgpu::Extent3d {
+            width: 4,
+            height: 4,
+            depth_or_array_layers: 1,
+        },
+    );
+    let index = device.queue().submit([encoder.finish().unwrap()]).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    output.map_async(wgpu::MapMode::Read, .., move |result| {
+        tx.send(result).unwrap();
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    rx.recv().unwrap().unwrap();
+    let mapped = output.get_mapped_range(..).unwrap();
+    assert_eq!(&mapped[..8], &data[104..112]);
+    drop(mapped);
+    output.unmap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn dynamic_upload_pages_preserve_alignment_and_retire_by_submission() {
+    let device = device(8192);
+    let mut arena = crate::frame_upload::FrameUploadArena::new(device.clone(), 1024);
+    let first = arena.allocate_dynamic(100, 256).unwrap();
+    let second = arena.allocate_dynamic(100, 256).unwrap();
+    assert_eq!(first.buffer, second.buffer);
+    assert_eq!(first.offset, 0);
+    assert_eq!(second.offset, 256);
+    let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
+    encoder.clear_buffer(&first.buffer, 0, None);
+    let index = device.queue().submit([encoder.finish().unwrap()]).unwrap();
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    let reused = arena.allocate_dynamic(100, 256).unwrap();
+    assert_eq!(reused.buffer, first.buffer);
+    assert_eq!(reused.offset, 0);
+    assert_eq!(
+        device.runtime().stats().kind_bytes[ResourceKind::DynamicBuffer as usize],
+        1024
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn small_uniform_batches_share_a_page_without_shortening_bindings() {
+    let device = device(8192);
+    let mut arena = crate::frame_upload::FrameUploadArena::new(device.clone(), 1024);
+    let mut allocations = Vec::new();
+    for _ in 0..4 {
+        allocations.push(arena.allocate_uniform(16, 768, 64).unwrap());
+    }
+    for (index, allocation) in allocations.iter().enumerate() {
+        assert_eq!(allocation.buffer, allocations[0].buffer);
+        assert_eq!(allocation.offset, index as u64 * 64);
+        assert!(allocation.offset + 768 <= allocation.buffer.size());
+    }
+    assert_eq!(
+        device.runtime().stats().kind_bytes[ResourceKind::DynamicBuffer as usize],
+        1024
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn large_staged_geometry_stream_splits_without_replaying_earlier_writes() {
+    let device = device_with_staging_budget(16384, 512);
+    let target = device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 4112,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
+    encoder.push_debug_group("spans bounded submissions");
+    let mut shader_belt = StagingBelt::new(device.clone(), 64);
+    shader_belt
+        .write_buffer(&mut encoder, &target, 0, wgpu::BufferSize::new(16).unwrap())
+        .unwrap()
+        .copy_from_slice(&[7; 16]);
+    let mut belt = StagingBelt::new(device.clone(), 128);
+    let mut builder = crate::buffer_builder::BufferBuilder::new(&device.limits(), 0);
+    let data: Vec<u8> = (0..4096).map(|v| (v % 251) as u8).collect();
+    builder.add(&data).unwrap();
+    builder
+        .copy_to_at(&mut belt, &mut encoder, &target, 16)
+        .unwrap();
+    assert!(device.runtime().stats().submitted > 0);
+    encoder.pop_debug_group();
+    belt.finish();
+    shader_belt.finish();
+    let index = device.queue().submit([encoder.finish().unwrap()]).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    target.map_async(wgpu::MapMode::Read, .., move |result| {
+        tx.send(result).unwrap();
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    rx.recv().unwrap().unwrap();
+    let mapped = target.get_mapped_range(..).unwrap();
+    assert_eq!(&mapped[..16], &[7; 16]);
+    assert_eq!(&mapped[16..4112], &data);
+    drop(mapped);
+    target.unmap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn upload_page_reuse_waits_for_every_unsubmitted_encoder() {
+    let device = device(8192);
+    let target = device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let mut arena = StagingBelt::new(device.clone(), 64);
+    let mut first = device.create_command_encoder(&Default::default()).unwrap();
+    let mut second = device.create_command_encoder(&Default::default()).unwrap();
+    arena
+        .write_buffer(&mut first, &target, 0, wgpu::BufferSize::new(16).unwrap())
+        .unwrap()
+        .copy_from_slice(&[11; 16]);
+    arena
+        .write_buffer(&mut second, &target, 16, wgpu::BufferSize::new(16).unwrap())
+        .unwrap()
+        .copy_from_slice(&[22; 16]);
+    arena.finish();
+    let index = device.queue().submit([first.finish().unwrap()]).unwrap();
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    let mut third = device.create_command_encoder(&Default::default()).unwrap();
+    arena
+        .write_buffer(&mut third, &target, 32, wgpu::BufferSize::new(32).unwrap())
+        .unwrap()
+        .copy_from_slice(&[33; 32]);
+    arena.finish();
+    assert_eq!(
+        device.runtime().stats().kind_counts[ResourceKind::StagingBuffer as usize],
+        2
+    );
+    let index = device
+        .queue()
+        .submit([second.finish().unwrap(), third.finish().unwrap()])
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    target.map_async(wgpu::MapMode::Read, .., move |result| {
+        tx.send(result).unwrap();
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    rx.recv().unwrap().unwrap();
+    let mapped = target.get_mapped_range(..).unwrap();
+    assert_eq!(&mapped[16..32], &[22; 16]);
+    drop(mapped);
+    target.unmap();
 }

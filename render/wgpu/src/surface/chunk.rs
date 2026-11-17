@@ -238,13 +238,21 @@ impl<'encoder> CommandRenderer<'encoder> {
         if let Some(work) = &mut self.work {
             work.draw_calls += 1;
         }
+        let vertex_offset = if draw_offsets.vertex_buffer.is_none() {
+            self.chunk_buffers.vertex_offset
+        } else {
+            0
+        };
         render_pass.set_vertex_buffer(
             0,
             draw_offsets
                 .vertex_buffer
                 .as_ref()
                 .unwrap_or(&self.chunk_buffers.vertex_buffer)
-                .slice(draw_offsets.vertices.clone()),
+                .slice(
+                    draw_offsets.vertices.start + vertex_offset
+                        ..draw_offsets.vertices.end + vertex_offset,
+                ),
         );
 
         if self.current_index_buffer != Some(&draw_offsets.index_buffer) {

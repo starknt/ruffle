@@ -66,10 +66,11 @@ pub enum ResourceKind {
     HostTarget,
     QuerySet,
     CommandEncoder,
+    DynamicBuffer,
 }
 
 impl ResourceKind {
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 17;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -573,30 +574,45 @@ impl ResourceReservation {
         let id = self
             .id
             .ok_or_else(|| failure(RenderFailureKind::Internal, "reservation already consumed"))?;
-        let transient_bytes = {
+        let (transient_bytes, staging_bytes, upload_page) = {
             let mut ledger = self.runtime.0.ledger();
             ledger.transition(id, ResourceState::Active);
-            if let Some(record) = ledger.records.get_mut(&id) {
-                record.dependencies = dependencies.iter().map(ResourceLease::id).collect();
-                if matches!(
-                    record.kind,
-                    ResourceKind::OffscreenTarget
-                        | ResourceKind::StagingBuffer
-                        | ResourceKind::ReadbackBuffer
-                ) {
+            let record = ledger.records.get_mut(&id).ok_or_else(|| {
+                failure(RenderFailureKind::Internal, "missing resource reservation")
+            })?;
+            record.dependencies = dependencies.iter().map(ResourceLease::id).collect();
+            let transient = if matches!(
+                record.kind,
+                ResourceKind::OffscreenTarget
+                    | ResourceKind::StagingBuffer
+                    | ResourceKind::ReadbackBuffer
+                    | ResourceKind::DynamicBuffer
+            ) {
+                record.bytes
+            } else {
+                0
+            };
+            (
+                transient,
+                if record.kind == ResourceKind::StagingBuffer {
                     record.bytes
                 } else {
                     0
-                }
-            } else {
-                0
-            }
+                },
+                matches!(
+                    record.kind,
+                    ResourceKind::StagingBuffer | ResourceKind::DynamicBuffer
+                ),
+            )
         };
         self.id = None;
         Ok(ResourceLease(Arc::new(Allocation {
             runtime: self.runtime.clone(),
             id,
             transient_bytes,
+            staging_bytes,
+            upload_page,
+            unsubmitted: Default::default(),
             _dependencies: dependencies.to_vec(),
         })))
     }
@@ -614,6 +630,9 @@ struct Allocation {
     runtime: GpuRuntime,
     id: ResourceId,
     transient_bytes: u64,
+    staging_bytes: u64,
+    upload_page: bool,
+    unsubmitted: std::sync::atomic::AtomicUsize,
     // These mirror the owning GPU object's references, not registry ownership.
     _dependencies: Vec<ResourceLease>,
 }
@@ -643,7 +662,42 @@ impl std::fmt::Debug for ResourceLease {
     }
 }
 
+pub(crate) struct UnsubmittedUse(Arc<Allocation>);
+impl Drop for UnsubmittedUse {
+    fn drop(&mut self) {
+        self.0
+            .unsubmitted
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 impl ResourceLease {
+    pub(crate) fn staging_bytes(&self) -> u64 {
+        self.0.staging_bytes
+    }
+    pub(crate) fn unsubmitted_uses(&self) -> usize {
+        self.0
+            .unsubmitted
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn recording_use(&self) -> Option<UnsubmittedUse> {
+        if !self.0.upload_page {
+            return None;
+        }
+        self.0
+            .unsubmitted
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Some(UnsubmittedUse(self.0.clone()))
+    }
+    pub(crate) fn last_submission(&self) -> u64 {
+        self.0
+            .runtime
+            .0
+            .ledger()
+            .records
+            .get(&self.id())
+            .map_or(0, |record| record.last_submission)
+    }
     /// Conservative cache-retention weight, not a second storage charge.
     pub(crate) fn retained_storage_bytes(&self) -> u64 {
         let mut pending = vec![self];

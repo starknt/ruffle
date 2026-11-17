@@ -13,6 +13,9 @@ pub struct ChunkBuffers {
     pub transforms: crate::gpu_resources::Buffer,
     pub vertex_buffer: crate::gpu_resources::Buffer,
     pub bind_group: crate::gpu_resources::BindGroup,
+    pub vertex_offset: u64,
+    arena: crate::frame_upload::FrameUploadArena,
+    scratch: crate::buffer_builder::ScratchPool,
 }
 
 pub fn transforms_per_draw(limits: &wgpu::Limits) -> u64 {
@@ -48,27 +51,13 @@ impl ChunkBuffers {
                 }],
             })?;
         Ok(Self {
+            vertex_offset: 0,
+            arena: crate::frame_upload::FrameUploadArena::new(descriptors.device.clone(), 65536),
+            scratch: Default::default(),
             transforms,
             bind_group,
             vertex_buffer,
         })
-    }
-
-    pub fn ensure_vertex_buffer_fit(
-        &mut self,
-        device: &crate::gpu_resources::Device,
-        required_size: u64,
-    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
-        if self.vertex_buffer.size() < required_size {
-            self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: create_debug_label!("Chunk vertex buffer").as_deref(),
-                size: required_size,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })?;
-        }
-
-        Ok(())
     }
 }
 
@@ -138,9 +127,9 @@ pub struct ChunkBufferBuilder {
 
 impl ChunkBufferBuilder {
     pub fn new(chunk_buffers: &ChunkBuffers, limits: &wgpu::Limits) -> Self {
-        let mut transforms = BufferBuilder::new(limits, 0);
-        transforms.set_buffer_limit(chunk_buffers.transforms.size());
-        let mut vertices = BufferBuilder::new(limits, 0);
+        let mut transforms = BufferBuilder::with_scratch(limits, 0, chunk_buffers.scratch.clone());
+        transforms.set_buffer_limit(transforms_per_draw(limits) * size_of::<Transforms>() as u64);
+        let mut vertices = BufferBuilder::with_scratch(limits, 0, chunk_buffers.scratch.clone());
 
         // It's extremely likely that every chunk will have a quad, so let's prime those eagerly and save some complexity later
         let quad_pos_uv_vertices = vertices
@@ -300,15 +289,49 @@ impl ChunkBufferBuilder {
     pub fn copy_to(
         self,
         staging_belt: &mut StagingBelt,
-        device: &crate::gpu_resources::Device,
+        descriptors: &Descriptors,
         draw_encoder: &mut crate::gpu_resources::CommandEncoder,
         chunk_buffers: &mut ChunkBuffers,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
-        self.transforms
-            .copy_to(staging_belt, draw_encoder, &chunk_buffers.transforms)?;
-        chunk_buffers.ensure_vertex_buffer_fit(device, self.vertices.len() as u64)?;
-        self.vertices
-            .copy_to(staging_belt, draw_encoder, &chunk_buffers.vertex_buffer)?;
+        let uniform_size =
+            transforms_per_draw(&descriptors.limits) * size_of::<Transforms>() as u64;
+        let uniforms = chunk_buffers.arena.allocate_uniform(
+            self.transforms.len() as u64,
+            uniform_size,
+            u64::from(descriptors.limits.min_uniform_buffer_offset_alignment),
+        )?;
+        let vertices = chunk_buffers
+            .arena
+            .allocate_dynamic(self.vertices.len() as u64, 4)?;
+        // Reserve both destinations before encoding either write.
+        let bind_group = descriptors.cached_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Paged chunk transforms"),
+            layout: &descriptors.bind_layouts.transforms,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &uniforms.buffer,
+                    offset: uniforms.offset,
+                    size: wgpu::BufferSize::new(uniform_size),
+                }),
+            }],
+        })?;
+        self.transforms.copy_to_at(
+            staging_belt,
+            draw_encoder,
+            &uniforms.buffer,
+            uniforms.offset,
+        )?;
+        self.vertices.copy_to_at(
+            staging_belt,
+            draw_encoder,
+            &vertices.buffer,
+            vertices.offset,
+        )?;
+        chunk_buffers.transforms = uniforms.buffer;
+        chunk_buffers.vertex_buffer = vertices.buffer;
+        chunk_buffers.vertex_offset = vertices.offset;
+        chunk_buffers.bind_group = bind_group;
 
         Ok(())
     }

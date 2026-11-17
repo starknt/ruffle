@@ -40,11 +40,15 @@ type UseSet = FnvHashMap<ResourceId, ResourceLease>;
 struct Recording {
     uses: UseSet,
     transient_bytes: u64,
+    staging_bytes: u64,
+    pending: Vec<crate::gpu_runtime::UnsubmittedUse>,
 }
 impl Recording {
     fn retain(&mut self, lease: ResourceLease) {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.uses.entry(lease.id()) {
             self.transient_bytes += lease.transient_bytes();
+            self.staging_bytes += lease.staging_bytes();
+            self.pending.extend(lease.recording_use());
             let dependencies = lease.dependencies().to_vec();
             entry.insert(lease);
             for dependency in dependencies {
@@ -120,6 +124,7 @@ struct DeviceInner {
     runtime: GpuRuntime,
     index: Mutex<FnvHashMap<ObjectKey, Vec<Weak<dyn Indexed>>>>,
     pending_writes: Mutex<UseSet>,
+    upload_sealers: Mutex<Vec<Weak<dyn crate::frame_upload::SealUploads>>>,
     submission_gate: Mutex<()>,
     external_submission_lock: Mutex<Option<Arc<Mutex<()>>>>,
     pending_submissions: Mutex<
@@ -202,12 +207,38 @@ impl Device {
                 runtime,
                 index: Default::default(),
                 pending_writes: Default::default(),
+                upload_sealers: Default::default(),
                 submission_gate: Default::default(),
                 external_submission_lock: Default::default(),
                 pending_submissions: Default::default(),
             }),
             ResourceOwner::default(),
         )
+    }
+    pub(crate) fn register_upload_sealer(&self, sealer: Arc<dyn crate::frame_upload::SealUploads>) {
+        let mut sealers = self
+            .0
+            .inner()
+            .upload_sealers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sealers.retain(|weak| weak.strong_count() != 0);
+        sealers.push(Arc::downgrade(&sealer));
+    }
+    fn seal_uploads(&self) -> Result<(), RenderFailure> {
+        let sealers: Vec<_> = self
+            .0
+            .inner()
+            .upload_sealers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for sealer in sealers {
+            sealer.seal()?;
+        }
+        Ok(())
     }
     pub fn runtime(&self) -> &GpuRuntime {
         &self.0.inner().runtime
@@ -461,6 +492,13 @@ impl Device {
         } else {
             ResourceKind::Buffer
         };
+        self.create_buffer_with_kind(desc, kind)
+    }
+    pub(crate) fn create_buffer_with_kind(
+        &self,
+        desc: &wgpu::BufferDescriptor<'_>,
+        kind: ResourceKind,
+    ) -> Result<Buffer, RenderFailure> {
         self.create(
             kind,
             desc.size,
@@ -468,6 +506,7 @@ impl Device {
             |device| Ok(device.create_buffer(desc)),
         )
     }
+
     pub fn create_buffer_init(
         &self,
         desc: &wgpu::util::BufferInitDescriptor<'_>,
@@ -674,6 +713,8 @@ impl Device {
         let uses = Arc::new(Mutex::new(Recording {
             uses: UseSet::default(),
             transient_bytes: 0,
+            staging_bytes: 0,
+            pending: Vec::new(),
         }));
         {
             let mut recording = uses
@@ -684,6 +725,7 @@ impl Device {
         Ok(CommandEncoder {
             raw,
             uses,
+            debug_groups: Vec::new(),
             device: self.clone(),
         })
     }
@@ -721,6 +763,7 @@ impl TextureView {
 
 pub struct CommandEncoder {
     raw: wgpu::CommandEncoder,
+    debug_groups: Vec<String>,
     uses: Arc<Mutex<Recording>>,
     device: Device,
 }
@@ -731,25 +774,60 @@ impl CommandEncoder {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .transient_bytes
     }
+    /// Called only between passes with no mapped upload views held. Submitting
+    /// the already recorded prefix never replays a draw or an ActionScript write.
+    pub(crate) fn flush_uploads_if_needed(&mut self, incoming: u64) -> Result<(), RenderFailure> {
+        let staging = self
+            .uses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .staging_bytes;
+        let config = self.device.runtime().config();
+        if staging == 0
+            || (staging.saturating_add(incoming) <= config.staging_limit / 2
+                && self.transient_bytes() < config.transient_watermark)
+        {
+            return Ok(());
+        }
+        self.device.seal_uploads()?;
+        let next = self.device.create_command_encoder(&Default::default())?;
+        let mut previous = std::mem::replace(self, next);
+        let groups = std::mem::take(&mut previous.debug_groups);
+        for _ in &groups {
+            previous.raw.pop_debug_group();
+        }
+        for group in &groups {
+            self.raw.push_debug_group(group);
+        }
+        self.debug_groups = groups;
+        let commands = previous.finish()?;
+        self.device.queue().submit([commands])?;
+        Ok(())
+    }
     pub fn finish(self) -> Result<CommandBuffer, RenderFailure> {
-        let uses = {
+        let (uses, pending) = {
             let mut recording = self
                 .uses
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::take(&mut recording.uses)
+            (
+                std::mem::take(&mut recording.uses),
+                std::mem::take(&mut recording.pending),
+            )
         };
         self.device.runtime().check_health()?;
         let raw = self.device.scoped(|_| Ok(self.raw.finish()))?;
         Ok(CommandBuffer {
             raw,
             uses: uses.into_values().collect(),
+            pending,
         })
     }
 }
 pub struct CommandBuffer {
     raw: wgpu::CommandBuffer,
     uses: Vec<ResourceLease>,
+    pending: Vec<crate::gpu_runtime::UnsubmittedUse>,
 }
 
 /// All writes and submissions use the same device ledger and ordering gate.
@@ -777,12 +855,37 @@ impl Queue {
         &self.0.0.inner().queue
     }
 
+    fn prepare_upload(&self, bytes: u64) -> Result<(), RenderFailure> {
+        let limit = self.0.runtime().config().staging_limit;
+        if bytes > limit {
+            return Err(RenderFailure::new(
+                RenderFailureKind::BudgetExceeded,
+                "upload slice exceeds staging budget",
+            ));
+        }
+        let pending = self.pending_upload_bytes();
+        if pending != 0 && pending.saturating_add(bytes) > limit / 2 {
+            self.submit(std::iter::empty())?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let stats = self.0.runtime().stats();
+            if stats.kind_bytes[ResourceKind::StagingBuffer as usize].saturating_add(bytes) <= limit
+                || stats.submitted == stats.completed
+            {
+                break;
+            }
+            self.0.wait_for_oldest(deadline)?;
+        }
+        Ok(())
+    }
     fn write(
         &self,
         bytes: u64,
         destination: ResourceLease,
         write: impl FnOnce(&wgpu::Queue),
     ) -> Result<(), RenderFailure> {
+        self.prepare_upload(bytes)?;
         let staging = self
             .0
             .reserve_with_reclaim(ResourceKind::StagingBuffer, bytes)?
@@ -812,12 +915,34 @@ impl Queue {
     pub fn write_buffer(
         &self,
         buffer: &wgpu::Buffer,
-        offset: wgpu::BufferAddress,
+        offset: u64,
         data: &[u8],
     ) -> Result<(), RenderFailure> {
-        self.write(data.len() as u64, self.0.lookup(buffer)?, |queue| {
-            queue.write_buffer(buffer, offset, data)
-        })
+        let lease = self.0.lookup(buffer)?;
+        if !offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+            || !(data.len() as u64).is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+            || offset
+                .checked_add(data.len() as u64)
+                .is_none_or(|end| end > buffer.size())
+        {
+            return Err(RenderFailure::new(
+                RenderFailureKind::Validation,
+                "invalid buffer upload range",
+            ));
+        }
+        let capacity = (self.0.runtime().config().staging_limit / 2).min(4 * 1024 * 1024) / 4 * 4;
+        if capacity == 0 {
+            return Err(RenderFailure::new(
+                RenderFailureKind::BudgetExceeded,
+                "staging budget cannot hold a buffer copy",
+            ));
+        }
+        for (index, chunk) in data.chunks(capacity as usize).enumerate() {
+            self.write(chunk.len() as u64, lease.clone(), |queue| {
+                queue.write_buffer(buffer, offset + index as u64 * capacity, chunk)
+            })?;
+        }
+        self.0.runtime().check_health()
     }
     pub fn write_texture(
         &self,
@@ -826,31 +951,104 @@ impl Queue {
         layout: wgpu::TexelCopyBufferLayout,
         size: wgpu::Extent3d,
     ) -> Result<(), RenderFailure> {
+        let lease = self.0.lookup(destination.texture)?;
+        self.0.runtime().check_health()?;
+        if size.width == 0 || size.height == 0 || size.depth_or_array_layers == 0 {
+            return Ok(());
+        }
+        let invalid = || {
+            RenderFailure::new(
+                RenderFailureKind::Validation,
+                "invalid texture upload layout or extent",
+            )
+        };
         let format = destination.texture.format();
-        let block = format
-            .block_copy_size(Some(destination.aspect))
-            .ok_or_else(|| {
-                RenderFailure::new(
-                    RenderFailureKind::Validation,
-                    "texture upload has no copyable aspect",
-                )
-            })?;
+        let block = u64::from(
+            format
+                .block_copy_size(Some(destination.aspect))
+                .ok_or_else(invalid)?,
+        );
         let (bw, bh) = format.block_dimensions();
-        let row = u64::from(size.width.div_ceil(bw)) * u64::from(block);
+        let row = u64::from(size.width.div_ceil(bw)) * block;
+        let rows = size.height.div_ceil(bh);
+        let stride = match layout.bytes_per_row {
+            Some(stride) if u64::from(stride) >= row && u64::from(stride).is_multiple_of(block) => {
+                u64::from(stride)
+            }
+            None if rows == 1 && size.depth_or_array_layers == 1 => row,
+            _ => return Err(invalid()),
+        };
+        let image_rows = match layout.rows_per_image {
+            Some(rows_per_image) if rows_per_image >= rows => u64::from(rows_per_image),
+            None if size.depth_or_array_layers == 1 => u64::from(rows),
+            _ => return Err(invalid()),
+        };
+        let image_bytes = stride.checked_mul(image_rows).ok_or_else(invalid)?;
+        let end = image_bytes
+            .checked_mul(u64::from(size.depth_or_array_layers - 1))
+            .and_then(|v| v.checked_add(stride * u64::from(rows - 1)))
+            .and_then(|v| v.checked_add(row))
+            .and_then(|v| v.checked_add(layout.offset))
+            .ok_or_else(invalid)?;
+        if end > data.len() as u64 || destination.mip_level >= destination.texture.mip_level_count()
+        {
+            return Err(invalid());
+        }
+        let extent = destination
+            .texture
+            .size()
+            .mip_level_size(destination.mip_level, destination.texture.dimension())
+            .physical_size(format);
+        if destination
+            .origin
+            .x
+            .checked_add(size.width)
+            .is_none_or(|end| end > extent.width)
+            || destination
+                .origin
+                .y
+                .checked_add(size.height)
+                .is_none_or(|end| end > extent.height)
+            || destination
+                .origin
+                .z
+                .checked_add(size.depth_or_array_layers)
+                .is_none_or(|end| end > extent.depth_or_array_layers)
+        {
+            return Err(invalid());
+        }
         let padded = row.div_ceil(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
             * u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let bytes = padded
-            .checked_mul(u64::from(size.height.div_ceil(bh)))
-            .and_then(|v| v.checked_mul(u64::from(size.depth_or_array_layers)))
-            .ok_or_else(|| {
-                RenderFailure::new(
-                    RenderFailureKind::BudgetExceeded,
-                    "texture upload size overflow",
-                )
-            })?;
-        self.write(bytes, self.0.lookup(destination.texture)?, |queue| {
-            queue.write_texture(destination, data, layout, size)
-        })
+        let capacity = (self.0.runtime().config().staging_limit / 2)
+            .min(4 * 1024 * 1024)
+            .max(padded);
+        let rows_per_slice = (capacity / padded).max(1).min(u64::from(rows)) as u32;
+        for layer in 0..size.depth_or_array_layers {
+            let mut first_row = 0;
+            while first_row < rows {
+                let count = rows_per_slice.min(rows - first_row);
+                let mut target = destination;
+                target.origin.y += first_row * bh;
+                target.origin.z += layer;
+                let source = wgpu::TexelCopyBufferLayout {
+                    offset: layout.offset
+                        + u64::from(layer) * image_bytes
+                        + u64::from(first_row) * stride,
+                    bytes_per_row: Some(stride as u32),
+                    rows_per_image: None,
+                };
+                let extent = wgpu::Extent3d {
+                    width: size.width,
+                    height: (count * bh).min(size.height - first_row * bh),
+                    depth_or_array_layers: 1,
+                };
+                self.write(padded * u64::from(count), lease.clone(), |queue| {
+                    queue.write_texture(target, data, source, extent)
+                })?;
+                first_row += count;
+            }
+        }
+        Ok(())
     }
     pub fn submit_external(
         &self,
@@ -928,12 +1126,15 @@ impl Queue {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner),
                 );
+                let mut pending = Vec::new();
                 for command in commands {
+                    pending.extend(command.pending);
                     raw.push(command.raw);
                     uses.extend(command.uses.into_iter().map(|lease| (lease.id(), lease)));
                 }
                 let leases: Vec<_> = uses.into_values().collect();
                 let serial = self.0.runtime().register_submission(&leases)?;
+                drop(pending);
                 let index = self.raw().submit(raw);
                 {
                     let completed = self.0.runtime().stats().completed;
@@ -986,47 +1187,8 @@ impl ComputePipeline {
 #[cfg(test)]
 mod tests;
 
-/// Tracked staging foundation. Pages and completion-aware reuse are supplied by
-/// the frame upload arena; until then every admitted slice has an exact lease.
-#[derive(Debug)]
-pub struct StagingBelt {
-    device: Device,
-    active: Vec<Buffer>,
-}
-impl StagingBelt {
-    pub fn new(device: Device, _chunk_size: u64) -> Self {
-        Self {
-            device,
-            active: Vec::new(),
-        }
-    }
-    pub fn write_buffer(
-        &mut self,
-        encoder: &mut CommandEncoder,
-        target: &wgpu::Buffer,
-        offset: u64,
-        size: wgpu::BufferSize,
-    ) -> Result<wgpu::BufferViewMut, RenderFailure> {
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Tracked upload slice"),
-            size: size.get(),
-            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        })?;
-        let view = buffer
-            .get_mapped_range_mut(..)
-            .map_err(|e| RenderFailure::new(RenderFailureKind::MapFailed, e.to_string()))?;
-        encoder.copy_buffer_to_buffer(&buffer, 0, target, offset, size.get());
-        self.active.push(buffer);
-        Ok(view)
-    }
-    pub fn finish(&mut self) {
-        for buffer in self.active.drain(..) {
-            buffer.unmap();
-        }
-    }
-    pub fn recall(&mut self) {}
-}
+/// Native callers share the submission-aware paged upload implementation.
+pub type StagingBelt = crate::frame_upload::FrameUploadArena;
 
 impl Device {
     pub fn create_texture_with_data(

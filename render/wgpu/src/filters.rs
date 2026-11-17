@@ -225,6 +225,7 @@ impl Filters {
         );
         let mut current: Option<CommandTarget> = None;
         for step in graph.steps {
+            draw_encoder.flush_uploads_if_needed(staging_belt.page_size())?;
             let input = current
                 .as_ref()
                 .map(|target| FilterSource::for_entire_texture(target.color_texture()));

@@ -175,6 +175,7 @@ impl Surface {
             )?;
 
             for chunk in chunks {
+                draw_encoder.flush_uploads_if_needed(staging_belt.page_size())?;
                 match chunk {
                     Chunk::Draw {
                         chunk,
@@ -183,7 +184,7 @@ impl Surface {
                     } => {
                         chunk_buffer_builder.copy_to(
                             staging_belt,
-                            &descriptors.device,
+                            descriptors,
                             draw_encoder,
                             chunk_buffers,
                         )?;
