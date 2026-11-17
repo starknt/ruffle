@@ -89,6 +89,10 @@ struct Record {
     bytes: usize,
 }
 
+// Weak<Node> keeps the Rc allocation, including Node's inline storage, alive
+// after its last strong owner drops. Charge that lifetime with the block too.
+const ENTRY_OVERHEAD: usize = std::mem::size_of::<Node>() + 2 * std::mem::size_of::<Record>() + 256;
+
 pub struct Cache {
     records: Vec<Record>,
     limit: usize,
@@ -126,6 +130,11 @@ impl Cache {
                 true
             }
         });
+        // Entry charges cover spare capacity up to twice the live record count.
+        // Do not retain an old large registry alongside a new large block.
+        if self.records.capacity() > self.records.len().saturating_mul(2) {
+            self.records.shrink_to_fit();
+        }
     }
     fn new_node(&mut self) -> Option<Rc<Node>> {
         // Includes Rc/allocator overhead; observation keys live inside Node.
@@ -178,7 +187,7 @@ impl Cache {
         let Some(bytes) = entry
             .commands
             .retained_bytes()
-            .and_then(|b| b.checked_add(512))
+            .and_then(|b| b.checked_add(ENTRY_OVERHEAD))
         else {
             return false;
         };
@@ -215,6 +224,35 @@ mod tests {
             commands: Rc::new(CommandList::new()),
         }
     }
+    #[test]
+    fn pinned_blocks_charge_weak_node_storage_and_prune_releases_registry_capacity() {
+        let mut cache = Cache::default();
+        let mut frames = Vec::new();
+        for _ in 0..65 {
+            let state = State::default();
+            let node = state.node(&mut cache).unwrap();
+            let block = entry();
+            frames.push(block.commands.clone());
+            assert!(cache.insert(&node, block));
+            state.clear();
+        }
+        assert_eq!(cache.node_bytes.get(), 0);
+        let actual = frames
+            .iter()
+            .map(|c| c.retained_bytes().unwrap())
+            .sum::<usize>()
+            + cache.records.capacity() * std::mem::size_of::<Record>()
+            + frames.len() * (std::mem::size_of::<Node>() + 4 * std::mem::size_of::<usize>());
+        assert!(
+            cache.bytes >= actual,
+            "{} charged for at least {actual} retained bytes",
+            cache.bytes
+        );
+        frames.clear();
+        cache.prune();
+        assert_eq!(cache.records.capacity(), 0);
+    }
+
     #[test]
     fn rejected_candidates_cannot_retain_unbounded_metadata() {
         let mut cache = Cache::new(4096);
@@ -264,7 +302,7 @@ mod tests {
 
     #[test]
     fn eviction_keeps_charging_blocks_pinned_by_current_frame() {
-        let cost = entry().commands.retained_bytes().unwrap() + 512;
+        let cost = entry().commands.retained_bytes().unwrap() + ENTRY_OVERHEAD;
         let mut cache = Cache::new(cost);
         let a = Rc::new(Node::default());
         let b = Rc::new(Node::default());

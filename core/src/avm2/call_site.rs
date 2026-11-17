@@ -170,6 +170,9 @@ impl<'gc> Budget<'gc> {
             return false;
         }
         self.tables.retain(|w| w.upgrade(mc).is_some());
+        if self.tables.capacity() > self.tables.len().saturating_mul(2) {
+            self.tables.shrink_to_fit();
+        }
         while self.used.get() + bytes > self.limit {
             let oldest = self
                 .tables
@@ -213,6 +216,25 @@ impl Drop for Counters {
 mod tests {
     use super::*;
     use gc_arena::{Arena, Rootable};
+    #[test]
+    fn dead_table_registry_does_not_keep_its_peak_capacity() {
+        let mut arena = Arena::<Rootable![(Budget<'_>, Vec<Gc<'_, Table<'_>>>)]>::new(|mc| {
+            let mut budget = Budget::default();
+            let tables = (0..500).map(|_| budget.new_table(1, mc).unwrap()).collect();
+            (budget, tables)
+        });
+        arena.mutate_root(|_, (_, tables)| tables.clear());
+        arena.finish_cycle();
+        arena.mutate_root(|mc, (budget, tables)| {
+            tables.push(budget.new_table(1, mc).unwrap());
+            assert!(
+                budget.tables.capacity() <= 4,
+                "retained {} registry slots for one table",
+                budget.tables.capacity()
+            );
+        });
+    }
+
     #[test]
     fn live_evicted_tables_keep_their_metadata_charged() {
         let mut arena = Arena::<Rootable![(Budget<'_>, Vec<Gc<'_, Table<'_>>>)]>::new(|mc| {
