@@ -4,7 +4,7 @@ mod chunk;
 mod commands;
 pub mod mask;
 pub mod target;
-#[cfg(all(test, not(target_family = "wasm")))]
+#[cfg(test)]
 mod tests;
 
 use crate::backend::RenderTargetMode;

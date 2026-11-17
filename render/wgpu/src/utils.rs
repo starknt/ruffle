@@ -65,9 +65,6 @@ pub fn get_backend_names(backends: wgpu::Backends) -> Vec<&'static str> {
     if backends.contains(wgpu::Backends::GL) {
         names.push("Open GL");
     }
-    if backends.contains(wgpu::Backends::BROWSER_WEBGPU) {
-        names.push("Web GPU");
-    }
 
     names
 }
@@ -155,7 +152,6 @@ pub fn capture_image<R, F: FnOnce(&[u8], u32) -> R>(
     result
 }
 
-#[cfg(not(target_family = "wasm"))]
 pub fn buffer_to_image(
     device: &wgpu::Device,
     buffer: &wgpu::Buffer,

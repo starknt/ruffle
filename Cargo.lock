@@ -4999,7 +4999,6 @@ dependencies = [
  "smallvec",
  "swf 0.4.0",
  "tracing",
- "web-sys",
  "wgpu",
  "wgpu-profiler",
 ]
@@ -5133,7 +5132,6 @@ dependencies = [
  "ruffle_render",
  "ruffle_render_canvas",
  "ruffle_render_webgl",
- "ruffle_render_wgpu",
  "ruffle_video_external",
  "ruffle_web_common",
  "serde",

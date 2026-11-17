@@ -1,5 +1,8 @@
-// Remove this when we decide on how to handle multithreaded rendering (especially on wasm)
+// Renderer ownership stays on the player thread; preparation workers use owned CPU data.
 #![allow(clippy::arc_with_non_send_sync)]
+
+#[cfg(target_family = "wasm")]
+compile_error!("ruffle_render_wgpu supports native targets only");
 
 use crate::backend::ActiveFrame;
 use crate::bitmaps::BitmapSamplers;

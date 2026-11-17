@@ -785,21 +785,6 @@ impl Context3D for WgpuContext3D {
                 if sample_count == 0 {
                     sample_count = 1;
                 }
-                #[cfg(target_family = "wasm")]
-                {
-                    if sample_count > 1
-                        && matches!(
-                            self.descriptors.adapter.get_info().backend,
-                            wgpu::Backend::Gl
-                        )
-                    {
-                        tracing::warn!(
-                            "Context.setRenderToTexture with antiAlias > 1 is not yet supported on WebGL"
-                        );
-                        sample_count = 1;
-                    }
-                }
-
                 let texture_wrapper =
                     <dyn Any>::downcast_ref::<TextureWrapper>(texture.as_ref()).unwrap();
                 self.current_texture_size = Some(Extent3d {

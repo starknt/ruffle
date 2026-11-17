@@ -92,42 +92,6 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
 }
 
 impl WgpuRenderBackend<SwapChainTarget> {
-    #[cfg(target_family = "wasm")]
-    pub async fn for_canvas(
-        canvas: web_sys::HtmlCanvasElement,
-        webgpu: bool,
-    ) -> Result<Self, Error> {
-        let backends = if webgpu {
-            wgpu::Backends::BROWSER_WEBGPU
-        } else {
-            wgpu::Backends::GL
-        };
-        let instance = create_wgpu_instance(
-            backends,
-            wgpu::BackendOptions {
-                gl: wgpu::GlBackendOptions {
-                    // See <https://github.com/gfx-rs/wgpu/releases/tag/v25.0.0>
-                    fence_behavior: wgpu::GlFenceBehavior::AutoFinish,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            None,
-        );
-        let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas))?;
-        let (adapter, device, queue) = request_adapter_and_device(
-            backends,
-            &instance,
-            Some(&surface),
-            wgpu::PowerPreference::HighPerformance,
-        )
-        .await?;
-        let descriptors = Descriptors::new(instance, adapter, device, queue);
-        let target =
-            SwapChainTarget::new(surface, &descriptors.adapter, (1, 1), &descriptors.device);
-        Self::new(Arc::new(descriptors), target)
-    }
-
     /// # Safety
     ///  See [`wgpu::SurfaceTargetUnsafe`] variants for safety requirements.
     ///
@@ -137,7 +101,6 @@ impl WgpuRenderBackend<SwapChainTarget> {
     /// provide one). Prefer passing `display` - some backends (e.g. GL via
     /// EGL) select their platform when the instance is created, before the
     /// target's display handle is seen.
-    #[cfg(not(target_family = "wasm"))]
     pub unsafe fn for_window_unsafe(
         window: wgpu::SurfaceTargetUnsafe,
         size: (u32, u32),
@@ -166,7 +129,6 @@ impl WgpuRenderBackend<SwapChainTarget> {
 
     /// # Safety
     ///  See [`wgpu::SurfaceTargetUnsafe`] variants for safety requirements.
-    #[cfg(not(target_family = "wasm"))]
     pub unsafe fn recreate_surface_unsafe(
         &mut self,
         window: wgpu::SurfaceTargetUnsafe,
@@ -180,7 +142,6 @@ impl WgpuRenderBackend<SwapChainTarget> {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl WgpuRenderBackend<crate::target::TextureTarget> {
     pub fn for_offscreen(
         size: (u32, u32),
@@ -589,16 +550,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     }
 
     fn name(&self) -> &'static str {
-        if cfg!(target_family = "wasm") {
-            let info = self.descriptors.adapter.get_info();
-            if info.backend == wgpu::Backend::BrowserWebGpu {
-                "webgpu"
-            } else {
-                "wgpu-webgl"
-            }
-        } else {
-            "wgpu"
-        }
+        "wgpu"
     }
 
     fn set_quality(&mut self, quality: StageQuality) {
@@ -1518,7 +1470,7 @@ async fn request_device(
     limits.max_uniform_buffer_binding_size = adapter.limits().max_uniform_buffer_binding_size;
     limits.max_inter_stage_shader_variables = adapter.limits().max_inter_stage_shader_variables;
     // This will be a default limit in a future wgpu version (down from 8).
-    // It's required for some WebGL devices to be supported.
+    // Keep the GLES-compatible baseline for native GL adapters.
     limits.max_color_attachments = 4;
 
     let mut features = Default::default();
