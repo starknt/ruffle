@@ -4,9 +4,13 @@ use crate::matrix::Matrix;
 use crate::pixel_bender::PixelBenderShaderHandle;
 use crate::region::RenderRegion;
 use crate::transform::Transform;
+use std::rc::Rc;
 use swf::{BlendMode, Color};
 
 pub trait CommandHandler {
+    fn render_shared(&mut self, commands: Rc<CommandList>) {
+        commands.execute_ref(self);
+    }
     fn render_bitmap(
         &mut self,
         bitmap: BitmapHandle,
@@ -51,6 +55,37 @@ pub struct CommandList {
 }
 
 impl CommandList {
+    pub fn append(&mut self, mut other: CommandList) {
+        debug_assert_eq!(other.maskers_in_progress, 0);
+        self.region = self.region.union(other.region);
+        self.commands.append(&mut other.commands);
+    }
+
+    /// Counts command storage and all resources it can keep resident. Shared
+    /// resources are intentionally charged once per reference (an upper bound).
+    pub fn retained_bytes(&self) -> Option<usize> {
+        let mut bytes =
+            std::mem::size_of::<Self>() + self.commands.capacity() * std::mem::size_of::<Command>();
+        for command in &self.commands {
+            bytes = bytes.checked_add(match command {
+                Command::RenderShape { shape, .. } => shape.0.retained_bytes()?,
+                Command::Shared(commands) => commands.retained_bytes()?,
+                Command::DrawRect { .. }
+                | Command::DrawLine { .. }
+                | Command::DrawLineRect { .. } => 0,
+                _ => return None,
+            })?;
+        }
+        Some(bytes)
+    }
+
+    fn execute_ref(&self, handler: &mut (impl CommandHandler + ?Sized)) {
+        for command in &self.commands {
+            // Eligible retained blocks contain only leaf draws or Shared
+            // blocks, so replay clones handles, never a subtree vector.
+            command.clone().execute(handler);
+        }
+    }
     pub fn iter(&self) -> std::slice::Iter<'_, Command> {
         self.commands.iter()
     }
@@ -74,38 +109,45 @@ impl CommandList {
         self.commands.is_empty()
     }
 
-    pub fn execute(self, handler: &mut impl CommandHandler) {
+    pub fn execute(self, handler: &mut (impl CommandHandler + ?Sized)) {
         for command in self.commands {
-            match command {
-                Command::RenderBitmap {
-                    bitmap,
-                    transform,
-                    smoothing,
-                    pixel_snapping,
-                    region,
-                } => handler.render_bitmap(bitmap, transform, smoothing, pixel_snapping, region),
-                Command::RenderShape { shape, transform } => handler.render_shape(shape, transform),
-                Command::RenderStage3D { bitmap, transform } => {
-                    handler.render_stage3d(bitmap, transform)
-                }
-                Command::DrawRect { color, matrix } => handler.draw_rect(color, matrix),
-                Command::DrawLine { color, matrix } => handler.draw_line(color, matrix),
-                Command::DrawLineRect { color, matrix } => handler.draw_line_rect(color, matrix),
-                Command::PushMask => handler.push_mask(),
-                Command::ActivateMask => handler.activate_mask(),
-                Command::DeactivateMask => handler.deactivate_mask(),
-                Command::PopMask => handler.pop_mask(),
-                Command::Blend(commands, blend_mode) => handler.blend(commands, blend_mode),
-                Command::RenderAlphaMask {
-                    maskee_commands,
-                    mask_commands,
-                } => handler.render_alpha_mask(maskee_commands, mask_commands),
-            }
+            command.execute(handler);
         }
     }
 
     pub fn drawing_mask(&self) -> bool {
         self.maskers_in_progress > 0
+    }
+}
+
+impl Command {
+    fn execute(self, handler: &mut (impl CommandHandler + ?Sized)) {
+        match self {
+            Command::Shared(commands) => handler.render_shared(commands),
+            Command::RenderBitmap {
+                bitmap,
+                transform,
+                smoothing,
+                pixel_snapping,
+                region,
+            } => handler.render_bitmap(bitmap, transform, smoothing, pixel_snapping, region),
+            Command::RenderShape { shape, transform } => handler.render_shape(shape, transform),
+            Command::RenderStage3D { bitmap, transform } => {
+                handler.render_stage3d(bitmap, transform)
+            }
+            Command::DrawRect { color, matrix } => handler.draw_rect(color, matrix),
+            Command::DrawLine { color, matrix } => handler.draw_line(color, matrix),
+            Command::DrawLineRect { color, matrix } => handler.draw_line_rect(color, matrix),
+            Command::PushMask => handler.push_mask(),
+            Command::ActivateMask => handler.activate_mask(),
+            Command::DeactivateMask => handler.deactivate_mask(),
+            Command::PopMask => handler.pop_mask(),
+            Command::Blend(commands, blend_mode) => handler.blend(commands, blend_mode),
+            Command::RenderAlphaMask {
+                maskee_commands,
+                mask_commands,
+            } => handler.render_alpha_mask(maskee_commands, mask_commands),
+        }
     }
 }
 
@@ -216,6 +258,7 @@ impl CommandHandler for CommandList {
 
 #[derive(Debug, Clone)]
 pub enum Command {
+    Shared(Rc<CommandList>),
     RenderBitmap {
         bitmap: BitmapHandle,
         transform: Transform,
@@ -257,6 +300,7 @@ pub enum Command {
 impl Command {
     fn region(&self) -> RenderRegion {
         match self {
+            Self::Shared(commands) => commands.region(),
             Self::RenderBitmap {
                 transform,
                 pixel_snapping,

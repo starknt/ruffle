@@ -17,6 +17,7 @@ const GRADIENT_SIZE: usize = 256;
 #[derive(Debug)]
 pub struct Mesh {
     pub bounds: Option<[f64; 4]>,
+    pub retained_bytes: Option<usize>,
     pub draws: Vec<Draw>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
@@ -24,6 +25,9 @@ pub struct Mesh {
 }
 
 impl ShapeHandleImpl for Mesh {
+    fn retained_bytes(&self) -> Option<usize> {
+        self.retained_bytes
+    }
     fn bounds(&self) -> Option<[f64; 4]> {
         self.bounds
     }

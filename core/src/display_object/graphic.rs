@@ -112,6 +112,7 @@ impl<'gc> Graphic<'gc> {
     }
 
     pub fn drawing_mut(&self) -> RefMut<'_, Drawing> {
+        self.invalidate_cached_bitmap();
         self.0.drawing.get_or_init(Default::default).borrow_mut()
     }
 

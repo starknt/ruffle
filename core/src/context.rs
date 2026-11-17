@@ -585,6 +585,9 @@ impl Default for ActionQueue<'_> {
 /// As a convenience, this type can be deref-coerced to `Mutation<'gc>`, but note that explicitly
 /// writing `context.gc()` can be sometimes necessary to satisfy the borrow checker.
 pub struct RenderContext<'a, 'gc> {
+    pub snapshots: Option<&'a mut crate::display_object::snapshot::Cache>,
+    pub snapshot_allowed: bool,
+    pub snapshot_barriers: u64,
     /// The renderer, used by the display objects to register themselves.
     pub renderer: &'a mut dyn RenderBackend,
 

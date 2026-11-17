@@ -22,6 +22,9 @@ use ruffle_render::perspective_projection::PerspectiveProjection;
 use ruffle_render::pixel_bender::PixelBenderShaderHandle;
 use ruffle_render::transform::{Transform, TransformStack};
 use std::cell::{Cell, Ref, RefCell, RefMut};
+pub(crate) mod snapshot;
+#[cfg(test)]
+mod snapshot_tests;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::num::NonZero;
@@ -304,6 +307,8 @@ pub enum RenderMask<'gc> {
 // Ensure this always has the same alignment as its subclasses (needed for `Gc` casts).
 #[repr(align(8))]
 pub struct DisplayObjectBase<'gc> {
+    #[collect(require_static)]
+    snapshots: snapshot::State,
     cell: RefCell<DisplayObjectBaseMut>,
     parent: Lock<Option<DisplayObject<'gc>>>,
     place_frame: Cell<u16>,
@@ -380,6 +385,7 @@ struct DisplayObjectBaseMut {
 impl Default for DisplayObjectBase<'_> {
     fn default() -> Self {
         Self {
+            snapshots: Default::default(),
             cell: RefCell::new(DisplayObjectBaseMut {
                 filters: Default::default(),
                 blend_shader: None,
@@ -414,6 +420,15 @@ impl Default for DisplayObjectBase<'_> {
 }
 
 impl<'gc> DisplayObjectBase<'gc> {
+    fn invalidate_render(&self) {
+        self.snapshots.invalidate();
+        let mut parent = self.parent();
+        while let Some(object) = parent {
+            object.base().snapshots.invalidate();
+            parent = object.parent();
+        }
+    }
+
     fn contains_flag(&self, flag: DisplayObjectFlags) -> bool {
         self.flags.get().contains(flag)
     }
@@ -421,11 +436,20 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn set_flag(&self, flag: DisplayObjectFlags, value: bool) {
         let mut flags = self.flags.get();
         flags.set(flag, value);
+        if (self.flags.get() ^ flags).intersects(
+            DisplayObjectFlags::VISIBLE
+                | DisplayObjectFlags::HAS_SCROLL_RECT
+                | DisplayObjectFlags::CACHE_AS_BITMAP
+                | DisplayObjectFlags::AVM1_REMOVED,
+        ) {
+            self.invalidate_render();
+        }
         self.flags.set(flags);
     }
 
     /// Reset all properties that would be adjusted by a movie load.
     fn reset_for_movie_load(&self) {
+        self.invalidate_render();
         let retained = DisplayObjectFlags::LOCK_ROOT;
         // Other buttons may still reference this object as an inactive state.
         // Movie replacement resets its contents, not those foreign references.
@@ -469,6 +493,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     pub fn set_matrix(&self, matrix: Matrix) {
+        if self.matrix.get() != matrix {
+            self.invalidate_render();
+        }
         self.matrix.set(matrix);
         self.set_scale_rotation_cached(false);
     }
@@ -478,6 +505,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     pub fn set_color_transform(&self, color_transform: ColorTransform) {
+        if self.color_transform.get() != color_transform {
+            self.invalidate_render();
+        }
         self.color_transform.set(color_transform);
     }
 
@@ -489,6 +519,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         &self,
         perspective_projection: Option<PerspectiveProjection>,
     ) -> bool {
+        if self.perspective_projection.get() != perspective_projection {
+            self.invalidate_render();
+        }
         let old = self.perspective_projection.replace(perspective_projection);
         perspective_projection != old
     }
@@ -501,6 +534,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         let changed = matrix.tx != x;
         matrix.tx = x;
+        if self.matrix.get() != matrix {
+            self.invalidate_render();
+        }
         self.matrix.set(matrix);
         self.set_transformed_by_script(true);
         changed
@@ -514,6 +550,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         let changed = matrix.ty != y;
         matrix.ty = y;
+        if self.matrix.get() != matrix {
+            self.invalidate_render();
+        }
         self.matrix.set(matrix);
         self.set_transformed_by_script(true);
         changed
@@ -526,6 +565,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn set_z(&self, tz: f64) -> bool {
         let changed = self.tz.get() != tz;
         self.set_transformed_by_script(true);
+        if changed {
+            self.invalidate_render();
+        }
         self.tz.set(tz);
         changed
     }
@@ -602,6 +644,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         matrix.b = (scale_x * sin_x) as f32;
         matrix.c = (scale_y * -sin_y) as f32;
         matrix.d = (scale_y * cos_y) as f32;
+        if self.matrix.get() != matrix {
+            self.invalidate_render();
+        }
         self.matrix.set(matrix);
 
         changed
@@ -637,6 +682,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         matrix.a = (cos * value.unit()) as f32;
         matrix.b = (sin * value.unit()) as f32;
+        if self.matrix.get() != matrix {
+            self.invalidate_render();
+        }
         self.matrix.set(matrix);
 
         changed
@@ -673,6 +721,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         matrix.c = (-sin * value.unit()) as f32;
         matrix.d = (cos * value.unit()) as f32;
+        if self.matrix.get() != matrix {
+            self.invalidate_render();
+        }
         self.matrix.set(matrix);
 
         changed
@@ -711,6 +762,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut tf = self.color_transform.get();
         let changed = tf.a_multiply != value;
         tf.a_multiply = value;
+        if changed {
+            self.invalidate_render();
+        }
         self.color_transform.set(tf);
         changed
     }
@@ -720,6 +774,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_clip_depth(&self, depth: Depth) {
+        if self.clip_depth.get() != depth {
+            self.invalidate_render();
+        }
         self.clip_depth.set(depth);
     }
 
@@ -730,6 +787,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     /// You should almost always use `DisplayObject.set_parent` instead, which
     /// properly handles 'orphan' movie clips
     fn set_parent_ignoring_orphan_list(this: &Write<Self>, parent: Option<DisplayObject<'gc>>) {
+        this.invalidate_render();
         this.wake_orphan_worklists();
         unlock!(this, Self, parent).set(parent)
     }
@@ -1024,6 +1082,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_masker(this: &Write<Self>, node: Option<DisplayObject<'gc>>) {
+        this.invalidate_render();
         unlock!(this, Self, masker).set(node);
     }
 
@@ -1032,6 +1091,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_maskee(this: &Write<Self>, node: Option<DisplayObject<'gc>>) {
+        this.invalidate_render();
         unlock!(this, Self, maskee).set(node);
     }
 
@@ -1089,6 +1149,118 @@ struct DrawCacheInfo {
 }
 
 pub fn render_base<'gc>(
+    this: DisplayObject<'gc>,
+    context: &mut RenderContext<'_, 'gc>,
+    options: RenderOptions,
+) {
+    let base = this.base();
+    let eligible = matches!(
+        this,
+        DisplayObject::MovieClip(_) | DisplayObject::Graphic(_) | DisplayObject::Stage(_)
+    ) && options.apply_transform
+        && options.apply_matrix
+        && options.skip_masks
+        && !context.is_offscreen
+        && !context.commands.drawing_mask()
+        && this.blend_mode() == ExtendedBlendMode::Normal
+        && !this.is_bitmap_cached()
+        && this.masker().is_none()
+        && this.maskee().is_none()
+        && this.clip_depth() == 0
+        && !base.has_scroll_rect()
+        && base.scroll_rect.get().is_none()
+        && base.scaling_grid.get() == Rectangle::default()
+        && (base.perspective_projection.get().is_none()
+            || (matches!(this, DisplayObject::Stage(_))
+                && base.perspective_projection.get() == Some(Default::default())))
+        && base.tz.get() == 0.0
+        && !base.has_matrix3d_stub();
+    let allowed = context.snapshot_allowed;
+    context.snapshot_allowed &= eligible;
+    if !eligible {
+        context.snapshot_barriers += 1;
+    }
+    let candidate = context.snapshots.is_some()
+        && context.snapshot_allowed
+        && matches!(this, DisplayObject::MovieClip(_))
+        && this.as_container().is_some_and(|c| c.num_children() >= 8);
+    let prepared = if candidate {
+        let dimensions = context.renderer.viewport_dimensions();
+        let key = snapshot::Key {
+            generation: base.snapshots.generation.get(),
+            inherited: context.transform_stack.transform(),
+            own: base.transform(true),
+            viewport: (
+                dimensions.width,
+                dimensions.height,
+                dimensions.scale_factor.to_bits(),
+            ),
+            view: context.stage.view_bounds(),
+            quality: context.stage.quality(),
+        };
+        let node = base.snapshots.node();
+        let hit = node
+            .entry
+            .borrow()
+            .as_ref()
+            .filter(|e| e.key == key)
+            .map(|e| e.commands.clone());
+        if let Some(commands) = hit {
+            context.snapshots.as_deref_mut().unwrap().touch(&node);
+            context
+                .commands
+                .push(ruffle_render::commands::Command::Shared(commands));
+            ruffle_render::profile::work(|w| w.snapshot_hits += 1);
+            context.snapshot_allowed = allowed;
+            return;
+        }
+        node.entry.borrow_mut().take();
+        let stable = node
+            .observed
+            .borrow()
+            .as_ref()
+            .is_none_or(|old| *old == key);
+        *node.observed.borrow_mut() = Some(key.clone());
+        if !stable {
+            render_base_inner(this, context, options);
+            context.snapshot_allowed = allowed;
+            return;
+        }
+        ruffle_render::profile::work(|w| w.snapshot_misses += 1);
+        Some((
+            node,
+            key,
+            std::mem::take(&mut context.commands),
+            context.snapshot_barriers,
+        ))
+    } else {
+        None
+    };
+    render_base_inner(this, context, options);
+    if let Some((node, key, original, barriers)) = prepared {
+        let commands = std::rc::Rc::new(std::mem::replace(&mut context.commands, original));
+        let stored = context.snapshot_barriers == barriers
+            && context.snapshots.as_deref_mut().unwrap().insert(
+                &node,
+                snapshot::Entry {
+                    key,
+                    commands: commands.clone(),
+                },
+            );
+        if stored {
+            context
+                .commands
+                .push(ruffle_render::commands::Command::Shared(commands));
+        } else {
+            context.commands.append(
+                std::rc::Rc::try_unwrap(commands).expect("uncached block has no other owner"),
+            );
+        }
+    }
+    context.snapshot_allowed = allowed;
+}
+
+fn render_base_inner<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
     options: RenderOptions,
@@ -1219,6 +1391,9 @@ pub fn render_base<'gc>(
                 tz: Default::default(),
             });
             let mut offscreen_context = RenderContext {
+                snapshots: None,
+                snapshot_allowed: false,
+                snapshot_barriers: 0,
                 renderer: context.renderer,
                 commands: CommandList::new(),
                 cache_draws: context.cache_draws,
@@ -2080,6 +2255,9 @@ pub trait TDisplayObject<'gc>:
     /// Set the parent of this display object.
     #[no_dynamic]
     fn set_parent(self, context: &mut UpdateContext<'gc>, parent: Option<DisplayObject<'gc>>) {
+        if parent.is_none() {
+            self.clear_render_snapshots();
+        }
         let had_parent = self.parent().is_some();
         if let Some(old_parent) = self.parent() {
             old_parent.invalidate_construction();
@@ -2209,6 +2387,7 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn set_next_scroll_rect(self, rectangle: Rectangle<Twips>) {
+        self.base().invalidate_render();
         self.base().next_scroll_rect.set(rectangle);
 
         // Scroll rect is natively handled by cacheAsBitmap - don't invalidate self, only parents
@@ -2224,6 +2403,7 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn set_scaling_grid(self, rect: Rectangle<Twips>) {
+        self.base().invalidate_render();
         self.base().scaling_grid.set(rect);
     }
 
@@ -2787,6 +2967,7 @@ pub trait TDisplayObject<'gc>:
     }
 
     fn avm1_unload(self, context: &mut UpdateContext<'gc>) {
+        self.base().snapshots.invalidate();
         // Unload children.
         if let Some(ctr) = self.as_container() {
             for child in ctr.iter_render_list() {
@@ -3105,15 +3286,27 @@ pub trait TDisplayObject<'gc>:
         }
     }
 
+    #[no_dynamic]
+    fn clear_render_snapshots(self) {
+        self.base().snapshots.invalidate();
+        if let Some(container) = self.as_container() {
+            for child in container.iter_render_list() {
+                child.clear_render_snapshots();
+            }
+        }
+    }
+
     /// Inform this object and its ancestors that it has visually changed and must be redrawn.
     /// If this object or any ancestor is marked as cacheAsBitmap, it will invalidate that cache.
     #[no_dynamic]
     fn invalidate_cached_bitmap(self) {
-        if self.base().invalidate_cached_bitmap() {
-            // Don't inform ancestors if we've already done so this frame
-            if let Some(parent) = self.parent() {
-                parent.invalidate_cached_bitmap();
+        self.base().invalidate_render();
+        let mut object: Option<DisplayObject<'gc>> = Some(self.into());
+        while let Some(current) = object {
+            if !current.base().invalidate_cached_bitmap() {
+                break;
             }
+            object = current.parent();
         }
     }
 

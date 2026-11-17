@@ -715,6 +715,11 @@ pub enum Context3DCommand<'a> {
 pub struct ShapeHandle(pub Arc<dyn ShapeHandleImpl>);
 
 pub trait ShapeHandleImpl: Any + Debug {
+    /// Conservative bytes pinned by a retained command. None forbids retention
+    /// (e.g. mutable bitmap fills whose external storage is not accounted).
+    fn retained_bytes(&self) -> Option<usize> {
+        None
+    }
     /// Local pixel bounds of all rasterized geometry, including strokes.
     fn bounds(&self) -> Option<[f64; 4]> {
         None

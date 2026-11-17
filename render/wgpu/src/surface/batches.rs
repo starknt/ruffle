@@ -68,6 +68,7 @@ impl Iterator for CommandBatches {
 
 fn temporary_inputs(command: &Command) -> usize {
     match command {
+        Command::Shared(commands) => commands.iter().map(temporary_inputs).sum(),
         Command::Blend(..) => 1,
         Command::RenderAlphaMask { .. } => 2,
         _ => 0,
@@ -77,6 +78,7 @@ fn temporary_inputs(command: &Command) -> usize {
 fn samples_ancestor_layer(commands: &CommandList) -> bool {
     commands.iter().any(|command| match command {
         Command::Blend(_, RenderBlendMode::Builtin(BlendMode::Alpha | BlendMode::Erase)) => true,
+        Command::Shared(children) => samples_ancestor_layer(children),
         Command::Blend(children, _) => samples_ancestor_layer(children),
         Command::RenderAlphaMask {
             maskee_commands,

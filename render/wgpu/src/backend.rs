@@ -331,6 +331,11 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             self.shape_tessellator
                 .tessellate_shape_with_scale(shape, bitmap_source, scale);
 
+        let retainable = !lyon_mesh
+            .draws
+            .iter()
+            .any(|d| matches!(d.draw_type, ruffle_render::tessellator::DrawType::Bitmap(_)));
+        let gradient_bytes = lyon_mesh.gradients.len() * 2048;
         let mut bounds: Option<[f64; 4]> = None;
         for vertex in lyon_mesh.draws.iter().flat_map(|draw| &draw.vertices) {
             let (x, y) = (f64::from(vertex.x), f64::from(vertex.y));
@@ -400,6 +405,11 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         );
 
         Mesh {
+            retained_bytes: retainable.then_some(
+                (uniform_buffer.size() + vertex_buffer.size() + index_buffer.size()) as usize
+                    + gradient_bytes
+                    + 4096,
+            ),
             bounds,
             draws,
             vertex_buffer,

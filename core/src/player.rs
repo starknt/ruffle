@@ -323,6 +323,7 @@ enum RunState {
 }
 
 pub struct Player {
+    snapshots: crate::display_object::snapshot::Cache,
     /// The version of the player we're emulating.
     ///
     /// This serves a few purposes, primarily for compatibility:
@@ -2347,7 +2348,14 @@ impl Player {
             let stage = gc_root.stage;
 
             let mut cache_draws = vec![];
+            this.snapshots.prune();
             let mut render_context = RenderContext {
+                snapshots: Some(&mut this.snapshots),
+                snapshot_allowed: stage
+                    .stage3ds()
+                    .iter()
+                    .all(|s| !s.visible() || s.context3d().is_none()),
+                snapshot_barriers: 0,
                 renderer: this.renderer.deref_mut(),
                 commands: CommandList::new(),
                 cache_draws: &mut cache_draws,
@@ -3356,6 +3364,7 @@ impl PlayerBuilder {
         let forced_frame_rate = self.frame_rate.is_some();
         let player = Arc::new_cyclic(|self_ref| {
             Mutex::new(Player {
+                snapshots: Default::default(),
                 // Backends
                 audio,
                 log,
