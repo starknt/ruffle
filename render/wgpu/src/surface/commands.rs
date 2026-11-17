@@ -191,7 +191,9 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         &mut self,
         commands: PlannedList,
     ) -> Result<Vec<Chunk>, crate::gpu_runtime::RenderFailure> {
-        for command in commands.into_commands() {
+        let commands = commands.into_commands();
+        self.current.reserve(commands.len().min(64));
+        for command in commands {
             match command.op {
                 PlannedOp::Leaf(command) => command.execute(self),
                 PlannedOp::Blend(commands, mode, region) => {

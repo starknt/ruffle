@@ -156,48 +156,59 @@ pub(super) fn batch_bitmap_textures(
     use crate::layouts::BITMAP_BATCH_TEXTURES as N;
     let mut input = std::mem::take(commands).into_iter().peekable();
     while let Some(first) = input.next() {
-        let Some((texture, sampler, offsets)) = first.bitmap_input() else {
+        let Some((_, sampler, offsets)) = first.bitmap_input() else {
             commands.push(first);
             continue;
         };
-        let mut views: [_; N] = std::array::from_fn(|_| texture.view().clone());
         let sampler = sampler.clone();
         let mut offsets = offsets.clone();
-        let mut run = vec![first];
+        let mut run = smallvec::SmallVec::<[DrawCommand; N]>::new();
+        run.push(first);
         while run.len() < N {
             let Some((_, next_sampler, next_offsets)) =
                 input.peek().and_then(DrawCommand::bitmap_input)
             else {
                 break;
             };
-            if *next_sampler != sampler || next_offsets.instances.start != offsets.instances.end {
+            if *next_sampler != sampler
+                || next_offsets.instances.start != offsets.instances.end
+                || next_offsets.vertex_buffer != offsets.vertex_buffer
+                || next_offsets.index_buffer != offsets.index_buffer
+                || next_offsets.vertices != offsets.vertices
+                || next_offsets.indices != offsets.indices
+            {
                 break;
             }
-            let mut merged = offsets.clone();
-            if !merged.try_merge(next_offsets, 3) {
-                break;
-            }
-            offsets = merged;
+            offsets.instances.end = next_offsets.instances.end;
             run.extend(input.next());
         }
         if run.len() == 1 {
             commands.extend(run);
             continue;
         }
-        let mut sources = Vec::with_capacity(run.len());
+        // The first instance may start anywhere in a chunk's uniform window.
+        // Populate each binding once, using the first image for unused slots.
+        let views = std::array::from_fn(|slot| {
+            let index = (slot + N - offsets.instances.start as usize % N) % N;
+            run.get(index)
+                .unwrap_or(&run[0])
+                .bitmap_input()
+                .unwrap()
+                .0
+                .view()
+                .clone()
+        });
+        let mut sources = smallvec::SmallVec::<[_; N]>::new();
         let mut textures = Vec::with_capacity(run.len());
         for command in run {
             let DrawCommand::RenderTexture {
                 _texture: Some(texture),
                 batch_sampler: Some((_, source)),
-                draw_offsets,
                 ..
             } = command
             else {
                 unreachable!()
             };
-            // The first instance may start anywhere in a chunk's uniform window.
-            views[draw_offsets.instances.start as usize % N] = texture.view().clone();
             textures.push(texture);
             sources.push(source);
         }

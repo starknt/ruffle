@@ -135,6 +135,7 @@ impl GraphEncoder {
                 }
                 PassKind::Draw(nodes) => {
                     let target = targets.entry(attachment.resource).or_default();
+                    target.commands.reserve(nodes.len());
                     for node in nodes {
                         target.push(PlannedCommand {
                             op: PlannedOp::Leaf(self.prepared.leaf(node)?),
