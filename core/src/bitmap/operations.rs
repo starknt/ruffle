@@ -915,14 +915,14 @@ pub fn hit_test_bitmapdata<'gc>(
         )
     };
 
-    let target = target.read_area(
-        PixelRegion::for_region(self_x0, self_y0, width, height),
-        renderer,
-    )?;
-    let test = test.read_area(
-        PixelRegion::for_region(test_x0, test_y0, width, height),
-        renderer,
-    )?;
+    let self_region = PixelRegion::for_region(self_x0, self_y0, width, height);
+    let test_region = PixelRegion::for_region(test_x0, test_y0, width, height);
+    if target.ptr_eq(test) {
+        // Complete both regional reads before retaining either shared borrow.
+        drop(test.read_area(test_region, renderer)?);
+    }
+    let target = target.read_area(self_region, renderer)?;
+    let test = test.read_area(test_region, renderer)?;
 
     for x in 0..width {
         for y in 0..height {
@@ -1233,15 +1233,18 @@ pub fn copy_pixels_with_alpha_source<'gc>(
     let mut source_region =
         PixelRegion::for_region_i32(src_min_x, src_min_y, src_width, src_height);
     source_region.clamp(source_bitmap.width(), source_bitmap.height());
+    let mut alpha_region =
+        PixelRegion::for_region_i32(alpha_point.0, alpha_point.1, src_width, src_height);
+    alpha_region.clamp(alpha_bitmap.width(), alpha_bitmap.height());
+    if source_bitmap.ptr_eq(alpha_bitmap) && !source_bitmap.ptr_eq(target) {
+        drop(alpha_bitmap.read_area(alpha_region, context.renderer)?);
+    }
     let source_bitmap = if source_bitmap.ptr_eq(target) {
         None
     } else {
         Some(source_bitmap.read_area(source_region, context.renderer)?)
     };
 
-    let mut alpha_region =
-        PixelRegion::for_region_i32(alpha_point.0, alpha_point.1, src_width, src_height);
-    alpha_region.clamp(alpha_bitmap.width(), alpha_bitmap.height());
     let alpha_bitmap = if alpha_bitmap.ptr_eq(target) {
         None
     } else {

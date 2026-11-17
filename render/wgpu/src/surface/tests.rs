@@ -615,6 +615,38 @@ fn destroyed_readback_buffer_returns_error_without_publishing_pixels()
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn async_readback_completion_and_cancellation_return_unmapped_pool_entries() {
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (1, 1)).unwrap();
+    let renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    let dimensions = crate::utils::BufferDimensions::new(1, 1, wgpu::TextureFormat::Rgba8Unorm);
+    for complete in [true, false, true] {
+        let buffer = renderer
+            .offscreen_buffer_pool
+            .take(&descriptors, dimensions.clone())
+            .unwrap();
+        let mut readback =
+            crate::AsyncReadback::new(buffer, dimensions.clone(), descriptors.clone(), None);
+        if complete {
+            descriptors
+                .device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            let (pixels, stride) = readback.poll().unwrap().unwrap();
+            assert_eq!(stride, 256);
+            assert!(pixels.iter().all(|&byte| byte == 0));
+        }
+        drop(readback);
+        descriptors
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        descriptors.runtime.check_health().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn cheap_operations_do_not_force_a_draw_count_submission() {
     let descriptors = gpu();
     let budget = crate::idle_pool::Budget::with_runtime(&descriptors.runtime);

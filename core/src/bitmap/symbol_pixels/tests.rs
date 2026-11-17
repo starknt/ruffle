@@ -595,3 +595,80 @@ fn bitmap_validity_self_overlap_preserves_flash_down_left_row_smear() {
         assert_eq!(renderer.copies, 0);
     });
 }
+
+#[test]
+fn bitmap_validity_clean_alias_reads_do_not_require_an_exclusive_borrow() {
+    use crate::bitmap::{bitmap_data::BitmapData, operations::compare};
+    gc_arena::arena::rootless_mutate(|mc| {
+        let bitmap = BitmapData::new(mc, 2, 1, true, 0xff123456);
+        let mut renderer = renderer(false);
+        assert!(
+            compare(mc, &mut renderer, bitmap, bitmap)
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+#[test]
+fn bitmap_validity_self_hit_test_reads_both_disjoint_gpu_regions() {
+    use crate::bitmap::{bitmap_data::BitmapData, operations::hit_test_bitmapdata};
+    gc_arena::arena::rootless_mutate(|mc| {
+        let bitmap = BitmapData::new(mc, 8, 1, true, 0);
+        let mut renderer = renderer(false);
+        renderer.regional = true;
+        let handle = bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+        let full = PixelRegion::for_whole_size(8, 1);
+        bitmap.mark_gpu_dirty(mc, gpu_fill(&handle, full, [10, 20, 30, 255]), full);
+        assert!(
+            hit_test_bitmapdata(&mut renderer, bitmap, (0, 0), 255, bitmap, (7, 0), 255).unwrap()
+        );
+        assert_eq!(renderer.reads.len(), 2);
+        assert!(renderer.reads.contains(&PixelRegion::for_pixel(0, 0)));
+        assert!(renderer.reads.contains(&PixelRegion::for_pixel(7, 0)));
+        assert!(!bitmap.can_read(PixelRegion::for_pixel(3, 0)));
+    });
+}
+
+#[test]
+fn bitmap_validity_alpha_copy_reads_aliased_source_regions_before_borrowing() {
+    use crate::bitmap::{
+        bitmap_data::BitmapData,
+        operations::{copy_pixels_with_alpha_source, get_pixel32},
+    };
+    let mut renderer = renderer(false);
+    renderer.regional = true;
+    let player = crate::PlayerBuilder::new().with_renderer(renderer).build();
+    player
+        .lock()
+        .unwrap()
+        .mutate_with_update_context(|context| {
+            let source = BitmapData::new(context.gc(), 8, 1, true, 0);
+            let target = BitmapData::new(context.gc(), 1, 1, true, 0);
+            let handle = source
+                .bitmap_handle(context.gc(), context.renderer)
+                .unwrap();
+            let full = PixelRegion::for_whole_size(8, 1);
+            source.mark_gpu_dirty(
+                context.gc(),
+                gpu_fill(&handle, full, [10, 20, 30, 255]),
+                full,
+            );
+            copy_pixels_with_alpha_source(
+                context,
+                target,
+                source,
+                (0, 0, 1, 1),
+                (0, 0),
+                source,
+                (7, 0),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                get_pixel32(target, context.renderer, 0, 0).unwrap(),
+                0xff0a141e
+            );
+            assert!(!source.can_read(PixelRegion::for_pixel(3, 0)));
+        });
+}

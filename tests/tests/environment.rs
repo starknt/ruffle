@@ -149,16 +149,19 @@ mod renderer {
     */
 
     fn create_wgpu_device() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
-        let instance =
-            create_wgpu_instance(wgpu::Backends::all(), wgpu::BackendOptions::default(), None);
+        let backends = wgpu::Backends::from_env().unwrap_or_else(wgpu::Backends::all);
+        let instance = create_wgpu_instance(backends, wgpu::BackendOptions::default(), None);
         futures::executor::block_on(request_adapter_and_device(
-            wgpu::Backends::all(),
+            backends,
             &instance,
             None,
             Default::default(),
         ))
         .ok()
-        .map(|(adapter, device, queue)| (instance, adapter, device, queue))
+        .map(|(adapter, device, queue)| {
+            eprintln!("native regression adapter: {:?}", adapter.get_info());
+            (instance, adapter, device, queue)
+        })
     }
 
     pub(super) fn build_wgpu_descriptors() -> Option<Arc<Descriptors>> {

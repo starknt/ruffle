@@ -641,14 +641,19 @@ mod wrapper {
             renderer: &mut dyn RenderBackend,
         ) -> Result<(), RenderFailure> {
             renderer.health().check()?;
+            {
+                let read = self.0.borrow();
+                read.validity.check()?;
+                // Aliased input operands may already hold a shared pixel view.
+                // A clean region needs no exclusive access to those pixels.
+                if !read.validity.gpu.intersects(area) {
+                    return Ok(());
+                }
+            }
             // SAFETY: Only owned pixel/validity data changes; no GC references are written.
             let mut write = unsafe { Write::assume(Gc::as_ref(self.0)) }
                 .unlock()
                 .borrow_mut();
-            write.validity.check()?;
-            if !write.validity.gpu.intersects(area) {
-                return Ok(());
-            }
             let empty = Coverage::empty(write.width, write.height);
             let mut gpu = std::mem::replace(&mut write.validity.gpu, empty);
             let mut fallback_done = false;

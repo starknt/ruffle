@@ -229,6 +229,7 @@ pub struct AsyncReadback {
     descriptors: Arc<Descriptors>,
     receiver: Receiver<Result<(), wgpu::BufferAsyncError>>,
     started: std::time::Instant,
+    mapping: bool,
 }
 
 impl AsyncReadback {
@@ -252,12 +253,16 @@ impl AsyncReadback {
             descriptors,
             receiver,
             started: std::time::Instant::now(),
+            mapping: true,
         }
     }
 
     pub fn poll(&mut self) -> Result<Option<(Vec<u8>, u32)>, crate::gpu_runtime::RenderFailure> {
         use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
         self.descriptors.runtime.check_health()?;
+        if !self.mapping {
+            return Ok(None);
+        }
         self.descriptors
             .device
             .poll(wgpu::PollType::Poll)
@@ -278,12 +283,16 @@ impl AsyncReadback {
                 let bytes = map.to_vec();
                 drop(map);
                 self.buffer.unmap();
+                self.mapping = false;
                 Ok(Some((bytes, self.dimensions.padded_bytes_per_row)))
             }
-            Ok(Err(error)) => Err(self.descriptors.runtime.health().record(RenderFailure::new(
-                RenderFailureKind::MapFailed,
-                error.to_string(),
-            ))),
+            Ok(Err(error)) => {
+                self.mapping = false;
+                Err(self.descriptors.runtime.health().record(RenderFailure::new(
+                    RenderFailureKind::MapFailed,
+                    error.to_string(),
+                )))
+            }
             Err(TryRecvError::Empty)
                 if self.started.elapsed() < std::time::Duration::from_secs(2) =>
             {
@@ -296,6 +305,7 @@ impl AsyncReadback {
                 )))
             }
             Err(TryRecvError::Disconnected) => {
+                self.mapping = false;
                 Err(self.descriptors.runtime.health().record(RenderFailure::new(
                     RenderFailureKind::MapFailed,
                     "buffer map callback disconnected",
@@ -307,7 +317,16 @@ impl AsyncReadback {
 
 impl Drop for AsyncReadback {
     fn drop(&mut self) {
-        self.buffer.unmap();
+        // Completed reads already unmapped the buffer. An unobserved failed map
+        // is also unmapped; only cancel a pending map or release a successful one.
+        if self.mapping
+            && !matches!(
+                self.receiver.try_recv(),
+                Ok(Err(_)) | Err(TryRecvError::Disconnected)
+            )
+        {
+            self.buffer.unmap();
+        }
     }
 }
 
