@@ -276,6 +276,18 @@ impl RenderTargetFrame for TextureTargetFrame {
 }
 
 impl TextureTarget {
+    /// Use an already tracked texture as a render-only target, preserving its
+    /// resource identity and owner without allocating replacement storage.
+    pub fn from_texture(texture: crate::gpu_resources::Texture) -> Self {
+        Self {
+            cached_view: None,
+            size: texture.size(),
+            format: texture.format(),
+            texture,
+            buffer: None,
+        }
+    }
+
     pub fn new(device: &crate::gpu_resources::Device, size: (u32, u32)) -> Result<Self, Error> {
         Self::with_readback(device, size, true)
     }
