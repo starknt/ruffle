@@ -3,6 +3,29 @@ use crate::player::PlayerBuilder;
 use ruffle_render::profile::{RenderMetrics, enter};
 
 #[test]
+fn static_swf_containers_are_admitted_to_snapshot_lookup() {
+    let movie = crate::tag_utils::SwfMovieData::from_data(
+        include_bytes!("../../../tests/tests/swfs/native_perf/static_tree/test.swf"),
+        "file:///static-tree.swf".into(),
+        None,
+        None,
+    )
+    .unwrap();
+    let player = PlayerBuilder::new()
+        .with_movie(movie)
+        .with_viewport_dimensions(1280, 720, 1.0)
+        .with_autoplay(true)
+        .build();
+    let mut player = player.lock().unwrap();
+    assert!(player.preload(&mut crate::limits::ExecutionLimit::none()));
+    player.run_frame();
+    let metrics = RenderMetrics::default();
+    let _scope = enter(Some(&metrics));
+    player.render();
+    assert!(metrics.snapshot().work.snapshot_misses > 0);
+}
+
+#[test]
 fn retained_stage_subtree_reuses_and_immediately_invalidates_after_render() {
     let player = PlayerBuilder::new()
         .with_viewport_dimensions(64, 64, 1.0)

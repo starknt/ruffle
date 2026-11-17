@@ -165,6 +165,18 @@ mod tests {
         }
     }
     #[test]
+    fn cloned_display_object_state_does_not_share_cache_or_generation() {
+        let state = State::default();
+        let node = state.node();
+        *node.entry.borrow_mut() = Some(entry());
+        let copy = state.clone();
+        copy.invalidate();
+        assert!(node.entry.borrow().is_some());
+        assert!(copy.node.borrow().is_none());
+        assert_eq!(state.generation.get(), 0);
+    }
+
+    #[test]
     fn eviction_keeps_charging_blocks_pinned_by_current_frame() {
         let cost = entry().commands.retained_bytes().unwrap() + 512;
         let mut cache = Cache::new(cost);

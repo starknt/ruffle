@@ -1172,7 +1172,16 @@ pub fn render_base<'gc>(
         && base.scaling_grid.get() == Rectangle::default()
         && (base.perspective_projection.get().is_none()
             || (matches!(this, DisplayObject::Stage(_))
-                && base.perspective_projection.get() == Some(Default::default())))
+                && base.perspective_projection.get() == Some(Default::default()))
+            || (this.is_root()
+                && base.perspective_projection.get()
+                    == Some(PerspectiveProjection {
+                        field_of_view: 55.0,
+                        center: (
+                            this.movie().width().to_pixels() / 2.0,
+                            this.movie().height().to_pixels() / 2.0,
+                        ),
+                    })))
         && base.tz.get() == 0.0
         && !base.has_matrix3d_stub();
     let allowed = context.snapshot_allowed;
