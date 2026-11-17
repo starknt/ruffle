@@ -1,4 +1,5 @@
 pub mod atlas;
+pub mod coverage;
 
 use h263_rs_yuv::bt601::yuv420_to_rgba;
 use ruffle_wstr::{FromWStr, WStr};
@@ -56,12 +57,6 @@ pub trait BitmapSource {
 pub type RgbaBufRead<'a> = Box<dyn FnOnce(&[u8], u32) + 'a>;
 
 pub trait SyncHandle: Any + Debug {}
-
-impl Clone for Box<dyn SyncHandle> {
-    fn clone(&self) -> Box<dyn SyncHandle> {
-        panic!("SyncHandle should have been consumed before clone() is called!")
-    }
-}
 
 /// How bitmaps should snap to the pixel grid when rendering
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]

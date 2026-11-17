@@ -166,6 +166,24 @@ pub trait RenderBackend: Any {
         Ok(pending.take_ready())
     }
 
+    /// Whether arbitrary current bitmap regions can be read without an earlier
+    /// sync token. Chained copies require this capability to cover older writes.
+    fn supports_bitmap_region_readback(&self) -> bool {
+        false
+    }
+
+    /// Read the current GPU pixels in exactly this region, without consuming a
+    /// previously issued sync token. Unsupported backends return Ok(None) and
+    /// do not call the callback; failures must propagate as errors.
+    fn read_bitmap_region(
+        &mut self,
+        _handle: &BitmapHandle,
+        _region: PixelRegion,
+        _with_rgba: RgbaBufRead,
+    ) -> Result<Option<()>, Error> {
+        Ok(None)
+    }
+
     fn resolve_sync_handle(
         &mut self,
         handle: Box<dyn SyncHandle>,

@@ -25,11 +25,18 @@ pub struct TestRenderer {
     retained: Option<BitmapHandle>,
     registrations: usize,
     fail_upload: bool,
+    regional: bool,
+    reads: Vec<PixelRegion>,
+    uploads: Vec<PixelRegion>,
+    sync_reads: usize,
+    copies: usize,
+    fail_read: bool,
 }
 
 #[derive(Clone, Debug)]
 struct TestBitmapHandle {
-    pixels: Vec<u8>,
+    pixels: std::cell::RefCell<Vec<u8>>,
+    width: u32,
 }
 impl BitmapHandleImpl for TestBitmapHandle {}
 
@@ -93,7 +100,8 @@ impl RenderBackend for TestRenderer {
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, Error> {
         self.registrations += 1;
         Ok(BitmapHandle(Arc::new(TestBitmapHandle {
-            pixels: bitmap.to_rgba().data().to_vec(),
+            width: bitmap.width(),
+            pixels: std::cell::RefCell::new(bitmap.to_rgba().data().to_vec()),
         })))
     }
     fn cache_immutable_bitmap(&mut self, bitmap: &BitmapHandle) -> bool {
@@ -105,9 +113,9 @@ impl RenderBackend for TestRenderer {
 
     fn update_texture(
         &mut self,
-        _handle: &BitmapHandle,
-        _bitmap: Bitmap<'_>,
-        _region: PixelRegion,
+        handle: &BitmapHandle,
+        bitmap: Bitmap<'_>,
+        region: PixelRegion,
     ) -> Result<(), Error> {
         if self.fail_upload {
             return Err(ruffle_render::error::RenderFailure::new(
@@ -116,7 +124,39 @@ impl RenderBackend for TestRenderer {
             )
             .into());
         }
+        self.uploads.push(region);
+        let target = test_handle(handle);
+        let mut pixels = target.pixels.borrow_mut();
+        for y in region.y_min..region.y_max {
+            let start = ((y * target.width + region.x_min) * 4) as usize;
+            let end = start + region.width() as usize * 4;
+            pixels[start..end].copy_from_slice(&bitmap.data()[start..end]);
+        }
         Ok(())
+    }
+
+    fn copy_bitmap_region(
+        &mut self,
+        source: BitmapHandle,
+        source_region: PixelRegion,
+        destination: BitmapHandle,
+        destination_region: PixelRegion,
+    ) -> Result<Option<Box<dyn SyncHandle>>, Error> {
+        self.copies += 1;
+        let source = snapshot(&source, source_region);
+        let dest = test_handle(&destination);
+        {
+            let mut pixels = dest.pixels.borrow_mut();
+            for y in 0..destination_region.height() {
+                let start = (((destination_region.y_min + y) * dest.width
+                    + destination_region.x_min)
+                    * 4) as usize;
+                let row = (y * source.stride) as usize;
+                pixels[start..start + source.stride as usize]
+                    .copy_from_slice(&source.pixels[row..row + source.stride as usize]);
+            }
+        }
+        Ok(Some(Box::new(snapshot(&destination, destination_region))))
     }
 
     fn create_context3d(
@@ -155,10 +195,48 @@ impl RenderBackend for TestRenderer {
 
     fn resolve_sync_handle(
         &mut self,
-        _handle: Box<dyn SyncHandle>,
-        _with_rgba: RgbaBufRead,
+        handle: Box<dyn SyncHandle>,
+        with_rgba: RgbaBufRead,
     ) -> Result<(), Error> {
-        Err(Error::Unimplemented("Sync handle resolution".into()))
+        self.sync_reads += 1;
+        if self.fail_read {
+            return Err(ruffle_render::error::RenderFailure::new(
+                ruffle_render::error::RenderFailureKind::MapFailed,
+                "injected map failure",
+            )
+            .into());
+        }
+        let snapshot = (handle.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<SnapshotSync>()
+            .unwrap();
+        with_rgba(&snapshot.pixels, snapshot.stride);
+        Ok(())
+    }
+
+    fn supports_bitmap_region_readback(&self) -> bool {
+        self.regional
+    }
+
+    fn read_bitmap_region(
+        &mut self,
+        handle: &BitmapHandle,
+        region: PixelRegion,
+        with_rgba: RgbaBufRead,
+    ) -> Result<Option<()>, Error> {
+        if !self.regional {
+            return Ok(None);
+        }
+        self.reads.push(region);
+        if self.fail_read {
+            return Err(ruffle_render::error::RenderFailure::new(
+                ruffle_render::error::RenderFailureKind::MapFailed,
+                "injected map failure",
+            )
+            .into());
+        }
+        let snapshot = snapshot(handle, region);
+        with_rgba(&snapshot.pixels, snapshot.stride);
+        Ok(Some(()))
     }
 
     fn compile_pixelbender_shader(
@@ -176,7 +254,8 @@ impl RenderBackend for TestRenderer {
         _height: NonZeroU32,
     ) -> Result<BitmapHandle, Error> {
         Ok(BitmapHandle(Arc::new(TestBitmapHandle {
-            pixels: Vec::new(),
+            pixels: Default::default(),
+            width: _width.get(),
         })))
     }
 }
@@ -211,14 +290,54 @@ fn renderer(managed: bool) -> TestRenderer {
         retained: None,
         registrations: 0,
         fail_upload: false,
+        regional: false,
+        reads: vec![],
+        uploads: vec![],
+        sync_reads: 0,
+        copies: 0,
+        fail_read: false,
     }
 }
-fn rgba(handle: &BitmapHandle) -> &[u8] {
+fn test_handle(handle: &BitmapHandle) -> &TestBitmapHandle {
     (handle.0.as_ref() as &dyn std::any::Any)
         .downcast_ref::<TestBitmapHandle>()
         .unwrap()
-        .pixels
-        .as_slice()
+}
+fn rgba(handle: &BitmapHandle) -> Vec<u8> {
+    test_handle(handle).pixels.borrow().clone()
+}
+
+#[derive(Debug)]
+struct SnapshotSync {
+    pixels: Vec<u8>,
+    stride: u32,
+}
+impl SyncHandle for SnapshotSync {}
+fn snapshot(handle: &BitmapHandle, region: PixelRegion) -> SnapshotSync {
+    let handle = test_handle(handle);
+    let pixels = handle.pixels.borrow();
+    let mut data = Vec::new();
+    for y in region.y_min..region.y_max {
+        let start = ((y * handle.width + region.x_min) * 4) as usize;
+        data.extend_from_slice(&pixels[start..start + region.width() as usize * 4]);
+    }
+    SnapshotSync {
+        pixels: data,
+        stride: region.width() * 4,
+    }
+}
+fn gpu_fill(handle: &BitmapHandle, region: PixelRegion, color: [u8; 4]) -> Box<dyn SyncHandle> {
+    let target = test_handle(handle);
+    {
+        let mut pixels = target.pixels.borrow_mut();
+        for y in region.y_min..region.y_max {
+            for x in region.x_min..region.x_max {
+                let offset = ((y * target.width + x) * 4) as usize;
+                pixels[offset..offset + 4].copy_from_slice(&color);
+            }
+        }
+    }
+    Box::new(snapshot(handle, region))
 }
 
 #[test]
@@ -286,5 +405,189 @@ fn failed_bitmap_upload_preserves_dirty_cpu_pixels() {
         assert!(matches!(raw.dirty_state(), DirtyState::CpuModified(_)));
         assert_eq!(raw.pixels_rgba(), [0x12, 0x34, 0x56, 0xff]);
         assert!(renderer.health().check().is_err());
+    });
+}
+
+#[test]
+fn bitmap_validity_reads_only_requested_gpu_pixels_and_preserves_cpu_holes() {
+    use crate::bitmap::{
+        bitmap_data::BitmapData,
+        operations::{get_pixel32, set_pixel32},
+    };
+    gc_arena::arena::rootless_mutate(|mc| {
+        let bitmap = BitmapData::new(mc, 8, 2, true, 0xff000000);
+        let mut renderer = renderer(false);
+        renderer.regional = true;
+        let handle = bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+        let full = PixelRegion::for_whole_size(8, 2);
+        bitmap.mark_gpu_dirty(mc, gpu_fill(&handle, full, [10, 20, 30, 255]), full);
+        assert_eq!(
+            (bitmap.width(), bitmap.height(), bitmap.transparency()),
+            (8, 2, true)
+        );
+        assert!(renderer.reads.is_empty());
+        assert_eq!(
+            get_pixel32(bitmap, &mut renderer, 2, 1).unwrap(),
+            0xff0a141e
+        );
+        assert_eq!(renderer.reads, [PixelRegion::for_pixel(2, 1)]);
+        assert!(!bitmap.can_read(PixelRegion::for_pixel(3, 1)));
+        set_pixel32(mc, &mut renderer, bitmap, 1, 0, 0xffabcdef).unwrap();
+        set_pixel32(mc, &mut renderer, bitmap, 6, 0, 0xff123456).unwrap();
+        assert_eq!(
+            renderer.reads.len(),
+            1,
+            "overwrites must not read GPU pixels"
+        );
+        bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+        assert_eq!(
+            renderer.uploads,
+            [PixelRegion::for_pixel(1, 0), PixelRegion::for_pixel(6, 0)]
+        );
+        let second = PixelRegion::for_region(4, 1, 2, 1);
+        bitmap.mark_gpu_dirty(mc, gpu_fill(&handle, second, [70, 80, 90, 255]), second);
+        let read = bitmap.sync(&mut renderer).unwrap();
+        let read = read.borrow();
+        assert_eq!(u32::from(read.get_pixel32_raw(0, 0)), 0xff0a141e);
+        assert_eq!(u32::from(read.get_pixel32_raw(1, 0)), 0xffabcdef);
+        assert_eq!(u32::from(read.get_pixel32_raw(6, 0)), 0xff123456);
+        assert_eq!(u32::from(read.get_pixel32_raw(4, 1)), 0xff46505a);
+        assert_eq!(renderer.sync_reads, 0);
+    });
+}
+
+#[test]
+fn bitmap_validity_fallback_sync_preserves_cpu_overwrites_and_buffer_origin() {
+    use crate::bitmap::{
+        bitmap_data::BitmapData,
+        operations::{get_pixel32, set_pixel32},
+    };
+    gc_arena::arena::rootless_mutate(|mc| {
+        let bitmap = BitmapData::new(mc, 8, 2, true, 0xff000000);
+        let mut renderer = renderer(false);
+        let handle = bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+        let area = PixelRegion::for_region(2, 1, 5, 1);
+        bitmap.mark_gpu_dirty(mc, gpu_fill(&handle, area, [40, 50, 60, 255]), area);
+        set_pixel32(mc, &mut renderer, bitmap, 3, 1, 0xff112233).unwrap();
+        assert_eq!(renderer.sync_reads, 0);
+        assert_eq!(
+            get_pixel32(bitmap, &mut renderer, 6, 1).unwrap(),
+            0xff28323c
+        );
+        assert_eq!(
+            get_pixel32(bitmap, &mut renderer, 3, 1).unwrap(),
+            0xff112233
+        );
+        assert_eq!(
+            get_pixel32(bitmap, &mut renderer, 0, 0).unwrap(),
+            0xff000000
+        );
+        assert_eq!(renderer.sync_reads, 1);
+    });
+}
+
+#[test]
+fn bitmap_validity_failed_partial_read_stays_terminal() {
+    use crate::bitmap::{bitmap_data::BitmapData, operations::get_pixel32};
+    gc_arena::arena::rootless_mutate(|mc| {
+        let bitmap = BitmapData::new(mc, 4, 1, true, 0xff000000);
+        let mut renderer = renderer(false);
+        renderer.regional = true;
+        let handle = bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+        let full = PixelRegion::for_whole_size(4, 1);
+        bitmap.mark_gpu_dirty(mc, gpu_fill(&handle, full, [1, 2, 3, 255]), full);
+        assert_eq!(
+            get_pixel32(bitmap, &mut renderer, 0, 0).unwrap(),
+            0xff010203
+        );
+        renderer.fail_read = true;
+        assert!(get_pixel32(bitmap, &mut renderer, 3, 0).is_err());
+        assert!(get_pixel32(bitmap, &mut renderer, 0, 0).is_err());
+        assert!(!bitmap.can_read(full));
+    });
+}
+
+#[test]
+fn bitmap_validity_full_overwrite_discards_pending_readback() {
+    use crate::bitmap::{
+        bitmap_data::BitmapData,
+        operations::{fill_rect, get_pixel32},
+    };
+    gc_arena::arena::rootless_mutate(|mc| {
+        let bitmap = BitmapData::new(mc, 4, 1, true, 0xff000000);
+        let mut renderer = renderer(false);
+        renderer.regional = true;
+        let handle = bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+        let full = PixelRegion::for_whole_size(4, 1);
+        bitmap.mark_gpu_dirty(mc, gpu_fill(&handle, full, [1, 2, 3, 255]), full);
+        renderer.fail_read = true;
+        fill_rect(mc, &mut renderer, bitmap, 0, 0, 4, 1, 0xff345678).unwrap();
+        assert_eq!(
+            get_pixel32(bitmap, &mut renderer, 3, 0).unwrap(),
+            0xff345678
+        );
+        assert!(renderer.reads.is_empty());
+        assert_eq!(renderer.sync_reads, 0);
+    });
+}
+
+#[test]
+fn bitmap_validity_gpu_copies_chain_and_self_overlap_in_as_order() {
+    use crate::bitmap::{
+        bitmap_data::BitmapData,
+        operations::{copy_pixels_inner, get_pixel32, set_pixel32},
+    };
+    gc_arena::arena::rootless_mutate(|mc| {
+        let source = BitmapData::new(mc, 6, 1, true, 0xff102030);
+        let dest = BitmapData::new(mc, 6, 1, true, 0xff000000);
+        let mut renderer = renderer(false);
+        renderer.regional = true;
+        copy_pixels_inner(mc, &mut renderer, dest, source, (0, 0, 2, 1), (0, 0), false).unwrap();
+        set_pixel32(mc, &mut renderer, source, 0, 0, 0xffaabbcc).unwrap();
+        copy_pixels_inner(mc, &mut renderer, dest, source, (0, 0, 2, 1), (4, 0), false).unwrap();
+        copy_pixels_inner(mc, &mut renderer, dest, dest, (0, 0, 5, 1), (1, 0), false).unwrap();
+        assert_eq!(renderer.copies, 3);
+        assert!(renderer.reads.is_empty());
+        let expected = [
+            0xff102030, 0xff102030, 0xff102030, 0xff000000, 0xff000000, 0xffaabbcc,
+        ];
+        for (x, color) in expected.into_iter().enumerate() {
+            assert_eq!(
+                get_pixel32(dest, &mut renderer, x as u32, 0).unwrap(),
+                color
+            );
+        }
+    });
+}
+
+#[test]
+fn bitmap_validity_self_overlap_preserves_flash_down_left_row_smear() {
+    use crate::bitmap::{
+        bitmap_data::{BitmapData, Color},
+        operations::{copy_pixels_inner, get_pixel32},
+    };
+    gc_arena::arena::rootless_mutate(|mc| {
+        let pixels = (1..=9).map(|n| Color::from(0xff000000 | n)).collect();
+        let bitmap = BitmapData::new_with_pixels(mc, 3, 3, true, pixels);
+        let mut renderer = renderer(false);
+        renderer.regional = true;
+        copy_pixels_inner(
+            mc,
+            &mut renderer,
+            bitmap,
+            bitmap,
+            (1, 0, 2, 2),
+            (0, 1),
+            false,
+        )
+        .unwrap();
+        let expected = [1, 2, 3, 2, 3, 6, 3, 6, 9];
+        for (i, blue) in expected.into_iter().enumerate() {
+            assert_eq!(
+                get_pixel32(bitmap, &mut renderer, i as u32 % 3, i as u32 / 3).unwrap(),
+                0xff000000 | blue
+            );
+        }
+        assert_eq!(renderer.copies, 0);
     });
 }

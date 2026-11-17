@@ -49,13 +49,7 @@ pub fn fill_rect<'gc>(
 
     let is_full = rect.width() == target.width() && rect.height() == target.height();
 
-    let target = if is_full {
-        // If we're filling the whole region, we can discard the gpu data
-        target.overwrite_cpu_pixels_from_gpu(mc).0
-    } else {
-        // If we're filling a partial region, finish any gpu->cpu sync
-        target.sync(renderer)?
-    };
+    let target = target.write_area(rect, false, renderer)?;
     let mut write = target.borrow_mut(mc);
     let color = Color::from(color).to_premultiplied_alpha(write.transparency());
 
@@ -82,7 +76,7 @@ pub fn set_pixel32<'gc>(
     if x >= target.width() || y >= target.height() {
         return Ok(());
     }
-    let target = target.sync(renderer)?;
+    let target = target.write_area(PixelRegion::for_pixel(x, y), false, renderer)?;
     let mut write = target.borrow_mut(mc);
     let transparency = write.transparency();
     write.set_pixel32_raw(
@@ -123,7 +117,11 @@ pub fn set_pixel<'gc>(
     if x >= target.width() || y >= target.height() {
         return Ok(());
     }
-    let target = target.sync(renderer)?;
+    let target = target.write_area(
+        PixelRegion::for_pixel(x, y),
+        target.transparency(),
+        renderer,
+    )?;
     let mut write = target.borrow_mut(mc);
 
     if write.transparency() {
@@ -1091,6 +1089,27 @@ pub fn copy_pixels<'gc>(
     dest_point: (i32, i32),
     merge_alpha: bool,
 ) -> Result<(), RenderFailure> {
+    copy_pixels_inner(
+        context.gc(),
+        context.renderer,
+        target,
+        source_bitmap,
+        src_rect,
+        dest_point,
+        merge_alpha,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn copy_pixels_inner<'gc>(
+    mc: &Mutation<'gc>,
+    renderer: &mut dyn RenderBackend,
+    target: BitmapData<'gc>,
+    source_bitmap: BitmapData<'gc>,
+    src_rect: (i32, i32, i32, i32),
+    dest_point: (i32, i32),
+    merge_alpha: bool,
+) -> Result<(), RenderFailure> {
     let (src_min_x, src_min_y, src_width, src_height) = src_rect;
     let (dest_min_x, dest_min_y) = dest_point;
     let transparency = target.transparency();
@@ -1117,22 +1136,22 @@ pub fn copy_pixels<'gc>(
         transparency,
         merge_alpha,
         false,
-        target_has_pending_gpu_write,
-    ) && !source_bitmap.ptr_eq(target);
+        target_has_pending_gpu_write && !renderer.supports_bitmap_region_readback(),
+    ) && (!source_bitmap.ptr_eq(target)
+        || (renderer.supports_bitmap_region_readback()
+            && !(source_region.intersects(dest_region)
+                && dest_region.x_min < source_region.x_min
+                && dest_region.y_min > source_region.y_min)));
+    // Flash's down-left overlapping self-copy reads rows already overwritten
+    // by preceding rows. Preserve that CPU behavior instead of memmove here.
     if gpu_copy_candidate {
-        let source_handle = source_bitmap.bitmap_handle(context.gc(), context.renderer)?;
-        let target_handle = target.bitmap_handle(context.gc(), context.renderer)?;
-        if let Some(sync_handle) = context
-            .renderer
+        let source_handle = source_bitmap.bitmap_handle(mc, renderer)?;
+        let target_handle = target.bitmap_handle(mc, renderer)?;
+        if let Some(sync_handle) = renderer
             .copy_bitmap_region(source_handle, source_region, target_handle, dest_region)
-            .map_err(|error| {
-                context
-                    .renderer
-                    .health()
-                    .record(error.into_render_failure())
-            })?
+            .map_err(|error| renderer.health().record(error.into_render_failure()))?
         {
-            target.mark_gpu_dirty(context.gc(), sync_handle, dest_region);
+            target.mark_gpu_dirty(mc, sync_handle, dest_region);
             ruffle_render::profile::bitmap_gpu_copy(true);
             return Ok(());
         }
@@ -1141,8 +1160,8 @@ pub fn copy_pixels<'gc>(
     ruffle_render::profile::bitmap_gpu_copy(false);
 
     copy_on_cpu(
-        context.gc(),
-        context.renderer,
+        mc,
+        renderer,
         source_bitmap,
         target,
         source_region,
@@ -1368,9 +1387,9 @@ pub fn apply_filter<'gc>(
     }
 
     let source_handle = source.bitmap_handle(context.gc(), context.renderer)?;
+    let dest = target.bitmap_handle(context.gc(), context.renderer)?;
     let (target, _) = target.overwrite_cpu_pixels_from_gpu(context.gc());
     let mut write = target.borrow_mut(context.gc());
-    let dest = write.bitmap_handle(context.renderer)?;
 
     let sync_handle = context
         .renderer

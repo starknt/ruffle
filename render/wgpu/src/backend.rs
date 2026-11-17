@@ -949,8 +949,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         destination_region: PixelRegion,
     ) -> Result<Option<Box<dyn SyncHandle>>, BitmapError> {
         self.descriptors.runtime.check_health()?;
-        if source == destination
-            || source_region.is_empty()
+        if source_region.is_empty()
             || source_region.width() != destination_region.width()
             || source_region.height() != destination_region.height()
         {
@@ -967,6 +966,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             return Ok(None);
         }
 
+        if source_texture.texture.format() != wgpu::TextureFormat::Rgba8Unorm
+            || destination_texture.texture.format() != wgpu::TextureFormat::Rgba8Unorm
+        {
+            return Ok(None);
+        }
+
         let target = TextureTarget {
             size: wgpu::Extent3d {
                 width: destination_texture.texture.width(),
@@ -978,36 +983,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             buffer: None,
         };
 
-        self.active_frame
-            .command_encoder
-            .record()
-            .copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &source_texture.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: source_region.x_min,
-                        y: source_region.y_min,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &destination_texture.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: destination_region.x_min,
-                        y: destination_region.y_min,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: source_region.width(),
-                    height: source_region.height(),
-                    depth_or_array_layers: 1,
-                },
-            );
+        crate::transfers::copy(
+            &self.descriptors,
+            &mut self.offscreen_texture_pool,
+            self.active_frame.command_encoder.record(),
+            &source,
+            source_region,
+            &destination,
+            destination_region,
+        )?;
 
         crate::record_bitmap_write(&destination)?;
         self.active_frame.maybe_flush(&self.descriptors)?;
@@ -1524,6 +1508,40 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             clamped_nearest: Default::default(),
             copy_count: Default::default(),
         })))
+    }
+
+    fn supports_bitmap_region_readback(&self) -> bool {
+        true
+    }
+
+    fn read_bitmap_region(
+        &mut self,
+        handle: &BitmapHandle,
+        region: PixelRegion,
+        with_rgba: RgbaBufRead,
+    ) -> Result<Option<()>, BitmapError> {
+        self.descriptors.runtime.check_health()?;
+        let texture = as_texture(handle, &self.descriptors.device)?;
+        if region.is_empty()
+            || region.x_max > texture.texture.width()
+            || region.y_max > texture.texture.height()
+        {
+            return Err(crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::Validation,
+                "invalid bitmap readback region",
+            )
+            .into());
+        }
+        QueueSyncHandle::NotCopied {
+            handle: handle.clone(),
+            copy_area: region,
+            descriptors: self.descriptors.clone(),
+            pool: self.offscreen_buffer_pool.clone(),
+        }
+        .capture(with_rgba, &mut self.active_frame)
+        .map_err(|error| self.descriptors.runtime.health().record(error))?;
+        self.descriptors.runtime.check_health()?;
+        Ok(Some(()))
     }
 
     fn resolve_sync_handle(

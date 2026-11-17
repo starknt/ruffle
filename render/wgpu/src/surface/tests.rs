@@ -1398,3 +1398,112 @@ fn adjacent_geometry_merges_only_contiguous_indices_with_identical_instances() {
         draw_offsets: offsets
     }));
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn chained_gpu_copies_preserve_self_overlap_in_both_directions() {
+    use ruffle_render::{
+        bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping},
+        transform::Transform,
+    };
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (8, 4)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    renderer.set_quality(StageQuality::Low).unwrap();
+    let mut expected = Vec::new();
+    for y in 0..4u8 {
+        for x in 0..8u8 {
+            expected.extend([x * 21, y * 61, (x + y) * 17, 255]);
+        }
+    }
+    let source = renderer
+        .register_bitmap(Bitmap::new(8, 4, BitmapFormat::Rgba, expected.clone()))
+        .unwrap();
+    let destination = renderer
+        .register_bitmap(Bitmap::new(8, 4, BitmapFormat::Rgba, vec![0; 128]))
+        .unwrap();
+    renderer
+        .copy_bitmap_region(
+            source,
+            PixelRegion::for_whole_size(8, 4),
+            destination.clone(),
+            PixelRegion::for_whole_size(8, 4),
+        )
+        .unwrap()
+        .unwrap();
+    for (src, dst) in [
+        (
+            PixelRegion::for_region(0, 0, 6, 3),
+            PixelRegion::for_region(2, 1, 6, 3),
+        ),
+        (
+            PixelRegion::for_region(2, 0, 6, 4),
+            PixelRegion::for_region(0, 0, 6, 4),
+        ),
+    ] {
+        let before = expected.clone();
+        for y in 0..src.height() {
+            for x in 0..src.width() {
+                let from = ((src.y_min + y) * 8 + src.x_min + x) as usize * 4;
+                let to = ((dst.y_min + y) * 8 + dst.x_min + x) as usize * 4;
+                expected[to..to + 4].copy_from_slice(&before[from..from + 4]);
+            }
+        }
+        assert!(
+            renderer
+                .copy_bitmap_region(destination.clone(), src, destination.clone(), dst)
+                .unwrap()
+                .is_some(),
+            "self-copy must use a budgeted GPU temporary"
+        );
+    }
+    let mut commands = CommandList::new();
+    commands.render_bitmap(
+        destination,
+        Transform::default(),
+        false,
+        PixelSnapping::Never,
+        PixelRegion::for_whole_size(8, 4),
+    );
+    renderer
+        .submit_frame(Color::TRANSPARENT, commands, vec![])
+        .unwrap();
+    assert_eq!(
+        renderer.capture_frame().unwrap().unwrap().into_raw(),
+        expected
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn bitmap_region_readback_does_not_capture_unrequested_rows() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (64, 64)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let pixels: Vec<u8> = (0..64u8)
+        .flat_map(|y| (0..64u8).flat_map(move |x| [x, y, x + y, 255]))
+        .collect();
+    let bitmap = renderer
+        .register_bitmap(Bitmap::new(64, 64, BitmapFormat::Rgba, pixels))
+        .unwrap();
+    let mut observed = None;
+    let result = renderer
+        .read_bitmap_region(
+            &bitmap,
+            PixelRegion::for_pixel(31, 47),
+            Box::new(|bytes, stride| {
+                observed = Some((bytes.to_vec(), stride));
+            }),
+        )
+        .unwrap();
+    assert_eq!(result, Some(()));
+    let (bytes, stride) = observed.unwrap();
+    assert_eq!(&bytes[..4], &[31, 47, 78, 255]);
+    assert_eq!(stride, 256);
+    assert_eq!(
+        bytes.len(),
+        256,
+        "readback may pad its row but must not copy unrelated rows"
+    );
+}

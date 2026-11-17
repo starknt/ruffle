@@ -65,7 +65,7 @@ pub enum PassKind {
     Mask(MaskCommand),
     Blend(SnapshotBlend),
     AlphaMask,
-    Copy,
+    Copy { source_bounds: RenderRect },
     Readback,
     Filter(usize),
     Opaque(SnapshotNode),
@@ -104,7 +104,7 @@ struct AccessState {
     writer: Option<usize>,
     readers: Vec<usize>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PassGraph {
     pub passes: Vec<Pass>,
     states: HashMap<GraphResource, AccessState>,
@@ -118,6 +118,14 @@ fn invalid(message: &str) -> RenderFailure {
     RenderFailure::new(RenderFailureKind::Validation, message)
 }
 impl PassGraph {
+    pub fn import(&mut self, resource: ResourceVersion) -> GraphResource {
+        let key = GraphResource::External(resource.key);
+        self.states.entry(key).or_insert_with(|| AccessState {
+            version: resource.version,
+            ..Default::default()
+        });
+        key
+    }
     pub fn compile(
         snapshot: &RenderSnapshot,
         bounds: RenderRect,
@@ -516,12 +524,28 @@ impl PassGraph {
         destination: GraphResource,
         bounds: RenderRect,
     ) -> Result<usize, RenderFailure> {
+        self.copy_region(source, destination, bounds, bounds)
+    }
+    pub fn copy_region(
+        &mut self,
+        source: GraphResource,
+        destination: GraphResource,
+        source_bounds: RenderRect,
+        destination_bounds: RenderRect,
+    ) -> Result<usize, RenderFailure> {
+        if source_bounds.width != destination_bounds.width
+            || source_bounds.height != destination_bounds.height
+            || source_bounds.width == 0
+            || source_bounds.height == 0
+        {
+            return Err(invalid("invalid graph copy extents"));
+        }
         self.add(
-            PassKind::Copy,
+            PassKind::Copy { source_bounds },
             &[source],
             &[destination],
             None,
-            bounds,
+            destination_bounds,
             true,
         )
     }

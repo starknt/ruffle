@@ -1,9 +1,8 @@
 //! Lazy native bitmap storage. Registration and CPU updates own their pixels;
 //! allocation/upload happens only at an explicit GPU use on the player thread.
-pub(crate) mod coverage;
-use crate::gpu_runtime::{OwnerKind, RenderFailure, RenderFailureKind, ResourceOwner};
+pub(crate) use crate::gpu_runtime::{OwnerKind, RenderFailure, RenderFailureKind, ResourceOwner};
 use crate::{Texture, bitmap_residency::BitmapResidency, gpu_resources::Device};
-use coverage::Coverage;
+use ruffle_render::bitmap::coverage::Coverage;
 use ruffle_render::bitmap::{Bitmap, BitmapHandleImpl, PixelRegion};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 

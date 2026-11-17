@@ -1010,11 +1010,14 @@ impl DisplayObjectWindow {
                 match bitmap_data.dirty_state() {
                     DirtyState::Failed(error) => ui.label(error.to_string()),
                     DirtyState::Clean => ui.label("Clean"),
+                    DirtyState::Mixed { cpu, gpu } => {
+                        ui.label(format!("CPU modified {cpu:?}; GPU modified {gpu:?}"))
+                    }
                     DirtyState::CpuModified(region) => ui.label(format!(
                         "CPU Modified ({},{} to {},{})",
                         region.x_min, region.y_min, region.x_max, region.y_max
                     )),
-                    DirtyState::GpuModified(_, region) => ui.label(format!(
+                    DirtyState::GpuModified(region) => ui.label(format!(
                         "GPU Modified ({},{} to {},{})",
                         region.x_min, region.y_min, region.x_max, region.y_max
                     )),

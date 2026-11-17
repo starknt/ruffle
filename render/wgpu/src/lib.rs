@@ -37,8 +37,8 @@ mod bitmap_recipe;
 mod bitmap_residency;
 mod bitmaps;
 mod context3d;
-mod globals;
 mod frame_upload;
+mod globals;
 pub mod gpu_profiler;
 pub mod gpu_resources;
 pub mod gpu_runtime;
@@ -50,6 +50,7 @@ mod render_snapshot;
 mod resource_scheduler;
 mod shape_recipe;
 pub mod target;
+mod transfers;
 pub use ruffle_render::profile;
 mod idle_pool;
 
@@ -62,8 +63,8 @@ pub mod clap;
 pub mod descriptors;
 mod filters;
 mod layouts;
-mod mesh;
 mod material_cache;
+mod mesh;
 mod shaders;
 mod surface;
 
@@ -329,31 +330,14 @@ impl QueueSyncHandle {
                     texture.texture.format(),
                 );
                 let buffer = pool.take(&descriptors, dimensions.clone())?;
-                frame.encoder().copy_texture_to_buffer(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &texture.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: copy_area.x_min,
-                            y: copy_area.y_min,
-                            z: 0,
-                        },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &buffer,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(dimensions.padded_bytes_per_row),
-                            rows_per_image: None,
-                        },
-                    },
-                    wgpu::Extent3d {
-                        width: copy_area.width(),
-                        height: copy_area.height(),
-                        depth_or_array_layers: 1,
-                    },
-                );
+                crate::transfers::readback(
+                    &descriptors,
+                    frame.encoder(),
+                    &handle,
+                    copy_area,
+                    &buffer,
+                    &dimensions,
+                )?;
                 let index = frame.submit_direct(&descriptors)?;
                 AsyncReadback::new(buffer, dimensions, descriptors, Some(index))
             }
@@ -394,31 +378,14 @@ impl QueueSyncHandle {
                 );
 
                 let buffer = pool.take(&descriptors, buffer_dimensions.clone())?;
-                frame.encoder().copy_texture_to_buffer(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &texture.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: copy_area.x_min,
-                            y: copy_area.y_min,
-                            z: 0,
-                        },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &buffer,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(buffer_dimensions.padded_bytes_per_row),
-                            rows_per_image: None,
-                        },
-                    },
-                    wgpu::Extent3d {
-                        width: copy_area.width(),
-                        height: copy_area.height(),
-                        depth_or_array_layers: 1,
-                    },
-                );
+                crate::transfers::readback(
+                    &descriptors,
+                    frame.encoder(),
+                    &handle,
+                    copy_area,
+                    &buffer,
+                    &buffer_dimensions,
+                )?;
                 let index = frame.submit_direct(&descriptors)?;
 
                 let image = capture_image(

@@ -45,7 +45,7 @@ pub enum ResourceRecipe {
     Bitmap {
         resource: ResourceVersion,
         pixels: Arc<Bitmap<'static>>,
-        coverage: crate::bitmap_recipe::coverage::Coverage,
+        coverage: ruffle_render::bitmap::coverage::Coverage,
     },
     Shape {
         resource: ResourceVersion,
@@ -119,6 +119,9 @@ enum Handle {
     Bitmap(BitmapHandle),
     Shape(ShapeHandle),
     Shader(PixelBenderShaderHandle),
+}
+pub(crate) fn bitmap_version(handle: &BitmapHandle) -> Result<ResourceVersion, RenderFailure> {
+    Handle::Bitmap(handle.clone()).version()
 }
 impl Handle {
     fn version(&self) -> Result<ResourceVersion, RenderFailure> {
