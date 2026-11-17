@@ -252,6 +252,10 @@ pub struct TextureBufferInfo {
 
 #[derive(Debug)]
 pub struct TextureTarget {
+    pub(crate) cached_view: Option<(
+        crate::gpu_runtime::ResourceId,
+        crate::gpu_resources::TextureView,
+    )>,
     pub size: wgpu::Extent3d,
     pub texture: crate::gpu_resources::Texture,
     pub format: wgpu::TextureFormat,
@@ -337,6 +341,7 @@ impl TextureTarget {
             })
             .transpose()?;
         Ok(Self {
+            cached_view: None,
             size,
             texture,
             format,
@@ -383,9 +388,19 @@ impl RenderTarget for TextureTarget {
     }
 
     fn get_next_texture(&mut self) -> Result<Option<Self::Frame>, Error> {
-        Ok(Some(TextureTargetFrame(
-            self.texture.create_view(&Default::default())?,
-        )))
+        self.texture.lease().check_health()?;
+        let id = self.texture.lease().id();
+        if self
+            .cached_view
+            .as_ref()
+            .is_none_or(|(source, _)| *source != id)
+        {
+            self.cached_view = Some((id, self.texture.create_view(&Default::default())?));
+        }
+        Ok(self
+            .cached_view
+            .as_ref()
+            .map(|(_, view)| TextureTargetFrame(view.clone())))
     }
 
     #[instrument(level = "debug", skip_all)]

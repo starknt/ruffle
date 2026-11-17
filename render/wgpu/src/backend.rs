@@ -1061,6 +1061,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         }
 
         let target = TextureTarget {
+            cached_view: None,
             size: wgpu::Extent3d {
                 width: destination_texture.texture.width(),
                 height: destination_texture.texture.height(),
@@ -1110,6 +1111,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         };
 
         let mut target = TextureTarget {
+            cached_view: None,
             size: extent,
             texture: texture.texture.clone(),
             format: wgpu::TextureFormat::Rgba8Unorm,
@@ -1201,6 +1203,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
 
         let target = TextureTarget {
+            cached_view: None,
             size: wgpu::Extent3d {
                 width: dest_texture.texture.width(),
                 height: dest_texture.texture.height(),
@@ -1468,6 +1471,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         });
 
         let mut texture_target = TextureTarget {
+            cached_view: None,
             size: extent,
             texture: target_texture.texture.clone(),
             format: target_texture.texture.format(),

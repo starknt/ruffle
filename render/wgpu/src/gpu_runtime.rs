@@ -4,7 +4,7 @@
 //! and binding dependencies. Once the last lease dies, bytes remain charged until
 //! the last recorded submission completes, even though wgpu owns GPU retirement.
 
-use fnv::{FnvHashMap, FnvHashSet};
+use fnv::FnvHashMap;
 pub use ruffle_render::error::{RenderFailure, RenderFailureKind, RendererHealth};
 use std::sync::{
     Arc, Mutex, MutexGuard,
@@ -168,6 +168,7 @@ pub enum ResourcePriority {
 
 #[derive(Clone, Debug)]
 pub struct ResourceInfo {
+    visited: u64,
     pub id: ResourceId,
     pub owner: ResourceOwner,
     pub kind: ResourceKind,
@@ -203,6 +204,8 @@ pub struct GpuMemoryStats {
 
 #[derive(Default)]
 struct Ledger {
+    visit: u64,
+    retiring: Vec<ResourceId>,
     records: FnvHashMap<ResourceId, ResourceInfo>,
     stats: GpuMemoryStats,
     next_resource: u64,
@@ -415,6 +418,7 @@ impl GpuRuntime {
         };
         let created_submission = ledger.stats.submitted;
         ledger.insert(ResourceInfo {
+            visited: 0,
             id,
             owner,
             kind,
@@ -536,16 +540,26 @@ impl GpuRuntime {
                 "submission identity space exhausted",
             )
         })?;
+        // Use a unique traversal stamp rather than allocating a second identity
+        // set for every submission. Attempts have separate stamps, including a
+        // failed attempt that did not issue its proposed submission serial.
+        ledger.visit = ledger.visit.checked_add(1).ok_or_else(|| {
+            failure(
+                RenderFailureKind::Internal,
+                "submission visit space exhausted",
+            )
+        })?;
+        let visit = ledger.visit;
         let mut pending: Vec<_> = resources.iter().map(ResourceLease::id).collect();
-        let mut visited = FnvHashSet::default();
         while let Some(id) = pending.pop() {
-            if visited.insert(id) {
-                let record = ledger.records.get_mut(&id).ok_or_else(|| {
-                    failure(
-                        RenderFailureKind::Validation,
-                        "submission references a retired resource",
-                    )
-                })?;
+            let record = ledger.records.get_mut(&id).ok_or_else(|| {
+                failure(
+                    RenderFailureKind::Validation,
+                    "submission references a retired resource",
+                )
+            })?;
+            if record.visited != visit {
+                record.visited = visit;
                 record.last_submission = serial;
                 pending.extend_from_slice(&record.dependencies);
             }
@@ -568,14 +582,21 @@ impl GpuRuntime {
             return false;
         }
         ledger.stats.completed = serial.index;
-        let retired: Vec<_> = ledger
-            .records
-            .values()
-            .filter(|r| r.state == ResourceState::Retiring && r.last_submission <= serial.index)
-            .map(|r| r.id)
-            .collect();
-        for id in retired {
-            ledger.remove(id);
+        // Completion only needs resources whose last owning lease has gone.
+        // A large live movie must not turn every completion into a full scan.
+        let mut index = 0;
+        while index < ledger.retiring.len() {
+            let id = ledger.retiring[index];
+            if ledger
+                .records
+                .get(&id)
+                .is_none_or(|r| r.last_submission <= serial.index)
+            {
+                ledger.retiring.swap_remove(index);
+                ledger.remove(id);
+            } else {
+                index += 1;
+            }
         }
         true
     }
@@ -720,6 +741,7 @@ impl Drop for Allocation {
             .is_some_and(|r| r.last_submission > ledger.stats.completed);
         if pending {
             ledger.transition(self.id, ResourceState::Retiring);
+            ledger.retiring.push(self.id);
         } else {
             ledger.remove(self.id);
         }
@@ -746,6 +768,9 @@ impl Drop for UnsubmittedUse {
 }
 
 impl ResourceLease {
+    pub(crate) fn check_health(&self) -> Result<(), RenderFailure> {
+        self.0.runtime.check_health()
+    }
     pub(crate) fn staging_bytes(&self) -> u64 {
         self.0.staging_bytes
     }

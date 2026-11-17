@@ -16,11 +16,23 @@ fn measurement_target_never_allocates_a_readback_buffer_even_after_resize() {
     let descriptors = gpu();
     let mut target = TextureTarget::new_without_readback(&descriptors.device, (32, 32)).unwrap();
     assert!(target.buffer.is_none());
+    use crate::target::RenderTargetFrame;
+    let first = target.get_next_texture().unwrap().unwrap();
+    let second = target.get_next_texture().unwrap().unwrap();
+    assert_eq!(
+        first.view().lease().id(),
+        second.view().lease().id(),
+        "unchanged target reuses its native view"
+    );
     target
         .resize(&descriptors.device, 64, 48)
         .expect("GPU operation failed");
     assert!(target.buffer.is_none());
     assert_eq!((target.width(), target.height()), (64, 48));
+    let resized = target.get_next_texture().unwrap().unwrap();
+    assert_ne!(resized.view().lease().id(), first.view().lease().id());
+    assert_eq!(first.view().texture_handle().unwrap().width(), 32);
+    assert_eq!(resized.view().texture_handle().unwrap().width(), 64);
     let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
     renderer
         .submit_frame(Color::RED, CommandList::new(), vec![])
