@@ -16,12 +16,16 @@ fn measurement_target_never_allocates_a_readback_buffer_even_after_resize() {
     let descriptors = gpu();
     let mut target = TextureTarget::new_without_readback(&descriptors.device, (32, 32)).unwrap();
     assert!(target.buffer.is_none());
-    target.resize(&descriptors.device, 64, 48);
+    target
+        .resize(&descriptors.device, 64, 48)
+        .expect("GPU operation failed");
     assert!(target.buffer.is_none());
     assert_eq!((target.width(), target.height()), (64, 48));
     let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
-    renderer.submit_frame(Color::RED, CommandList::new(), vec![]);
-    assert!(renderer.capture_frame().is_none());
+    renderer
+        .submit_frame(Color::RED, CommandList::new(), vec![])
+        .expect("GPU operation failed");
+    assert!(renderer.capture_frame().unwrap().is_none());
 }
 
 #[test]
@@ -34,7 +38,9 @@ fn measurement_counts_encoded_draws_and_passes() {
     let _scope = ruffle_render::profile::enter(Some(&metrics));
     let mut commands = CommandList::new();
     rect(&mut commands, 0.0, 0.0, 10.0, 10.0, Color::RED);
-    renderer.submit_frame(Color::BLACK, commands, vec![]);
+    renderer
+        .submit_frame(Color::BLACK, commands, vec![])
+        .expect("GPU operation failed");
     let work = metrics.snapshot().work;
     // One shape pass followed by the surface copy pass, no capture pass.
     assert_eq!(work.draw_calls, 2);
@@ -56,7 +62,9 @@ fn measurement_counts_mask_passes_not_mask_inputs() {
     rect(&mut mask, 2.0, 2.0, 12.0, 12.0, Color::WHITE);
     let mut commands = CommandList::new();
     commands.render_alpha_mask(source, mask);
-    renderer.submit_frame(Color::BLACK, commands, vec![]);
+    renderer
+        .submit_frame(Color::BLACK, commands, vec![])
+        .expect("GPU operation failed");
     assert_eq!(metrics.snapshot().work.mask_passes, 1);
     assert_eq!(metrics.snapshot().work.offscreen_targets, 2);
 }
@@ -72,7 +80,7 @@ fn bounded_compositing_matches_full_target_pixels() {
                 let target = TextureTarget::new(&descriptors.device, (128, 128)).unwrap();
                 let mut renderer =
                     WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
-                renderer.set_quality(quality);
+                renderer.set_quality(quality).expect("GPU operation failed");
                 let metrics = ruffle_render::profile::RenderMetrics::default();
                 let _scope = ruffle_render::profile::enter(Some(&metrics));
                 let mut foreground = CommandList::new();
@@ -105,8 +113,14 @@ fn bounded_compositing_matches_full_target_pixels() {
                     inner.blend(foreground, RenderBlendMode::Builtin(BlendMode::Multiply));
                     commands.blend(inner, RenderBlendMode::Builtin(BlendMode::Layer));
                 }
-                renderer.submit_frame(Color::from_rgb(0x96b052, 255), commands, vec![]);
-                let pixels = renderer.capture_frame().unwrap().into_raw();
+                renderer
+                    .submit_frame(Color::from_rgb(0x96b052, 255), commands, vec![])
+                    .expect("GPU operation failed");
+                let pixels = renderer
+                    .capture_frame()
+                    .expect("GPU operation failed")
+                    .unwrap()
+                    .into_raw();
                 results.push((pixels, metrics.snapshot().work));
             }
             assert_eq!(
@@ -136,7 +150,8 @@ fn gpu() -> Arc<Descriptors> {
         wgpu::PowerPreference::HighPerformance,
     ))
     .expect("explicit GPU regressions require a Vulkan adapter");
-    Arc::new(Descriptors::new(instance, adapter, device, queue))
+    eprintln!("native GPU regression adapter: {:?}", adapter.get_info());
+    Arc::new(Descriptors::new(instance, adapter, device, queue).expect("GPU operation failed"))
 }
 
 fn rect(list: &mut CommandList, x: f32, y: f32, w: f32, h: f32, color: Color) {
@@ -251,13 +266,16 @@ fn render(
         .read();
     let target = TextureTarget::new(&descriptors.device, (128, 128)).unwrap();
     let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
-    renderer.set_quality(quality);
+    renderer.set_quality(quality).expect("GPU operation failed");
     let mut frames = Vec::new();
     let mut live = 0;
     for frame in 0..3 {
-        renderer.submit_frame(Color::WHITE, scene(frame, masked, parent_alpha), vec![]);
+        renderer
+            .submit_frame(Color::WHITE, scene(frame, masked, parent_alpha), vec![])
+            .expect("GPU operation failed");
         let image = renderer
             .capture_frame()
+            .expect("GPU operation failed")
             .expect("rendered frame must be readable");
         assert_eq!(image.get_pixel(0, 0).0, [255, 255, 255, 255]);
         assert_eq!(image.get_pixel(120, 120).0, [255, 0, 0, 255]);
@@ -303,17 +321,27 @@ fn blend_batches_are_enabled_by_default() {
     let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
     let metrics = ruffle_render::profile::RenderMetrics::default();
     let _scope = ruffle_render::profile::enter(Some(&metrics));
-    renderer.submit_frame(Color::WHITE, scene(0, true, false), vec![]);
-    let expected = renderer.capture_frame().expect("default renderer capture");
+    renderer
+        .submit_frame(Color::WHITE, scene(0, true, false), vec![])
+        .expect("GPU operation failed");
+    let expected = renderer
+        .capture_frame()
+        .expect("GPU operation failed")
+        .expect("default renderer capture");
     assert!(
         metrics.snapshot().blend_batch_splits > 0,
         "bounded batching must be enabled by the renderer default"
     );
-    renderer.set_viewport_dimensions(renderer.viewport_dimensions());
+    renderer
+        .set_viewport_dimensions(renderer.viewport_dimensions())
+        .unwrap();
     let before = metrics.snapshot().blend_batch_splits;
-    renderer.submit_frame(Color::WHITE, scene(0, true, false), vec![]);
+    renderer
+        .submit_frame(Color::WHITE, scene(0, true, false), vec![])
+        .expect("GPU operation failed");
     let actual = renderer
         .capture_frame()
+        .expect("GPU operation failed")
         .expect("configured renderer capture");
     assert_eq!(actual, expected, "batch policy changed pixels");
     assert!(metrics.snapshot().blend_batch_splits > before);
@@ -346,14 +374,21 @@ fn benchmark_blend_batches_encode_and_submit() {
     let descriptors = gpu();
     let target = TextureTarget::new(&descriptors.device, (128, 128)).unwrap();
     let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
-    renderer.set_quality(StageQuality::High);
+    renderer
+        .set_quality(StageQuality::High)
+        .expect("GPU operation failed");
     let mut timings = Vec::new();
     for frame in 0..34 {
         let commands = scene(frame, true, false);
         let start = std::time::Instant::now();
-        renderer.submit_frame(Color::WHITE, commands, vec![]);
+        renderer
+            .submit_frame(Color::WHITE, commands, vec![])
+            .expect("GPU operation failed");
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        renderer.capture_frame().expect("benchmark capture failed");
+        renderer
+            .capture_frame()
+            .expect("GPU operation failed")
+            .expect("benchmark capture failed");
         if frame >= 3 {
             timings.push(elapsed);
         }
@@ -389,9 +424,16 @@ fn immutable_bitmap_eviction_preserves_recorded_pixels_and_releases_gpu_memory()
     };
     let target = TextureTarget::new(&descriptors.device, (128, 128)).unwrap();
     let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
-    renderer.set_quality(StageQuality::Low);
-    renderer.submit_frame(Color::WHITE, CommandList::new(), vec![]);
-    renderer.capture_frame().unwrap();
+    renderer
+        .set_quality(StageQuality::Low)
+        .expect("GPU operation failed");
+    renderer
+        .submit_frame(Color::WHITE, CommandList::new(), vec![])
+        .expect("GPU operation failed");
+    renderer
+        .capture_frame()
+        .expect("GPU operation failed")
+        .unwrap();
     let baseline = memory();
     assert!(baseline > 0, "run with wgpu/counters");
     // Retain exactly one upload. The first draw must survive eviction before
@@ -420,15 +462,25 @@ fn immutable_bitmap_eviction_preserves_recorded_pixels_and_releases_gpu_memory()
                 PixelRegion::for_region(0, 0, 64, 64),
             );
         }
-        renderer.submit_frame(Color::WHITE, commands, vec![]);
-        let actual = renderer.capture_frame().unwrap();
+        renderer
+            .submit_frame(Color::WHITE, commands, vec![])
+            .expect("GPU operation failed");
+        let actual = renderer
+            .capture_frame()
+            .expect("GPU operation failed")
+            .unwrap();
         assert_eq!(actual.get_pixel(32, 32).0, [255, 0, 0, 255]);
         assert_eq!(actual.get_pixel(96, 32).0, [0, 0, 255, 255]);
         assert_eq!(actual.get_pixel(32, 96).0, [255, 255, 255, 255]);
     }
     // Drain only in this explicit test, never in the eviction implementation.
-    renderer.submit_frame(Color::WHITE, CommandList::new(), vec![]);
-    renderer.capture_frame().unwrap();
+    renderer
+        .submit_frame(Color::WHITE, CommandList::new(), vec![])
+        .expect("GPU operation failed");
+    renderer
+        .capture_frame()
+        .expect("GPU operation failed")
+        .unwrap();
     descriptors
         .device
         .poll(wgpu::PollType::wait_indefinitely())
@@ -510,4 +562,25 @@ fn bitmap_gpu_copy_preserves_the_requested_region() {
         .unwrap();
 
     assert_eq!(copied, source_pixels);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn destroyed_readback_buffer_returns_error_without_publishing_pixels() {
+    let descriptors = gpu();
+    let dimensions = crate::utils::BufferDimensions::new(1, 1, wgpu::TextureFormat::Rgba8Unorm);
+    let buffer = descriptors.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("injected map failure"),
+        size: 256,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    buffer.destroy();
+    let published = std::cell::Cell::new(false);
+    let result =
+        crate::utils::capture_image(&descriptors.device, &buffer, &dimensions, None, |_, _| {
+            published.set(true)
+        });
+    assert!(result.is_err());
+    assert!(!published.get());
 }

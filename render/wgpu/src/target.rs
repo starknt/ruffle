@@ -1,7 +1,8 @@
-use crate::Error;
 use crate::buffer_pool::PoolEntry;
+use crate::gpu_runtime::{RenderFailure as Error, RenderFailureKind};
 use crate::utils::{BufferDimensions, remove_srgb};
 use ruffle_render::bitmap::PixelRegion;
+use ruffle_render::error::RendererHealth;
 use std::fmt::Debug;
 use std::ops::Deref;
 use tracing::instrument;
@@ -15,7 +16,7 @@ pub trait RenderTargetFrame: Debug {
 pub trait RenderTarget: Debug + 'static {
     type Frame: RenderTargetFrame;
 
-    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32);
+    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> Result<(), Error>;
 
     fn format(&self) -> wgpu::TextureFormat;
 
@@ -26,15 +27,16 @@ pub trait RenderTarget: Debug + 'static {
     /// Returns the frame to render into, or `None` if no frame could be
     /// acquired - in which case the caller should skip this frame, and
     /// may attempt to recreate the swap chain via [`RenderTarget::resize`].
-    fn get_next_texture(&mut self) -> Option<Self::Frame>;
+    fn get_next_texture(&mut self) -> Result<Option<Self::Frame>, Error>;
 
     fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        health: &RendererHealth,
         command_buffers: I,
         frame: Self::Frame,
-    ) -> wgpu::SubmissionIndex;
+    ) -> Result<wgpu::SubmissionIndex, Error>;
 }
 
 #[derive(Debug)]
@@ -65,7 +67,17 @@ impl SwapChainTarget {
         adapter: &wgpu::Adapter,
         (width, height): (u32, u32),
         device: &wgpu::Device,
-    ) -> Self {
+    ) -> Result<Self, Error> {
+        if width == 0
+            || height == 0
+            || width > device.limits().max_texture_dimension_2d
+            || height > device.limits().max_texture_dimension_2d
+        {
+            return Err(Error::new(
+                RenderFailureKind::Validation,
+                "invalid surface dimensions",
+            ));
+        }
         // Flash colors and blending are done in sRGB space -- we don't want the GPU to
         // adjust the colors. We prefer a non-sRGB surface format directly, but on platforms
         // that only expose sRGB surface formats we view the surface texture as its non-sRGB
@@ -82,8 +94,12 @@ impl SwapChainTarget {
             })
             .or_else(|| capabilities.formats.first())
             .copied()
-            // No surface (rendering to texture), default to linear RBGA.
-            .unwrap_or(wgpu::TextureFormat::Rgba8Unorm);
+            .ok_or_else(|| {
+                Error::new(
+                    RenderFailureKind::Validation,
+                    "surface has no supported texture format",
+                )
+            })?;
 
         let linear_format = remove_srgb(format);
         let surface_config = wgpu::SurfaceConfiguration {
@@ -94,7 +110,12 @@ impl SwapChainTarget {
             height,
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
-            alpha_mode: capabilities.alpha_modes[0],
+            alpha_mode: capabilities.alpha_modes.first().copied().ok_or_else(|| {
+                Error::new(
+                    RenderFailureKind::Validation,
+                    "surface has no supported alpha mode",
+                )
+            })?,
             view_formats: if linear_format == format {
                 vec![format]
             } else {
@@ -102,20 +123,22 @@ impl SwapChainTarget {
             },
         };
         surface.configure(device, &surface_config);
-        Self {
+        Ok(Self {
             surface_config,
             window_surface: surface,
-        }
+        })
     }
 }
 
 impl RenderTarget for SwapChainTarget {
     type Frame = SwapChainTargetFrame;
 
-    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> Result<(), Error> {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.window_surface.configure(device, &self.surface_config);
+
+        Ok(())
     }
 
     fn format(&self) -> wgpu::TextureFormat {
@@ -130,7 +153,7 @@ impl RenderTarget for SwapChainTarget {
         self.surface_config.height
     }
 
-    fn get_next_texture(&mut self) -> Option<Self::Frame> {
+    fn get_next_texture(&mut self) -> Result<Option<Self::Frame>, Error> {
         let texture = match self.window_surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
             // The texture is still usable - no reason to waste an already
@@ -138,9 +161,18 @@ impl RenderTarget for SwapChainTarget {
             // before the next acquire; we don't currently do that (matching
             // pre-wgpu-29 behavior, which never checked the suboptimal flag).
             wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => surface_texture,
+            wgpu::CurrentSurfaceTexture::Lost => {
+                return Err(Error::new(RenderFailureKind::DeviceLost, "surface lost"));
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(Error::new(
+                    RenderFailureKind::Validation,
+                    "surface acquisition failed",
+                ));
+            }
             state => {
                 tracing::warn!("Couldn't acquire surface texture: {:?}", state);
-                return None;
+                return Ok(None);
             }
         };
         let view_format = remove_srgb(self.surface_config.format);
@@ -150,7 +182,7 @@ impl RenderTarget for SwapChainTarget {
             ..Default::default()
         });
 
-        Some(SwapChainTargetFrame { texture, view })
+        Ok(Some(SwapChainTargetFrame { texture, view }))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -158,19 +190,23 @@ impl RenderTarget for SwapChainTarget {
         &self,
         _device: &wgpu::Device,
         queue: &wgpu::Queue,
+        health: &RendererHealth,
         command_buffers: I,
         frame: Self::Frame,
-    ) -> wgpu::SubmissionIndex {
+    ) -> Result<wgpu::SubmissionIndex, Error> {
         let index = {
             let _timer = ruffle_render::profile::native_time(
                 ruffle_render::profile::NativePhase::QueueSubmit,
             );
+            health.check()?;
             queue.submit(command_buffers)
         };
         let _timer =
             ruffle_render::profile::native_time(ruffle_render::profile::NativePhase::Present);
+        health.check()?;
         queue.present(frame.texture);
-        index
+        health.check()?;
+        Ok(index)
     }
 }
 
@@ -236,13 +272,15 @@ impl TextureTarget {
             || size.0 < 1
             || size.1 < 1
         {
-            return Err(format!(
-                "Texture target cannot be smaller than 1 or larger than {}px on either dimension (requested {} x {})",
-                device.limits().max_texture_dimension_2d,
-                size.0,
-                size.1
-            )
-            .into());
+            return Err(Error::new(
+                RenderFailureKind::Validation,
+                format!(
+                    "Texture target cannot be smaller than 1 or larger than {}px on either dimension (requested {} x {})",
+                    device.limits().max_texture_dimension_2d,
+                    size.0,
+                    size.1
+                ),
+            ));
         }
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let buffer_dimensions = BufferDimensions::new(size.0 as usize, size.1 as usize, format);
@@ -297,9 +335,10 @@ impl TextureTarget {
 impl RenderTarget for TextureTarget {
     type Frame = TextureTargetFrame;
 
-    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        *self = Self::with_readback(device, (width, height), self.buffer.is_some())
-            .expect("Unable to resize texture target");
+    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> Result<(), Error> {
+        *self = Self::with_readback(device, (width, height), self.buffer.is_some())?;
+
+        Ok(())
     }
 
     fn format(&self) -> wgpu::TextureFormat {
@@ -314,10 +353,10 @@ impl RenderTarget for TextureTarget {
         self.size.height
     }
 
-    fn get_next_texture(&mut self) -> Option<Self::Frame> {
-        Some(TextureTargetFrame(
+    fn get_next_texture(&mut self) -> Result<Option<Self::Frame>, Error> {
+        Ok(Some(TextureTargetFrame(
             self.texture.create_view(&Default::default()),
-        ))
+        )))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -325,10 +364,12 @@ impl RenderTarget for TextureTarget {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        health: &RendererHealth,
         command_buffers: I,
         _frame: Self::Frame,
-    ) -> wgpu::SubmissionIndex {
-        if let Some(TextureBufferInfo { buffer, copy_area }) = &self.buffer {
+    ) -> Result<wgpu::SubmissionIndex, Error> {
+        health.check()?;
+        let index = if let Some(TextureBufferInfo { buffer, copy_area }) = &self.buffer {
             let label = create_debug_label!("Render target transfer encoder");
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: label.as_deref(),
@@ -372,6 +413,8 @@ impl RenderTarget for TextureTarget {
                 ruffle_render::profile::NativePhase::QueueSubmit,
             );
             queue.submit(command_buffers)
-        }
+        };
+        health.check()?;
+        Ok(index)
     }
 }

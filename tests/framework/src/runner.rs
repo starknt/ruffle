@@ -183,7 +183,7 @@ impl TestRunner {
 
         let unwind_result = catch_unwind(AssertUnwindSafe(|| self.do_tick()));
         match (unwind_result, &self.options.known_failure) {
-            (Ok(()), _) => (),
+            (Ok(result), _) => result?,
             (Err(panic), KnownFailure::Panic { message }) => {
                 let actual = panic_payload_as_string(panic);
                 if actual.contains(message) {
@@ -222,7 +222,7 @@ impl TestRunner {
         }
     }
 
-    fn do_tick(&mut self) {
+    fn do_tick(&mut self) -> Result<(), anyhow::Error> {
         if !self
             .player
             .lock()
@@ -230,12 +230,12 @@ impl TestRunner {
             .preload(&mut ExecutionLimit::exhausted())
         {
             self.executor.run();
-            return;
+            return Ok(());
         }
         self.preloaded = true;
 
         if self.options.num_ticks.is_some() {
-            self.player.lock().unwrap().tick(self.frame_time);
+            self.player.lock().unwrap().tick(self.frame_time)?;
         } else {
             self.player.lock().unwrap().run_frame();
             self.player.lock().unwrap().update_timers(self.frame_time);
@@ -244,6 +244,8 @@ impl TestRunner {
         self.remaining_iterations -= 1;
         self.current_iteration += 1;
         self.executor.run();
+
+        Ok(())
     }
 
     /// After a tick, run any custom fdcommands that were queued up and perform any scheduled tests.
@@ -287,7 +289,7 @@ impl TestRunner {
             perform_automated_event(evt, &mut player);
         });
         // Rendering has side-effects (such as processing 'DisplayObject.scrollRect' updates)
-        self.player.lock().unwrap().render();
+        self.player.lock().unwrap().render()?;
 
         let trigger = ImageTrigger::SpecificIteration(self.current_iteration);
         if let Some((name, comp)) = self.take_image_comparison_by_trigger(trigger) {

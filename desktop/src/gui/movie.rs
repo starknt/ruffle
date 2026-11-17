@@ -223,7 +223,12 @@ impl MovieView {
 impl RenderTarget for MovieView {
     type Frame = MovieViewFrame;
 
-    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+    fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ruffle_render::error::RenderFailure> {
         *self = MovieView::new(
             self.renderer.clone(),
             device,
@@ -232,6 +237,8 @@ impl RenderTarget for MovieView {
             #[cfg(feature = "tracy_images")]
             self.tracy_frame_captures.clone(),
         );
+
+        Ok(())
     }
 
     fn format(&self) -> wgpu::TextureFormat {
@@ -246,20 +253,26 @@ impl RenderTarget for MovieView {
         self.texture.height()
     }
 
-    fn get_next_texture(&mut self) -> Option<Self::Frame> {
-        Some(MovieViewFrame(
+    fn get_next_texture(
+        &mut self,
+    ) -> Result<Option<Self::Frame>, ruffle_render::error::RenderFailure> {
+        Ok(Some(MovieViewFrame(
             self.texture.create_view(&Default::default()),
-        ))
+        )))
     }
 
     fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(
         &self,
         _device: &wgpu::Device,
         queue: &wgpu::Queue,
+        health: &ruffle_render::error::RendererHealth,
         command_buffers: I,
         _frame: Self::Frame,
-    ) -> wgpu::SubmissionIndex {
-        queue.submit(command_buffers)
+    ) -> Result<wgpu::SubmissionIndex, ruffle_render::error::RenderFailure> {
+        health.check()?;
+        let index = queue.submit(command_buffers);
+        health.check()?;
+        Ok(index)
     }
 }
 

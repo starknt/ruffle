@@ -7,7 +7,9 @@ use ruffle_core::Player;
 use ruffle_render_wgpu::{backend::WgpuRenderBackend, target::TextureTarget};
 
 pub trait PlayerExporterExt {
-    fn capture_frame(&self) -> Option<image::RgbaImage>;
+    fn capture_frame(
+        &self,
+    ) -> Result<Option<image::RgbaImage>, ruffle_render_wgpu::gpu_runtime::RenderFailure>;
 
     fn header_frames(&self) -> u16;
 
@@ -15,7 +17,9 @@ pub trait PlayerExporterExt {
 }
 
 impl PlayerExporterExt for Arc<Mutex<Player>> {
-    fn capture_frame(&self) -> Option<image::RgbaImage> {
+    fn capture_frame(
+        &self,
+    ) -> Result<Option<image::RgbaImage>, ruffle_render_wgpu::gpu_runtime::RenderFailure> {
         let mut player = self.lock().unwrap();
         let renderer =
             <dyn Any>::downcast_mut::<WgpuRenderBackend<TextureTarget>>(player.renderer_mut())

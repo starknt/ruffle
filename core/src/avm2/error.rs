@@ -1520,3 +1520,9 @@ impl<'gc> From<ruffle_render::error::Error> for Error<'gc> {
         Error::rust_error(val.into())
     }
 }
+
+impl From<ruffle_render::error::RenderFailure> for Error<'_> {
+    fn from(error: ruffle_render::error::RenderFailure) -> Self {
+        Self::rust_error(Box::new(error))
+    }
+}

@@ -121,7 +121,10 @@ mod renderer {
             let renderer =
                 <dyn Any>::downcast_mut::<WgpuRenderBackend<TextureTarget>>(backend).unwrap();
 
-            renderer.capture_frame().expect("Failed to capture image")
+            renderer
+                .capture_frame()
+                .expect("GPU readback failed")
+                .expect("Failed to capture image")
         }
     }
 
@@ -161,6 +164,8 @@ mod renderer {
     pub(super) fn build_wgpu_descriptors() -> Option<Arc<Descriptors>> {
         let (instance, adapter, device, queue) = create_wgpu_device()?;
 
-        Some(Arc::new(Descriptors::new(instance, adapter, device, queue)))
+        Some(Arc::new(
+            Descriptors::new(instance, adapter, device, queue).expect("GPU initialization failed"),
+        ))
     }
 }

@@ -118,7 +118,13 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
         let scale_x = f32::abs(matrix.a + matrix.c);
         let scale_y = f32::abs(matrix.b + matrix.d);
         let current_scale = ((scale_x * scale_x + scale_y * scale_y) / 2.0).sqrt();
-        let shape_handle = shared.get_shape(context, ratio, current_scale);
+        let shape_handle = match shared.get_shape(context, ratio, current_scale) {
+            Ok(handle) => handle,
+            Err(error) => {
+                context.renderer.health().fail(error);
+                return;
+            }
+        };
         context
             .commands
             .render_shape(shape_handle, context.transform_stack.transform());
@@ -241,20 +247,22 @@ impl<'gc> MorphShapeShared<'gc> {
         context: &mut RenderContext<'_, 'gc>,
         ratio: u16,
         scale: f32,
-    ) -> ShapeHandle {
+    ) -> Result<ShapeHandle, ruffle_render::error::RenderFailure> {
         let mut frame = self.get_frame(ratio);
-        if let Some(handle) = frame.shape_cache.find_near_and_touch(scale) {
-            handle
-        } else {
-            let library = context.library.library_for_movie(self.movie).unwrap();
-            let handle = context.renderer.register_shape_with_scale(
-                (&frame.shape).into(),
-                &MovieLibrarySource { library },
-                scale,
-            );
-            frame.shape_cache.insert(scale, handle.clone());
-            handle
-        }
+        Ok(
+            if let Some(handle) = frame.shape_cache.find_near_and_touch(scale) {
+                handle
+            } else {
+                let library = context.library.library_for_movie(self.movie).unwrap();
+                let handle = context.renderer.register_shape_with_scale(
+                    (&frame.shape).into(),
+                    &MovieLibrarySource { library },
+                    scale,
+                )?;
+                frame.shape_cache.insert(scale, handle.clone());
+                handle
+            },
+        )
     }
 
     fn build_morph_frame(&self, ratio: u16) -> Frame {

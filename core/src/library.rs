@@ -367,6 +367,9 @@ impl ruffle_render::bitmap::BitmapSource for MovieLibrarySource<'_, '_> {
             Ok(handle) => Some(handle),
             Err(e) => {
                 tracing::error!("Failed to register bitmap character {id}: {e}");
+                if let ruffle_render::error::Error::Render(error) = e {
+                    backend.health().fail(error);
+                }
                 None
             }
         }

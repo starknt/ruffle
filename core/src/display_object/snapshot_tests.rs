@@ -21,7 +21,7 @@ fn static_swf_containers_are_admitted_to_snapshot_lookup() {
     player.run_frame();
     let metrics = RenderMetrics::default();
     let _scope = enter(Some(&metrics));
-    player.render();
+    player.render().unwrap();
     assert!(metrics.snapshot().work.snapshot_misses > 0);
 }
 
@@ -43,9 +43,9 @@ fn retained_stage_subtree_reuses_and_immediately_invalidates_after_render() {
     });
     let metrics = RenderMetrics::default();
     let _scope = enter(Some(&metrics));
-    player.render();
+    player.render().unwrap();
     let first = metrics.snapshot().work;
-    player.render();
+    player.render().unwrap();
     let second = metrics.snapshot().work.delta(first);
     assert!(second.snapshot_hits > 0);
     assert!(second.tree_visits < 8);
@@ -62,7 +62,7 @@ fn retained_stage_subtree_reuses_and_immediately_invalidates_after_render() {
                 .set_matrix(Matrix::translate(Twips::new(x), Twips::ZERO));
         });
         let before = metrics.snapshot().work;
-        player.render();
+        player.render().unwrap();
         assert!(metrics.snapshot().work.delta(before).tree_visits >= 16);
     }
 }

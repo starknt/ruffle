@@ -61,7 +61,7 @@ pub fn do_copy<'gc>(
         }
     };
     texture.context3d().copy_bitmapdata_to_texture(
-        &bitmap_data.sync(activation.context.renderer).borrow(),
+        &bitmap_data.sync(activation.context.renderer)?.borrow(),
         texture.handle(),
         side,
     );
@@ -127,7 +127,7 @@ pub fn upload_from_bitmap_data<'gc>(
             let mip_level = args.get_u32(1);
             if mip_level == 0 {
                 texture.context3d().copy_bitmapdata_to_texture(
-                    &source.sync(activation.context.renderer).borrow(),
+                    &source.sync(activation.context.renderer)?.borrow(),
                     texture.handle(),
                     0,
                 );

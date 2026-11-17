@@ -71,6 +71,13 @@ impl GuiController {
             preferences.graphics_power_preference().into(),
         ))
         .map_err(|e| anyhow!(e.to_string()))?;
+        let runtime = ruffle_render_wgpu::gpu_runtime::GpuRuntime::new(
+            ruffle_render_wgpu::gpu_runtime::GpuBudgetConfig::for_adapter(
+                adapter.get_info().device_type,
+                cfg!(target_os = "android"),
+            ),
+        )?;
+        runtime.install_device_callbacks(&device);
         let adapter_info = adapter.get_info();
         tracing::info!(
             "Using graphics API {} on {} (type: {:?})",
@@ -110,7 +117,7 @@ impl GuiController {
                 view_formats: Default::default(),
             },
         );
-        let descriptors = Descriptors::new(instance, adapter, device, queue);
+        let descriptors = Descriptors::with_runtime(instance, adapter, device, queue, runtime)?;
         let egui_ctx = Context::default();
 
         let theme_controller = futures::executor::block_on(ThemeController::new(
@@ -312,6 +319,10 @@ impl GuiController {
     }
 
     pub fn render(&mut self, mut player: Option<MutexGuard<Player>>) {
+        if let Err(error) = self.descriptors.runtime.check_health() {
+            tracing::error!("GPU rendering stopped: {error}");
+            return;
+        }
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
             wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
@@ -444,7 +455,10 @@ impl GuiController {
         if let Some(player) = player.as_deref_mut()
             && player.debug_ui().has_open_windows()
         {
-            player.render();
+            if let Err(error) = player.render() {
+                tracing::error!("GPU rendering stopped: {error}");
+                return;
+            }
         }
 
         let movie_view = if let Some(player) = player.as_deref_mut() {
@@ -491,7 +505,13 @@ impl GuiController {
         }
 
         command_buffers.push(encoder.finish());
+        if self.descriptors.runtime.check_health().is_err() {
+            return;
+        }
         self.descriptors.queue.submit(command_buffers);
+        if self.descriptors.runtime.check_health().is_err() {
+            return;
+        }
 
         // Free textures only after submitting the command buffer that may still
         // reference them.  Destroying a texture before its usage is submitted

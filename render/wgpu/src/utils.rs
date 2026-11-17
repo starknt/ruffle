@@ -130,26 +130,57 @@ pub fn capture_image<R, F: FnOnce(&[u8], u32) -> R>(
     dimensions: &BufferDimensions,
     index: Option<wgpu::SubmissionIndex>,
     with_rgba: F,
-) -> R {
+) -> Result<R, crate::gpu_runtime::RenderFailure> {
+    use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
+    let started = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(2);
     let (sender, receiver) = std::sync::mpsc::channel();
     let buffer_slice = buffer.slice(..);
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-        sender.send(result).unwrap();
+        let _ = sender.send(result);
     });
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: index,
-            timeout: None,
-        })
-        .expect("Device must not fail to poll");
-    let _ = receiver.recv().expect("MPSC channel must not fail");
-    let map = buffer_slice
-        .get_mapped_range()
-        .expect("Buffer slice must be mappable");
-    let result = with_rgba(&map, dimensions.padded_bytes_per_row);
-    drop(map);
+    let result = (|| {
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: index,
+                timeout: Some(deadline),
+            })
+            .map_err(poll_failure)?;
+        receiver
+            .recv_timeout(deadline.saturating_sub(started.elapsed()))
+            .map_err(|error| {
+                RenderFailure::new(
+                    RenderFailureKind::Timeout,
+                    format!("readback callback: {error}"),
+                )
+            })?
+            .map_err(|error| {
+                RenderFailure::new(
+                    RenderFailureKind::MapFailed,
+                    format!("readback map: {error}"),
+                )
+            })?;
+        let map = buffer_slice.get_mapped_range().map_err(|error| {
+            RenderFailure::new(
+                RenderFailureKind::MapFailed,
+                format!("readback range: {error}"),
+            )
+        })?;
+        let result = with_rgba(&map, dimensions.padded_bytes_per_row);
+        drop(map);
+        Ok(result)
+    })();
     buffer.unmap();
     result
+}
+
+pub fn poll_failure(error: wgpu::PollError) -> crate::gpu_runtime::RenderFailure {
+    use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
+    let kind = match error {
+        wgpu::PollError::Timeout => RenderFailureKind::Timeout,
+        wgpu::PollError::WrongSubmissionIndex(..) => RenderFailureKind::Internal,
+    };
+    RenderFailure::new(kind, error.to_string())
 }
 
 pub fn buffer_to_image(
@@ -158,7 +189,7 @@ pub fn buffer_to_image(
     dimensions: &BufferDimensions,
     index: Option<wgpu::SubmissionIndex>,
     size: wgpu::Extent3d,
-) -> image::RgbaImage {
+) -> Result<image::RgbaImage, crate::gpu_runtime::RenderFailure> {
     capture_image(device, buffer, dimensions, index, |rgba, _buffer_width| {
         let mut bytes = Vec::with_capacity(dimensions.height * dimensions.unpadded_bytes_per_row);
 

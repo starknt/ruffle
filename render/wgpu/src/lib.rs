@@ -171,6 +171,7 @@ pub struct AsyncReadback {
     dimensions: BufferDimensions,
     descriptors: Arc<Descriptors>,
     receiver: Receiver<Result<(), wgpu::BufferAsyncError>>,
+    started: std::time::Instant,
 }
 
 impl AsyncReadback {
@@ -193,28 +194,63 @@ impl AsyncReadback {
             dimensions,
             descriptors,
             receiver,
+            started: std::time::Instant::now(),
         }
     }
 
-    pub fn poll(&mut self) -> Result<Option<(Vec<u8>, u32)>, String> {
+    pub fn poll(&mut self) -> Result<Option<(Vec<u8>, u32)>, crate::gpu_runtime::RenderFailure> {
+        use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
+        self.descriptors.runtime.check_health()?;
         self.descriptors
             .device
             .poll(wgpu::PollType::Poll)
-            .map_err(|error| format!("wgpu poll failed: {error:?}"))?;
+            .map_err(|error| {
+                self.descriptors
+                    .runtime
+                    .health()
+                    .record(crate::utils::poll_failure(error))
+            })?;
         match self.receiver.try_recv() {
             Ok(Ok(())) => {
-                let Ok(map) = self.buffer.slice(..).get_mapped_range() else {
-                    return Ok(None);
-                };
+                let map = self.buffer.slice(..).get_mapped_range().map_err(|error| {
+                    self.descriptors.runtime.health().record(RenderFailure::new(
+                        RenderFailureKind::MapFailed,
+                        error.to_string(),
+                    ))
+                })?;
                 let bytes = map.to_vec();
                 drop(map);
                 self.buffer.unmap();
                 Ok(Some((bytes, self.dimensions.padded_bytes_per_row)))
             }
-            Ok(Err(error)) => Err(format!("buffer map failed: {error:?}")),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err("buffer map callback disconnected".into()),
+            Ok(Err(error)) => Err(self.descriptors.runtime.health().record(RenderFailure::new(
+                RenderFailureKind::MapFailed,
+                error.to_string(),
+            ))),
+            Err(TryRecvError::Empty)
+                if self.started.elapsed() < std::time::Duration::from_secs(2) =>
+            {
+                Ok(None)
+            }
+            Err(TryRecvError::Empty) => {
+                Err(self.descriptors.runtime.health().record(RenderFailure::new(
+                    RenderFailureKind::Timeout,
+                    "asynchronous readback timed out",
+                )))
+            }
+            Err(TryRecvError::Disconnected) => {
+                Err(self.descriptors.runtime.health().record(RenderFailure::new(
+                    RenderFailureKind::MapFailed,
+                    "buffer map callback disconnected",
+                )))
+            }
         }
+    }
+}
+
+impl Drop for AsyncReadback {
+    fn drop(&mut self) {
+        self.buffer.unmap();
     }
 }
 
@@ -237,8 +273,11 @@ pub enum QueueSyncHandle {
 impl SyncHandle for QueueSyncHandle {}
 
 impl QueueSyncHandle {
-    pub fn prepare_async(self, frame: &mut ActiveFrame) -> AsyncReadback {
-        match self {
+    pub fn prepare_async(
+        self,
+        frame: &mut ActiveFrame,
+    ) -> Result<AsyncReadback, crate::gpu_runtime::RenderFailure> {
+        Ok(match self {
             QueueSyncHandle::AlreadyCopied {
                 index,
                 buffer,
@@ -283,17 +322,17 @@ impl QueueSyncHandle {
                         depth_or_array_layers: 1,
                     },
                 );
-                let index = frame.submit_direct(&descriptors);
+                let index = frame.submit_direct(&descriptors)?;
                 AsyncReadback::new(buffer, dimensions, descriptors, Some(index))
             }
-        }
+        })
     }
 
     pub fn capture<R, F: FnOnce(&[u8], u32) -> R>(
         self,
         with_rgba: F,
         frame: &mut ActiveFrame,
-    ) -> R {
+    ) -> Result<R, crate::gpu_runtime::RenderFailure> {
         let _readback = ruffle_render::profile::time(ruffle_render::profile::Phase::Readback);
         match self {
             QueueSyncHandle::AlreadyCopied {
@@ -348,7 +387,7 @@ impl QueueSyncHandle {
                         depth_or_array_layers: 1,
                     },
                 );
-                let index = frame.submit_direct(&descriptors);
+                let index = frame.submit_direct(&descriptors)?;
 
                 let image = capture_image(
                     &descriptors.device,

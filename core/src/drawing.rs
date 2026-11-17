@@ -245,7 +245,10 @@ impl Drawing {
             return None;
         }
 
-        let handle = self.render_handle.get_or_init(|| {
+        if let Some(handle) = self.render_handle.get() {
+            return Some(handle.clone());
+        }
+        let result = (|| {
             let mut paths = Vec::with_capacity(self.paths.len());
 
             for path in &self.paths {
@@ -312,9 +315,17 @@ impl Drawing {
                 id: 0,
             };
             renderer.register_shape(shape, self)
-        });
-
-        Some(handle.clone())
+        })();
+        match result {
+            Ok(handle) => {
+                let _ = self.render_handle.set(handle.clone());
+                Some(handle)
+            }
+            Err(error) => {
+                renderer.health().fail(error);
+                None
+            }
+        }
     }
 
     pub fn render(&self, context: &mut RenderContext) {

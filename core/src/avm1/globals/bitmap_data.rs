@@ -248,7 +248,7 @@ fn get_pixel<'gc>(
     let x = args.get_u32(activation, 0)?;
     let y = args.get_u32(activation, 1)?;
     // AVM1 returns a signed int, so we need to convert it.
-    let col = operations::get_pixel(bitmap_data, activation.context.renderer, x, y) as i32;
+    let col = operations::get_pixel(bitmap_data, activation.context.renderer, x, y)? as i32;
     Ok(col.into())
 }
 
@@ -267,7 +267,7 @@ fn get_pixel32<'gc>(
     let x = args.get_u32(activation, 0)?;
     let y = args.get_u32(activation, 1)?;
     // AVM1 returns a signed int, so we need to convert it.
-    let col = operations::get_pixel32(bitmap_data, activation.context.renderer, x, y) as i32;
+    let col = operations::get_pixel32(bitmap_data, activation.context.renderer, x, y)? as i32;
     Ok(col.into())
 }
 
@@ -293,7 +293,7 @@ fn set_pixel<'gc>(
         x,
         y,
         color.into(),
-    );
+    )?;
     Ok(0.into())
 }
 
@@ -319,7 +319,7 @@ fn set_pixel32<'gc>(
         x,
         y,
         color,
-    );
+    )?;
     Ok(0.into())
 }
 
@@ -368,7 +368,7 @@ fn copy_channel<'gc>(
         source_bitmap,
         source_channel,
         dest_channel,
-    );
+    )?;
 
     Ok((-1).into())
 }
@@ -400,7 +400,7 @@ fn fill_rect<'gc>(
         width,
         height,
         color,
-    );
+    )?;
     Ok(0.into())
 }
 
@@ -415,7 +415,7 @@ fn clone<'gc>(
 
     Ok(new_bitmap_data(
         this.get_local_stored(istr!("__proto__"), activation),
-        bitmap_data.clone_data(activation.context.gc_context, activation.context.renderer),
+        bitmap_data.clone_data(activation.context.gc_context, activation.context.renderer)?,
         activation,
     )
     .into())
@@ -456,7 +456,7 @@ fn flood_fill<'gc>(
         x,
         y,
         color,
-    ) {
+    )? {
         Ok(1.into())
     } else {
         Ok(0.into())
@@ -588,6 +588,7 @@ fn draw<'gc>(
         quality,
     ) {
         Ok(()) => {}
+        Err(BitmapDataDrawError::Render(error)) => return Err(error.into()),
         Err(BitmapDataDrawError::Unimplemented) => {
             avm_error!(
                 activation,
@@ -648,7 +649,7 @@ fn apply_filter<'gc>(
         .get(3)
         .unwrap_or(&Value::Undefined)
         .coerce_to_object_or_bare(activation)?;
-    let filter = bitmap_filter::avm1_to_filter(filter_object, activation.context);
+    let filter = bitmap_filter::avm1_to_filter(filter_object, activation.context)?;
 
     if let Some(filter) = filter {
         operations::apply_filter(
@@ -659,7 +660,7 @@ fn apply_filter<'gc>(
             (src_width, src_height),
             (dest_x, dest_y),
             filter,
-        );
+        )?;
         return Ok(0.into());
     }
 
@@ -710,7 +711,7 @@ fn color_transform<'gc>(
         (x + width) as u32,
         (y + height) as u32,
         &color_transform.into(),
-    );
+    )?;
 
     Ok((-1).into())
 }
@@ -739,7 +740,7 @@ fn get_color_bounds_rect<'gc>(
         find_color,
         mask,
         color,
-    );
+    )?;
 
     let rect = activation.instantiate_class_fast(
         [istr!("flash"), istr!("geom"), istr!("Rectangle")],
@@ -861,7 +862,7 @@ fn hit_test<'gc>(
             other_bmd,
             second_point,
             second_threshold,
-        );
+        )?;
         Ok(Value::Bool(result))
     } else {
         // Determine what kind of Object we have, point or rectangle.
@@ -884,7 +885,7 @@ fn hit_test<'gc>(
                     bitmap_data,
                     source_threshold,
                     test_point,
-                )))
+                )?))
             }
 
             // BitmapData vs. rectangle
@@ -903,7 +904,7 @@ fn hit_test<'gc>(
                     source_threshold,
                     test_point,
                     size,
-                )))
+                )?))
             }
 
             // Invalid compare object.
@@ -974,7 +975,7 @@ fn copy_pixels<'gc>(
             alpha_bitmap,
             (alpha_x, alpha_y),
             merge_alpha.unwrap_or(true),
-        );
+        )?;
     } else {
         operations::copy_pixels(
             activation.context,
@@ -985,7 +986,7 @@ fn copy_pixels<'gc>(
             // Despite what the docs claim, mergeAlpa appears to be treated as 'false'
             // when no 'alphaBitmap' is specified (e.g. only 3 args are passed)
             merge_alpha.unwrap_or(false),
-        );
+        )?;
     }
 
     Ok(0.into())
@@ -1040,7 +1041,7 @@ fn merge<'gc>(
         (src_min_x, src_min_y, src_width, src_height),
         (dest_x, dest_y),
         (red_mult, green_mult, blue_mult, alpha_mult),
-    );
+    )?;
 
     Ok((-1).into())
 }
@@ -1109,7 +1110,7 @@ fn palette_map<'gc>(
         (src_min_x, src_min_y, src_width, src_height),
         (dest_x, dest_y),
         (red_array, green_array, blue_array, alpha_array),
-    );
+    )?;
 
     Ok((-1).into())
 }
@@ -1173,7 +1174,7 @@ fn pixel_dissolve<'gc>(
         random_seed,
         num_pixels,
         fill_color,
-    )
+    )?
     .into())
 }
 
@@ -1198,7 +1199,7 @@ fn scroll<'gc>(
         bitmap_data,
         x,
         y,
-    );
+    )?;
 
     Ok(0.into())
 }
@@ -1257,7 +1258,7 @@ fn threshold<'gc>(
         colour,
         mask,
         copy_source,
-    );
+    )?;
 
     Ok(modified_count.into())
 }
@@ -1300,7 +1301,7 @@ fn compare<'gc>(
         activation.context.renderer,
         this_bitmap_data,
         other_bitmap_data,
-    ) {
+    )? {
         Some(bitmap_data) => Ok(new_bitmap_data(
             this.get_local_stored(istr!("__proto__"), activation),
             bitmap_data,

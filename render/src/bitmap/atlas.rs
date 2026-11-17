@@ -67,32 +67,33 @@ impl BitmapAtlas {
     /// Returns the handle for this atlas's texture, registering it on first
     /// use and pushing any pending CPU-side changes since the last call.
     pub fn handle(&self, renderer: &mut dyn RenderBackend) -> Option<BitmapHandle> {
-        let mut data = self.0.borrow_mut();
-
-        let handle = if let Some(handle) = data.handle.get() {
-            handle
-        } else {
-            // First use: registering captures the bitmap's current state,
-            // so there's nothing left to separately push as an update.
-            data.dirty = None;
-
-            let bitmap = data.bitmap.reborrow();
-            data.handle.get_or_init(|| {
-                renderer
-                    .register_bitmap(bitmap)
-                    .inspect_err(|e| tracing::error!("Failed to register a bitmap atlas: {e}"))
-                    .ok()
-            })
+        if renderer.health().check().is_err() {
+            return None;
         }
-        .clone();
-
-        if let Some(dirty) = data.dirty.take()
+        let mut data = self.0.borrow_mut();
+        let handle = if let Some(handle) = data.handle.get() {
+            handle.clone()
+        } else {
+            match renderer.register_bitmap(data.bitmap.reborrow()) {
+                Ok(handle) => {
+                    data.dirty = None;
+                    let _ = data.handle.set(Some(handle.clone()));
+                    Some(handle)
+                }
+                Err(error) => {
+                    renderer.health().record(error.into_render_failure());
+                    return None;
+                }
+            }
+        };
+        if let Some(dirty) = data.dirty
             && let Some(handle) = handle.as_ref()
         {
-            let bitmap = data.bitmap.reborrow();
-            if let Err(e) = renderer.update_texture(handle, bitmap, dirty) {
-                tracing::error!("Failed to update atlas texture: {e}");
+            if let Err(error) = renderer.update_texture(handle, data.bitmap.reborrow(), dirty) {
+                renderer.health().record(error.into_render_failure());
+                return None;
             }
+            data.dirty = None;
         }
 
         handle
@@ -239,6 +240,7 @@ mod test {
     /// be observed. Every other method is unreachable from these tests.
     #[derive(Default)]
     struct RecordingBackend {
+        health: crate::error::RendererHealth,
         fail_register: bool,
 
         register_calls: RefCell<u32>,
@@ -249,17 +251,23 @@ mod test {
     }
 
     impl RenderBackend for RecordingBackend {
+        fn health(&self) -> &crate::error::RendererHealth {
+            &self.health
+        }
         fn viewport_dimensions(&self) -> ViewportDimensions {
             unimplemented!()
         }
-        fn set_viewport_dimensions(&mut self, _dimensions: ViewportDimensions) {
+        fn set_viewport_dimensions(
+            &mut self,
+            _dimensions: ViewportDimensions,
+        ) -> Result<(), crate::error::RenderFailure> {
             unimplemented!()
         }
         fn register_shape(
             &mut self,
             _shape: DistilledShape,
             _bitmap_source: &dyn BitmapSource,
-        ) -> ShapeHandle {
+        ) -> Result<ShapeHandle, crate::error::RenderFailure> {
             unimplemented!()
         }
         fn render_offscreen(
@@ -268,7 +276,7 @@ mod test {
             _commands: CommandList,
             _quality: StageQuality,
             _bounds: PixelRegion,
-        ) -> Option<Box<dyn SyncHandle>> {
+        ) -> Result<Option<Box<dyn SyncHandle>>, crate::error::Error> {
             unimplemented!()
         }
         fn submit_frame(
@@ -276,7 +284,7 @@ mod test {
             _clear: Color,
             _commands: CommandList,
             _cache_entries: Vec<BitmapCacheEntry>,
-        ) {
+        ) -> Result<(), crate::error::RenderFailure> {
             unimplemented!()
         }
         fn create_empty_texture(
@@ -316,7 +324,10 @@ mod test {
         fn name(&self) -> &'static str {
             "test"
         }
-        fn set_quality(&mut self, _quality: StageQuality) {
+        fn set_quality(
+            &mut self,
+            _quality: StageQuality,
+        ) -> Result<(), crate::error::RenderFailure> {
             unimplemented!()
         }
         fn compile_pixelbender_shader(

@@ -864,7 +864,8 @@ fn set_filters<'gc>(
             let filter_object = value
                 .get(index, activation)?
                 .coerce_to_object_or_bare(activation)?;
-            if let Some(filter) = bitmap_filter::avm1_to_filter(filter_object, activation.context) {
+            if let Some(filter) = bitmap_filter::avm1_to_filter(filter_object, activation.context)?
+            {
                 filters.push(filter);
             }
         }

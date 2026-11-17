@@ -526,6 +526,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     }
 
     pub fn run_actions(&mut self, code: SwfSlice) -> Result<ReturnType<'gc>, Error<'gc>> {
+        self.context.renderer.health().check()?;
         let mut read = Reader::new(&code.entire_data()[code.start..], self.swf_version());
 
         loop {
@@ -546,6 +547,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     ) -> Result<FrameControl<'gc>, Error<'gc>> {
         *self.context.actions_since_timeout_check += 1;
         if *self.context.actions_since_timeout_check >= 2000 {
+            self.context.renderer.health().check()?;
             *self.context.actions_since_timeout_check = 0;
             if self.context.update_start.elapsed() >= self.context.max_execution_duration {
                 return Err(Error::ExecutionTimeout);

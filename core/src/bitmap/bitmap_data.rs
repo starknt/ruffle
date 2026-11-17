@@ -8,6 +8,7 @@ use ruffle_render::backend::RenderBackend;
 use ruffle_render::bitmap::{
     Bitmap, BitmapFormat, BitmapHandle, PixelRegion, PixelSnapping, SyncHandle,
 };
+use ruffle_render::error::RenderFailure;
 use ruffle_wstr::WStr;
 use std::cell::Ref;
 use std::fmt::Debug;
@@ -60,6 +61,39 @@ pub struct Color {
 #[derive(Debug, Clone)]
 pub enum BitmapDataDrawError {
     Unimplemented,
+    Render(RenderFailure),
+}
+
+impl From<RenderFailure> for BitmapDataDrawError {
+    fn from(error: RenderFailure) -> Self {
+        Self::Render(error)
+    }
+}
+
+pub enum BitmapDataWriteError {
+    ByteArray(crate::avm2::bytearray::ByteArrayError),
+    Render(RenderFailure),
+}
+impl From<crate::avm2::bytearray::ByteArrayError> for BitmapDataWriteError {
+    fn from(error: crate::avm2::bytearray::ByteArrayError) -> Self {
+        Self::ByteArray(error)
+    }
+}
+impl From<RenderFailure> for BitmapDataWriteError {
+    fn from(error: RenderFailure) -> Self {
+        Self::Render(error)
+    }
+}
+impl BitmapDataWriteError {
+    pub fn to_avm<'gc>(
+        self,
+        activation: &mut crate::avm2::Activation<'_, 'gc>,
+    ) -> crate::avm2::Error<'gc> {
+        match self {
+            Self::ByteArray(error) => error.to_avm(activation),
+            Self::Render(error) => error.into(),
+        }
+    }
 }
 
 impl Color {
@@ -270,13 +304,16 @@ impl<'gc> BitmapData<'gc> {
         &self,
         mc: &Mutation<'gc>,
         renderer: &mut dyn RenderBackend,
-    ) -> BitmapData<'gc> {
-        let data = self.0.clone_data(renderer);
+    ) -> Result<BitmapData<'gc>, RenderFailure> {
+        let data = self.0.clone_data(renderer)?;
         let data = BitmapRawDataWrapper::new(Gc::new(mc, data.into()));
-        Self(data)
+        Ok(Self(data))
     }
 
-    pub fn sync(&self, renderer: &mut dyn RenderBackend) -> GcRefLock<'gc, BitmapRawData<'gc>> {
+    pub fn sync(
+        &self,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<GcRefLock<'gc, BitmapRawData<'gc>>, RenderFailure> {
         self.0.sync(renderer)
     }
 
@@ -284,7 +321,7 @@ impl<'gc> BitmapData<'gc> {
         &self,
         gc_context: &Mutation<'gc>,
         renderer: &mut dyn RenderBackend,
-    ) -> BitmapHandle {
+    ) -> Result<BitmapHandle, RenderFailure> {
         self.0.bitmap_handle(gc_context, renderer)
     }
 
@@ -308,7 +345,7 @@ impl<'gc> BitmapData<'gc> {
         &self,
         read_area: PixelRegion,
         renderer: &mut dyn RenderBackend,
-    ) -> Ref<'_, BitmapRawData<'gc>> {
+    ) -> Result<Ref<'_, BitmapRawData<'gc>>, RenderFailure> {
         self.0.read_area(read_area, renderer)
     }
 
@@ -434,6 +471,43 @@ pub enum DirtyState {
 
     // The GPU pixels have been modified, and need to be synced to the CPU via `BitmapRawDataWrapper::sync`
     GpuModified(Box<dyn SyncHandle>, PixelRegion),
+
+    // The readback was consumed but did not produce valid pixels. Never expose them.
+    Failed(RenderFailure),
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use ruffle_render::backend::{ViewportDimensions, null::NullRenderer};
+
+    #[derive(Debug)]
+    struct FailedSync;
+    impl SyncHandle for FailedSync {}
+
+    #[test]
+    fn failed_bitmap_readback_never_exposes_stale_pixels() {
+        let arena = gc_arena::Arena::<gc_arena::Rootable![BitmapData<'_>]>::new(|mc| {
+            BitmapData::new(mc, 1, 1, true, 0xff123456)
+        });
+        arena.mutate(|mc, bitmap| {
+            let mut renderer = NullRenderer::new(ViewportDimensions {
+                width: 1,
+                height: 1,
+                scale_factor: 1.0,
+            });
+            bitmap.mark_gpu_dirty(mc, Box::new(FailedSync), PixelRegion::for_whole_size(1, 1));
+            assert!(bitmap.sync(&mut renderer).is_err());
+            assert!(bitmap.sync(&mut renderer).is_err());
+            assert!(
+                bitmap
+                    .read_area(PixelRegion::for_pixel(0, 0), &mut renderer)
+                    .is_err()
+            );
+            assert!(!bitmap.can_read(PixelRegion::for_pixel(0, 0)));
+            assert!(renderer.health().check().is_err());
+        });
+    }
 }
 
 mod wrapper {
@@ -446,6 +520,7 @@ mod wrapper {
     use ruffle_render::backend::RenderBackend;
     use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping, SyncHandle};
     use ruffle_render::commands::CommandHandler;
+    use ruffle_render::error::RenderFailure;
     use std::cell::Ref;
     use web_time::Instant;
 
@@ -514,11 +589,14 @@ mod wrapper {
 
         /// Clones the underlying data, producing a new `BitmapData`
         /// that has no GPU texture or associated display objects
-        pub fn clone_data(&self, renderer: &mut dyn RenderBackend) -> BitmapRawData<'gc> {
+        pub fn clone_data(
+            &self,
+            renderer: &mut dyn RenderBackend,
+        ) -> Result<BitmapRawData<'gc>, RenderFailure> {
             // Sync from the GPU to CPU, since our new BitmapData starts out
             // with no GPU texture
-            let data = self.sync(renderer).borrow();
-            BitmapRawData {
+            let data = self.sync(renderer)?.borrow();
+            Ok(BitmapRawData {
                 pixels: data.pixels.clone(),
                 width: data.width,
                 height: data.height,
@@ -531,12 +609,16 @@ mod wrapper {
                 dirty_state: DirtyState::Clean,
                 #[cfg(feature = "egui")]
                 egui_texture: Default::default(),
-            }
+            })
         }
 
         // Provides access to the underlying `BitmapData`. If a GPU -> CPU sync
         // is in progress, waits for it to complete
-        pub fn sync(&self, renderer: &mut dyn RenderBackend) -> GcRefLock<'gc, BitmapRawData<'gc>> {
+        pub fn sync(
+            &self,
+            renderer: &mut dyn RenderBackend,
+        ) -> Result<GcRefLock<'gc, BitmapRawData<'gc>>, RenderFailure> {
+            renderer.health().check()?;
             // SAFETY: The only fields that can store gc pointers are `avm2_object` and `dirty_callbacks`,
             // which we don't update here. Ideally, we would refactor this so that
             // `BitmapData` doesn't contain any gc pointers, allowing us to use a normal
@@ -547,14 +629,19 @@ mod wrapper {
             match std::mem::replace(&mut write.dirty_state, DirtyState::Clean) {
                 DirtyState::GpuModified(sync_handle, bounds) => {
                     let readback_started = Instant::now();
-                    renderer
-                        .resolve_sync_handle(
-                            sync_handle,
-                            Box::new(|buffer, buffer_width| {
-                                copy_pixels_to_bitmapdata(&mut write, buffer, buffer_width, bounds)
-                            }),
-                        )
-                        .expect("Failed to sync BitmapData");
+                    let result = renderer.resolve_sync_handle(
+                        sync_handle,
+                        Box::new(|buffer, buffer_width| {
+                            copy_pixels_to_bitmapdata(&mut write, buffer, buffer_width, bounds)
+                        }),
+                    );
+                    let result =
+                        result.and_then(|()| renderer.health().check().map_err(Into::into));
+                    if let Err(error) = result {
+                        let error = renderer.health().record(error.into_render_failure());
+                        write.dirty_state = DirtyState::Failed(error.clone());
+                        return Err(error);
+                    }
                     ruffle_render::profile::bitmap_readback(
                         u64::from(bounds.width())
                             .saturating_mul(u64::from(bounds.height()))
@@ -565,9 +652,13 @@ mod wrapper {
                     #[cfg(feature = "egui")]
                     write.egui_texture.borrow_mut().take();
                 }
+                DirtyState::Failed(error) => {
+                    write.dirty_state = DirtyState::Failed(error.clone());
+                    return Err(error);
+                }
                 old_state => write.dirty_state = old_state,
             }
-            self.0
+            Ok(self.0)
         }
 
         /// Provides access to the underlying `BitmapHandle`.
@@ -580,9 +671,9 @@ mod wrapper {
             &self,
             gc_context: &Mutation<'gc>,
             renderer: &mut dyn RenderBackend,
-        ) -> BitmapHandle {
+        ) -> Result<BitmapHandle, RenderFailure> {
             let mut bitmap_data = self.0.borrow_mut(gc_context);
-            bitmap_data.update_dirty_texture(renderer);
+            bitmap_data.update_dirty_texture(renderer)?;
             bitmap_data.bitmap_handle(renderer)
         }
 
@@ -616,7 +707,7 @@ mod wrapper {
                     write.dirty_state = DirtyState::Clean;
                     Some(rect)
                 }
-                DirtyState::CpuModified(_) | DirtyState::Clean => None,
+                DirtyState::CpuModified(_) | DirtyState::Clean | DirtyState::Failed(_) => None,
             };
             #[cfg(feature = "egui")]
             write.egui_texture.borrow_mut().take();
@@ -630,7 +721,8 @@ mod wrapper {
             &self,
             read_area: PixelRegion,
             renderer: &mut dyn RenderBackend,
-        ) -> Ref<'_, BitmapRawData<'gc>> {
+        ) -> Result<Ref<'_, BitmapRawData<'gc>>, RenderFailure> {
+            renderer.health().check()?;
             let needs_update = if let DirtyState::GpuModified(_, area) = self.0.borrow().dirty_state
             {
                 area.intersects(read_area)
@@ -638,9 +730,9 @@ mod wrapper {
                 false
             };
             if needs_update {
-                self.sync(renderer);
+                self.sync(renderer)?;
             }
-            self.0.borrow()
+            Ok(self.0.borrow())
         }
 
         // These methods do not require a sync to complete, as they do not depend on the
@@ -715,14 +807,34 @@ mod wrapper {
             let view = if inner_bitmap_data.bitmap_handle.is_none()
                 && matches!(inner_bitmap_data.dirty_state, DirtyState::Clean)
             {
-                inner_bitmap_data.pixels.view(context.renderer)
+                match inner_bitmap_data.pixels.view(context.renderer) {
+                    Ok(view) => view,
+                    Err(error) => {
+                        context
+                            .renderer
+                            .health()
+                            .record(error.into_render_failure());
+                        return;
+                    }
+                }
             } else {
                 None
             };
-            let handle = view.unwrap_or_else(|| {
-                inner_bitmap_data.update_dirty_texture(context.renderer);
-                inner_bitmap_data.bitmap_handle(context.renderer)
-            });
+            let handle = match view {
+                Some(handle) => handle,
+                None => {
+                    if inner_bitmap_data
+                        .update_dirty_texture(context.renderer)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    match inner_bitmap_data.bitmap_handle(context.renderer) {
+                        Ok(handle) => handle,
+                        Err(_) => return,
+                    }
+                }
+            };
 
             context.commands.render_bitmap(
                 handle,
@@ -734,16 +846,17 @@ mod wrapper {
         }
 
         pub fn can_read(&self, read_area: PixelRegion) -> bool {
-            if let DirtyState::GpuModified(_, area) = self.0.borrow().dirty_state {
-                !area.intersects(read_area)
-            } else {
-                true
+            match &self.0.borrow().dirty_state {
+                DirtyState::GpuModified(_, area) => !area.intersects(read_area),
+                DirtyState::Failed(_) => false,
+                _ => true,
             }
         }
 
         #[cfg(feature = "egui")]
         pub fn debug_sync_status(&self) -> std::borrow::Cow<'static, str> {
             match self.0.borrow().dirty_state {
+                DirtyState::Failed(ref error) => std::borrow::Cow::Owned(error.to_string()),
                 DirtyState::Clean => std::borrow::Cow::Borrowed("Clean"),
                 DirtyState::CpuModified(area) => std::borrow::Cow::Owned(format!(
                     "CPU modified from {}, {} to {}, {}",
@@ -844,6 +957,7 @@ impl<'gc> BitmapRawData<'gc> {
         &mut self,
         renderer: &mut dyn RenderBackend,
     ) -> Result<BitmapHandle, ruffle_render::error::Error> {
+        renderer.health().check()?;
         if let Some(ref handle) = self.bitmap_handle {
             return Ok(handle.clone());
         }
@@ -862,9 +976,12 @@ impl<'gc> BitmapRawData<'gc> {
         bitmap_handle
     }
 
-    pub fn bitmap_handle(&mut self, renderer: &mut dyn RenderBackend) -> BitmapHandle {
+    pub fn bitmap_handle(
+        &mut self,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<BitmapHandle, RenderFailure> {
         self.try_bitmap_handle(renderer)
-            .expect("Failed to register bitmap")
+            .map_err(|error| renderer.health().record(error.into_render_failure()))
     }
 
     pub fn transparency(&self) -> bool {
@@ -901,6 +1018,7 @@ impl<'gc> BitmapRawData<'gc> {
                 self.dirty_state = DirtyState::CpuModified(region);
                 true
             }
+            DirtyState::Failed(_) => return,
             DirtyState::GpuModified(_, _) => {
                 panic!("Attempted to modify CPU dirty state while GPU sync is in progress!")
             }
@@ -966,26 +1084,32 @@ impl<'gc> BitmapRawData<'gc> {
 
     // Updates the data stored with our `BitmapHandle` if this `BitmapRawData`
     // is dirty
-    pub fn update_dirty_texture(&mut self, renderer: &mut dyn RenderBackend) {
-        let handle = self.bitmap_handle(renderer);
+    pub fn update_dirty_texture(
+        &mut self,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<(), RenderFailure> {
+        renderer.health().check()?;
+        let handle = self.bitmap_handle(renderer)?;
         match &self.dirty_state {
             DirtyState::CpuModified(region) => {
-                if let Err(e) = renderer.update_texture(
-                    &handle,
-                    Bitmap::new(
-                        self.width(),
-                        self.height(),
-                        BitmapFormat::Rgba,
-                        self.pixels_rgba(),
-                    ),
-                    *region,
-                ) {
-                    tracing::error!("Failed to update dirty bitmap {:?}: {:?}", handle, e);
-                }
+                renderer
+                    .update_texture(
+                        &handle,
+                        Bitmap::new(
+                            self.width(),
+                            self.height(),
+                            BitmapFormat::Rgba,
+                            self.pixels_rgba(),
+                        ),
+                        *region,
+                    )
+                    .map_err(|error| renderer.health().record(error.into_render_failure()))?;
                 self.dirty_state = DirtyState::Clean
             }
             DirtyState::Clean | DirtyState::GpuModified(_, _) => {}
+            DirtyState::Failed(error) => return Err(error.clone()),
         }
+        Ok(())
     }
 
     fn inform_display_objects(&self, gc_context: &Mutation<'gc>) {

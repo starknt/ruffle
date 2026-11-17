@@ -267,7 +267,7 @@ pub fn draw_to_bitmap_data<'gc>(
             PixelRegion::for_whole_size(source_width, source_height),
         );
 
-        let handle = destination.bitmap_handle(activation.gc(), activation.context.renderer);
+        let handle = destination.bitmap_handle(activation.gc(), activation.context.renderer)?;
 
         let (destination, _) = destination.overwrite_cpu_pixels_from_gpu(activation.gc());
         let mut write = destination.borrow_mut(activation.gc());
@@ -279,7 +279,7 @@ pub fn draw_to_bitmap_data<'gc>(
             commands,
             StageQuality::High,
             dirty_region,
-        );
+        )?;
 
         if let Some(sync_handle) = image {
             write.set_gpu_dirty(activation.gc(), sync_handle, dirty_region);

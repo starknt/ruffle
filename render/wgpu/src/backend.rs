@@ -13,14 +13,13 @@ use crate::{
     AsyncReadback, Descriptors, Error, QueueSyncHandle, RenderTarget, SwapChainTarget, Texture,
     as_texture, format_list, get_backend_names,
 };
-use image::imageops::FilterType;
 use ruffle_render::backend::{
     BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderPending,
     PixelBenderTarget,
 };
 use ruffle_render::backend::{RenderBackend, ShapeHandle, ViewportDimensions};
 use ruffle_render::bitmap::{
-    Bitmap, BitmapFormat, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
+    Bitmap, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
 };
 use ruffle_render::commands::CommandList;
 use ruffle_render::error::Error as BitmapError;
@@ -122,8 +121,9 @@ impl WgpuRenderBackend<SwapChainTarget> {
             Some(&surface),
             power_preference,
         ))?;
-        let descriptors = Descriptors::new(instance, adapter, device, queue);
-        let target = SwapChainTarget::new(surface, &descriptors.adapter, size, &descriptors.device);
+        let descriptors = Descriptors::new(instance, adapter, device, queue)?;
+        let target =
+            SwapChainTarget::new(surface, &descriptors.adapter, size, &descriptors.device)?;
         Self::new(Arc::new(descriptors), target)
     }
 
@@ -137,7 +137,7 @@ impl WgpuRenderBackend<SwapChainTarget> {
         let descriptors = &self.descriptors;
         let surface = unsafe { descriptors.wgpu_instance.create_surface_unsafe(window)? };
         self.target =
-            SwapChainTarget::new(surface, &descriptors.adapter, size, &descriptors.device);
+            SwapChainTarget::new(surface, &descriptors.adapter, size, &descriptors.device)?;
         Ok(())
     }
 }
@@ -161,24 +161,30 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
             None,
             power_preference,
         ))?;
-        let descriptors = Descriptors::new(instance, adapter, device, queue);
+        let descriptors = Descriptors::new(instance, adapter, device, queue)?;
         let target = crate::target::TextureTarget::new(&descriptors.device, size)?;
         Self::new(Arc::new(descriptors), target)
     }
 
-    pub fn capture_frame(&self) -> Option<image::RgbaImage> {
+    pub fn capture_frame(
+        &self,
+    ) -> Result<Option<image::RgbaImage>, crate::gpu_runtime::RenderFailure> {
+        self.descriptors.runtime.check_health()?;
         use crate::utils::buffer_to_image;
         if let Some(buffer) = &self.target.buffer {
             let (buffer, dimensions) = buffer.buffer.inner();
-            Some(buffer_to_image(
-                &self.descriptors.device,
-                buffer,
-                dimensions,
-                None,
-                self.target.size,
+            Ok(Some(
+                buffer_to_image(
+                    &self.descriptors.device,
+                    buffer,
+                    dimensions,
+                    None,
+                    self.target.size,
+                )
+                .map_err(|error| self.descriptors.runtime.health().record(error))?,
             ))
         } else {
-            None
+            Ok(None)
         }
     }
 }
@@ -193,6 +199,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         target: T,
         measure_gpu: bool,
     ) -> Result<Self, Error> {
+        descriptors.runtime.check_health()?;
         if target.width() > descriptors.limits.max_texture_dimension_2d
             || target.height() > descriptors.limits.max_texture_dimension_2d
         {
@@ -251,6 +258,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         #[cfg(not(feature = "profile-with-tracy"))]
         let profiler = GpuProfiler::new(&descriptors.device, profiler_settings)?;
 
+        descriptors.runtime.check_health()?;
         Ok(Self {
             budget: budget.clone(),
             descriptors,
@@ -382,30 +390,24 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         }
     }
 
-    fn clamp_bitmap(&self, bitmap: &mut Bitmap) -> bool {
+    fn validate_bitmap_size(
+        &self,
+        bitmap: &Bitmap<'_>,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
         let max_size = self.descriptors.limits.max_texture_dimension_2d;
-        if bitmap.width() > max_size || bitmap.height() > max_size {
-            let image =
-                image::RgbaImage::from_raw(bitmap.width(), bitmap.height(), bitmap.data().to_vec())
-                    .expect("Width and height of bitmap must match bitmap data");
-
-            let ratio = bitmap.width() as f32 / bitmap.height() as f32;
-            let mut width = bitmap.width();
-            let mut height = bitmap.height();
-            if width > max_size {
-                width = max_size;
-                height = (max_size as f32 / ratio) as u32;
-            }
-            if height > max_size {
-                height = max_size;
-                width = (max_size as f32 * ratio) as u32;
-            }
-            let resized = image::imageops::resize(&image, width, height, FilterType::CatmullRom);
-            *bitmap = Bitmap::new(width, height, BitmapFormat::Rgba, resized.into_raw());
-            true
-        } else {
-            false
+        if bitmap.width() == 0
+            || bitmap.height() == 0
+            || bitmap.width() > max_size
+            || bitmap.height() > max_size
+        {
+            return Err(self.descriptors.runtime.health().record(
+                crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Validation,
+                    "bitmap dimensions exceed device limits",
+                ),
+            ));
         }
+        Ok(())
     }
 
     /// Collect completed timestamp queries without blocking or inventing missing samples.
@@ -483,24 +485,29 @@ enum WgpuPixelBenderPending {
 }
 
 impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
-    fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions) {
-        // Avoid panics from creating 0-sized framebuffers.
-        // TODO: find a way to bubble an error when the size is too large
-        let width = std::cmp::max(
-            std::cmp::min(
-                dimensions.width,
-                self.descriptors.limits.max_texture_dimension_2d,
-            ),
-            1,
-        );
-        let height = std::cmp::max(
-            std::cmp::min(
-                dimensions.height,
-                self.descriptors.limits.max_texture_dimension_2d,
-            ),
-            1,
-        );
-        self.target.resize(&self.descriptors.device, width, height);
+    fn health(&self) -> &ruffle_render::error::RendererHealth {
+        self.descriptors.runtime.health()
+    }
+
+    fn set_viewport_dimensions(
+        &mut self,
+        dimensions: ViewportDimensions,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.descriptors.runtime.check_health()?;
+        if dimensions.width > self.descriptors.limits.max_texture_dimension_2d
+            || dimensions.height > self.descriptors.limits.max_texture_dimension_2d
+        {
+            return Err(self.descriptors.runtime.health().record(
+                crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Validation,
+                    "viewport exceeds device texture limits",
+                ),
+            ));
+        }
+        let width = dimensions.width.max(1);
+        let height = dimensions.height.max(1);
+        self.target
+            .resize(&self.descriptors.device, width, height)?;
 
         self.surface = Surface::new(
             &self.descriptors,
@@ -512,12 +519,17 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         self.viewport_scale_factor = dimensions.scale_factor;
         self.texture_pool = TexturePool::new(self.budget.clone());
+
+        self.descriptors.runtime.check_health()?;
+        Ok(())
     }
 
     fn create_context3d(
         &mut self,
         profile: Context3DProfile,
     ) -> Result<Box<dyn Context3D>, BitmapError> {
+        self.descriptors.runtime.check_health()?;
+        self.descriptors.runtime.check_health()?;
         Ok(Box::new(WgpuContext3D::new(
             self.descriptors.clone(),
             profile,
@@ -553,7 +565,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         "wgpu"
     }
 
-    fn set_quality(&mut self, quality: StageQuality) {
+    fn set_quality(
+        &mut self,
+        quality: StageQuality,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.descriptors.runtime.check_health()?;
         self.surface = Surface::new(
             &self.descriptors,
             quality,
@@ -561,6 +577,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             self.surface.size().height,
             self.target.format(),
         );
+
+        self.descriptors.runtime.check_health()?;
+        Ok(())
     }
 
     fn viewport_dimensions(&self) -> ViewportDimensions {
@@ -576,9 +595,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         &mut self,
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
-    ) -> ShapeHandle {
+    ) -> Result<ShapeHandle, crate::gpu_runtime::RenderFailure> {
+        self.descriptors.runtime.check_health()?;
         let mesh = self.register_shape_internal(shape, bitmap_source, 1.0);
-        ShapeHandle(Arc::new(mesh))
+        self.descriptors.runtime.check_health()?;
+        Ok(ShapeHandle(Arc::new(mesh)))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -587,9 +608,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
         scale: f32,
-    ) -> ShapeHandle {
+    ) -> Result<ShapeHandle, crate::gpu_runtime::RenderFailure> {
+        self.descriptors.runtime.check_health()?;
         let mesh = self.register_shape_internal(shape, bitmap_source, scale);
-        ShapeHandle(Arc::new(mesh))
+        self.descriptors.runtime.check_health()?;
+        Ok(ShapeHandle(Arc::new(mesh)))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -598,14 +621,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         clear: Color,
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
-    ) {
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.descriptors.runtime.check_health()?;
         let _render_backend =
             ruffle_render::profile::time(ruffle_render::profile::Phase::RenderBackend);
         let frame_output = {
             let _timer = ruffle_render::profile::native_time(
                 ruffle_render::profile::NativePhase::SurfaceAcquire,
             );
-            self.target.get_next_texture()
+            self.target.get_next_texture()?
         };
         let Some(frame_output) = frame_output else {
             // Attempt to recreate the swap chain in this case.
@@ -613,8 +637,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 &self.descriptors.device,
                 self.target.width(),
                 self.target.height(),
-            );
-            return;
+            )?;
+            return Ok(());
         };
 
         for entry in cache_entries {
@@ -702,7 +726,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             // Periodically flush GPU work to prevent OOM when many cache entries
             // accumulate (e.g. when a large container's cacheAsBitmap is skipped
             // but its hundreds of children each have their own bitmap caches).
-            self.active_frame.maybe_flush(&self.descriptors);
+            self.active_frame.maybe_flush(&self.descriptors)?;
         }
 
         self.surface.draw_commands_and_copy_to(
@@ -735,24 +759,34 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             &self.descriptors,
             &self.target,
             frame_output,
-        ));
+        )?);
         let (idle, peak, combined) = self.budget.stats();
         ruffle_render::profile::pool(idle, peak, combined);
         self.texture_pool.end_frame();
         self.offscreen_texture_pool.end_frame();
-        self.profiler
-            .end_frame()
-            .expect("Frame should end successfully");
+        self.profiler.end_frame().map_err(|error| {
+            self.descriptors
+                .runtime
+                .health()
+                .record(crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Internal,
+                    format!("GPU profiler: {error}"),
+                ))
+        })?;
         ruffle_render::profile::submitted();
         self.collect_gpu_samples();
+
+        self.descriptors.runtime.check_health()?;
+        Ok(())
     }
 
     #[instrument(level = "debug", skip_all)]
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         let _upload = ruffle_render::profile::time(ruffle_render::profile::Phase::Upload);
-        let mut bitmap = bitmap.to_rgba();
+        let bitmap = bitmap.to_rgba();
 
-        self.clamp_bitmap(&mut bitmap);
+        self.validate_bitmap_size(&bitmap)?;
 
         let extent = wgpu::Extent3d {
             width: bitmap.width(),
@@ -810,6 +844,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             copy_count: Cell::new(0),
         }));
 
+        self.descriptors.runtime.check_health()?;
         Ok(handle)
     }
 
@@ -831,8 +866,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         &mut self,
         handle: &BitmapHandle,
         bitmap: Bitmap<'_>,
-        mut region: PixelRegion,
+        region: PixelRegion,
     ) -> Result<(), BitmapError> {
+        self.descriptors.runtime.check_health()?;
         if region.width() == 0 || region.height() == 0 {
             // Nothing to do. It's important to bail out now, as the
             // write_texture call panics when the source buffer is of zero size.
@@ -842,12 +878,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         let texture = as_texture(handle);
 
         let _upload = ruffle_render::profile::time(ruffle_render::profile::Phase::Upload);
-        let mut bitmap = bitmap.to_rgba();
-        if self.clamp_bitmap(&mut bitmap) {
-            // If we're updating a resized texture, just redo the whole thing.
-            // We can't trivially map pixel regions as we use a filter to resize.
-            region = PixelRegion::for_whole_size(bitmap.width(), bitmap.height());
-        }
+        let bitmap = bitmap.to_rgba();
+        self.validate_bitmap_size(&bitmap)?;
 
         let extent = wgpu::Extent3d {
             width: region.width(),
@@ -856,7 +888,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         };
 
         if self.active_frame.command_encoder.dirty {
-            self.active_frame.submit_direct(&self.descriptors);
+            self.active_frame.submit_direct(&self.descriptors)?;
         }
         ruffle_render::profile::uploaded(u64::from(extent.width) * u64::from(extent.height) * 4);
         self.descriptors.queue.write_texture(
@@ -880,6 +912,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             extent,
         );
 
+        self.descriptors.runtime.check_health()?;
         Ok(())
     }
 
@@ -890,6 +923,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         destination: BitmapHandle,
         destination_region: PixelRegion,
     ) -> Result<Option<Box<dyn SyncHandle>>, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         if source == destination
             || source_region.is_empty()
             || source_region.width() != destination_region.width()
@@ -950,7 +984,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 },
             );
 
-        self.active_frame.maybe_flush(&self.descriptors);
+        self.active_frame.maybe_flush(&self.descriptors)?;
+        self.descriptors.runtime.check_health()?;
         Ok(Some(self.make_queue_sync_handle(
             target,
             None,
@@ -966,7 +1001,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         commands: CommandList,
         quality: StageQuality,
         bounds: PixelRegion,
-    ) -> Option<Box<dyn SyncHandle>> {
+    ) -> Result<Option<Box<dyn SyncHandle>>, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         let texture = as_texture(&handle);
 
         let extent = wgpu::Extent3d {
@@ -982,9 +1018,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             buffer: None,
         };
 
-        let frame_output = target
-            .get_next_texture()
-            .expect("TextureTargetFrame.get_next_texture is infallible");
+        let frame_output = target.get_next_texture()?.ok_or_else(|| {
+            self.descriptors
+                .runtime
+                .health()
+                .record(crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Internal,
+                    "texture target returned no attachment",
+                ))
+        })?;
 
         let surface = Surface::new(
             &self.descriptors,
@@ -1009,8 +1051,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             &mut self.offscreen_texture_pool,
         );
 
-        self.active_frame.maybe_flush(&self.descriptors);
-        Some(self.make_queue_sync_handle(target, None, handle, bounds))
+        self.active_frame.maybe_flush(&self.descriptors)?;
+        self.descriptors.runtime.check_health()?;
+        Ok(Some(
+            self.make_queue_sync_handle(target, None, handle, bounds),
+        ))
     }
 
     fn is_filter_supported(&self, filter: &Filter) -> bool {
@@ -1038,7 +1083,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         destination: BitmapHandle,
         dest_point: (i32, i32),
         filter: Filter,
-    ) -> Option<Box<dyn SyncHandle>> {
+    ) -> Result<Option<Box<dyn SyncHandle>>, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         let source_texture = as_texture(&source);
         let dest_texture = as_texture(&destination);
 
@@ -1088,7 +1134,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         let copy_height = available_height.min(dest_available_height);
 
         if copy_width == 0 || copy_height == 0 {
-            return None;
+            return Ok(None);
         }
 
         self.active_frame
@@ -1122,14 +1168,21 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 },
             );
 
-        self.active_frame.maybe_flush(&self.descriptors);
-        Some(self.make_queue_sync_handle(target, None, destination, copy_area))
+        self.active_frame.maybe_flush(&self.descriptors)?;
+        self.descriptors.runtime.check_health()?;
+        Ok(Some(self.make_queue_sync_handle(
+            target,
+            None,
+            destination,
+            copy_area,
+        )))
     }
 
     fn compile_pixelbender_shader(
         &mut self,
         shader: PixelBenderShader,
     ) -> Result<PixelBenderShaderHandle, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         self.compile_pixelbender_shader_impl(shader)
     }
 
@@ -1139,6 +1192,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         arguments: &[PixelBenderShaderArgument],
         target: &PixelBenderTarget,
     ) -> Result<PixelBenderOutput, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         let mut pending = self.submit_pixelbender_shader(shader, arguments, target)?;
         loop {
             if let Some(output) = self.poll_pixelbender_shader(&mut pending)? {
@@ -1148,10 +1202,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 .device
                 .poll(wgpu::PollType::Wait {
                     submission_index: None,
-                    timeout: None,
+                    timeout: Some(std::time::Duration::from_secs(2)),
                 })
-                .map_err(|_| {
-                    BitmapError::Unimplemented(Cow::Borrowed("Pixel Bender poll failed"))
+                .map_err(|error| {
+                    self.descriptors
+                        .runtime
+                        .health()
+                        .record(crate::utils::poll_failure(error))
                 })?;
         }
     }
@@ -1160,6 +1217,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         &mut self,
         pending: &mut PixelBenderPending,
     ) -> Result<Option<PixelBenderOutput>, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         let state =
             pending
                 .backend_mut::<WgpuPixelBenderPending>()
@@ -1181,16 +1239,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     let handle = sync_handle
                         .take()
                         .expect("Pixel Bender readback handle missing");
-                    *readback = Some(handle.prepare_async(&mut self.active_frame));
+                    *readback = Some(handle.prepare_async(&mut self.active_frame)?);
                     return Ok(None);
                 }
-                let Some((raw_pixels, buffer_width)) =
-                    readback.as_mut().unwrap().poll().map_err(|error| {
-                        BitmapError::Unimplemented(Cow::Owned(
-                            format!("Pixel Bender readback poll failed: {error}").into(),
-                        ))
-                    })?
-                else {
+                let Some((raw_pixels, buffer_width)) = readback.as_mut().unwrap().poll()? else {
                     return Ok(None);
                 };
                 let pixels = if buffer_width as usize
@@ -1226,6 +1278,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         arguments: &[PixelBenderShaderArgument],
         target: &PixelBenderTarget,
     ) -> Result<PixelBenderPending, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         let output_channels = shader
             .0
             .parsed_shader()
@@ -1312,9 +1365,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             buffer: buffer_info,
         };
 
-        let frame_output = texture_target
-            .get_next_texture()
-            .expect("TextureTargetFrame.get_next_texture is infallible");
+        let frame_output = texture_target.get_next_texture()?.ok_or_else(|| {
+            self.descriptors
+                .runtime
+                .health()
+                .record(crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Internal,
+                    "texture target returned no attachment",
+                ))
+        })?;
 
         run_pixelbender_shader_impl(
             &self.descriptors,
@@ -1341,7 +1400,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             &self.descriptors,
             &texture_target,
             frame_output,
-        ));
+        )?);
 
         let sync_handle = self.make_queue_sync_handle(
             texture_target,
@@ -1371,13 +1430,22 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         width: NonZeroU32,
         height: NonZeroU32,
     ) -> Result<BitmapHandle, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         let width = width.get();
         let height = height.get();
 
         if width > self.descriptors.limits.max_texture_dimension_2d
             || height > self.descriptors.limits.max_texture_dimension_2d
         {
-            return Err(BitmapError::TooLarge);
+            return Err(self
+                .descriptors
+                .runtime
+                .health()
+                .record(crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Validation,
+                    "bitmap exceeds device texture limits",
+                ))
+                .into());
         }
 
         let extent = wgpu::Extent3d {
@@ -1403,6 +1471,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC,
             });
+        self.descriptors.runtime.check_health()?;
         Ok(BitmapHandle(Arc::new(Texture {
             _allocation: ruffle_render::profile::GpuBitmap::new(
                 u64::from(texture.width())
@@ -1424,8 +1493,20 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         handle: Box<dyn SyncHandle>,
         with_rgba: RgbaBufRead,
     ) -> Result<(), ruffle_render::error::Error> {
-        let handle = Box::<dyn Any>::downcast::<QueueSyncHandle>(handle).unwrap();
-        handle.capture(with_rgba, &mut self.active_frame);
+        self.descriptors.runtime.check_health()?;
+        let handle = Box::<dyn Any>::downcast::<QueueSyncHandle>(handle).map_err(|_| {
+            self.descriptors
+                .runtime
+                .health()
+                .record(crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Internal,
+                    "foreign readback handle",
+                ))
+        })?;
+        handle
+            .capture(with_rgba, &mut self.active_frame)
+            .map_err(|error| self.descriptors.runtime.health().record(error))?;
+        self.descriptors.runtime.check_health()?;
         Ok(())
     }
 }
@@ -1564,7 +1645,8 @@ impl ActiveFrame {
         descriptors: &Descriptors,
         target: &T,
         frame: T::Frame,
-    ) -> SubmissionIndex {
+    ) -> Result<SubmissionIndex, crate::gpu_runtime::RenderFailure> {
+        descriptors.runtime.check_health()?;
         self.draws_since_flush = 0;
         self.staging_belt.finish();
         let draw_encoder = std::mem::replace(
@@ -1590,17 +1672,23 @@ impl ActiveFrame {
             target.submit(
                 &descriptors.device,
                 &descriptors.queue,
+                descriptors.runtime.health(),
                 Some(command_buffer),
                 frame,
-            )
+            )?
         };
         self.staging_belt.recall();
         self.command_encoder.dirty = false;
         self.budget.submitted(&descriptors.queue);
-        index
+        descriptors.runtime.check_health()?;
+        Ok(index)
     }
 
-    pub fn submit_direct(&mut self, descriptors: &Descriptors) -> SubmissionIndex {
+    pub fn submit_direct(
+        &mut self,
+        descriptors: &Descriptors,
+    ) -> Result<SubmissionIndex, crate::gpu_runtime::RenderFailure> {
+        descriptors.runtime.check_health()?;
         self.draws_since_flush = 0;
         self.staging_belt.finish();
         let draw_encoder = std::mem::replace(
@@ -1631,10 +1719,15 @@ impl ActiveFrame {
         self.staging_belt.recall();
         self.command_encoder.dirty = false;
         self.budget.submitted(&descriptors.queue);
-        index
+        descriptors.runtime.check_health()?;
+        Ok(index)
     }
 
-    pub fn maybe_flush(&mut self, descriptors: &Descriptors) {
+    pub fn maybe_flush(
+        &mut self,
+        descriptors: &Descriptors,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        descriptors.runtime.check_health()?;
         // [NA] This is kind of a hack.
         // If we do "too much" during one frame, the submission ends up being way too large and goes OutOfMemory.
         // What it is that we're OOMing on is likely buffers and temporary textures and such from render_offscreen
@@ -1642,7 +1735,10 @@ impl ActiveFrame {
         self.draws_since_flush += 1;
 
         if self.draws_since_flush > Self::MAX_DRAWS_PER_FLUSH {
-            self.submit_direct(descriptors);
+            self.submit_direct(descriptors)?;
         }
+
+        descriptors.runtime.check_health()?;
+        Ok(())
     }
 }

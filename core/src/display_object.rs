@@ -208,11 +208,17 @@ impl BitmapCache {
             && acceptable_size
         {
             let handle = renderer.create_empty_texture(actual_width, actual_height);
-            self.bitmap = handle.ok().map(|handle| BitmapInfo {
-                width: actual_width.get(),
-                height: actual_height.get(),
-                handle,
-            });
+            self.bitmap = match handle {
+                Ok(handle) => Some(BitmapInfo {
+                    width: actual_width.get(),
+                    height: actual_height.get(),
+                    handle,
+                }),
+                Err(error) => {
+                    renderer.health().record(error.into_render_failure());
+                    None
+                }
+            };
         } else {
             self.bitmap = None;
         }

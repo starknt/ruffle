@@ -497,7 +497,7 @@ fn avm2_to_displacement_map_filter<'gc>(
                 bitmap
                     .as_bitmap_data()
                     .unwrap()
-                    .bitmap_handle(activation.gc(), activation.context.renderer),
+                    .bitmap_handle(activation.gc(), activation.context.renderer)?,
             )
         } else {
             None

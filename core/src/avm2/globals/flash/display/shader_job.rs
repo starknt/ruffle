@@ -111,9 +111,19 @@ pub fn begin_frame(context: &mut crate::context::UpdateContext<'_>) {
 /// Run queued jobs at the end of a frame and dispatch their completion events.
 /// All AVM objects and renderer access stay on the player thread.
 pub fn process_post_frame(context: &mut crate::context::UpdateContext<'_>) {
+    if context.renderer.health().check().is_err() {
+        context.pending_shader_jobs.clear();
+        context.active_shader_jobs.clear();
+        return;
+    }
     let mut jobs = std::mem::take(context.active_shader_jobs);
     let jobs_this_frame = jobs.len();
     for _ in 0..jobs_this_frame {
+        if context.renderer.health().check().is_err() {
+            context.pending_shader_jobs.clear();
+            context.active_shader_jobs.clear();
+            return;
+        }
         let Some(mut job) = jobs.pop_front() else {
             break;
         };
@@ -121,6 +131,11 @@ pub fn process_post_frame(context: &mut crate::context::UpdateContext<'_>) {
             let polled_at = Instant::now();
             match context.renderer.poll_pixelbender_shader(&mut pending) {
                 Ok(Some(output)) => {
+                    if context.renderer.health().check().is_err() {
+                        context.pending_shader_jobs.clear();
+                        context.active_shader_jobs.clear();
+                        return;
+                    }
                     job.phase = AsyncShaderJobPhase::Ready;
                     ruffle_render::profile::async_event(
                         "shaderJobCompleted",
@@ -400,7 +415,8 @@ pub fn get_shader_args<'gc>(
                     let texture = if let Some(input) = input.as_object() {
                         let input_texture = if let Some(bitmap) = input.as_bitmap_data() {
                             ImageInputTexture::Bitmap(
-                                bitmap.bitmap_handle(activation.gc(), activation.context.renderer),
+                                bitmap
+                                    .bitmap_handle(activation.gc(), activation.context.renderer)?,
                             )
                         } else if let Some(byte_array) = input.as_bytearray() {
                             assert_eq!(byte_array.endian(), Endian::Little);
@@ -526,7 +542,7 @@ pub fn start<'gc>(
 
     let pixel_bender_target = if let Some(bitmap) = target.as_bitmap_data() {
         PixelBenderTarget::Bitmap(
-            bitmap.bitmap_handle(activation.gc(), activation.context.renderer),
+            bitmap.bitmap_handle(activation.gc(), activation.context.renderer)?,
         )
     } else {
         PixelBenderTarget::Bytes {

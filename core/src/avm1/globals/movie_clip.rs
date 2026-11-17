@@ -578,7 +578,7 @@ fn begin_bitmap_fill<'gc>(
     let fill_style = if let [Value::Object(bitmap_data), ..] = args {
         if let NativeObject::BitmapData(bitmap_data) = bitmap_data.native() {
             // Register the bitmap data with the drawing.
-            let handle = bitmap_data.bitmap_handle(activation.gc(), activation.context.renderer);
+            let handle = bitmap_data.bitmap_handle(activation.gc(), activation.context.renderer)?;
             let bitmap = ruffle_render::bitmap::BitmapInfo {
                 handle,
                 width: bitmap_data.width(),
@@ -1797,7 +1797,8 @@ fn set_filters<'gc>(
             let filter_object = value
                 .get(index, activation)?
                 .coerce_to_object_or_bare(activation)?;
-            if let Some(filter) = bitmap_filter::avm1_to_filter(filter_object, activation.context) {
+            if let Some(filter) = bitmap_filter::avm1_to_filter(filter_object, activation.context)?
+            {
                 filters.push(filter);
             }
         }

@@ -11,6 +11,7 @@ use wgpu::Backend;
 use wgpu::util::DeviceExt;
 
 pub struct Descriptors {
+    pub runtime: crate::gpu_runtime::GpuRuntime,
     pub wgpu_instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
@@ -39,7 +40,25 @@ impl Descriptors {
         adapter: wgpu::Adapter,
         device: wgpu::Device,
         queue: wgpu::Queue,
-    ) -> Self {
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        let runtime =
+            crate::gpu_runtime::GpuRuntime::new(crate::gpu_runtime::GpuBudgetConfig::for_adapter(
+                adapter.get_info().device_type,
+                cfg!(target_os = "android"),
+            ))?;
+        runtime.install_device_callbacks(&device);
+        Self::with_runtime(instance, adapter, device, queue, runtime)
+    }
+
+    /// Shared-device hosts install callbacks once, then use this constructor.
+    pub fn with_runtime(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        runtime: crate::gpu_runtime::GpuRuntime,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        runtime.check_health()?;
         let limits = device.limits();
         let bind_layouts = BindLayouts::new(&device);
         let bitmap_samplers = BitmapSamplers::new(&device);
@@ -48,7 +67,9 @@ impl Descriptors {
         let filters = Filters::new(&device);
         let backend = adapter.get_info().backend;
 
-        Self {
+        runtime.check_health()?;
+        Ok(Self {
+            runtime,
             wgpu_instance: instance,
             adapter,
             device,
@@ -63,7 +84,7 @@ impl Descriptors {
             shaders,
             pipelines: Default::default(),
             filters,
-        }
+        })
     }
 
     pub fn lock_submission(&self) -> Option<std::sync::MutexGuard<'_, ()>> {

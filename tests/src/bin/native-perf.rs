@@ -177,7 +177,7 @@ fn main() -> Result<()> {
     .map_err(|e| anyhow::anyhow!("adapter/device: {e}"))?;
     let info = adapter.get_info();
     let environment = PerfEnvironment {
-        descriptors: Arc::new(Descriptors::new(instance, adapter, device, queue)),
+        descriptors: Arc::new(Descriptors::new(instance, adapter, device, queue)?),
         compile: opt.compile,
         profiling: !opt.profile_off,
     };

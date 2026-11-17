@@ -138,17 +138,20 @@ impl Avm2ObjectWindow {
                             ui.label("Alive");
                             ui.add_space(10.0);
                             if ui.button("Save File...").clicked() {
+                                let pixels = match bmd.sync(activation.context.renderer) {
+                                    Ok(data) => data,
+                                    Err(error) => {
+                                        tracing::error!("Bitmap readback failed: {error}");
+                                        return;
+                                    }
+                                };
                                 let mut data = Vec::new();
                                 let mut encoder =
                                     png::Encoder::new(&mut data, bmd.width(), bmd.height());
                                 encoder.set_color(png::ColorType::Rgba);
                                 encoder.set_depth(png::BitDepth::Eight);
                                 if let Err(e) = encoder.write_header().and_then(|mut w| {
-                                    w.write_image_data(
-                                        bmd.sync(activation.context.renderer)
-                                            .borrow()
-                                            .pixels_rgba(),
-                                    )
+                                    w.write_image_data(pixels.borrow().pixels_rgba())
                                 }) {
                                     tracing::error!("Couldn't create png: {e}");
                                 } else {

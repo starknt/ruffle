@@ -973,7 +973,14 @@ impl DisplayObjectWindow {
             .num_columns(2)
             .show(ui, |ui| {
                 let bitmap_data = object.bitmap_data();
-                let bitmap_data = bitmap_data.sync(context.renderer).borrow();
+                let bitmap_data = match bitmap_data.sync(context.renderer) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        ui.label(error.to_string());
+                        return;
+                    }
+                };
+                let bitmap_data = bitmap_data.borrow();
 
                 ui.label("Width");
                 ui.label(format!("{} px", bitmap_data.width()));
@@ -1001,6 +1008,7 @@ impl DisplayObjectWindow {
 
                 ui.label("Dirty State");
                 match bitmap_data.dirty_state() {
+                    DirtyState::Failed(error) => ui.label(error.to_string()),
                     DirtyState::Clean => ui.label("Clean"),
                     DirtyState::CpuModified(region) => ui.label(format!(
                         "CPU Modified ({},{} to {},{})",
@@ -1018,7 +1026,14 @@ impl DisplayObjectWindow {
             .id_salt(ui.id().with("bitmap-preview"))
             .show(ui, |ui| {
                 let bitmap_data = object.bitmap_data();
-                let bitmap_data = bitmap_data.sync(context.renderer).borrow();
+                let bitmap_data = match bitmap_data.sync(context.renderer) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        ui.label(error.to_string());
+                        return;
+                    }
+                };
+                let bitmap_data = bitmap_data.borrow();
 
                 if bitmap_data.width() == 0 || bitmap_data.height() == 0 {
                     ui.weak("(no pixels)");

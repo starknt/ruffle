@@ -83,9 +83,15 @@ impl GlyphShape {
             GlyphShape::Swf(glyph) => {
                 let mut glyph = glyph.borrow_mut();
                 let (shape, handle) = glyph.shape();
-                handle.get_or_insert_with(|| {
-                    renderer.register_shape((&*shape).into(), &NullBitmapSource)
-                });
+                if handle.is_none() {
+                    match renderer.register_shape((&*shape).into(), &NullBitmapSource) {
+                        Ok(new_handle) => *handle = Some(new_handle),
+                        Err(error) => {
+                            renderer.health().fail(error);
+                            return None;
+                        }
+                    }
+                }
                 handle.clone().map(GlyphRenderData::from_shape)
             }
             GlyphShape::Drawing(drawing) => drawing

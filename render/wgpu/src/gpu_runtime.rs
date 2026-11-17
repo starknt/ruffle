@@ -5,9 +5,9 @@
 //! the last recorded submission completes, even though wgpu owns GPU retirement.
 
 use fnv::{FnvHashMap, FnvHashSet};
-pub use ruffle_render::error::{RenderFailure, RenderFailureKind};
+pub use ruffle_render::error::{RenderFailure, RenderFailureKind, RendererHealth};
 use std::sync::{
-    Arc, Mutex, MutexGuard, OnceLock,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -166,7 +166,7 @@ struct Inner {
     device: u64,
     config: GpuBudgetConfig,
     ledger: Mutex<Ledger>,
-    failure: OnceLock<RenderFailure>,
+    failure: RendererHealth,
 }
 
 impl Inner {
@@ -177,9 +177,7 @@ impl Inner {
     }
 
     fn healthy(&self) -> Result<(), RenderFailure> {
-        self.failure
-            .get()
-            .map_or(Ok(()), |error| Err(error.clone()))
+        self.failure.check()
     }
 }
 
@@ -200,6 +198,48 @@ fn failure(kind: RenderFailureKind, message: impl Into<Arc<str>>) -> RenderFailu
 }
 
 impl GpuRuntime {
+    /// Called once by the native device owner, before any renderer resources.
+    /// Shared hosts pass this runtime to Descriptors instead of installing
+    /// callbacks again for each movie.
+    pub fn install_device_callbacks(&self, device: &wgpu::Device) {
+        self.install_device_callbacks_with_sink(device, |_| {});
+    }
+
+    pub fn install_device_callbacks_with_sink(
+        &self,
+        device: &wgpu::Device,
+        sink: impl Fn(&RenderFailure) + Send + Sync + 'static,
+    ) {
+        let sink = Arc::new(sink);
+        let errors = sink.clone();
+        let health = self.health().clone();
+        device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            let error = Self::wgpu_failure(error);
+            if health.fail(error.clone()) {
+                errors(&error);
+            }
+        }));
+        let health = self.health().clone();
+        device.set_device_lost_callback(move |reason, message| {
+            let error = RenderFailure::new(
+                RenderFailureKind::DeviceLost,
+                format!("{reason:?}: {message}"),
+            );
+            if health.fail(error.clone()) {
+                sink(&error);
+            }
+        });
+    }
+
+    pub fn wgpu_failure(error: wgpu::Error) -> RenderFailure {
+        let kind = match &error {
+            wgpu::Error::OutOfMemory { .. } => RenderFailureKind::OutOfMemory,
+            wgpu::Error::Validation { .. } => RenderFailureKind::Validation,
+            wgpu::Error::Internal { .. } => RenderFailureKind::Internal,
+        };
+        RenderFailure::new(kind, error.to_string())
+    }
+
     pub fn new(config: GpuBudgetConfig) -> Result<Self, RenderFailure> {
         if config.soft_limit > config.hard_limit || config.resource_limit == 0 {
             return Err(failure(
@@ -208,7 +248,7 @@ impl GpuRuntime {
             ));
         }
         let device = NEXT_DEVICE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
             .map_err(|_| {
                 failure(
                     RenderFailureKind::Internal,
@@ -219,7 +259,7 @@ impl GpuRuntime {
             device,
             config,
             ledger: Mutex::default(),
-            failure: OnceLock::new(),
+            failure: RendererHealth::default(),
         })))
     }
 
@@ -231,13 +271,17 @@ impl GpuRuntime {
         self.0.device
     }
 
+    pub fn health(&self) -> &RendererHealth {
+        &self.0.failure
+    }
+
     pub fn failure(&self) -> Option<RenderFailure> {
-        self.0.failure.get().cloned()
+        self.0.failure.failure()
     }
 
     /// Preserve the initiating cause rather than cascading invalid-resource errors.
     pub fn fail(&self, error: RenderFailure) -> bool {
-        self.0.failure.set(error).is_ok()
+        self.0.failure.fail(error)
     }
 
     pub fn check_health(&self) -> Result<(), RenderFailure> {

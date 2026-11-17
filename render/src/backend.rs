@@ -2,7 +2,7 @@ pub mod null;
 
 use crate::bitmap::{Bitmap, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle};
 use crate::commands::CommandList;
-use crate::error::Error;
+use crate::error::{Error, RenderFailure, RendererHealth};
 use crate::filters::Filter;
 use crate::pixel_bender::{PixelBenderShader, PixelBenderShaderHandle};
 use crate::pixel_bender_support::PixelBenderShaderArgument;
@@ -26,22 +26,27 @@ pub struct BitmapCacheEntry {
 }
 
 pub trait RenderBackend: Any {
+    fn health(&self) -> &RendererHealth;
+
     fn viewport_dimensions(&self) -> ViewportDimensions;
     // Do not call this method directly - use `player.set_viewport_dimensions`,
     // which will ensure that the stage is properly updated as well.
-    fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions);
+    fn set_viewport_dimensions(
+        &mut self,
+        dimensions: ViewportDimensions,
+    ) -> Result<(), RenderFailure>;
     fn register_shape(
         &mut self,
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
-    ) -> ShapeHandle;
+    ) -> Result<ShapeHandle, RenderFailure>;
 
     fn register_shape_with_scale(
         &mut self,
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
         _scale: f32,
-    ) -> ShapeHandle {
+    ) -> Result<ShapeHandle, RenderFailure> {
         // Default implementation ignores scale
         self.register_shape(shape, bitmap_source)
     }
@@ -52,7 +57,7 @@ pub trait RenderBackend: Any {
         commands: CommandList,
         quality: StageQuality,
         bounds: PixelRegion,
-    ) -> Option<Box<dyn SyncHandle>>;
+    ) -> Result<Option<Box<dyn SyncHandle>>, Error>;
 
     /// Applies the given filter with a `BitmapHandle` source onto a destination `BitmapHandle`.
     /// The `destination_rect` must be calculated by the caller and is assumed to be correct.
@@ -68,8 +73,8 @@ pub trait RenderBackend: Any {
         _destination: BitmapHandle,
         _dest_point: (i32, i32),
         _filter: Filter,
-    ) -> Option<Box<dyn SyncHandle>> {
-        None
+    ) -> Result<Option<Box<dyn SyncHandle>>, Error> {
+        Ok(None)
     }
 
     fn is_filter_supported(&self, _filter: &Filter) -> bool {
@@ -85,7 +90,7 @@ pub trait RenderBackend: Any {
         clear: swf::Color,
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
-    );
+    ) -> Result<(), RenderFailure>;
 
     fn create_empty_texture(
         &mut self,
@@ -127,7 +132,7 @@ pub trait RenderBackend: Any {
     /// An internal name that is used to identify the render-backend.
     fn name(&self) -> &'static str;
 
-    fn set_quality(&mut self, quality: StageQuality);
+    fn set_quality(&mut self, quality: StageQuality) -> Result<(), RenderFailure>;
 
     fn compile_pixelbender_shader(
         &mut self,
