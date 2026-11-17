@@ -19,7 +19,7 @@ use ruffle_render::matrix::Matrix;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::region::RenderRect;
 use ruffle_render::transform::Transform;
-use std::mem;
+use std::{mem, sync::Arc};
 use swf::{BlendMode, Color, ColorTransform, Twips};
 use wgpu::Backend;
 
@@ -67,6 +67,53 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     .chunk_blends(commands)?)
 }
 
+// Exact, immutable solid geometry in the same target-local coordinate system.
+// This cache lives only while preparing one bounded sibling set; it never spans
+// frames, changes draw order, or retains an image after the last encoded use.
+#[derive(PartialEq)]
+struct SolidInputKey {
+    vertices: crate::gpu_runtime::ResourceId,
+    indices: crate::gpu_runtime::ResourceId,
+    vertex_range: std::ops::Range<u64>,
+    index_range: std::ops::Range<u32>,
+    transform: Transform,
+    size: [u32; 2],
+    clear: wgpu::Color,
+}
+impl SolidInputKey {
+    fn new(
+        commands: &PlannedList,
+        region: RenderRect,
+        clear: wgpu::Color,
+    ) -> Result<Option<Self>, crate::gpu_runtime::RenderFailure> {
+        let Some(Command::RenderShape { shape, transform }) = commands.single_leaf() else {
+            return Ok(None);
+        };
+        if transform.tz != 0.0 || transform.perspective_projection.is_some() {
+            return Ok(None);
+        }
+        let mesh = as_mesh(shape)?;
+        let [draw] = mesh.draws.as_slice() else {
+            return Ok(None);
+        };
+        if !matches!(draw.draw_type, DrawType::Color) {
+            return Ok(None);
+        }
+        let mut transform = transform.clone();
+        transform.matrix.tx -= Twips::from_pixels(region.x as f64);
+        transform.matrix.ty -= Twips::from_pixels(region.y as f64);
+        Ok(Some(Self {
+            vertices: mesh.vertex_buffer.lease().id(),
+            indices: mesh.index_buffer.lease().id(),
+            vertex_range: draw.vertices.clone(),
+            index_range: draw.indices.clone(),
+            transform,
+            size: [region.width, region.height],
+            clear,
+        }))
+    }
+}
+
 struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     descriptors: &'encoder Descriptors,
     quality: StageQuality,
@@ -82,6 +129,7 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     texture_pool: &'encoder mut TexturePool,
     emulate_lines: bool,
 
+    solid_inputs: Vec<(SolidInputKey, Arc<PoolOrArcTexture>)>,
     result: Vec<Chunk>,
     current: Vec<DrawCommand>,
     chunk_buffer_builder: ChunkBufferBuilder,
@@ -128,6 +176,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             texture_pool,
             emulate_lines,
 
+            solid_inputs: vec![],
             result: vec![],
             current: vec![],
             chunk_buffer_builder,
@@ -548,18 +597,6 @@ impl WgpuCommandHandler<'_, '_> {
             return;
         }
         let result = (|| -> Result<(), crate::gpu_runtime::RenderFailure> {
-            ruffle_render::profile::work(|w| {
-                w.offscreen_targets += 1;
-                w.offscreen_pixels += u64::from(region.width) * u64::from(region.height);
-            });
-            let surface = Surface::new(
-                self.descriptors,
-                self.quality,
-                region.width,
-                region.height,
-                wgpu::TextureFormat::Rgba8Unorm,
-            )?
-            .with_origin([region.x, region.y]);
             let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
                 LayerRef::Current
             } else {
@@ -567,18 +604,55 @@ impl WgpuCommandHandler<'_, '_> {
             };
             let blend_type = BlendType::from(blend_mode);
             let clear_color = blend_type.default_color();
-            let target = surface.draw_commands(
-                RenderTargetMode::FreshWithColor(clear_color),
-                self.descriptors,
-                self.meshes,
-                commands,
-                self.staging_belt,
-                self.chunk_buffers,
-                self.draw_encoder,
-                target_layer,
-                self.texture_pool,
-            )?;
-            target.ensure_cleared(self.draw_encoder);
+            let key = if matches!(blend_type, BlendType::Shader(_)) {
+                None
+            } else {
+                SolidInputKey::new(&commands, region, clear_color)?
+            };
+            let reused = key.as_ref().and_then(|key| {
+                self.solid_inputs
+                    .iter()
+                    .find(|(candidate, _)| candidate == key)
+                    .map(|(_, texture)| texture.clone())
+            });
+            let texture = if let Some(texture) = reused {
+                PoolOrArcTexture::Shared(texture)
+            } else {
+                ruffle_render::profile::work(|w| {
+                    w.offscreen_targets += 1;
+                    w.offscreen_pixels += u64::from(region.width) * u64::from(region.height);
+                });
+                let surface = Surface::new(
+                    self.descriptors,
+                    self.quality,
+                    region.width,
+                    region.height,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                )?
+                .with_origin([region.x, region.y]);
+                let target = surface.draw_commands(
+                    RenderTargetMode::FreshWithColor(clear_color),
+                    self.descriptors,
+                    self.meshes,
+                    commands,
+                    self.staging_belt,
+                    self.chunk_buffers,
+                    self.draw_encoder,
+                    target_layer,
+                    self.texture_pool,
+                )?;
+                target.ensure_cleared(self.draw_encoder);
+                let texture = target.take_color_texture();
+                if let Some(key) = key
+                    && self.solid_inputs.len() < 64
+                {
+                    let texture = Arc::new(texture);
+                    self.solid_inputs.push((key, texture.clone()));
+                    PoolOrArcTexture::Shared(texture)
+                } else {
+                    texture
+                }
+            };
 
             match blend_type {
                 BlendType::Trivial(blend_mode) => {
@@ -586,13 +660,12 @@ impl WgpuCommandHandler<'_, '_> {
                         matrix: Matrix {
                             tx: Twips::from_pixels(region.x as f64),
                             ty: Twips::from_pixels(region.y as f64),
-                            ..Matrix::scale(target.width() as f32, target.height() as f32)
+                            ..Matrix::scale(region.width as f32, region.height as f32)
                         },
                         tz: 0.0,
                         color_transform: Default::default(),
                         perspective_projection: None,
                     };
-                    let texture = target.take_color_texture();
                     let bind_group =
                         self.descriptors
                             .cached_bind_group(&wgpu::BindGroupDescriptor {
@@ -654,7 +727,7 @@ impl WgpuCommandHandler<'_, '_> {
                             y: region.y - self.origin[1],
                             ..region
                         },
-                        texture: target.take_color_texture(),
+                        texture,
                         blend_mode: chunk_blend_mode,
                         needs_stencil: self.mask_state.count > 0,
                     });

@@ -45,17 +45,11 @@ impl ResolveBuffer {
     }
 
     pub fn view(&self) -> &crate::gpu_resources::TextureView {
-        match self.texture {
-            PoolOrArcTexture::Pool(ref texture) => &texture.1,
-            PoolOrArcTexture::Manual(ref texture) => &texture.1,
-        }
+        self.texture.view()
     }
 
     pub fn texture(&self) -> &crate::gpu_resources::Texture {
-        match self.texture {
-            PoolOrArcTexture::Pool(ref texture) => &texture.0,
-            PoolOrArcTexture::Manual(ref texture) => &texture.0,
-        }
+        self.texture.texture()
     }
 
     pub fn take_texture(self) -> PoolOrArcTexture {
@@ -75,6 +69,7 @@ pub struct FrameBuffer {
 /// (when rendering to the main screen), or rendering to a non-pooled `Texture`
 /// (when doing an offscreen render to a BitmapData texture)
 pub enum PoolOrArcTexture {
+    Shared(Arc<PoolOrArcTexture>),
     Pool(
         PoolEntry<
             (
@@ -95,12 +90,14 @@ pub enum PoolOrArcTexture {
 impl PoolOrArcTexture {
     pub fn texture(&self) -> &crate::gpu_resources::Texture {
         match self {
+            PoolOrArcTexture::Shared(texture) => texture.texture(),
             PoolOrArcTexture::Pool(texture) => &texture.0,
             PoolOrArcTexture::Manual(texture) => &texture.0,
         }
     }
     pub fn view(&self) -> &crate::gpu_resources::TextureView {
         match self {
+            PoolOrArcTexture::Shared(texture) => texture.view(),
             PoolOrArcTexture::Pool(texture) => &texture.1,
             PoolOrArcTexture::Manual(texture) => &texture.1,
         }
@@ -148,17 +145,11 @@ impl FrameBuffer {
     }
 
     pub fn view(&self) -> &crate::gpu_resources::TextureView {
-        match self.texture {
-            PoolOrArcTexture::Pool(ref texture) => &texture.1,
-            PoolOrArcTexture::Manual(ref texture) => &texture.1,
-        }
+        self.texture.view()
     }
 
     pub fn texture(&self) -> &crate::gpu_resources::Texture {
-        match self.texture {
-            PoolOrArcTexture::Pool(ref texture) => &texture.0,
-            PoolOrArcTexture::Manual(ref texture) => &texture.0,
-        }
+        self.texture.texture()
     }
 
     pub fn take_texture(self) -> PoolOrArcTexture {

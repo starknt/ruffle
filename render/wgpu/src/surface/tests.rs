@@ -1381,6 +1381,116 @@ fn equal_small_meshes_batch_without_retaining_unloaded_shape_owners() {
 }
 
 #[test]
+#[ignore = "requires a real native adapter"]
+fn repeated_solid_blend_inputs_share_rasterization_without_changing_pixels() {
+    use ruffle_render::{
+        bitmap::{BitmapHandle, BitmapSize, BitmapSource},
+        shape_utils::{DistilledShape, DrawCommand, DrawPath, FillRule},
+        transform::Transform,
+    };
+    struct NoBitmaps;
+    impl BitmapSource for NoBitmaps {
+        fn bitmap_size(&self, _: u16) -> Option<BitmapSize> {
+            None
+        }
+        fn bitmap_handle(&self, _: u16, _: &mut dyn RenderBackend) -> Option<BitmapHandle> {
+            None
+        }
+    }
+    for descriptors in [gpu(), gpu_with_backend(wgpu::Backends::GL, None, None)] {
+        for quality in [StageQuality::Low, StageQuality::High] {
+            for (fractional, variant) in [(0.0, 0), (0.25, 0), (0.25, 1), (0.25, 2)] {
+                let mut images = Vec::new();
+                for reference in [true, false] {
+                    let target = TextureTarget::new(&descriptors.device, (128, 64)).unwrap();
+                    let mut renderer =
+                        WgpuRenderBackend::with_options(descriptors.clone(), target, false)
+                            .unwrap();
+                    renderer.set_quality(quality).unwrap();
+                    let style = swf::FillStyle::Color(Color::from_rgb(0x48a0dd, 179));
+                    let point =
+                        |x, y| swf::Point::new(Twips::from_pixels(x), Twips::from_pixels(y));
+                    let shape = renderer
+                        .register_shape(
+                            DistilledShape {
+                                id: 1,
+                                shape_bounds: Default::default(),
+                                edge_bounds: Default::default(),
+                                paths: vec![DrawPath::Fill {
+                                    style: &style,
+                                    winding_rule: FillRule::EvenOdd,
+                                    commands: vec![
+                                        DrawCommand::MoveTo(point(0.0, 0.0)),
+                                        DrawCommand::LineTo(point(12.0, 0.0)),
+                                        DrawCommand::LineTo(point(12.0, 12.0)),
+                                        DrawCommand::LineTo(point(0.0, 12.0)),
+                                        DrawCommand::LineTo(point(0.0, 0.0)),
+                                    ],
+                                }],
+                            },
+                            &NoBitmaps,
+                        )
+                        .unwrap();
+                    // Prepare the shape's exact mesh bounds before measuring reuse.
+                    let mut warmup = CommandList::new();
+                    warmup.render_shape(shape.clone(), Transform::default());
+                    renderer.submit_frame(Color::WHITE, warmup, vec![]).unwrap();
+                    let metrics = ruffle_render::profile::RenderMetrics::default();
+                    let _scope = ruffle_render::profile::enter(Some(&metrics));
+                    let mut commands = CommandList::new();
+                    for i in 0..24 {
+                        let x = 4.0 + (i % 8) as f64 * 10.0 + fractional;
+                        let y = 4.0 + (i / 8) as f64 * 10.0 + fractional;
+                        let mut child = CommandList::new();
+                        let mut transform = Transform {
+                            matrix: Matrix::translate(Twips::from_pixels(x), Twips::from_pixels(y)),
+                            ..Default::default()
+                        };
+                        if i % 2 == 0 {
+                            if variant == 1 {
+                                transform.color_transform.b_add = -80;
+                            }
+                            if variant == 2 {
+                                transform.matrix.a = 1.5;
+                            }
+                        }
+                        child.render_shape(shape.clone(), transform);
+                        if reference {
+                            rect(
+                                &mut child,
+                                x as f32,
+                                y as f32,
+                                12.0,
+                                12.0,
+                                Color::TRANSPARENT,
+                            );
+                        }
+                        commands.blend(child, RenderBlendMode::Builtin(BlendMode::Multiply));
+                    }
+                    renderer
+                        .submit_frame(Color::WHITE, commands, vec![])
+                        .unwrap();
+                    if !reference {
+                        assert_eq!(
+                            metrics.snapshot().work.offscreen_targets,
+                            if variant == 0 { 1 } else { 2 },
+                            "identical solid input is rasterized once per bounded sibling set"
+                        );
+                    }
+                    let image = renderer.capture_frame().unwrap().unwrap();
+                    assert_eq!(image.get_pixel(127, 63).0, [255, 255, 255, 255]);
+                    images.push(image);
+                }
+                assert_eq!(
+                    images[0], images[1],
+                    "{quality:?}, fractional={fractional}, variant={variant}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires a Vulkan adapter"]
 fn numeric_snapshot_freezes_pixels_and_rejects_a_changed_version_before_allocation() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
