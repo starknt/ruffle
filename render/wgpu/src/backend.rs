@@ -644,6 +644,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         for entry in cache_entries {
             let texture = as_texture(&entry.handle);
+            ruffle_render::profile::work(|w| {
+                w.offscreen_targets += 1;
+                w.offscreen_pixels +=
+                    u64::from(texture.texture.width()) * u64::from(texture.texture.height());
+            });
             let surface = Surface::new(
                 &self.descriptors,
                 self.surface.quality(),

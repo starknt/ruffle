@@ -1093,6 +1093,7 @@ pub fn render_base<'gc>(
     context: &mut RenderContext<'_, 'gc>,
     options: RenderOptions,
 ) {
+    ruffle_render::profile::work(|w| w.tree_visits += 1);
     if options.skip_masks && this.maskee().is_some() {
         // Skip rendering masks (unless we are rendering one explicitly).
         return;
@@ -1205,6 +1206,7 @@ pub fn render_base<'gc>(
             + Twips::from_pixels_i32(cache_info.draw_offset.y);
 
         if cache_info.dirty {
+            ruffle_render::profile::work(|w| w.cache_redraws += 1);
             let mut transform_stack = TransformStack::new();
             transform_stack.push(&Transform {
                 color_transform: Default::default(),
@@ -1235,6 +1237,8 @@ pub fn render_base<'gc>(
                 clear: this.opaque_background().unwrap_or_default(),
                 filters: cache_info.filters,
             });
+        } else {
+            ruffle_render::profile::work(|w| w.cache_hits += 1);
         }
 
         // When rendering it back, ensure we're only keeping the translation - scale/rotation is within the image already

@@ -138,6 +138,42 @@ pub enum Phase {
     RenderBackend,
     RenderSubmit,
 }
+impl Phase {
+    pub const NAMES: [&'static str; 32] = [
+        "logic",
+        "gc",
+        "decode",
+        "upload",
+        "readback",
+        "gpu",
+        "executor",
+        "stageCpu",
+        "hostAction",
+        "preload",
+        "avm2",
+        "avm1",
+        "audio",
+        "postFrame",
+        "connections",
+        "audioSkew",
+        "socket",
+        "netConnection",
+        "wallTimers",
+        "timers",
+        "streams",
+        "audioTick",
+        "socketReceive",
+        "socketConnect",
+        "socketData",
+        "socketClose",
+        "wake",
+        "input",
+        "composite",
+        "renderTree",
+        "renderBackend",
+        "renderSubmit",
+    ];
+}
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Timing {
     pub samples: u64,
