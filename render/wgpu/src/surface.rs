@@ -164,6 +164,10 @@ impl Surface {
                             draw_encoder,
                             chunk_buffers,
                         );
+                        ruffle_render::profile::work(|w| {
+                            w.render_passes += 1;
+                            w.pass_pixels += u64::from(target.width()) * u64::from(target.height());
+                        });
                         let mut render_pass = draw_encoder.scoped_render_pass(
                             format!(
                                 "Chunked draw calls {}",
@@ -293,6 +297,14 @@ impl Surface {
                                     ],
                                 });
 
+                        ruffle_render::profile::work(|w| {
+                            w.render_passes += 1;
+                            w.blend_passes += 1;
+                            w.draw_calls += 1;
+                            w.pipeline_changes += 1;
+                            w.material_binds += 2;
+                            w.pass_pixels += u64::from(target.width()) * u64::from(target.height());
+                        });
                         let mut render_pass =
                             draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: create_debug_label!(

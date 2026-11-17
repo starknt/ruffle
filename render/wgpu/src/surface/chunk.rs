@@ -151,6 +151,7 @@ pub struct CommandRenderer<'encoder> {
     chunk_buffers: &'encoder ChunkBuffers,
     current_pipeline: Option<&'encoder wgpu::RenderPipeline>,
     current_index_buffer: Option<&'encoder wgpu::Buffer>,
+    work: Option<ruffle_render::profile::RenderWork>,
 }
 
 impl<'encoder> CommandRenderer<'encoder> {
@@ -167,6 +168,7 @@ impl<'encoder> CommandRenderer<'encoder> {
             chunk_buffers,
             current_pipeline: None,
             current_index_buffer: None,
+            work: ruffle_render::profile::enabled().then(Default::default),
         }
     }
 
@@ -215,6 +217,9 @@ impl<'encoder> CommandRenderer<'encoder> {
         pipeline: &'encoder wgpu::RenderPipeline,
     ) {
         if self.current_pipeline != Some(pipeline) {
+            if let Some(work) = &mut self.work {
+                work.pipeline_changes += 1;
+            }
             render_pass.set_pipeline(pipeline);
             self.current_pipeline = Some(pipeline);
         }
@@ -225,6 +230,9 @@ impl<'encoder> CommandRenderer<'encoder> {
         render_pass: &mut wgpu::RenderPass<'encoder>,
         draw_offsets: &'encoder DrawOffsets,
     ) {
+        if let Some(work) = &mut self.work {
+            work.draw_calls += 1;
+        }
         render_pass.set_vertex_buffer(
             0,
             draw_offsets
@@ -278,6 +286,9 @@ impl<'encoder> CommandRenderer<'encoder> {
             }
         }
 
+        if let Some(work) = &mut self.work {
+            work.material_binds += 1;
+        }
         render_pass.set_bind_group(2, bind_group, &[]);
 
         self.draw(render_pass, draw_offsets);
@@ -298,6 +309,9 @@ impl<'encoder> CommandRenderer<'encoder> {
             },
         );
 
+        if let Some(work) = &mut self.work {
+            work.material_binds += 1;
+        }
         render_pass.set_bind_group(2, bind_group, &[]);
 
         self.draw(render_pass, draw_offsets);
@@ -320,6 +334,9 @@ impl<'encoder> CommandRenderer<'encoder> {
             },
         );
 
+        if let Some(work) = &mut self.work {
+            work.material_binds += 1;
+        }
         render_pass.set_bind_group(2, bind_group, &[]);
 
         self.draw(render_pass, draw_offsets);
@@ -361,5 +378,13 @@ impl<'encoder> CommandRenderer<'encoder> {
 
     pub fn set_mask_state(&mut self, mask_state: MaskState) {
         *self.mask_state = mask_state;
+    }
+}
+
+impl Drop for CommandRenderer<'_> {
+    fn drop(&mut self) {
+        if let Some(local) = self.work.take() {
+            ruffle_render::profile::work(|work| work.add(local));
+        }
     }
 }

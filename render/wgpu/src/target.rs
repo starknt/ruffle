@@ -161,7 +161,14 @@ impl RenderTarget for SwapChainTarget {
         command_buffers: I,
         frame: Self::Frame,
     ) -> wgpu::SubmissionIndex {
-        let index = queue.submit(command_buffers);
+        let index = {
+            let _timer = ruffle_render::profile::native_time(
+                ruffle_render::profile::NativePhase::QueueSubmit,
+            );
+            queue.submit(command_buffers)
+        };
+        let _timer =
+            ruffle_render::profile::native_time(ruffle_render::profile::NativePhase::Present);
         queue.present(frame.texture);
         index
     }
@@ -211,6 +218,19 @@ impl RenderTargetFrame for TextureTargetFrame {
 
 impl TextureTarget {
     pub fn new(device: &wgpu::Device, size: (u32, u32)) -> Result<Self, Error> {
+        Self::with_readback(device, size, true)
+    }
+
+    /// Render-only target: neither allocates a mapping buffer nor copies into it.
+    pub fn new_without_readback(device: &wgpu::Device, size: (u32, u32)) -> Result<Self, Error> {
+        Self::with_readback(device, size, false)
+    }
+
+    fn with_readback(
+        device: &wgpu::Device,
+        size: (u32, u32),
+        readback: bool,
+    ) -> Result<Self, Error> {
         if size.0 > device.limits().max_texture_dimension_2d
             || size.1 > device.limits().max_texture_dimension_2d
             || size.0 < 1
@@ -245,17 +265,20 @@ impl TextureTarget {
                 | wgpu::TextureUsages::TEXTURE_BINDING,
         });
         let buffer_label = create_debug_label!("Render target buffer");
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: buffer_label.as_deref(),
-            size: (buffer_dimensions.padded_bytes_per_row as u64 * buffer_dimensions.height as u64),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
+        let buffer = readback.then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: buffer_label.as_deref(),
+                size: (buffer_dimensions.padded_bytes_per_row as u64
+                    * buffer_dimensions.height as u64),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
         });
         Ok(Self {
             size,
             texture,
             format,
-            buffer: Some(TextureBufferInfo {
+            buffer: buffer.map(|buffer| TextureBufferInfo {
                 buffer: MaybeOwnedBuffer::Owned(buffer, buffer_dimensions),
                 copy_area: PixelRegion::for_whole_size(size.width, size.height),
             }),
@@ -275,8 +298,8 @@ impl RenderTarget for TextureTarget {
     type Frame = TextureTargetFrame;
 
     fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        *self =
-            TextureTarget::new(device, (width, height)).expect("Unable to resize texture target");
+        *self = Self::with_readback(device, (width, height), self.buffer.is_some())
+            .expect("Unable to resize texture target");
     }
 
     fn format(&self) -> wgpu::TextureFormat {
@@ -336,8 +359,18 @@ impl RenderTarget for TextureTarget {
                     depth_or_array_layers: 1,
                 },
             );
-            queue.submit(command_buffers.into_iter().chain(Some(encoder.finish())))
+            let buffer = encoder.finish();
+            ruffle_render::profile::work(|w| {
+                w.copy_bytes += u64::from(copy_area.width()) * u64::from(copy_area.height()) * 4
+            });
+            let _timer = ruffle_render::profile::native_time(
+                ruffle_render::profile::NativePhase::QueueSubmit,
+            );
+            queue.submit(command_buffers.into_iter().chain(Some(buffer)))
         } else {
+            let _timer = ruffle_render::profile::native_time(
+                ruffle_render::profile::NativePhase::QueueSubmit,
+            );
             queue.submit(command_buffers)
         }
     }

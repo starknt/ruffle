@@ -209,6 +209,10 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
     fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) {
+        ruffle_render::profile::work(|w| {
+            w.offscreen_targets += 1;
+            w.offscreen_pixels += u64::from(self.width) * u64::from(self.height);
+        });
         let surface = Surface::new(
             self.descriptors,
             self.quality,
@@ -554,6 +558,11 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
     }
 
     fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList) {
+        ruffle_render::profile::work(|w| {
+            w.offscreen_targets += 2;
+            w.mask_passes += 2;
+            w.offscreen_pixels += 2 * u64::from(self.width) * u64::from(self.height);
+        });
         let surface = Surface::new(
             self.descriptors,
             self.quality,

@@ -736,6 +736,8 @@ impl Player {
             }
         }
 
+        ruffle_render::profile::work(|w| w.catch_up_frames += u64::from(frame.saturating_sub(1)));
+
         // Now that we're done running code,
         // we can stop pretending that more time passed than actually did.
         // Note: update_timers(dt) doesn't need to see this either.
@@ -748,6 +750,9 @@ impl Player {
         // Sanity: If we had too many frames to tick, just reset the accumulator
         // to prevent running at turbo speed.
         if self.frame_accumulator >= frame_duration {
+            ruffle_render::profile::work(|w| {
+                w.discarded_frame_debt_us += (self.frame_accumulator.as_millis() * 1000.0) as u64
+            });
             self.frame_accumulator = FloatDuration::ZERO;
         }
 

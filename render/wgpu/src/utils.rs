@@ -228,6 +228,14 @@ pub fn run_copy_pipeline(
     // so this doesn't matter.
     let load = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
 
+    ruffle_render::profile::work(|w| {
+        w.render_passes += 1;
+        w.draw_calls += 1;
+        w.pipeline_changes += 1;
+        w.material_binds += 1;
+        w.pass_pixels +=
+            u64::from(frame_view.texture().width()) * u64::from(frame_view.texture().height());
+    });
     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: create_debug_label!("Copy back to render target").as_deref(),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {

@@ -87,6 +87,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     chunk_buffers: ChunkBuffers,
     active_frame: ActiveFrame,
     profiler: GpuProfiler,
+    last_submission: Option<SubmissionIndex>,
     bitmap_residency: Option<crate::bitmap_residency::BitmapResidency>,
 }
 
@@ -303,6 +304,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             chunk_buffers,
             active_frame,
             profiler,
+            last_submission: None,
             bitmap_residency: Some(crate::bitmap_residency::BitmapResidency::new(
                 DEFAULT_IMMUTABLE_BITMAP_CACHE_LIMIT,
             )),
@@ -422,8 +424,28 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         }
     }
 
+    /// Collect completed timestamp queries without blocking or inventing missing samples.
+    pub fn collect_gpu_samples(&mut self) {
+        let timestamp_period = self.descriptors.queue.get_timestamp_period();
+        while let Some(queries) = self.profiler.process_finished_frame(timestamp_period) {
+            let mut ranges = queries.iter().filter_map(|q| q.time.as_ref());
+            if let Some(first) = ranges.next() {
+                let (lo, hi) = ranges.fold((first.start, first.end), |(a, b), t| {
+                    (a.min(t.start), b.max(t.end))
+                });
+                let frame = queries
+                    .iter()
+                    .find_map(|q| q.label.strip_prefix("Stage ")?.parse().ok());
+                ruffle_render::profile::record_gpu(((hi - lo) * 1e9) as u64, frame);
+            }
+        }
+    }
     pub fn descriptors(&self) -> &Arc<Descriptors> {
         &self.descriptors
+    }
+
+    pub fn last_submission(&self) -> Option<SubmissionIndex> {
+        self.last_submission.clone()
     }
 
     pub fn target(&self) -> &T {
@@ -604,7 +626,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     ) {
         let _render_backend =
             ruffle_render::profile::time(ruffle_render::profile::Phase::RenderBackend);
-        let Some(frame_output) = self.target.get_next_texture() else {
+        let frame_output = {
+            let _timer = ruffle_render::profile::native_time(
+                ruffle_render::profile::NativePhase::SurfaceAcquire,
+            );
+            self.target.get_next_texture()
+        };
+        let Some(frame_output) = frame_output else {
             // Attempt to recreate the swap chain in this case.
             self.target.resize(
                 &self.descriptors.device,
@@ -723,8 +751,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             .resolve_queries(self.active_frame.command_encoder.record());
         self.active_frame.staging_belt.finish();
 
-        self.active_frame
-            .submit_for_target(&self.descriptors, &self.target, frame_output);
+        self.last_submission = Some(self.active_frame.submit_for_target(
+            &self.descriptors,
+            &self.target,
+            frame_output,
+        ));
         let (idle, peak, combined) = self.budget.stats();
         ruffle_render::profile::pool(idle, peak, combined);
         self.texture_pool.end_frame();
@@ -732,20 +763,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.profiler
             .end_frame()
             .expect("Frame should end successfully");
-        let timestamp_period = self.descriptors.queue.get_timestamp_period();
         ruffle_render::profile::submitted();
-        if let Some(queries) = self.profiler.process_finished_frame(timestamp_period) {
-            let mut ranges = queries.iter().filter_map(|q| q.time.as_ref());
-            if let Some(first) = ranges.next() {
-                let (lo, hi) = ranges.fold((first.start, first.end), |(a, b), t| {
-                    (a.min(t.start), b.max(t.end))
-                });
-                let frame = queries
-                    .iter()
-                    .find_map(|q| q.label.strip_prefix("Stage ")?.parse().ok());
-                ruffle_render::profile::record_gpu(((hi - lo) * 1e9) as u64, frame);
-            }
-        }
+        self.collect_gpu_samples();
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1576,11 +1595,22 @@ impl ActiveFrame {
         );
         let index = {
             let _submit = ruffle_render::profile::time(ruffle_render::profile::Phase::RenderSubmit);
-            let _submission = descriptors.lock_submission();
+            let command_buffer = {
+                let _timer = ruffle_render::profile::native_time(
+                    ruffle_render::profile::NativePhase::EncoderFinish,
+                );
+                draw_encoder.finish()
+            };
+            let _submission = {
+                let _timer = ruffle_render::profile::native_time(
+                    ruffle_render::profile::NativePhase::SubmitLock,
+                );
+                descriptors.lock_submission()
+            };
             target.submit(
                 &descriptors.device,
                 &descriptors.queue,
-                Some(draw_encoder.finish()),
+                Some(command_buffer),
                 frame,
             )
         };
@@ -1601,8 +1631,22 @@ impl ActiveFrame {
         );
         let index = {
             let _submit = ruffle_render::profile::time(ruffle_render::profile::Phase::RenderSubmit);
-            let _submission = descriptors.lock_submission();
-            descriptors.queue.submit(Some(draw_encoder.finish()))
+            let command_buffer = {
+                let _timer = ruffle_render::profile::native_time(
+                    ruffle_render::profile::NativePhase::EncoderFinish,
+                );
+                draw_encoder.finish()
+            };
+            let _submission = {
+                let _timer = ruffle_render::profile::native_time(
+                    ruffle_render::profile::NativePhase::SubmitLock,
+                );
+                descriptors.lock_submission()
+            };
+            let _timer = ruffle_render::profile::native_time(
+                ruffle_render::profile::NativePhase::QueueSubmit,
+            );
+            descriptors.queue.submit(Some(command_buffer))
         };
         self.staging_belt.recall();
         self.command_encoder.dirty = false;

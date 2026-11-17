@@ -1,6 +1,7 @@
 //! Real-device regressions; enable wgpu/counters when running these.
 use crate::backend::{WgpuRenderBackend, request_adapter_and_device};
 use crate::descriptors::Descriptors;
+use crate::target::RenderTarget;
 use crate::target::TextureTarget;
 use ruffle_render::backend::RenderBackend;
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
@@ -8,6 +9,38 @@ use ruffle_render::matrix::Matrix;
 use ruffle_render::quality::StageQuality;
 use std::sync::Arc;
 use swf::{BlendMode, Color, Twips};
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn measurement_target_never_allocates_a_readback_buffer_even_after_resize() {
+    let descriptors = gpu();
+    let mut target = TextureTarget::new_without_readback(&descriptors.device, (32, 32)).unwrap();
+    assert!(target.buffer.is_none());
+    target.resize(&descriptors.device, 64, 48);
+    assert!(target.buffer.is_none());
+    assert_eq!((target.width(), target.height()), (64, 48));
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    renderer.submit_frame(Color::RED, CommandList::new(), vec![]);
+    assert!(renderer.capture_frame().is_none());
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn measurement_counts_encoded_draws_and_passes() {
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (32, 32)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let metrics = ruffle_render::profile::RenderMetrics::default();
+    let _scope = ruffle_render::profile::enter(Some(&metrics));
+    let mut commands = CommandList::new();
+    rect(&mut commands, 0.0, 0.0, 10.0, 10.0, Color::RED);
+    renderer.submit_frame(Color::BLACK, commands, vec![]);
+    let work = metrics.snapshot().work;
+    // One shape pass followed by the surface copy pass, no capture pass.
+    assert_eq!(work.draw_calls, 2);
+    assert_eq!(work.render_passes, 2);
+    assert_eq!(work.copy_bytes, 0);
+}
 
 fn gpu() -> Arc<Descriptors> {
     let mut options = wgpu::InstanceDescriptor::new_without_display_handle();

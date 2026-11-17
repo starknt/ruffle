@@ -265,6 +265,9 @@ impl CommandTarget {
 
         if let RenderTargetMode::FreshWithTexture(texture) = &render_target_mode {
             if let Some(resolve_buffer) = &resolve_buffer {
+                ruffle_render::profile::work(|w| {
+                    w.copy_bytes += u64::from(size.width) * u64::from(size.height) * 4
+                });
                 encoder.copy_texture_to_texture(
                     texture.as_image_copy(),
                     resolve_buffer.texture().as_image_copy(),
@@ -286,6 +289,9 @@ impl CommandTarget {
                     encoder,
                 );
             } else {
+                ruffle_render::profile::work(|w| {
+                    w.copy_bytes += u64::from(size.width) * u64::from(size.height) * 4
+                });
                 encoder.copy_texture_to_texture(
                     texture.as_image_copy(),
                     frame_buffer.texture().as_image_copy(),
@@ -323,6 +329,10 @@ impl CommandTarget {
         // If we aren't clearing with a color (eg a texture instead)
         // the there's no point in creating a new render pass that does nothing.
         if self.render_target_mode.color().is_some() {
+            ruffle_render::profile::work(|w| {
+                w.render_passes += 1;
+                w.pass_pixels += u64::from(self.width()) * u64::from(self.height());
+            });
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: create_debug_label!("Clearing command target").as_deref(),
                 color_attachments: &[self.color_attachments()],
@@ -404,6 +414,9 @@ impl CommandTarget {
             )
         });
         self.ensure_cleared(encoder);
+        ruffle_render::profile::work(|w| {
+            w.copy_bytes += u64::from(self.size.width) * u64::from(self.size.height) * 4
+        });
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: self

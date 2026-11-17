@@ -3,6 +3,103 @@
 use std::{cell::RefCell, rc::Rc};
 use web_time::Instant;
 
+macro_rules! work_counters {
+    ($($name:ident),* $(,)?) => {
+        #[derive(Debug, Default, Clone, Copy)]
+        #[cfg_attr(feature = "serde", derive(serde::Serialize))]
+        pub struct RenderWork { $(pub $name: u64,)* }
+        impl RenderWork {
+            pub fn entries(&self) -> impl Iterator<Item = (&'static str, u64)> {
+                [$( (stringify!($name), self.$name),)*].into_iter()
+            }
+            pub fn delta(self, previous: Self) -> Self {
+                Self { $($name: self.$name.saturating_sub(previous.$name),)* }
+            }
+            pub fn add(&mut self, other: Self) {
+                $(self.$name = self.$name.saturating_add(other.$name);)*
+            }
+        }
+    }
+}
+work_counters!(
+    draw_calls,
+    render_passes,
+    blend_passes,
+    mask_passes,
+    filter_passes,
+    offscreen_targets,
+    offscreen_pixels,
+    pass_pixels,
+    copy_bytes,
+    pipeline_changes,
+    material_binds,
+    cache_hits,
+    cache_redraws,
+    tree_visits,
+    snapshot_hits,
+    snapshot_misses,
+    snapshot_evictions,
+    snapshot_bytes,
+    pic_hits,
+    pic_misses,
+    pic_megamorphic,
+    catch_up_frames,
+    discarded_frame_debt_us,
+);
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct GpuSample {
+    pub frame: Option<u64>,
+    pub nanos: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum NativePhase {
+    EncoderFinish,
+    SubmitLock,
+    QueueSubmit,
+    SurfaceAcquire,
+    Present,
+    QueueThrottle,
+}
+impl NativePhase {
+    pub const NAMES: [&'static str; 6] = [
+        "encoderFinish",
+        "submitLock",
+        "queueSubmit",
+        "surfaceAcquire",
+        "present",
+        "queueThrottle",
+    ];
+}
+
+/// Aggregate locally in renderer hot loops, then publish once per chunk.
+pub fn work(f: impl FnOnce(&mut RenderWork)) {
+    CURRENT.with_borrow(|current| {
+        if let Some(metrics) = current {
+            f(&mut metrics.0.borrow_mut().work);
+        }
+    });
+}
+
+pub struct NativeTimer(Option<(RenderMetrics, NativePhase, Instant)>);
+pub fn native_time(phase: NativePhase) -> NativeTimer {
+    NativeTimer(CURRENT.with_borrow(|m| m.clone().map(|m| (m, phase, Instant::now()))))
+}
+impl Drop for NativeTimer {
+    fn drop(&mut self) {
+        if let Some((metrics, phase, start)) = &self.0 {
+            let mut counters = metrics.0.borrow_mut();
+            let timing = &mut counters.native_timings[*phase as usize];
+            let nanos = start.elapsed().as_nanos() as u64;
+            timing.samples += 1;
+            timing.nanos += nanos;
+            timing.max_nanos = timing.max_nanos.max(nanos);
+        }
+    }
+}
+
 #[cfg(feature = "lifecycle_counts")]
 pub mod lifecycle;
 
@@ -81,6 +178,10 @@ pub struct PublishedCodeStats {
 
 #[derive(Debug, Default, Clone)]
 pub struct Counters {
+    pub work: RenderWork,
+    pub native_timings: [Timing; 6],
+    pub gpu_samples: Vec<GpuSample>,
+    pub dropped_gpu_samples: u64,
     #[cfg(feature = "lifecycle_counts")]
     pub lifecycle: lifecycle::Counters,
     pub timings: [Timing; 32],
@@ -151,6 +252,9 @@ impl Drop for Scope {
     }
 }
 impl RenderMetrics {
+    pub fn take_gpu_samples(&self) -> Vec<GpuSample> {
+        std::mem::take(&mut self.0.borrow_mut().gpu_samples)
+    }
     pub fn snapshot(&self) -> Counters {
         self.0.borrow().clone()
     }
@@ -173,7 +277,13 @@ pub fn record_gpu(nanos: u64, frame: Option<u64>) {
     CURRENT.with_borrow(|m| {
         if let Some(m) = m {
             m.record(Phase::Gpu, nanos);
-            m.0.borrow_mut().gpu_frame = frame;
+            let mut counters = m.0.borrow_mut();
+            counters.gpu_frame = frame;
+            if counters.gpu_samples.len() < 256 {
+                counters.gpu_samples.push(GpuSample { frame, nanos });
+            } else {
+                counters.dropped_gpu_samples += 1;
+            }
         }
     });
 }
@@ -436,6 +546,40 @@ mod tests {
     use super::{
         RenderMetrics, bitmap_gpu_copy, bitmap_readback, enabled, enter, executor_queue_depth,
     };
+
+    #[test]
+    fn completed_gpu_samples_preserve_each_frame_and_drain_once() {
+        let metrics = RenderMetrics::default();
+        let _scope = enter(Some(&metrics));
+        super::record_gpu(11, Some(3));
+        super::record_gpu(17, Some(4));
+        let samples = metrics.take_gpu_samples();
+        assert_eq!(
+            samples
+                .iter()
+                .map(|s| (s.frame, s.nanos))
+                .collect::<Vec<_>>(),
+            [(Some(3), 11), (Some(4), 17)]
+        );
+        assert!(metrics.take_gpu_samples().is_empty());
+    }
+
+    #[test]
+    fn work_counters_belong_to_the_scoped_player() {
+        let a = RenderMetrics::default();
+        let b = RenderMetrics::default();
+        {
+            let _scope = enter(Some(&a));
+            super::work(|w| w.draw_calls += 2);
+            {
+                let _scope = enter(Some(&b));
+                super::work(|w| w.draw_calls += 7);
+            }
+            super::work(|w| w.draw_calls += 3);
+        }
+        assert_eq!(a.snapshot().work.draw_calls, 5);
+        assert_eq!(b.snapshot().work.draw_calls, 7);
+    }
 
     #[test]
     fn executor_queue_depth_is_recorded_in_the_current_metrics() {
