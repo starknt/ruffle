@@ -41,6 +41,7 @@ mod globals;
 pub mod gpu_profiler;
 pub mod gpu_resources;
 pub mod gpu_runtime;
+mod pass_graph;
 mod pipelines;
 mod pixel_bender;
 mod render_snapshot;
