@@ -2629,6 +2629,7 @@ impl Player {
                 root_swf,
                 library,
                 rng: &mut this.rng,
+                renderer_health: this.renderer.health().clone(),
                 renderer: this.renderer.deref_mut(),
                 audio: this.audio.deref_mut(),
                 navigator: this.navigator.deref_mut(),
@@ -3684,10 +3685,18 @@ mod render_failure_tests {
         let mut player = player.lock().unwrap();
         player.set_is_playing(true);
         let frame = player.current_frame();
-        player.renderer().health().fail(RenderFailure::new(
-            RenderFailureKind::DeviceLost,
-            "injected loss",
-        ));
+        player.mutate_with_update_context(|context| {
+            assert!(context.renderer_health.check().is_ok());
+            context.renderer.health().fail(RenderFailure::new(
+                RenderFailureKind::DeviceLost,
+                "injected loss",
+            ));
+            assert_eq!(
+                context.renderer_health.check().unwrap_err().kind(),
+                RenderFailureKind::DeviceLost,
+                "an existing VM context must observe a newly recorded failure"
+            );
+        });
         assert!(player.tick(FloatDuration::from_millis(40.0)).is_err());
         assert!(player.render().is_err());
         assert!(!player.is_playing());

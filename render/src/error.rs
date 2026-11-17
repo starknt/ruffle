@@ -63,6 +63,7 @@ impl RendererHealth {
         self.0.get().cloned()
     }
 
+    #[inline]
     pub fn check(&self) -> Result<(), RenderFailure> {
         self.0.get().map_or(Ok(()), |error| Err(error.clone()))
     }

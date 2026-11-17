@@ -106,6 +106,10 @@ pub struct UpdateContext<'gc> {
     /// The renderer, used by the display objects to draw themselves.
     pub renderer: &'gc mut dyn RenderBackend,
 
+    /// The renderer's shared failure latch for hot VM boundaries. This is a live
+    /// handle, not a snapshot: device callbacks remain visible within this tick.
+    pub(crate) renderer_health: ruffle_render::error::RendererHealth,
+
     /// The UI backend, used to detect user interactions.
     pub ui: &'gc mut dyn UiBackend,
 
