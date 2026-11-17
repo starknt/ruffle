@@ -98,7 +98,7 @@ pub fn init<'gc>(
             activation
                 .context
                 .library
-                .library_for_movie_mut(movie)
+                .library_for_movie_mut(movie, activation.context.gc_context)
                 .character_by_id(chara_id)
         });
 

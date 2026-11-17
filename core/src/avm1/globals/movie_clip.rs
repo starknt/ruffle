@@ -793,7 +793,7 @@ fn attach_movie<'gc>(
     if let Some(new_clip) = activation
         .context
         .library
-        .library_for_movie(movie_clip.movie())
+        .library_for_movie(movie_clip.movie(), activation.context.gc_context)
         .and_then(|l| l.instantiate_by_export_name(&export_name, activation.gc()))
     {
         new_clip.set_placed_by_avm1_script(true);
@@ -977,7 +977,10 @@ pub fn clone_sprite<'gc>(
     #[allow(clippy::question_mark)]
     let cloned_sprite = if sprite.id() != 0 {
         // Clip from SWF; instantiate a new copy.
-        let library = context.library.library_for_movie(movie).unwrap();
+        let library = context
+            .library
+            .library_for_movie(movie, context.gc_context)
+            .unwrap();
         library
             .instantiate_by_id(sprite.id(), context.gc())
             .unwrap()

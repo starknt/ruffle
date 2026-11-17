@@ -148,11 +148,11 @@ impl<'gc> Graphic<'gc> {
         // Tessellate at the current scale
         let library = context
             .library
-            .library_for_movie(shared.movie)
+            .library_for_movie(shared.movie, context.gc_context)
             .expect("Graphic's movie has a library");
         let new_handle = context.renderer.register_shape_with_scale(
             (&shared.shape).into(),
-            &MovieLibrarySource { library },
+            &MovieLibrarySource { library: &library },
             current_scale,
         )?;
 
@@ -227,7 +227,7 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
         // This does not create a new instance, but instead swaps out the underlying static data to point to the new art.
         if let Some(new_graphic) = context
             .library
-            .library_for_movie_mut(self.movie())
+            .library_for_movie_mut(self.movie(), context.gc_context)
             .get_graphic(id)
         {
             self.set_shared(context.gc(), new_graphic.0.shared.get());

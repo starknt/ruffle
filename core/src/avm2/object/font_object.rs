@@ -20,7 +20,11 @@ pub fn font_allocator<'gc>(
         .avm2_class_registry()
         .class_symbol(class.inner_class_definition())
     {
-        if let Some(lib) = activation.context.library.library_for_movie(movie) {
+        if let Some(lib) = activation
+            .context
+            .library
+            .library_for_movie(movie, activation.context.gc_context)
+        {
             if let Some(Character::Font(font)) = lib.character_by_id(id) {
                 Some(font)
             } else {

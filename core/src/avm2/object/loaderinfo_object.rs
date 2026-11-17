@@ -14,6 +14,9 @@ use gc_arena::{Collect, Gc, GcWeak, Mutation, lock::Lock};
 use ruffle_common::utils::HasPrefixField;
 use std::cell::Cell;
 
+#[cfg(test)]
+mod tests;
+
 /// Represents a thing which can be loaded by a loader.
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
@@ -316,6 +319,16 @@ impl<'gc> LoaderInfoObject<'gc> {
 
         // Remove the Loader's content element if it exists.
         if let Some(child) = content {
+            // AS3 containers normally keep removed clips running as orphans.
+            // A loaded AVM1 movie instead belongs to AVM1's strong execution
+            // list: explicit unload must mark its entire timeline for removal.
+            // Do this while the parent is intact for AVM1 unload/sound handling.
+            if loader.raw_container().is_action_script_3()
+                && let Some(clip) = child.as_movie_clip()
+                && !clip.movie().is_action_script_3()
+            {
+                clip.avm1_unload(context);
+            }
             loader.remove_child(context, child);
         }
     }

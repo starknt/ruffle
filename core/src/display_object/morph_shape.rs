@@ -73,7 +73,7 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
     fn replace_with(self, context: &mut UpdateContext<'gc>, id: CharacterId) {
         if let Some(new_morph_shape) = context
             .library
-            .library_for_movie_mut(self.movie())
+            .library_for_movie_mut(self.movie(), context.gc_context)
             .get_morph_shape(id)
         {
             unlock!(Gc::write(context.gc(), self.0), MorphShapeData, shared)
@@ -253,10 +253,13 @@ impl<'gc> MorphShapeShared<'gc> {
             if let Some(handle) = frame.shape_cache.find_near_and_touch(scale) {
                 handle
             } else {
-                let library = context.library.library_for_movie(self.movie).unwrap();
+                let library = context
+                    .library
+                    .library_for_movie(self.movie, context.gc_context)
+                    .unwrap();
                 let handle = context.renderer.register_shape_with_scale(
                     (&frame.shape).into(),
-                    &MovieLibrarySource { library },
+                    &MovieLibrarySource { library: &library },
                     scale,
                 )?;
                 frame.shape_cache.insert(scale, handle.clone());

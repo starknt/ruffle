@@ -1,6 +1,7 @@
 use crate::sandbox::SandboxType;
 
-use gc_arena::{Collect, Gc, GcWeak, Mutation};
+use gc_arena::barrier::unlock;
+use gc_arena::{Collect, Gc, GcWeak, Lock, Mutation};
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -13,11 +14,35 @@ pub type SwfStream<'a> = swf::read::Reader<'a>;
 /// A shared pointer to a `SwfMovieData`.
 #[derive(Clone, Collect, Copy, Debug)]
 #[collect(no_drop)]
-pub struct SwfMovie<'gc>(Gc<'gc, SwfMovieData>);
+pub struct SwfMovie<'gc>(Gc<'gc, MovieData<'gc>>);
+
+#[derive(Collect, Debug)]
+#[collect(no_drop)]
+struct MovieData<'gc> {
+    data: SwfMovieData,
+    // The core crate defines the library type. An erased GC edge still traces
+    // the allocation's original type, including cycles back to this movie.
+    library: Lock<Option<Gc<'gc, ()>>>,
+}
 
 impl<'gc> SwfMovie<'gc> {
     pub fn new(mc: &Mutation<'gc>, data: SwfMovieData) -> Self {
-        SwfMovie(Gc::new(mc, data))
+        SwfMovie(Gc::new(
+            mc,
+            MovieData {
+                data,
+                library: Lock::new(None),
+            },
+        ))
+    }
+
+    /// Keep a symbol library alive exactly as long as this movie is reachable.
+    pub fn attach_library<T: Collect<'gc>>(self, mc: &Mutation<'gc>, library: Gc<'gc, T>) {
+        assert!(
+            self.0.library.get().is_none(),
+            "movie library is already attached"
+        );
+        unlock!(Gc::write(mc, self.0), MovieData, library).set(Some(Gc::erase(library)));
     }
 
     pub fn downgrade(self) -> SwfMovieWeak<'gc> {
@@ -25,7 +50,7 @@ impl<'gc> SwfMovie<'gc> {
     }
 
     pub fn as_ptr(self) -> *const SwfMovieData {
-        Gc::as_ptr(self.0)
+        &self.0.data
     }
 
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
@@ -37,7 +62,7 @@ impl<'gc> Deref for SwfMovie<'gc> {
     type Target = SwfMovieData;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.0.data
     }
 }
 
@@ -58,11 +83,15 @@ impl Hash for SwfMovie<'_> {
 /// Like `SwfMovie`, but is a weak reference.
 #[derive(Clone, Collect, Copy, Debug)]
 #[collect(no_drop)]
-pub struct SwfMovieWeak<'gc>(GcWeak<'gc, SwfMovieData>);
+pub struct SwfMovieWeak<'gc>(GcWeak<'gc, MovieData<'gc>>);
 
 impl<'gc> SwfMovieWeak<'gc> {
     pub fn upgrade(&self, mc: &Mutation<'gc>) -> Option<SwfMovie<'gc>> {
         self.0.upgrade(mc).map(SwfMovie)
+    }
+
+    pub fn is_dropped(self) -> bool {
+        self.0.is_dropped()
     }
 }
 

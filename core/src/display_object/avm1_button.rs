@@ -166,11 +166,11 @@ impl<'gc> Avm1Button<'gc> {
 
                     // Instantiate new child.
                     _ => {
-                        if let Some(child) = context
+                        let child = context
                             .library
-                            .library_for_movie_mut(movie)
-                            .instantiate_by_id(record.id, context.gc_context)
-                        {
+                            .library_for_movie_mut(movie, context.gc_context)
+                            .instantiate_by_id(record.id, context.gc_context);
+                        if let Some(child) = child {
                             // New child that did not previously exist, create it.
                             child.set_parent(context, Some(self.into()));
                             child.set_depth(record.depth.into());
@@ -299,11 +299,11 @@ impl<'gc> TDisplayObject<'gc> for Avm1Button<'gc> {
 
             for record in &self.0.shared.cell.borrow().records {
                 if record.states.contains(swf::ButtonState::HIT_TEST) {
-                    match context
+                    let child = context
                         .library
-                        .library_for_movie_mut(self.0.movie())
-                        .instantiate_by_id(record.id, context.gc_context)
-                    {
+                        .library_for_movie_mut(self.0.movie(), context.gc_context)
+                        .instantiate_by_id(record.id, context.gc_context);
+                    match child {
                         Some(child) => {
                             child.set_matrix(record.matrix.into());
                             child.set_parent(context, Some(self.into()));
