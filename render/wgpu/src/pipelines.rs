@@ -255,7 +255,7 @@ impl Pipelines {
             format,
             &shaders.alpha_mask_shader,
             msaa_sample_count,
-            &VERTEX_BUFFERS_DESCRIPTION_POS,
+            &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
             &alpha_mask_bindings,
             BlendState::PREMULTIPLIED_ALPHA_BLENDING,
             0,

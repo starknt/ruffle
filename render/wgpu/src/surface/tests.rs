@@ -82,6 +82,101 @@ fn measurement_counts_mask_passes_not_mask_inputs() {
 
 #[test]
 #[ignore = "requires a real native adapter"]
+fn alpha_mask_samples_aligned_bitmap_content_without_an_intermediate_copy() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    for descriptors in [gpu(), gpu_with_backend(wgpu::Backends::GL, None, None)] {
+        for (quality, smoothing) in [StageQuality::Low, StageQuality::High]
+            .into_iter()
+            .flat_map(|q| [false, true].map(|s| (q, s)))
+        {
+            for (x, scale) in [(-3.0, 1.0), (7.0, 1.0), (7.25, 1.0), (7.0, 1.5)] {
+                let mut images = Vec::new();
+                for reference in [true, false] {
+                    let target = TextureTarget::new(&descriptors.device, (32, 24)).unwrap();
+                    let mut renderer =
+                        WgpuRenderBackend::with_options(descriptors.clone(), target, false)
+                            .unwrap();
+                    renderer.set_quality(quality).unwrap();
+                    let pixels: Vec<u8> = (0..48)
+                        .flat_map(|i| {
+                            let a = [0, 1, 127, 255][i % 4];
+                            [a / 2, a / 3, a, a]
+                        })
+                        .collect();
+                    let bitmap = renderer
+                        .register_bitmap(Bitmap::new(8, 6, BitmapFormat::Rgba, pixels))
+                        .unwrap();
+                    let mut content = CommandList::new();
+                    if reference {
+                        // A transparent draw preserves pixels while requiring general composition.
+                        rect(
+                            &mut content,
+                            x as f32,
+                            4.0,
+                            8.0 * scale,
+                            6.0 * scale,
+                            Color::TRANSPARENT,
+                        );
+                    }
+                    content.render_bitmap(
+                        bitmap,
+                        Transform {
+                            matrix: Matrix {
+                                a: scale,
+                                d: scale,
+                                tx: Twips::from_pixels(x),
+                                ty: Twips::from_pixels(4.0),
+                                ..Matrix::IDENTITY
+                            },
+                            ..Default::default()
+                        },
+                        smoothing,
+                        PixelSnapping::Never,
+                        PixelRegion::for_whole_size(8, 6),
+                    );
+                    let mut mask = CommandList::new();
+                    rect(
+                        &mut mask,
+                        x as f32 + 1.0,
+                        5.0,
+                        7.0,
+                        7.0,
+                        Color::from_rgb(0xffffff, 137),
+                    );
+                    let mut commands = CommandList::new();
+                    commands.render_alpha_mask(content, mask);
+                    let nested = x == 7.0 && scale == 1.0;
+                    if nested {
+                        let mut parent = CommandList::new();
+                        parent.blend(commands, RenderBlendMode::Builtin(BlendMode::Layer));
+                        commands = parent;
+                    }
+                    let metrics = ruffle_render::profile::RenderMetrics::default();
+                    let _scope = ruffle_render::profile::enter(Some(&metrics));
+                    renderer
+                        .submit_frame(Color::WHITE, commands, vec![])
+                        .unwrap();
+                    let eligible = !reference && x.fract() == 0.0 && scale == 1.0;
+                    assert_eq!(
+                        metrics.snapshot().work.offscreen_targets,
+                        if eligible { 1 } else { 2 } + u64::from(nested)
+                    );
+                    let image = renderer.capture_frame().unwrap().unwrap();
+                    assert_eq!(image.get_pixel(31, 23).0, [255, 255, 255, 255]);
+                    images.push(image);
+                }
+                assert_eq!(
+                    images[0], images[1],
+                    "quality={quality:?}, x={x}, scale={scale}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a real native adapter"]
 fn chunk_uniform_windows_reuse_the_same_buffer_binding() {
     let descriptors = gpu();
     let mut buffers = super::buffers::ChunkBuffers::new(&descriptors).unwrap();

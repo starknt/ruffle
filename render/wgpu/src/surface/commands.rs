@@ -13,7 +13,7 @@ use crate::surface::target::{CommandTarget, PoolOrArcTexture};
 use crate::{Descriptors, PosUvVertex, as_texture};
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
-use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
+use ruffle_render::commands::{Command, CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::lines::{emulate_line, emulate_line_rect};
 use ruffle_render::matrix::Matrix;
 use ruffle_render::quality::StageQuality;
@@ -44,6 +44,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     width: u32,
     height: u32,
     origin: [u32; 2],
+    destination: &'encoder crate::gpu_resources::Texture,
     nearest_layer: LayerRef,
     texture_pool: &'encoder mut TexturePool,
     mask_state: MaskState,
@@ -58,6 +59,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         width,
         height,
         origin,
+        destination,
         nearest_layer,
         texture_pool,
         mask_state,
@@ -71,6 +73,7 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     width: u32,
     height: u32,
     origin: [u32; 2],
+    destination: &'encoder crate::gpu_resources::Texture,
     nearest_layer: LayerRef<'encoder>,
     meshes: &'encoder Vec<Mesh>,
     staging_belt: &'encoder mut crate::gpu_resources::StagingBelt,
@@ -98,6 +101,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         width: u32,
         height: u32,
         origin: [u32; 2],
+        destination: &'encoder crate::gpu_resources::Texture,
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
         mask_state: MaskState,
@@ -115,6 +119,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             width,
             height,
             origin,
+            destination,
             nearest_layer,
             meshes,
             staging_belt,
@@ -652,6 +657,67 @@ impl WgpuCommandHandler<'_, '_> {
         }
     }
 
+    fn alpha_mask_bitmap_input(
+        &self,
+        commands: &PlannedList,
+        output: RenderRect,
+    ) -> Result<Option<(PoolOrArcTexture, [PosUvVertex; 4])>, crate::gpu_runtime::RenderFailure>
+    {
+        let Some(Command::RenderBitmap {
+            bitmap,
+            transform,
+            pixel_snapping,
+            region,
+            ..
+        }) = commands.single_leaf()
+        else {
+            return Ok(None);
+        };
+        let mut matrix = transform.matrix;
+        pixel_snapping.apply(&mut matrix);
+        if matrix.a != 1.0
+            || matrix.d != 1.0
+            || matrix.b != 0.0
+            || matrix.c != 0.0
+            || matrix.tx.to_pixels().fract() != 0.0
+            || matrix.ty.to_pixels().fract() != 0.0
+            || transform.tz != 0.0
+            || transform.perspective_projection.is_some()
+            || transform.color_transform != ColorTransform::default()
+        {
+            return Ok(None);
+        }
+        let texture = as_texture(bitmap, &self.descriptors.device)?;
+        if texture.texture.raw() == self.destination.raw()
+            || texture.texture.format() != wgpu::TextureFormat::Rgba8Unorm
+            || texture.texture.sample_count() != 1
+            || *region
+                != PixelRegion::for_whole_size(texture.texture.width(), texture.texture.height())
+        {
+            return Ok(None);
+        }
+        // Integer, one-to-one RGBA8 rasterization would reproduce these exact texels.
+        // Keep the parent target's bounded quad and map its UVs into the original image;
+        // the shader supplies transparent pixels beyond the image's coverage.
+        let vertices =
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]].map(|position| PosUvVertex {
+                position,
+                uv: [
+                    ((f64::from(output.x) + f64::from(position[0]) * f64::from(output.width)
+                        - matrix.tx.to_pixels())
+                        / f64::from(texture.texture.width())) as f32,
+                    ((f64::from(output.y) + f64::from(position[1]) * f64::from(output.height)
+                        - matrix.ty.to_pixels())
+                        / f64::from(texture.texture.height())) as f32,
+                    1.0,
+                ],
+            });
+        Ok(Some((
+            PoolOrArcTexture::Manual((texture.texture.clone(), texture.view.clone())),
+            vertices,
+        )))
+    }
+
     fn alpha_mask_planned(
         &mut self,
         maskee_commands: PlannedList,
@@ -662,9 +728,11 @@ impl WgpuCommandHandler<'_, '_> {
             return;
         }
         let result = (|| -> Result<(), crate::gpu_runtime::RenderFailure> {
+            let direct = self.alpha_mask_bitmap_input(&maskee_commands, region)?;
+            let inputs = if direct.is_some() { 1 } else { 2 };
             ruffle_render::profile::work(|w| {
-                w.offscreen_targets += 2;
-                w.offscreen_pixels += 2 * u64::from(region.width) * u64::from(region.height);
+                w.offscreen_targets += inputs;
+                w.offscreen_pixels += inputs * u64::from(region.width) * u64::from(region.height);
             });
             let surface = Surface::new(
                 self.descriptors,
@@ -675,24 +743,28 @@ impl WgpuCommandHandler<'_, '_> {
             )?
             .with_origin([region.x, region.y]);
 
-            let maskee = surface.draw_commands(
-                RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
-                self.descriptors,
-                self.meshes,
-                maskee_commands,
-                self.staging_belt,
-                self.chunk_buffers,
-                self.draw_encoder,
-                LayerRef::None,
-                self.texture_pool,
-            )?;
-            maskee.ensure_cleared(self.draw_encoder);
+            let (maskee, vertices) = if let Some((texture, vertices)) = direct {
+                (texture, Some(vertices))
+            } else {
+                let maskee = surface.draw_commands(
+                    RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
+                    self.descriptors,
+                    self.meshes,
+                    maskee_commands,
+                    self.staging_belt,
+                    self.chunk_buffers,
+                    self.draw_encoder,
+                    LayerRef::None,
+                    self.texture_pool,
+                )?;
+                maskee.ensure_cleared(self.draw_encoder);
+                (maskee.take_color_texture(), None)
+            };
             let matrix = Matrix {
                 tx: Twips::from_pixels(region.x as f64),
                 ty: Twips::from_pixels(region.y as f64),
-                ..Matrix::scale(maskee.width() as f32, maskee.height() as f32)
+                ..Matrix::scale(region.width as f32, region.height as f32)
             };
-            let maskee = maskee.take_color_texture();
 
             let mask = surface.draw_commands(
                 RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
@@ -739,7 +811,10 @@ impl WgpuCommandHandler<'_, '_> {
                     perspective_projection: None,
                 },
                 &mut None,
-                DrawVertices::PosQuad,
+                match &vertices {
+                    Some(vertices) => DrawVertices::CustomPosUvQuad(bytemuck::cast_slice(vertices)),
+                    None => DrawVertices::PosUvQuad,
+                },
                 |draw_offsets| DrawCommand::RenderAlphaMask {
                     maskee,
                     mask,

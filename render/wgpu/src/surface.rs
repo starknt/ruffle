@@ -173,6 +173,7 @@ impl Surface {
                 target.width(),
                 target.height(),
                 self.origin,
+                target.color_texture(),
                 match nearest_layer {
                     LayerRef::Current => LayerRef::Parent(&target),
                     layer => layer,

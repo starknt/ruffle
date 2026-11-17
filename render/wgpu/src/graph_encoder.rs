@@ -61,6 +61,17 @@ impl PlannedList {
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
+    pub fn single_leaf(&self) -> Option<&Command> {
+        match self.commands.as_slice() {
+            [
+                PlannedCommand {
+                    op: PlannedOp::Leaf(command),
+                    ..
+                },
+            ] => Some(command),
+            _ => None,
+        }
+    }
 }
 
 pub struct GraphEncoder {
