@@ -24,6 +24,68 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// Keep the measurement writer allocation-light on both frozen builds. These
+// records retain the existing schema, real counters and measured interval.
+struct TimingDeltas<'a> {
+    names: &'static [&'static str],
+    current: &'a [profile::Timing],
+    previous: &'a [profile::Timing],
+}
+impl serde::Serialize for TimingDeltas<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.names.len()))?;
+        for (i, name) in self.names.iter().enumerate() {
+            map.serialize_entry(
+                name,
+                &self.current[i].nanos.saturating_sub(self.previous[i].nanos),
+            )?;
+        }
+        map.end()
+    }
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FrameRecord<'a, Resources: serde::Serialize> {
+    event: &'static str,
+    frame_id: u64,
+    cpu_ns: u64,
+    phase_ns: TimingDeltas<'a>,
+    native_ns: TimingDeltas<'a>,
+    work: profile::RenderWork,
+    rss_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_resources: Option<&'a Resources>,
+    allocator: Option<serde_json::Value>,
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GpuRecord<'a> {
+    event: &'static str,
+    frame_id: Option<u64>,
+    ns: u64,
+    phase_ns: &'a [(String, u64)],
+}
+fn write_record(writer: &mut impl Write, record: &impl serde::Serialize) -> Result<()> {
+    serde_json::to_writer(&mut *writer, record)?;
+    writer.write_all(b"\n")?;
+    Ok(())
+}
+fn write_gpu_record(writer: &mut impl Write, sample: &profile::GpuSample) -> Result<()> {
+    write_record(
+        writer,
+        &GpuRecord {
+            event: "gpu",
+            frame_id: sample.frame,
+            ns: sample.nanos,
+            phase_ns: &sample.phases,
+        },
+    )
+}
+
 #[derive(Parser)]
 struct Opt {
     #[arg(long)]
@@ -385,50 +447,36 @@ fn main() -> Result<()> {
                     resident_memory()
                 })
                 .flatten();
-            let phases: serde_json::Map<_, _> = profile::Phase::NAMES
-                .iter()
-                .enumerate()
-                .map(|(i, name)| {
-                    (
-                        (*name).into(),
-                        json!(
-                            current.timings[i]
-                                .nanos
-                                .saturating_sub(previous.timings[i].nanos)
-                        ),
-                    )
-                })
-                .collect();
-            let native: serde_json::Map<_, _> = NativePhase::NAMES
-                .iter()
-                .enumerate()
-                .map(|(i, name)| {
-                    (
-                        (*name).into(),
-                        json!(
-                            current.native_timings[i]
-                                .nanos
-                                .saturating_sub(previous.native_timings[i].nanos)
-                        ),
-                    )
-                })
-                .collect();
-            writeln!(
-                output,
-                "{}",
-                json!({"event":"frame", "frameId":if opt.profile_off { u64::from(frame)+1 } else { current.stage_submissions },
-                "cpuNs":cpu_ns,"phaseNs":phases,"nativeNs":native,"work":current.work.delta(previous.work),
-                "rssBytes":rss.map(|r|r.0),"nativeResources":current.native_resources,
-                "allocator":rss.map(|_| allocator_stats(&environment.descriptors.device))})
+            write_record(
+                &mut output,
+                &FrameRecord {
+                    event: "frame",
+                    frame_id: if opt.profile_off {
+                        u64::from(frame) + 1
+                    } else {
+                        current.stage_submissions
+                    },
+                    cpu_ns,
+                    phase_ns: TimingDeltas {
+                        names: &profile::Phase::NAMES,
+                        current: &current.timings,
+                        previous: &previous.timings,
+                    },
+                    native_ns: TimingDeltas {
+                        names: &NativePhase::NAMES,
+                        current: &current.native_timings,
+                        previous: &previous.native_timings,
+                    },
+                    work: current.work.delta(previous.work),
+                    rss_bytes: rss.map(|r| r.0),
+                    native_resources: current.native_resources.as_ref(),
+                    allocator: rss.map(|_| allocator_stats(&environment.descriptors.device)),
+                },
             )?;
         }
         for sample in metrics.take_gpu_samples() {
             if measured_start.is_some() {
-                writeln!(
-                    output,
-                    "{}",
-                    json!({"event":"gpu","frameId":sample.frame,"ns":sample.nanos,"phaseNs":sample.phases})
-                )?;
+                write_gpu_record(&mut output, &sample)?;
             }
         }
         if let Some(gc_before) = reclaim_gc_before {
@@ -470,11 +518,7 @@ fn main() -> Result<()> {
         .unwrap()
         .collect_gpu_samples();
     for sample in metrics.take_gpu_samples() {
-        writeln!(
-            output,
-            "{}",
-            json!({"event":"gpu","frameId":sample.frame,"ns":sample.nanos,"phaseNs":sample.phases})
-        )?;
+        write_gpu_record(&mut output, &sample)?;
     }
     let resources_after_drain = environment.descriptors.runtime.diagnostic_snapshot();
     let allocator_after_drain = allocator_stats(&environment.descriptors.device);
@@ -528,6 +572,86 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_trace_writer_preserves_exact_counters_and_gpu_identity() {
+        let current = [
+            profile::Timing {
+                nanos: u64::MAX,
+                ..Default::default()
+            },
+            profile::Timing {
+                nanos: 3,
+                ..Default::default()
+            },
+        ];
+        let previous = [
+            profile::Timing {
+                nanos: 7,
+                ..Default::default()
+            },
+            profile::Timing {
+                nanos: 9,
+                ..Default::default()
+            },
+        ];
+        let mut output = Vec::new();
+        write_record(
+            &mut output,
+            &FrameRecord {
+                event: "frame",
+                frame_id: 42,
+                cpu_ns: u64::MAX,
+                phase_ns: TimingDeltas {
+                    names: &["first", "second"],
+                    current: &current,
+                    previous: &previous,
+                },
+                native_ns: TimingDeltas {
+                    names: &[],
+                    current: &[],
+                    previous: &[],
+                },
+                work: profile::RenderWork {
+                    draw_calls: 13,
+                    ..Default::default()
+                },
+                rss_bytes: Some(1234),
+                native_resources: Some(&json!({"active_bytes":456})),
+                allocator: None,
+            },
+        )
+        .unwrap();
+        write_gpu_record(
+            &mut output,
+            &profile::GpuSample {
+                frame: Some(42),
+                nanos: 9001,
+                phases: vec![("render".into(), 7000)],
+            },
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.ends_with('\n'));
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["frameId"], 42);
+        assert_eq!(records[0]["cpuNs"], u64::MAX);
+        assert_eq!(
+            records[0]["phaseNs"],
+            json!({"first":u64::MAX-7,"second":0})
+        );
+        assert_eq!(records[0]["work"]["draw_calls"], 13);
+        assert_eq!(records[0]["nativeResources"]["active_bytes"], 456);
+        assert_eq!(records[0]["rssBytes"], 1234);
+        assert_eq!(
+            records[1],
+            json!({"event":"gpu","frameId":42,"ns":9001,"phaseNs":[["render",7000]]})
+        );
+    }
 
     #[test]
     fn rejects_duplicate_case_names_and_zero_frames() {
