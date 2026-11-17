@@ -123,6 +123,7 @@ impl RenderInterface for NoCaptures {
 
 fn wait(descriptors: &Descriptors, submission: Option<wgpu::SubmissionIndex>) -> Result<()> {
     let _timer = profile::native_time(NativePhase::QueueThrottle);
+    descriptors.runtime.check_health()?;
     descriptors
         .device
         .poll(wgpu::PollType::Wait {
@@ -130,6 +131,7 @@ fn wait(descriptors: &Descriptors, submission: Option<wgpu::SubmissionIndex>) ->
             timeout: Some(Duration::from_secs(30)),
         })
         .context("GPU completion timed out")?;
+    descriptors.runtime.check_health()?;
     Ok(())
 }
 
@@ -417,6 +419,33 @@ fn main() -> Result<()> {
             json!({"event":"gpu","frameId":sample.frame,"ns":sample.nanos,"phaseNs":sample.phases})
         )?;
     }
+    let resources_after_drain = environment.descriptors.runtime.diagnostic_snapshot();
+    let allocator_after_drain = allocator_stats(&environment.descriptors.device);
+    drop(player);
+    drop(runner); // Drops the movie GC arena and every display-owned lease.
+    wait(&environment.descriptors, None)?;
+    environment
+        .descriptors
+        .runtime
+        .purge_idle_and_cached_resources();
+    wait(&environment.descriptors, None)?;
+    let unloaded_owner_resources: Vec<_> = environment
+        .descriptors
+        .runtime
+        .resources()
+        .into_iter()
+        .filter(|r| {
+            !matches!(
+                r.owner.kind,
+                ruffle_render_wgpu::gpu_runtime::OwnerKind::Renderer
+                    | ruffle_render_wgpu::gpu_runtime::OwnerKind::Host
+            )
+        })
+        .collect();
+    ensure!(
+        unloaded_owner_resources.is_empty(),
+        "unloaded owners retain resources: {unloaded_owner_resources:?}"
+    );
     let memory = resident_memory();
     writeln!(
         output,
@@ -424,8 +453,10 @@ fn main() -> Result<()> {
         json!({"event":"summary","frames":opt.frames,"completedNs":completed_ns,
         "peakRssBytes":memory.map(|r|r.1),"rssBytes":memory.map(|r|r.0),
         "droppedGpuSamples":metrics.snapshot().dropped_gpu_samples,
-        "resourcesAfterDrain":environment.descriptors.runtime.diagnostic_snapshot(),
-        "allocatorAfterDrain":allocator_stats(&environment.descriptors.device)})
+        "resourcesAfterDrain":resources_after_drain, "allocatorAfterDrain":allocator_after_drain,
+        "resourcesAfterUnload":environment.descriptors.runtime.diagnostic_snapshot(),
+        "allocatorAfterUnload":allocator_stats(&environment.descriptors.device),
+        "unloadedOwnerResources":unloaded_owner_resources.len()})
     )?;
     output.flush()?;
     Ok(())

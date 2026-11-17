@@ -1992,3 +1992,67 @@ fn native_preparation_resize_and_unload_cancel_captured_generations() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn one_hundred_renderer_unloads_release_all_transient_resource_identities() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    let descriptors = gpu();
+    let cycle = || {
+        let target = TextureTarget::new_without_readback(&descriptors.device, (64, 64)).unwrap();
+        let mut renderer =
+            WgpuRenderBackend::with_options(descriptors.clone(), target, true).unwrap();
+        let bitmap = renderer
+            .register_bitmap(Bitmap::new(
+                16,
+                16,
+                BitmapFormat::Rgba,
+                [90, 50, 20, 255].repeat(256),
+            ))
+            .unwrap();
+        let mut children = CommandList::new();
+        children.render_bitmap(
+            bitmap,
+            Transform::default(),
+            true,
+            PixelSnapping::Never,
+            PixelRegion::for_whole_size(16, 16),
+        );
+        let mut commands = CommandList::new();
+        commands.blend(children, RenderBlendMode::Builtin(BlendMode::Multiply));
+        renderer
+            .submit_frame(Color::WHITE, commands, vec![])
+            .unwrap();
+        descriptors
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(2)),
+            })
+            .unwrap();
+        renderer.collect_gpu_samples();
+        drop(renderer);
+        descriptors.runtime.purge_idle_and_cached_resources();
+        descriptors.runtime.check_health().unwrap();
+    };
+    cycle(); // Warm immutable descriptor/pipeline storage before measuring owners.
+    let baseline: std::collections::HashSet<_> = descriptors
+        .runtime
+        .resources()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    let bytes = descriptors.runtime.stats().total_bytes;
+    for cycle_index in 0..100 {
+        cycle();
+        let remaining = descriptors.runtime.resources();
+        assert!(
+            remaining.iter().all(|r| baseline.contains(&r.id)),
+            "unloaded resources survived cycle {cycle_index}: {remaining:?}"
+        );
+        assert_eq!(descriptors.runtime.stats().total_bytes, bytes);
+        assert_eq!(descriptors.runtime.stats().retiring_bytes, 0);
+        assert_eq!(descriptors.runtime.stats().reserved_bytes, 0);
+    }
+}

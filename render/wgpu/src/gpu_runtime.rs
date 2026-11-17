@@ -435,6 +435,12 @@ impl GpuRuntime {
     pub(crate) fn record_creation_retry(&self) {
         self.0.ledger().stats.creation_retries += 1;
     }
+    /// Explicit acceptance/teardown purge. In-flight and recorded references
+    /// retain their storage; callers can drain first to make all idle pages eligible.
+    pub fn purge_idle_and_cached_resources(&self) {
+        self.0.scheduler.reclaim();
+    }
+
     pub fn diagnostic_snapshot(&self) -> ruffle_render::profile::NativeResources {
         let stats = self.stats();
         let work = self.preparation().stats();
