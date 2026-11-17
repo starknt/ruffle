@@ -265,6 +265,81 @@ impl PassGraph {
         self.textures.insert(resource, key);
         Ok(resource)
     }
+    fn append_draw(
+        &mut self,
+        node: &SnapshotNode,
+        reads: &[GraphResource],
+        attachment: &Attachment,
+        bounds: RenderRect,
+        submit_after: bool,
+    ) -> Result<bool, RenderFailure> {
+        let Some(previous) = self.passes.last() else {
+            return Ok(false);
+        };
+        if previous.attachment.as_ref() != Some(attachment)
+            || !matches!(previous.kind, PassKind::Draw(_))
+        {
+            return Ok(false);
+        }
+        let index = self.passes.len() - 1;
+        let previous = &mut self.passes[index];
+        // Adjacent leaf draws only write this attachment. Their input
+        // identities and versions are immutable across the run; preserve
+        // all external dependencies and every draw's original order.
+        for &resource in reads {
+            if resource == attachment.resource {
+                continue;
+            }
+            let state = self.states.entry(resource).or_default();
+            if state.readers.last() == Some(&index) {
+                continue;
+            }
+            state.readers.push(index);
+            previous.reads.push(Version {
+                resource,
+                version: state.version,
+            });
+            if let Some(writer) = state.writer
+                && let Err(position) = previous.dependencies.binary_search(&writer)
+            {
+                previous.dependencies.insert(position, writer);
+            }
+        }
+        let state = self.states.get_mut(&attachment.resource).unwrap();
+        state.version = state
+            .version
+            .checked_add(1)
+            .ok_or_else(|| invalid("graph content version exhausted"))?;
+        previous.writes[0].version = state.version;
+        let x = previous.bounds.x.min(bounds.x);
+        let y = previous.bounds.y.min(bounds.y);
+        let right = previous
+            .bounds
+            .x
+            .checked_add(previous.bounds.width)
+            .zip(bounds.x.checked_add(bounds.width))
+            .map(|(a, b)| a.max(b))
+            .ok_or_else(|| invalid("draw bounds overflow"))?;
+        let bottom = previous
+            .bounds
+            .y
+            .checked_add(previous.bounds.height)
+            .zip(bounds.y.checked_add(bounds.height))
+            .map(|(a, b)| a.max(b))
+            .ok_or_else(|| invalid("draw bounds overflow"))?;
+        previous.bounds = RenderRect {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        };
+        previous.submit_after = submit_after;
+        let PassKind::Draw(previous_nodes) = &mut previous.kind else {
+            unreachable!()
+        };
+        previous_nodes.push(node.clone());
+        Ok(true)
+    }
     fn add(
         &mut self,
         kind: PassKind,
@@ -274,72 +349,6 @@ impl PassGraph {
         bounds: RenderRect,
         submit_after: bool,
     ) -> Result<usize, RenderFailure> {
-        if let PassKind::Draw(nodes) = &kind
-            && let Some(attachment) = &attachment
-            && writes == [attachment.resource]
-            && let Some(previous) = self.passes.last()
-            && previous.attachment.as_ref() == Some(attachment)
-            && matches!(previous.kind, PassKind::Draw(_))
-        {
-            let index = self.passes.len() - 1;
-            let previous = &mut self.passes[index];
-            // Adjacent leaf draws only write this attachment. Their input
-            // identities and versions are immutable across the run; preserve
-            // all external dependencies and every draw's original order.
-            for &resource in reads {
-                if resource == attachment.resource {
-                    continue;
-                }
-                let state = self.states.entry(resource).or_default();
-                if state.readers.last() == Some(&index) {
-                    continue;
-                }
-                state.readers.push(index);
-                previous.reads.push(Version {
-                    resource,
-                    version: state.version,
-                });
-                if let Some(writer) = state.writer
-                    && let Err(position) = previous.dependencies.binary_search(&writer)
-                {
-                    previous.dependencies.insert(position, writer);
-                }
-            }
-            let state = self.states.get_mut(&attachment.resource).unwrap();
-            state.version = state
-                .version
-                .checked_add(1)
-                .ok_or_else(|| invalid("graph content version exhausted"))?;
-            previous.writes[0].version = state.version;
-            let x = previous.bounds.x.min(bounds.x);
-            let y = previous.bounds.y.min(bounds.y);
-            let right = previous
-                .bounds
-                .x
-                .checked_add(previous.bounds.width)
-                .zip(bounds.x.checked_add(bounds.width))
-                .map(|(a, b)| a.max(b))
-                .ok_or_else(|| invalid("draw bounds overflow"))?;
-            let bottom = previous
-                .bounds
-                .y
-                .checked_add(previous.bounds.height)
-                .zip(bounds.y.checked_add(bounds.height))
-                .map(|(a, b)| a.max(b))
-                .ok_or_else(|| invalid("draw bounds overflow"))?;
-            previous.bounds = RenderRect {
-                x,
-                y,
-                width: right - x,
-                height: bottom - y,
-            };
-            previous.submit_after = submit_after;
-            let PassKind::Draw(previous_nodes) = &mut previous.kind else {
-                unreachable!()
-            };
-            previous_nodes.extend(nodes.iter().cloned());
-            return Ok(index);
-        }
         let index = self.passes.len();
         let mut dependencies = smallvec::SmallVec::<[usize; 4]>::new();
         // Never material-sort independent Flash commands. The hazard edges are
@@ -500,7 +509,7 @@ impl PassGraph {
                     reads.push(stencil);
                     writes.clear();
                     writes.push(stencil);
-                    PassKind::Mask(*command)
+                    Some(PassKind::Mask(*command))
                 }
                 SnapshotCommand::Blend { children, mode } => {
                     self.direct = false;
@@ -540,7 +549,7 @@ impl PassGraph {
                         }
                         _ => {}
                     }
-                    PassKind::Blend(mode.clone())
+                    Some(PassKind::Blend(mode.clone()))
                 }
                 SnapshotCommand::AlphaMask { maskee, mask } => {
                     self.direct = false;
@@ -566,7 +575,7 @@ impl PassGraph {
                         ancestor,
                     )?;
                     reads.extend([content, mask_target]);
-                    PassKind::AlphaMask
+                    Some(PassKind::AlphaMask)
                 }
                 SnapshotCommand::Bitmap { resource, .. }
                 | SnapshotCommand::Shape { resource, .. } => {
@@ -574,17 +583,33 @@ impl PassGraph {
                     if let Some(inputs) = self.shape_inputs.get(&resource.key) {
                         reads.extend(inputs.iter().map(|r| GraphResource::External(r.key)));
                     }
-                    PassKind::Draw(smallvec::smallvec![node.clone()])
+                    None
                 }
                 SnapshotCommand::Stage3D { resource, .. } => {
                     reads.push(GraphResource::External(resource.key));
-                    PassKind::Opaque(node.clone())
+                    Some(PassKind::Opaque(node.clone()))
                 }
-                _ => PassKind::Draw(smallvec::smallvec![node.clone()]),
+                _ => None,
             };
             if attachment.stencil.is_some() {
                 reads.push(stencil);
             }
+            let kind = if let Some(kind) = kind {
+                kind
+            } else {
+                // Append directly to an adjacent draw pass. Avoid materializing
+                // and then cloning a second large PassKind for every leaf.
+                if self.append_draw(
+                    node,
+                    &reads,
+                    attachment,
+                    bounds,
+                    attachment.stencil_depth == 0,
+                )? {
+                    continue;
+                }
+                PassKind::Draw(smallvec::smallvec![node.clone()])
+            };
             self.add(
                 kind,
                 &reads,
