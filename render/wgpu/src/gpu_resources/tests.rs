@@ -361,6 +361,11 @@ fn profiler_queries_and_readback_storage_obey_the_device_ledger() {
     profiler.resolve_queries(&mut encoder);
     let submission = device.queue().submit([encoder.finish().unwrap()]).unwrap();
     profiler.end_frame().unwrap();
+    device.runtime().purge_idle_and_cached_resources();
+    assert!(
+        device.runtime().stats().kind_bytes[ResourceKind::QuerySet as usize] > 0,
+        "a pending profiler frame must survive idle reclamation"
+    );
     device
         .poll(wgpu::PollType::Wait {
             submission_index: Some(submission),
@@ -372,6 +377,47 @@ fn profiler_queries_and_readback_storage_obey_the_device_ledger() {
         .unwrap();
     assert_eq!(timings[0].label, "measured frame");
     assert!(timings[0].time.is_some());
+    assert!(
+        device.runtime().stats().idle_bytes > 0,
+        "completed query pools must participate in shared idle reclamation"
+    );
+    device.runtime().purge_idle_and_cached_resources();
+    assert_eq!(
+        device.runtime().stats().total_bytes,
+        0,
+        "idle query storage must be reclaimable while the profiler is alive"
+    );
+
+    let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
+    {
+        let _scope = profiler.scope("measured after reclamation", &mut encoder);
+    }
+    profiler.resolve_queries(&mut encoder);
+    let submission = device.queue().submit([encoder.finish().unwrap()]).unwrap();
+    profiler.end_frame().unwrap();
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    let timings = profiler
+        .process_finished_frame(device.queue().get_timestamp_period())
+        .unwrap();
+    assert_eq!(timings[0].label, "measured after reclamation");
+    assert!(timings[0].time.is_some());
+    assert!(device.runtime().stats().idle_bytes > 0);
+    profiler
+        .change_settings(crate::gpu_profiler::GpuProfilerSettings {
+            enable_timer_queries: false,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        device.runtime().stats().total_bytes,
+        0,
+        "disabling profiling must release its actual idle query cache"
+    );
     drop(profiler);
     device
         .runtime()

@@ -482,6 +482,16 @@ fn main() -> Result<()> {
         if let Some(gc_before) = reclaim_gc_before {
             wait(&environment.descriptors, None)?;
             inflight.clear();
+            // Finish consuming the now-complete timestamps before reclaiming
+            // their idle storage. These samples retain their original frame IDs.
+            let mut player = runner.player().lock().unwrap();
+            <dyn Any>::downcast_mut::<WgpuRenderBackend<TextureTarget>>(player.renderer_mut())
+                .unwrap()
+                .collect_gpu_samples();
+            drop(player);
+            for sample in metrics.take_gpu_samples() {
+                write_gpu_record(&mut output, &sample)?;
+            }
             let gc_after = runner.player().lock().unwrap().gc_object_count();
             environment
                 .descriptors

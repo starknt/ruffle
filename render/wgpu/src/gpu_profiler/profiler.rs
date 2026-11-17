@@ -25,7 +25,8 @@ use crate::gpu_profiler::{
 pub struct GpuProfiler {
     device: crate::gpu_resources::Device,
 
-    unused_pools: Vec<QueryPool>,
+    unused_pools: crate::idle_pool::Budget,
+    unused_pool_key: u64,
 
     active_frame: ActiveFrame,
     pending_frames: Vec<PendingFrame>,
@@ -63,11 +64,14 @@ impl GpuProfiler {
         settings.validate()?;
 
         let (closed_scope_sender, closed_scope_receiver) = std::sync::mpsc::channel();
+        let unused_pools = crate::idle_pool::Budget::with_runtime(device.runtime());
+        let unused_pool_key = unused_pools.key();
 
         Ok(GpuProfiler {
             device: device.clone(),
 
-            unused_pools: Vec::new(),
+            unused_pools,
+            unused_pool_key,
 
             pending_frames: Vec::with_capacity(settings.max_num_pending_frames),
             completed_frames: Default::default(),
@@ -119,7 +123,7 @@ impl GpuProfiler {
     pub fn change_settings(&mut self, settings: GpuProfilerSettings) -> Result<(), SettingsError> {
         settings.validate()?;
         if !settings.enable_timer_queries {
-            self.unused_pools.clear();
+            self.unused_pools.clear_pool(self.unused_pool_key);
         }
         self.settings = settings;
 
@@ -622,11 +626,12 @@ impl GpuProfiler {
             // This way we're going to need less pools in upcoming frames and thus have less overhead in the long run.
             // If timer queries were disabled, we also don't keep any pools.
             if self.settings.enable_timer_queries && pool.capacity >= capacity_threshold {
-                self.active_frame
-                    .query_pools
-                    .get_mut()
-                    .unused_pools
-                    .push(pool);
+                let bytes = u64::from(pool.capacity) * u64::from(wgpu::QUERY_SIZE) * 3;
+                pool.set_idle(true);
+                // Mapping has completed and all query references were consumed.
+                // The shared governor may now discard this reconstructible pool,
+                // including while the profiler and its current frame stay alive.
+                self.unused_pools.put(self.unused_pool_key, 1, bytes, pool);
             }
         }
     }
@@ -698,8 +703,13 @@ impl GpuProfiler {
             }
 
             // Now we know for certain that the last pool is exhausted, so add a new one!
-            let new_pool = if let Some(reused_pool) = query_pools.unused_pools.pop() {
+            let new_pool = if let Some(reused_pool) = self
+                .unused_pools
+                .take(self.unused_pool_key, |pool: &QueryPool| {
+                    Some(std::cmp::Reverse(pool.capacity))
+                }) {
                 // First check if there's an unused pool we can take.
+                reused_pool.set_idle(false);
                 Arc::new(reused_pool)
             } else {
                 // If we can't, create a new pool that is as big as all previous pools combined.
@@ -946,6 +956,12 @@ impl QueryPool {
         self.num_resolved_queries = AtomicU32::new(0);
         self.read_buffer.unmap();
     }
+
+    fn set_idle(&self, idle: bool) {
+        self.query_set.lease().set_idle(idle);
+        self.resolve_buffer.lease().set_idle(idle);
+        self.read_buffer.lease().set_idle(idle);
+    }
 }
 
 #[derive(Default)]
@@ -953,9 +969,6 @@ struct PendingFramePools {
     /// List of all pools used in this frame.
     /// The last pool is the one new profiling queries will try to make timer queries into.
     used_pools: Vec<Arc<QueryPool>>,
-
-    /// List of unused pools recycled from previous frames.
-    unused_pools: Vec<QueryPool>,
 }
 
 /// Internal handle to building a tree of profiling queries.
