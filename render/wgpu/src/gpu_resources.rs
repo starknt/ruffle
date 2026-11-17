@@ -36,6 +36,31 @@ pub type QuerySet = Resource<wgpu::QuerySet>;
 
 type ObjectKey = (TypeId, u64);
 type UseSet = FnvHashMap<ResourceId, ResourceLease>;
+
+/// A closed set of recorded resources, including every binding dependency.
+/// Only this module can construct one; submission need not traverse it again.
+#[derive(Default)]
+pub(crate) struct RecordedUses(UseSet);
+impl RecordedUses {
+    fn from_roots(roots: UseSet) -> Self {
+        fn retain(uses: &mut UseSet, lease: &ResourceLease) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = uses.entry(lease.id()) {
+                entry.insert(lease.clone());
+                for dependency in lease.dependencies() {
+                    retain(uses, dependency);
+                }
+            }
+        }
+        let mut uses = Self::default();
+        for lease in roots.into_values() {
+            retain(&mut uses.0, &lease);
+        }
+        uses
+    }
+    pub(crate) fn leases(&self) -> impl Iterator<Item = &ResourceLease> {
+        self.0.values()
+    }
+}
 #[derive(Default)]
 struct Recording {
     uses: UseSet,
@@ -829,12 +854,17 @@ impl CommandEncoder {
         };
         self.device.runtime().check_health()?;
         let raw = self.device.scoped(|_| Ok(self.raw.finish()))?;
-        Ok(CommandBuffer { raw, uses, pending })
+        // Recording::retain already closes this set transitively.
+        Ok(CommandBuffer {
+            raw,
+            uses: RecordedUses(uses),
+            pending,
+        })
     }
 }
 pub struct CommandBuffer {
     raw: wgpu::CommandBuffer,
-    uses: UseSet,
+    uses: RecordedUses,
     pending: Vec<crate::gpu_runtime::UnsubmittedUse>,
 }
 
@@ -1125,7 +1155,7 @@ impl Queue {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                 });
                 let mut raw = smallvec::SmallVec::<[wgpu::CommandBuffer; 1]>::new();
-                let mut uses = std::mem::take(
+                let mut uses = RecordedUses::from_roots(std::mem::take(
                     &mut *self
                         .0
                         .0
@@ -1133,18 +1163,18 @@ impl Queue {
                         .pending_writes
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner),
-                );
+                ));
                 let mut pending = Vec::new();
                 for command in commands {
                     pending.extend(command.pending);
                     raw.push(command.raw);
-                    if uses.is_empty() {
+                    if uses.0.is_empty() {
                         uses = command.uses;
                     } else {
-                        uses.extend(command.uses);
+                        uses.0.extend(command.uses.0);
                     }
                 }
-                let serial = self.0.runtime().register_submission(uses.values())?;
+                let serial = self.0.runtime().register_recorded_submission(&uses)?;
                 drop(pending);
                 let index = self.raw().submit(raw);
                 {

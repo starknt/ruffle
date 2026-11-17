@@ -529,19 +529,7 @@ impl GpuRuntime {
             pending.push(resource.id());
         }
         let mut ledger = self.0.ledger();
-        if ledger.stats.submitted - ledger.stats.completed >= 2 {
-            return Err(failure(
-                RenderFailureKind::BudgetExceeded,
-                "two Ruffle submissions are already in flight",
-            ));
-        }
-
-        let serial = ledger.stats.submitted.checked_add(1).ok_or_else(|| {
-            failure(
-                RenderFailureKind::Internal,
-                "submission identity space exhausted",
-            )
-        })?;
+        let serial = ledger.next_submission()?;
         // Use a unique traversal stamp rather than allocating a second identity
         // set for every submission. Attempts have separate stamps, including a
         // failed attempt that did not issue its proposed submission serial.
@@ -564,6 +552,40 @@ impl GpuRuntime {
                 record.last_submission = serial;
                 pending.extend_from_slice(&record.dependencies);
             }
+        }
+        ledger.stats.submitted = serial;
+        Ok(SubmissionSerial {
+            device: self.0.device,
+            index: serial,
+        })
+    }
+
+    /// Native encoders retain an exact, transitively closed use set. Queue-write
+    /// roots are closed at the same boundary before they can enter this API.
+    pub(crate) fn register_recorded_submission(
+        &self,
+        resources: &crate::gpu_resources::RecordedUses,
+    ) -> Result<SubmissionSerial, RenderFailure> {
+        self.0.healthy()?;
+        if resources
+            .leases()
+            .any(|r| !Arc::ptr_eq(&r.0.runtime.0, &self.0))
+        {
+            return Err(failure(
+                RenderFailureKind::Validation,
+                "submission references another device",
+            ));
+        }
+        let mut ledger = self.0.ledger();
+        let serial = ledger.next_submission()?;
+        for resource in resources.leases() {
+            let record = ledger.records.get_mut(&resource.id()).ok_or_else(|| {
+                failure(
+                    RenderFailureKind::Validation,
+                    "submission references a retired resource",
+                )
+            })?;
+            record.last_submission = serial;
         }
         ledger.stats.submitted = serial;
         Ok(SubmissionSerial {
@@ -604,6 +626,20 @@ impl GpuRuntime {
 }
 
 impl Ledger {
+    fn next_submission(&self) -> Result<u64, RenderFailure> {
+        if self.stats.submitted - self.stats.completed >= 2 {
+            return Err(failure(
+                RenderFailureKind::BudgetExceeded,
+                "two Ruffle submissions are already in flight",
+            ));
+        }
+        self.stats.submitted.checked_add(1).ok_or_else(|| {
+            failure(
+                RenderFailureKind::Internal,
+                "submission identity space exhausted",
+            )
+        })
+    }
     fn bucket(&mut self, state: ResourceState) -> &mut u64 {
         match state {
             ResourceState::Reserved => &mut self.stats.reserved_bytes,
