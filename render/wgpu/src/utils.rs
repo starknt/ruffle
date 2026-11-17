@@ -232,24 +232,22 @@ pub fn run_copy_pipeline(
     sample_count: u32,
     encoder: &mut CommandEncoder,
 ) -> Result<(), crate::gpu_runtime::RenderFailure> {
-    let copy_bind_group = descriptors
-        .device
-        .create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &descriptors.bind_layouts.bitmap,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(input),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(
-                        descriptors.bitmap_samplers.get_sampler(false, false),
-                    ),
-                },
-            ],
-            label: create_debug_label!("Copy bind group").as_deref(),
-        })?;
+    let copy_bind_group = descriptors.cached_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &descriptors.bind_layouts.bitmap,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(input),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(
+                    descriptors.bitmap_samplers.get_sampler(false, false),
+                ),
+            },
+        ],
+        label: create_debug_label!("Copy bind group").as_deref(),
+    })?;
 
     let pipeline = descriptors.copy_pipeline(format, sample_count)?;
 

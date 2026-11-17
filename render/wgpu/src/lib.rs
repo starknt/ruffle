@@ -62,6 +62,7 @@ pub mod descriptors;
 mod filters;
 mod layouts;
 mod mesh;
+mod material_cache;
 mod shaders;
 mod surface;
 

@@ -98,7 +98,7 @@ pub struct DrawOffsets {
 }
 
 impl DrawOffsets {
-    pub fn try_merge(&mut self, other: &DrawOffsets) -> bool {
+    pub fn try_merge(&mut self, other: &DrawOffsets, primitive_size: u32) -> bool {
         if self.vertex_buffer == other.vertex_buffer
             && self.index_buffer == other.index_buffer
             && self.vertices == other.vertices
@@ -110,7 +110,20 @@ impl DrawOffsets {
             return true;
         }
 
-        // [NA] We could, in theory, get smart and try to join contiguous meshes. Is it worth it? It would potentially harm the instancing.
+        // With one identical instance, adjacent index ranges are the same
+        // primitive sequence. Multi-instance ranges would reorder primitives.
+        if self.vertex_buffer == other.vertex_buffer
+            && self.index_buffer == other.index_buffer
+            && self.vertices == other.vertices
+            && self.instances == other.instances
+            && self.instances.end - self.instances.start == 1
+            && self.indices.end == other.indices.start
+            && (self.indices.end - self.indices.start).is_multiple_of(primitive_size)
+            && (other.indices.end - other.indices.start).is_multiple_of(primitive_size)
+        {
+            self.indices.end = other.indices.end;
+            return true;
+        }
         false
     }
 }

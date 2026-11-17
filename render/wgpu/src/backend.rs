@@ -95,6 +95,14 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
         Option<Arc<crate::bitmap_residency::BitmapResidency<crate::bitmap_recipe::BitmapRecipe>>>,
 }
 
+impl<T: RenderTarget> Drop for WgpuRenderBackend<T> {
+    fn drop(&mut self) {
+        // Descriptors may outlive a movie/renderer in a shared-device host.
+        // Cached bindings must not keep that renderer's targets alive there.
+        self.descriptors.materials.clear();
+    }
+}
+
 impl WgpuRenderBackend<SwapChainTarget> {
     /// # Safety
     ///  See [`wgpu::SurfaceTargetUnsafe`] variants for safety requirements.

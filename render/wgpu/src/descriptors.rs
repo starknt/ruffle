@@ -25,6 +25,7 @@ pub struct Descriptors {
     pub shaders: Shaders,
     pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), Arc<Pipelines>>>,
     pub filters: Filters,
+    pub materials: crate::material_cache::MaterialCache,
 }
 
 impl Debug for Descriptors {
@@ -81,7 +82,9 @@ impl Descriptors {
         let backend = adapter.get_info().backend;
 
         runtime.check_health()?;
+        let materials = crate::material_cache::MaterialCache::new(&runtime, 128);
         Ok(Self {
+            materials,
             runtime,
             wgpu_instance: instance,
             adapter,
@@ -97,6 +100,13 @@ impl Descriptors {
             pipelines: Default::default(),
             filters,
         })
+    }
+
+    pub fn cached_bind_group(
+        &self,
+        desc: &wgpu::BindGroupDescriptor<'_>,
+    ) -> Result<crate::gpu_resources::BindGroup, crate::gpu_runtime::RenderFailure> {
+        self.materials.get_or_create(&self.device, desc)
     }
 
     pub fn copy_pipeline(

@@ -314,28 +314,26 @@ impl BlurFilter {
         source: &TextureView,
         vertices: BufferSlice,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
-        let filter_group = descriptors
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: create_debug_label!("Filter group").as_deref(),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(source),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(
-                            descriptors.bitmap_samplers.get_sampler(false, true),
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.uniform_buffer.as_entire_binding(),
-                    },
-                ],
-            })?;
+        let filter_group = descriptors.cached_bind_group(&wgpu::BindGroupDescriptor {
+            label: create_debug_label!("Filter group").as_deref(),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(source),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(
+                        descriptors.bitmap_samplers.get_sampler(false, true),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+            ],
+        })?;
 
         ruffle_render::profile::work(|w| {
             w.render_passes += 1;

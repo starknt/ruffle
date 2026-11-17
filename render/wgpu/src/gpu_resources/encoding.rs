@@ -50,6 +50,8 @@ impl CommandEncoder {
         RenderPass {
             raw: self.raw.begin_render_pass(desc),
             uses,
+            state: PassState::default(),
+            changes: StateChanges::default(),
         }
     }
     pub fn begin_compute_pass(
@@ -145,14 +147,63 @@ impl CommandEncoder {
     }
 }
 
+/// Actual calls forwarded to the native pass after state suppression.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateChanges {
+    pub pipelines: u64,
+    pub bind_groups: u64,
+    pub vertex_buffers: u64,
+    pub index_buffers: u64,
+    pub scissors: u64,
+    pub stencil_references: u64,
+    pub viewports: u64,
+}
+#[derive(Clone, PartialEq, Eq)]
+struct BufferRange {
+    buffer: wgpu::Buffer,
+    offset: u64,
+    size: u64,
+}
+impl From<wgpu::BufferSlice<'_>> for BufferRange {
+    fn from(slice: wgpu::BufferSlice<'_>) -> Self {
+        Self {
+            buffer: slice.buffer().clone(),
+            offset: slice.offset(),
+            size: slice.size(),
+        }
+    }
+}
+#[derive(Default)]
+struct PassState {
+    pipeline: Option<wgpu::RenderPipeline>,
+    bindings: FnvHashMap<u32, (Option<wgpu::BindGroup>, smallvec::SmallVec<[u32; 4]>)>,
+    vertices: FnvHashMap<u32, Option<BufferRange>>,
+    index: Option<(BufferRange, wgpu::IndexFormat)>,
+    scissor: Option<[u32; 4]>,
+    stencil: Option<u32>,
+    viewport: Option<[u32; 6]>,
+}
+
 pub struct RenderPass<'a> {
     raw: wgpu::RenderPass<'a>,
     uses: Uses,
+    state: PassState,
+    changes: StateChanges,
 }
 impl RenderPass<'_> {
+    pub fn state_changes(&self) -> StateChanges {
+        self.changes
+    }
     pub fn set_pipeline(&mut self, pipeline: &wgpu::RenderPipeline) {
+        if self.state.pipeline.as_ref() == Some(pipeline) {
+            return;
+        }
         self.uses.retain(pipeline);
         self.raw.set_pipeline(pipeline);
+        self.state.pipeline = Some(pipeline.clone());
+        // Conservatively rebind after any pipeline-layout change.
+        self.state.bindings.clear();
+        self.changes.pipelines += 1;
     }
     pub fn set_bind_group<'a>(
         &mut self,
@@ -161,10 +212,23 @@ impl RenderPass<'_> {
         offsets: &[u32],
     ) {
         let group = group.into();
+        if self
+            .state
+            .bindings
+            .get(&index)
+            .is_some_and(|(old, dynamic)| old.as_ref() == group && dynamic.as_slice() == offsets)
+        {
+            return;
+        }
         if let Some(group) = group {
             self.uses.retain(group);
         }
         self.raw.set_bind_group(index, group, offsets);
+        self.state.bindings.insert(
+            index,
+            (group.cloned(), smallvec::SmallVec::from_slice(offsets)),
+        );
+        self.changes.bind_groups += 1;
     }
     pub fn set_vertex_buffer<'a>(
         &mut self,
@@ -172,14 +236,26 @@ impl RenderPass<'_> {
         slice: impl Into<Option<wgpu::BufferSlice<'a>>>,
     ) {
         let slice = slice.into();
+        let key = slice.map(BufferRange::from);
+        if self.state.vertices.get(&slot) == Some(&key) {
+            return;
+        }
         if let Some(slice) = slice {
             self.uses.retain(slice.buffer());
         }
         self.raw.set_vertex_buffer(slot, slice);
+        self.state.vertices.insert(slot, key);
+        self.changes.vertex_buffers += 1;
     }
     pub fn set_index_buffer(&mut self, slice: wgpu::BufferSlice<'_>, format: wgpu::IndexFormat) {
+        let key = (BufferRange::from(slice), format);
+        if self.state.index.as_ref() == Some(&key) {
+            return;
+        }
         self.uses.retain(slice.buffer());
         self.raw.set_index_buffer(slice, format);
+        self.state.index = Some(key);
+        self.changes.index_buffers += 1;
     }
     pub fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
         self.raw.draw(vertices, instances);
@@ -188,10 +264,21 @@ impl RenderPass<'_> {
         self.raw.draw_indexed(indices, base_vertex, instances);
     }
     pub fn set_stencil_reference(&mut self, value: u32) {
+        if self.state.stencil == Some(value) {
+            return;
+        }
         self.raw.set_stencil_reference(value);
+        self.state.stencil = Some(value);
+        self.changes.stencil_references += 1;
     }
     pub fn set_scissor_rect(&mut self, x: u32, y: u32, width: u32, height: u32) {
+        let key = [x, y, width, height];
+        if self.state.scissor == Some(key) {
+            return;
+        }
         self.raw.set_scissor_rect(x, y, width, height);
+        self.state.scissor = Some(key);
+        self.changes.scissors += 1;
     }
     pub fn set_viewport(
         &mut self,
@@ -202,8 +289,14 @@ impl RenderPass<'_> {
         min_depth: f32,
         max_depth: f32,
     ) {
+        let key = [x, y, width, height, min_depth, max_depth].map(f32::to_bits);
+        if self.state.viewport == Some(key) {
+            return;
+        }
         self.raw
             .set_viewport(x, y, width, height, min_depth, max_depth);
+        self.state.viewport = Some(key);
+        self.changes.viewports += 1;
     }
     pub fn write_timestamp(&mut self, queries: &wgpu::QuerySet, index: u32) {
         self.uses.retain(queries);

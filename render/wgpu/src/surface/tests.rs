@@ -1360,3 +1360,41 @@ fn filter_chain_preserves_fractional_blur_halos_at_image_edges() {
     assert_eq!(results[0].0, results[1].0);
     assert!(results[1].0[3] > 0, "edge contribution must survive");
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn adjacent_geometry_merges_only_contiguous_indices_with_identical_instances() {
+    use crate::surface::{buffers::DrawOffsets, chunk::DrawCommand, mask::MaskState};
+    let descriptors = gpu();
+    let offsets = DrawOffsets {
+        vertex_buffer: Some(descriptors.quad.vertex_buffer.clone()),
+        index_buffer: descriptors.quad.index_buffer.clone(),
+        vertices: descriptors.quad.vertices_pos.clone(),
+        indices: 0..3,
+        instances: 0..1,
+    };
+    let mut first = DrawCommand::DrawColor {
+        draw_offsets: offsets.clone(),
+    };
+    let mut next = offsets.clone();
+    next.indices = 3..6;
+    assert!(first.try_merge(&DrawCommand::DrawColor {
+        draw_offsets: next.clone()
+    }));
+    let DrawCommand::DrawColor { draw_offsets } = &first else {
+        panic!()
+    };
+    assert_eq!(draw_offsets.indices, 0..6);
+    next.indices = 6..9;
+    next.instances = 1..2;
+    assert!(!first.try_merge(&DrawCommand::DrawColor {
+        draw_offsets: next.clone()
+    }));
+    next.instances = 0..1;
+    next.indices = 9..12;
+    assert!(!first.try_merge(&DrawCommand::DrawColor { draw_offsets: next }));
+    assert!(!first.try_merge(&DrawCommand::SetMask(MaskState::empty())));
+    assert!(!first.try_merge(&DrawCommand::DrawLine {
+        draw_offsets: offsets
+    }));
+}

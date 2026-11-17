@@ -304,43 +304,39 @@ impl Surface {
                         };
 
                         let blend_bind_group =
-                            descriptors
-                                .device
-                                .create_bind_group(&wgpu::BindGroupDescriptor {
-                                    label: create_debug_label!(
-                                        "Complex blend binds {:?} {}",
-                                        blend_mode,
-                                        if needs_stencil {
-                                            "(with stencil)"
-                                        } else {
-                                            "(Stencilless)"
-                                        }
-                                    )
-                                    .as_deref(),
-                                    layout: &descriptors.bind_layouts.blend,
-                                    entries: &[
-                                        wgpu::BindGroupEntry {
-                                            binding: 0,
-                                            resource: wgpu::BindingResource::TextureView(
-                                                parent_blend_buffer.view(),
-                                            ),
-                                        },
-                                        wgpu::BindGroupEntry {
-                                            binding: 1,
-                                            resource: wgpu::BindingResource::TextureView(
-                                                texture.view(),
-                                            ),
-                                        },
-                                        wgpu::BindGroupEntry {
-                                            binding: 2,
-                                            resource: wgpu::BindingResource::Sampler(
-                                                descriptors
-                                                    .bitmap_samplers
-                                                    .get_sampler(false, false),
-                                            ),
-                                        },
-                                    ],
-                                })?;
+                            descriptors.cached_bind_group(&wgpu::BindGroupDescriptor {
+                                label: create_debug_label!(
+                                    "Complex blend binds {:?} {}",
+                                    blend_mode,
+                                    if needs_stencil {
+                                        "(with stencil)"
+                                    } else {
+                                        "(Stencilless)"
+                                    }
+                                )
+                                .as_deref(),
+                                layout: &descriptors.bind_layouts.blend,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(
+                                            parent_blend_buffer.view(),
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::TextureView(
+                                            texture.view(),
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: wgpu::BindingResource::Sampler(
+                                            descriptors.bitmap_samplers.get_sampler(false, false),
+                                        ),
+                                    },
+                                ],
+                            })?;
 
                         ruffle_render::profile::work(|w| {
                             w.render_passes += 1;

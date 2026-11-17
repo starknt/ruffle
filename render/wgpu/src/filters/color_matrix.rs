@@ -215,28 +215,26 @@ impl ColorMatrixFilter {
         staging_belt
             .write_buffer(draw_encoder, &self.vertex_buffer, 0, self.vertices_size)?
             .copy_from_slice(bytemuck::cast_slice(&[source.vertices()]));
-        let filter_group = descriptors
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: create_debug_label!("Filter group").as_deref(),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&source_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(
-                            descriptors.bitmap_samplers.get_sampler(false, false),
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.uniform_buffer.as_entire_binding(),
-                    },
-                ],
-            })?;
+        let filter_group = descriptors.cached_bind_group(&wgpu::BindGroupDescriptor {
+            label: create_debug_label!("Filter group").as_deref(),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(
+                        descriptors.bitmap_samplers.get_sampler(false, false),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+            ],
+        })?;
         ruffle_render::profile::work(|w| {
             w.render_passes += 1;
             w.filter_passes += 1;

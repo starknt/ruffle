@@ -538,3 +538,169 @@ fn encoder_retains_only_used_resources_with_interleaved_recordings() {
     drop(second);
     assert_eq!(device.runtime().stats().total_bytes, 0);
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn temporary_material_cache_respects_ranges_layouts_lru_and_reclamation() {
+    let device = device(8192);
+    let cache = crate::material_cache::MaterialCache::new(device.runtime(), 2);
+    let buffer = device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 1024,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let layout_desc = wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    };
+    let first_layout = device.create_bind_group_layout(&layout_desc).unwrap();
+    let second_layout = device.create_bind_group_layout(&layout_desc).unwrap();
+    let get = |layout: &BindGroupLayout, offset| {
+        cache
+            .get_or_create(
+                &device,
+                &wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &buffer,
+                            offset,
+                            size: wgpu::BufferSize::new(256),
+                        }),
+                    }],
+                },
+            )
+            .unwrap()
+    };
+    let first = get(&first_layout, 0);
+    assert_eq!(first, get(&first_layout, 0));
+    let range = get(&first_layout, 256);
+    assert_ne!(first, range);
+    assert_eq!(first, get(&first_layout, 0)); // first is MRU
+    let layout = get(&second_layout, 0);
+    assert_ne!(first, layout);
+    assert_ne!(range, get(&first_layout, 256)); // range was LRU
+    assert!(device.runtime().stats().cache_retained_bytes > 0);
+    device.runtime().scheduler().reclaim();
+    assert_eq!(device.runtime().stats().cache_retained_bytes, 0);
+    assert_ne!(first, get(&first_layout, 0));
+    // Recorded handles remain usable after eviction; storage still belongs to them.
+    drop(cache);
+    assert_eq!(device.runtime().stats().total_bytes, 1024);
+    drop((first, range, layout, buffer));
+    assert_eq!(device.runtime().stats().total_bytes, 0);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn render_pass_suppresses_identical_state_but_preserves_offsets_and_boundaries() {
+    let device = device(8192);
+    let buffer = device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 1024,
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::INDEX,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let layout = device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        })
+        .unwrap();
+    let group = device
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(256),
+                }),
+            }],
+        })
+        .unwrap();
+    let texture = device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 8,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .unwrap();
+    let view = texture.create_view(&Default::default()).unwrap();
+    let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
+    for _ in 0..2 {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        for _ in 0..3 {
+            pass.set_bind_group(0, group.raw(), &[0]);
+            pass.set_vertex_buffer(0, buffer.slice(0..64));
+            pass.set_index_buffer(buffer.slice(0..64), wgpu::IndexFormat::Uint16);
+            pass.set_scissor_rect(0, 0, 4, 4);
+            pass.set_stencil_reference(1);
+        }
+        assert_eq!(pass.state_changes().bind_groups, 1);
+        assert_eq!(pass.state_changes().vertex_buffers, 1);
+        assert_eq!(pass.state_changes().index_buffers, 1);
+        assert_eq!(pass.state_changes().scissors, 1);
+        assert_eq!(pass.state_changes().stencil_references, 1);
+        pass.set_bind_group(0, group.raw(), &[256]);
+        pass.set_vertex_buffer(0, buffer.slice(64..128));
+        pass.set_index_buffer(buffer.slice(0..64), wgpu::IndexFormat::Uint32);
+        pass.set_scissor_rect(4, 0, 4, 4);
+        pass.set_stencil_reference(2);
+        assert_eq!(pass.state_changes().bind_groups, 2);
+        assert_eq!(pass.state_changes().vertex_buffers, 2);
+        assert_eq!(pass.state_changes().index_buffers, 2);
+        assert_eq!(pass.state_changes().scissors, 2);
+        assert_eq!(pass.state_changes().stencil_references, 2);
+    }
+    assert!(encoder.finish().is_ok());
+}

@@ -67,82 +67,66 @@ impl DrawCommand {
         }
     }
 
-    pub fn try_merge(&mut self, other: &DrawCommand) -> bool {
-        match (self, other) {
-            (
-                DrawCommand::DrawColor {
-                    draw_offsets: self_offsets,
-                },
-                DrawCommand::DrawColor {
-                    draw_offsets: other_offsets,
-                },
-            ) => self_offsets.try_merge(other_offsets),
-            (
-                DrawCommand::DrawLine {
-                    draw_offsets: self_offsets,
-                },
-                DrawCommand::DrawLine {
-                    draw_offsets: other_offsets,
-                },
-            ) => self_offsets.try_merge(other_offsets),
-            (
-                DrawCommand::RenderGradient {
-                    bind_group: self_bind_group,
-                    draw_offsets: self_offsets,
-                },
-                DrawCommand::RenderGradient {
-                    bind_group: other_bind_group,
-                    draw_offsets: other_offsets,
-                },
-            ) if self_bind_group == other_bind_group => self_offsets.try_merge(other_offsets),
-            (
-                DrawCommand::RenderTexture {
-                    _texture: self_texture,
-                    binds: self_binds,
-                    blend_mode: self_blend,
-                    render_stage3d: self_stage3d,
-                    draw_offsets: self_offsets,
-                },
-                DrawCommand::RenderTexture {
-                    _texture: other_texture,
-                    binds: other_binds,
-                    blend_mode: other_blend,
-                    render_stage3d: other_stage3d,
-                    draw_offsets: other_offsets,
-                },
-            ) if self_texture == other_texture
-                && self_binds == other_binds
-                && self_blend == other_blend
-                && self_stage3d == other_stage3d =>
-            {
-                self_offsets.try_merge(other_offsets)
-            }
-            (
-                DrawCommand::RenderAlphaMask {
-                    maskee: self_maskee,
-                    mask: self_mask,
-                    binds: self_binds,
-                    draw_offsets: self_offsets,
-                },
-                DrawCommand::RenderAlphaMask {
-                    maskee: other_maskee,
-                    mask: other_mask,
-                    binds: other_binds,
-                    draw_offsets: other_offsets,
-                },
-            ) if self_maskee == other_maskee
-                && self_mask == other_mask
-                && self_binds == other_binds =>
-            {
-                self_offsets.try_merge(other_offsets)
-            }
-            (DrawCommand::SetMask(self_mask), DrawCommand::SetMask(new_mask)) => {
-                *self_mask = *new_mask;
-                true
-            }
-            _ => false,
+    fn batch_key(&self) -> Option<BatchKey> {
+        Some(match self {
+            Self::DrawColor { .. } => BatchKey::Color,
+            Self::DrawLine { .. } => BatchKey::Line,
+            Self::RenderGradient { bind_group, .. } => BatchKey::Gradient(bind_group.lease().id()),
+            Self::RenderTexture {
+                binds,
+                blend_mode,
+                render_stage3d,
+                ..
+            } => BatchKey::Texture(binds.lease().id(), *blend_mode, *render_stage3d),
+            Self::RenderAlphaMask { binds, .. } => BatchKey::AlphaMask(binds.lease().id()),
+            Self::SetMask(_) => return None,
+        })
+    }
+    fn offsets_mut(&mut self) -> Option<&mut DrawOffsets> {
+        match self {
+            Self::DrawColor { draw_offsets }
+            | Self::DrawLine { draw_offsets }
+            | Self::RenderGradient { draw_offsets, .. }
+            | Self::RenderTexture { draw_offsets, .. }
+            | Self::RenderAlphaMask { draw_offsets, .. } => Some(draw_offsets),
+            Self::SetMask(_) => None,
         }
     }
+    pub fn try_merge(&mut self, other: &DrawCommand) -> bool {
+        if let (Self::SetMask(current), Self::SetMask(next)) = (&mut *self, other) {
+            *current = *next;
+            return true;
+        }
+        let Some(key) = self.batch_key() else {
+            return false;
+        };
+        if other.batch_key() != Some(key) {
+            return false;
+        }
+        let primitive_size = if key == BatchKey::Line { 2 } else { 3 };
+        let offsets = match other {
+            Self::DrawColor { draw_offsets }
+            | Self::DrawLine { draw_offsets }
+            | Self::RenderGradient { draw_offsets, .. }
+            | Self::RenderTexture { draw_offsets, .. }
+            | Self::RenderAlphaMask { draw_offsets, .. } => draw_offsets,
+            Self::SetMask(_) => return false,
+        };
+        self.offsets_mut()
+            .is_some_and(|current| current.try_merge(offsets, primitive_size))
+    }
+}
+
+/// Complete material/pipeline identity for adjacent draws. Vertex/index ranges
+/// and instances are checked by DrawOffsets. Mask commands are barriers; each
+/// chunk fixes its attachments/scissor and cannot cross an upload or blend pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BatchKey {
+    Color,
+    Line,
+    Gradient(crate::gpu_runtime::ResourceId),
+    Texture(crate::gpu_runtime::ResourceId, TrivialBlend, bool),
+    AlphaMask(crate::gpu_runtime::ResourceId),
 }
 
 pub struct CommandRenderer<'encoder> {
@@ -152,6 +136,7 @@ pub struct CommandRenderer<'encoder> {
     chunk_buffers: &'encoder ChunkBuffers,
     current_pipeline: Option<&'encoder crate::gpu_resources::RenderPipeline>,
     current_index_buffer: Option<&'encoder crate::gpu_resources::Buffer>,
+    current_material: Option<&'encoder crate::gpu_resources::BindGroup>,
     work: Option<ruffle_render::profile::RenderWork>,
 }
 
@@ -169,6 +154,7 @@ impl<'encoder> CommandRenderer<'encoder> {
             chunk_buffers,
             current_pipeline: None,
             current_index_buffer: None,
+            current_material: None,
             work: ruffle_render::profile::enabled().then(|| ruffle_render::profile::RenderWork {
                 mask_passes: u64::from(needs_stencil),
                 ..Default::default()
@@ -226,6 +212,21 @@ impl<'encoder> CommandRenderer<'encoder> {
             }
             render_pass.set_pipeline(pipeline);
             self.current_pipeline = Some(pipeline);
+            self.current_material = None;
+        }
+    }
+
+    fn set_material(
+        &mut self,
+        render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
+        bind_group: &'encoder crate::gpu_resources::BindGroup,
+    ) {
+        if self.current_material != Some(bind_group) {
+            if let Some(work) = &mut self.work {
+                work.material_binds += 1;
+            }
+            render_pass.set_bind_group(2, bind_group.raw(), &[]);
+            self.current_material = Some(bind_group);
         }
     }
 
@@ -290,10 +291,7 @@ impl<'encoder> CommandRenderer<'encoder> {
             }
         }
 
-        if let Some(work) = &mut self.work {
-            work.material_binds += 1;
-        }
-        render_pass.set_bind_group(2, (bind_group).raw(), &[]);
+        self.set_material(render_pass, bind_group);
 
         self.draw(render_pass, draw_offsets);
     }
@@ -313,10 +311,7 @@ impl<'encoder> CommandRenderer<'encoder> {
             },
         );
 
-        if let Some(work) = &mut self.work {
-            work.material_binds += 1;
-        }
-        render_pass.set_bind_group(2, (bind_group).raw(), &[]);
+        self.set_material(render_pass, bind_group);
 
         self.draw(render_pass, draw_offsets);
     }
@@ -343,10 +338,7 @@ impl<'encoder> CommandRenderer<'encoder> {
             },
         );
 
-        if let Some(work) = &mut self.work {
-            work.material_binds += 1;
-        }
-        render_pass.set_bind_group(2, (bind_group).raw(), &[]);
+        self.set_material(render_pass, bind_group);
 
         self.draw(render_pass, draw_offsets);
     }

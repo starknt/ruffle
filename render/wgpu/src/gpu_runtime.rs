@@ -644,6 +644,21 @@ impl std::fmt::Debug for ResourceLease {
 }
 
 impl ResourceLease {
+    /// Conservative cache-retention weight, not a second storage charge.
+    pub(crate) fn retained_storage_bytes(&self) -> u64 {
+        let mut pending = vec![self];
+        let mut ids = std::collections::HashSet::new();
+        while let Some(lease) = pending.pop() {
+            if ids.insert(lease.id()) {
+                pending.extend(lease.dependencies());
+            }
+        }
+        let ledger = self.0.runtime.0.ledger();
+        ids.into_iter()
+            .filter_map(|id| ledger.records.get(&id))
+            .map(|record| record.bytes)
+            .sum()
+    }
     pub(crate) fn dependencies(&self) -> &[ResourceLease] {
         &self.0._dependencies
     }

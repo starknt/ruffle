@@ -223,7 +223,10 @@ impl Device {
         Queue(self.clone())
     }
 
-    fn lookup<T: Any + Eq + Hash>(&self, raw: &T) -> Result<ResourceLease, RenderFailure> {
+    pub(crate) fn lookup<T: Any + Eq + Hash>(
+        &self,
+        raw: &T,
+    ) -> Result<ResourceLease, RenderFailure> {
         let index = self
             .0
             .inner()

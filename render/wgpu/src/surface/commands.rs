@@ -579,8 +579,7 @@ impl WgpuCommandHandler<'_, '_> {
                     let texture = target.take_color_texture();
                     let bind_group =
                         self.descriptors
-                            .device
-                            .create_bind_group(&wgpu::BindGroupDescriptor {
+                            .cached_bind_group(&wgpu::BindGroupDescriptor {
                                 layout: &self.descriptors.bind_layouts.bitmap,
                                 entries: &[
                                     wgpu::BindGroupEntry {
@@ -711,8 +710,7 @@ impl WgpuCommandHandler<'_, '_> {
 
             let binds = self
                 .descriptors
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
+                .cached_bind_group(&wgpu::BindGroupDescriptor {
                     layout: &self.descriptors.bind_layouts.alpha_mask,
                     entries: &[
                         wgpu::BindGroupEntry {
