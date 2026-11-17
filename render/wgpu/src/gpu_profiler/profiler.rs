@@ -130,10 +130,10 @@ impl GpuProfiler {
     ///
     /// To nest scopes inside this scope, call [`Scope::scope`] on the returned scope.
     ///
-    /// If an [`wgpu::CommandEncoder`] is passed but the [`crate::gpu_resources::Device`]
+    /// If an [`crate::gpu_resources::CommandEncoder`] is passed but the [`crate::gpu_resources::Device`]
     /// does not support [`wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS`], no gpu timer will
     /// be queried and the scope will not show up in the final results.
-    /// If an [`wgpu::ComputePass`] or [`wgpu::RenderPass`] is passed but the [`crate::gpu_resources::Device`]
+    /// If an [`crate::gpu_resources::ComputePass`] or [`crate::gpu_resources::RenderPass`] is passed but the [`crate::gpu_resources::Device`]
     /// does not support [`wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES`], no scope will be opened.
     ///
     /// If [`GpuProfilerSettings::enable_debug_groups`] is true, a debug group will be pushed on the encoder or pass.
@@ -159,10 +159,10 @@ impl GpuProfiler {
     ///
     /// To nest scopes inside this scope, call [`OwningScope::scope`] on the returned scope.
     ///
-    /// If an [`wgpu::CommandEncoder`] is passed but the [`crate::gpu_resources::Device`]
+    /// If an [`crate::gpu_resources::CommandEncoder`] is passed but the [`crate::gpu_resources::Device`]
     /// does not support [`wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS`], no gpu timer will be queried
     /// and the scope will not show up in the final results.
-    /// If an [`wgpu::ComputePass`] or [`wgpu::RenderPass`] is passed but the [`crate::gpu_resources::Device`]
+    /// If an [`crate::gpu_resources::ComputePass`] or [`crate::gpu_resources::RenderPass`] is passed but the [`crate::gpu_resources::Device`]
     /// does not support [`wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES`], no scope will be opened.
     ///
     /// If [`GpuProfilerSettings::enable_debug_groups`] is true, a debug group will be pushed on the encoder or pass.
@@ -189,14 +189,14 @@ impl GpuProfiler {
     /// Does NOT call [`GpuProfiler::end_query()`] on drop.
     /// This construct is just for completeness in cases where working with scopes is preferred but one can't rely on the Drop call in the right place.
     /// This is useful when the owned value needs to be recovered after the end of the scope.
-    /// In particular, to submit a [`wgpu::CommandEncoder`] to a queue, ownership of the encoder is necessary.
+    /// In particular, to submit a [`crate::gpu_resources::CommandEncoder`] to a queue, ownership of the encoder is necessary.
     ///
     /// To nest scopes inside this scope, call [`ManualOwningScope::scope`] on the returned scope.
     ///
-    /// If an [`wgpu::CommandEncoder`] is passed but the [`crate::gpu_resources::Device`]
+    /// If an [`crate::gpu_resources::CommandEncoder`] is passed but the [`crate::gpu_resources::Device`]
     /// does not support [`wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS`], no gpu timer will be queried and the scope will
     /// not show up in the final results.
-    /// If an [`wgpu::ComputePass`] or [`wgpu::RenderPass`] is passed but the [`crate::gpu_resources::Device`]
+    /// If an [`crate::gpu_resources::ComputePass`] or [`crate::gpu_resources::RenderPass`] is passed but the [`crate::gpu_resources::Device`]
     /// does not support [`wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES`], no scope will be opened.
     ///
     /// If [`GpuProfilerSettings::enable_debug_groups`] is true, a debug group will be pushed on the encoder or pass.
@@ -222,10 +222,10 @@ impl GpuProfiler {
     /// even if timer queries are disabled.
     /// To do this automatically, use [`GpuProfiler::scope`]/[`GpuProfiler::owning_scope`] instead.
     ///
-    /// If an [`wgpu::CommandEncoder`] is passed but the [`crate::gpu_resources::Device`]
+    /// If an [`crate::gpu_resources::CommandEncoder`] is passed but the [`crate::gpu_resources::Device`]
     /// does not support [`wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS`], no gpu timer will be queried and the scope will
     /// not show up in the final results.
-    /// If an [`wgpu::ComputePass`] or [`wgpu::RenderPass`] is passed but the [`crate::gpu_resources::Device`]
+    /// If an [`crate::gpu_resources::ComputePass`] or [`crate::gpu_resources::RenderPass`] is passed but the [`crate::gpu_resources::Device`]
     /// does not support [`wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES`], no timer queries will be allocated.
     ///
     /// If [`GpuProfilerSettings::enable_debug_groups`] is true, a debug group will be pushed on the encoder or pass.
@@ -268,7 +268,7 @@ impl GpuProfiler {
     pub fn begin_pass_query(
         &self,
         label: impl Into<String>,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut crate::gpu_resources::CommandEncoder,
     ) -> GpuProfilerQuery {
         let is_for_pass_timestamp_writes = true;
         let mut query =
@@ -344,7 +344,7 @@ impl GpuProfiler {
     /// This method could be made `&self`, taking the internal lock on the query pools.
     /// However, the intended use is to call this once at the end of a frame, so we instead
     /// encourage this explicit sync point and avoid the lock.
-    pub fn resolve_queries(&mut self, encoder: &mut wgpu::CommandEncoder) {
+    pub fn resolve_queries(&mut self, encoder: &mut crate::gpu_resources::CommandEncoder) {
         let query_pools = self.active_frame.query_pools.get_mut();
 
         for query_pool in query_pools.used_pools.iter_mut() {

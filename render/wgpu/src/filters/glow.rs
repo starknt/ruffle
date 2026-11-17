@@ -162,7 +162,7 @@ impl GlowFilter {
         &self,
         descriptors: &Descriptors,
         texture_pool: &mut TexturePool,
-        draw_encoder: &mut wgpu::CommandEncoder,
+        draw_encoder: &mut crate::gpu_resources::CommandEncoder,
         staging_belt: &mut StagingBelt,
         source: &FilterSource,
         filter: &GlowFilterArgs,

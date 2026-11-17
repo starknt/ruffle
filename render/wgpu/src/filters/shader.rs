@@ -26,7 +26,7 @@ impl ShaderFilter {
         &self,
         descriptors: &Descriptors,
         texture_pool: &mut TexturePool,
-        draw_encoder: &mut wgpu::CommandEncoder,
+        draw_encoder: &mut crate::gpu_resources::CommandEncoder,
         source: &FilterSource<'a>,
         mut filter: ShaderFilterArgs<'a>,
     ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
@@ -66,7 +66,7 @@ impl ShaderFilter {
             target.sample_count(),
             source,
         )
-        .expect("Failed to run pixelbender shader");
+        .map_err(ruffle_render::error::Error::into_render_failure)?;
         Ok(target)
     }
 }

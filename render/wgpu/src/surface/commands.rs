@@ -3,6 +3,7 @@ use crate::blend::BlendType;
 use crate::blend::TrivialBlend;
 use crate::buffer_pool::TexturePool;
 use crate::gpu_profiler::Scope;
+use crate::graph_encoder::{PlannedList, PlannedOp};
 use crate::mesh::{DrawType, Mesh, as_mesh};
 use crate::surface::Surface;
 use crate::surface::buffers::{ChunkBufferBuilder, ChunkBuffers, DrawOffsets, DrawVertices};
@@ -16,7 +17,7 @@ use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::lines::{emulate_line, emulate_line_rect};
 use ruffle_render::matrix::Matrix;
 use ruffle_render::quality::StageQuality;
-use ruffle_render::region::{RenderRect, RenderRegion};
+use ruffle_render::region::RenderRect;
 use ruffle_render::transform::Transform;
 use std::mem;
 use swf::{BlendMode, Color, ColorTransform, Twips};
@@ -33,11 +34,11 @@ pub enum LayerRef<'a> {
 /// Every complex blend will be its own item, but every other draw will be chunked together
 #[expect(clippy::too_many_arguments)]
 pub fn chunk_blends<'encoder, 'global: 'encoder>(
-    commands: CommandList,
+    commands: PlannedList,
     descriptors: &'encoder Descriptors,
     staging_belt: &'encoder mut crate::gpu_resources::StagingBelt,
     chunk_buffers: &'encoder mut ChunkBuffers,
-    draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
+    draw_encoder: &'encoder mut Scope<'global, crate::gpu_resources::CommandEncoder>,
     meshes: &'encoder Vec<Mesh>,
     quality: StageQuality,
     width: u32,
@@ -74,7 +75,7 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     meshes: &'encoder Vec<Mesh>,
     staging_belt: &'encoder mut crate::gpu_resources::StagingBelt,
     chunk_buffers: &'encoder mut ChunkBuffers,
-    draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
+    draw_encoder: &'encoder mut Scope<'global, crate::gpu_resources::CommandEncoder>,
     texture_pool: &'encoder mut TexturePool,
     emulate_lines: bool,
 
@@ -91,7 +92,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         descriptors: &'encoder Descriptors,
         staging_belt: &'encoder mut crate::gpu_resources::StagingBelt,
         chunk_buffers: &'encoder mut ChunkBuffers,
-        draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
+        draw_encoder: &'encoder mut Scope<'global, crate::gpu_resources::CommandEncoder>,
         meshes: &'encoder Vec<Mesh>,
         quality: StageQuality,
         width: u32,
@@ -134,9 +135,19 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
     /// Every complex blend will be its own item, but every other draw will be chunked together
     fn chunk_blends(
         &mut self,
-        commands: CommandList,
+        commands: PlannedList,
     ) -> Result<Vec<Chunk>, crate::gpu_runtime::RenderFailure> {
-        commands.execute(self);
+        for command in commands.into_commands() {
+            match command.op {
+                PlannedOp::Leaf(command) => command.execute(self),
+                PlannedOp::Blend(commands, mode, region) => {
+                    self.blend_planned(commands, mode, region)
+                }
+                PlannedOp::AlphaMask(content, mask, region) => {
+                    self.alpha_mask_planned(content, mask, region)
+                }
+            }
+        }
         self.descriptors.runtime.check_health()?;
 
         let current = mem::take(&mut self.current);
@@ -156,15 +167,6 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         }
 
         Ok(result)
-    }
-
-    fn region(&self, region: RenderRegion) -> Option<RenderRect> {
-        region.clip(RenderRect {
-            x: self.origin[0],
-            y: self.origin[1],
-            width: self.width,
-            height: self.height,
-        })
     }
 
     fn push_command(&mut self, command: DrawCommand) {
@@ -236,150 +238,13 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 }
 
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
-    fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) -> () {
-        if self.descriptors.runtime.check_health().is_err() {
-            return;
-        }
-        let result = (|| -> Result<(), crate::gpu_runtime::RenderFailure> {
-            let region = match &blend_mode {
-                RenderBlendMode::Builtin(BlendMode::Alpha | BlendMode::Erase)
-                | RenderBlendMode::Shader(_) => RenderRegion::Full,
-                _ => commands.region(),
-            };
-            let Some(region) = self.region(region) else {
-                return Ok(());
-            };
-            ruffle_render::profile::work(|w| {
-                w.offscreen_targets += 1;
-                w.offscreen_pixels += u64::from(region.width) * u64::from(region.height);
-            });
-            let surface = Surface::new(
-                self.descriptors,
-                self.quality,
-                region.width,
-                region.height,
-                wgpu::TextureFormat::Rgba8Unorm,
-            )?
-            .with_origin([region.x, region.y]);
-            let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
-                LayerRef::Current
-            } else {
-                self.nearest_layer
-            };
-            let blend_type = BlendType::from(blend_mode);
-            let clear_color = blend_type.default_color();
-            let target = surface.draw_commands(
-                RenderTargetMode::FreshWithColor(clear_color),
-                self.descriptors,
-                self.meshes,
-                commands,
-                self.staging_belt,
-                self.chunk_buffers,
-                self.draw_encoder,
-                target_layer,
-                self.texture_pool,
-            )?;
-            target.ensure_cleared(self.draw_encoder);
-
-            // We currently do not support shader blends in masks. In order not to
-            // break other parts of the scene, we just fall back to a normal blend.
-            //
-            // TODO Add support for shader blends in masks.
-            let is_shader_blend_in_mask =
-                self.mask_state.count > 0 && matches!(blend_type, BlendType::Shader(_));
-            let blend_type = if is_shader_blend_in_mask {
-                BlendType::Trivial(TrivialBlend::Normal)
-            } else {
-                blend_type
-            };
-
-            match blend_type {
-                BlendType::Trivial(blend_mode) => {
-                    let transform = Transform {
-                        matrix: Matrix {
-                            tx: Twips::from_pixels(region.x as f64),
-                            ty: Twips::from_pixels(region.y as f64),
-                            ..Matrix::scale(target.width() as f32, target.height() as f32)
-                        },
-                        tz: 0.0,
-                        color_transform: Default::default(),
-                        perspective_projection: None,
-                    };
-                    let texture = target.take_color_texture();
-                    let bind_group =
-                        self.descriptors
-                            .device
-                            .create_bind_group(&wgpu::BindGroupDescriptor {
-                                layout: &self.descriptors.bind_layouts.bitmap,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            texture.view(),
-                                        ),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: wgpu::BindingResource::Sampler(
-                                            self.descriptors
-                                                .bitmap_samplers
-                                                .get_sampler(false, false),
-                                        ),
-                                    },
-                                ],
-                                label: None,
-                            })?;
-                    self.add_to_current(
-                        &transform,
-                        &mut None,
-                        DrawVertices::PosUvQuad,
-                        |draw_offsets| DrawCommand::RenderTexture {
-                            _texture: Some(texture),
-                            binds: bind_group,
-                            draw_offsets,
-                            blend_mode,
-                            render_stage3d: false,
-                        },
-                    );
-                }
-                blend_type => {
-                    if !self.current.is_empty() {
-                        self.result.push(Chunk::Draw {
-                            chunk: mem::take(&mut self.current),
-                            needs_stencil: self.needs_stencil,
-                            chunk_buffer_builder: mem::replace(
-                                &mut self.chunk_buffer_builder,
-                                ChunkBufferBuilder::new(
-                                    self.chunk_buffers,
-                                    &self.descriptors.limits,
-                                ),
-                            ),
-                        });
-                    }
-                    let chunk_blend_mode = match blend_type {
-                        BlendType::Complex(complex) => ChunkBlendMode::Complex(complex),
-                        BlendType::Shader(shader) => ChunkBlendMode::Shader(shader),
-                        _ => unreachable!(),
-                    };
-                    self.result.push(Chunk::Blend {
-                        region: RenderRect {
-                            x: region.x - self.origin[0],
-                            y: region.y - self.origin[1],
-                            ..region
-                        },
-                        texture: target.take_color_texture(),
-                        blend_mode: chunk_blend_mode,
-                        needs_stencil: self.mask_state.count > 0,
-                    });
-                    self.needs_stencil = self.mask_state.count > 0;
-                }
-            }
-
-            Ok(())
-        })();
-        if let Err(error) = result {
-            self.descriptors.runtime.fail(error);
-        }
+    fn blend(&mut self, _: CommandList, _: RenderBlendMode) {
+        self.descriptors
+            .runtime
+            .fail(crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::Internal,
+                "unplanned blend reached native encoding",
+            ));
     }
 
     fn render_bitmap(
@@ -646,19 +511,170 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         self.push_command(DrawCommand::SetMask(self.mask_state));
     }
 
-    fn render_alpha_mask(
+    fn render_alpha_mask(&mut self, _: CommandList, _: CommandList) {
+        self.descriptors
+            .runtime
+            .fail(crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::Internal,
+                "unplanned alpha mask reached native encoding",
+            ));
+    }
+}
+
+impl WgpuCommandHandler<'_, '_> {
+    fn blend_planned(
         &mut self,
-        maskee_commands: CommandList,
-        mask_commands: CommandList,
+        commands: PlannedList,
+        blend_mode: RenderBlendMode,
+        region: RenderRect,
     ) -> () {
         if self.descriptors.runtime.check_health().is_err() {
             return;
         }
         let result = (|| -> Result<(), crate::gpu_runtime::RenderFailure> {
-            let Some(region) = self.region(maskee_commands.region().union(mask_commands.region()))
-            else {
-                return Ok(());
+            ruffle_render::profile::work(|w| {
+                w.offscreen_targets += 1;
+                w.offscreen_pixels += u64::from(region.width) * u64::from(region.height);
+            });
+            let surface = Surface::new(
+                self.descriptors,
+                self.quality,
+                region.width,
+                region.height,
+                wgpu::TextureFormat::Rgba8Unorm,
+            )?
+            .with_origin([region.x, region.y]);
+            let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
+                LayerRef::Current
+            } else {
+                self.nearest_layer
             };
+            let blend_type = BlendType::from(blend_mode);
+            let clear_color = blend_type.default_color();
+            let target = surface.draw_commands(
+                RenderTargetMode::FreshWithColor(clear_color),
+                self.descriptors,
+                self.meshes,
+                commands,
+                self.staging_belt,
+                self.chunk_buffers,
+                self.draw_encoder,
+                target_layer,
+                self.texture_pool,
+            )?;
+            target.ensure_cleared(self.draw_encoder);
+
+            // We currently do not support shader blends in masks. In order not to
+            // break other parts of the scene, we just fall back to a normal blend.
+            //
+            // TODO Add support for shader blends in masks.
+            let is_shader_blend_in_mask =
+                self.mask_state.count > 0 && matches!(blend_type, BlendType::Shader(_));
+            let blend_type = if is_shader_blend_in_mask {
+                BlendType::Trivial(TrivialBlend::Normal)
+            } else {
+                blend_type
+            };
+
+            match blend_type {
+                BlendType::Trivial(blend_mode) => {
+                    let transform = Transform {
+                        matrix: Matrix {
+                            tx: Twips::from_pixels(region.x as f64),
+                            ty: Twips::from_pixels(region.y as f64),
+                            ..Matrix::scale(target.width() as f32, target.height() as f32)
+                        },
+                        tz: 0.0,
+                        color_transform: Default::default(),
+                        perspective_projection: None,
+                    };
+                    let texture = target.take_color_texture();
+                    let bind_group =
+                        self.descriptors
+                            .device
+                            .create_bind_group(&wgpu::BindGroupDescriptor {
+                                layout: &self.descriptors.bind_layouts.bitmap,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(
+                                            texture.view(),
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::Sampler(
+                                            self.descriptors
+                                                .bitmap_samplers
+                                                .get_sampler(false, false),
+                                        ),
+                                    },
+                                ],
+                                label: None,
+                            })?;
+                    self.add_to_current(
+                        &transform,
+                        &mut None,
+                        DrawVertices::PosUvQuad,
+                        |draw_offsets| DrawCommand::RenderTexture {
+                            _texture: Some(texture),
+                            binds: bind_group,
+                            draw_offsets,
+                            blend_mode,
+                            render_stage3d: false,
+                        },
+                    );
+                }
+                blend_type => {
+                    if !self.current.is_empty() {
+                        self.result.push(Chunk::Draw {
+                            chunk: mem::take(&mut self.current),
+                            needs_stencil: self.needs_stencil,
+                            chunk_buffer_builder: mem::replace(
+                                &mut self.chunk_buffer_builder,
+                                ChunkBufferBuilder::new(
+                                    self.chunk_buffers,
+                                    &self.descriptors.limits,
+                                ),
+                            ),
+                        });
+                    }
+                    let chunk_blend_mode = match blend_type {
+                        BlendType::Complex(complex) => ChunkBlendMode::Complex(complex),
+                        BlendType::Shader(shader) => ChunkBlendMode::Shader(shader),
+                        _ => unreachable!(),
+                    };
+                    self.result.push(Chunk::Blend {
+                        region: RenderRect {
+                            x: region.x - self.origin[0],
+                            y: region.y - self.origin[1],
+                            ..region
+                        },
+                        texture: target.take_color_texture(),
+                        blend_mode: chunk_blend_mode,
+                        needs_stencil: self.mask_state.count > 0,
+                    });
+                    self.needs_stencil = self.mask_state.count > 0;
+                }
+            }
+
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.descriptors.runtime.fail(error);
+        }
+    }
+
+    fn alpha_mask_planned(
+        &mut self,
+        maskee_commands: PlannedList,
+        mask_commands: PlannedList,
+        region: RenderRect,
+    ) -> () {
+        if self.descriptors.runtime.check_health().is_err() {
+            return;
+        }
+        let result = (|| -> Result<(), crate::gpu_runtime::RenderFailure> {
             ruffle_render::profile::work(|w| {
                 w.offscreen_targets += 2;
                 w.offscreen_pixels += 2 * u64::from(region.width) * u64::from(region.height);

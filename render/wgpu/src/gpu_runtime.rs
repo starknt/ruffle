@@ -644,6 +644,10 @@ impl std::fmt::Debug for ResourceLease {
 }
 
 impl ResourceLease {
+    pub(crate) fn dependencies(&self) -> &[ResourceLease] {
+        &self.0._dependencies
+    }
+
     pub(crate) fn transient_bytes(&self) -> u64 {
         self.0.transient_bytes
     }

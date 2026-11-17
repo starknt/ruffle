@@ -11,11 +11,12 @@ use swf::{Rectangle, Twips};
 
 use crate::gpu_resources::StagingBelt;
 use crate::gpu_resources::{BindGroup, TextureView};
+use crate::gpu_resources::{CommandEncoder, RenderPass};
+use wgpu::Extent3d;
 use wgpu::{
     BufferDescriptor, BufferUsages, COPY_BUFFER_ALIGNMENT, COPY_BYTES_PER_ROW_ALIGNMENT,
     TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
-use wgpu::{CommandEncoder, Extent3d, RenderPass};
 
 use crate::Texture;
 use crate::context3d::current_pipeline::{AGAL_FLOATS_PER_REGISTER, BoundTextureData, IntoWgpu};

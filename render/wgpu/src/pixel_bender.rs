@@ -1,3 +1,4 @@
+use crate::gpu_resources::CommandEncoder;
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,7 +18,7 @@ use ruffle_render::pixel_bender_support::{ImageInputTexture, PixelBenderShaderAr
 use smallvec::{SmallVec, smallvec_inline};
 use wgpu::{
     BindGroupEntry, BindingResource, BlendComponent, BufferDescriptor, BufferUsages,
-    ColorTargetState, ColorWrites, CommandEncoder, RenderPipelineDescriptor, SamplerBindingType,
+    ColorTargetState, ColorWrites, RenderPipelineDescriptor, SamplerBindingType,
     ShaderModuleDescriptor, TexelCopyTextureInfo, TextureDescriptor, TextureFormat, VertexState,
 };
 

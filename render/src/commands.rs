@@ -164,7 +164,7 @@ impl Command {
             _ => 0,
         }
     }
-    fn execute(self, handler: &mut (impl CommandHandler + ?Sized)) {
+    pub fn execute(self, handler: &mut (impl CommandHandler + ?Sized)) {
         match self {
             Command::Shared(commands) => handler.render_shared(commands),
             Command::RenderBitmap {

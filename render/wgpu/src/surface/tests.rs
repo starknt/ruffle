@@ -42,9 +42,9 @@ fn measurement_counts_encoded_draws_and_passes() {
         .submit_frame(Color::BLACK, commands, vec![])
         .expect("GPU operation failed");
     let work = metrics.snapshot().work;
-    // One shape pass followed by the surface copy pass, no capture pass.
-    assert_eq!(work.draw_calls, 2);
-    assert_eq!(work.render_passes, 2);
+    // One direct shape pass, with no surface-copy or capture pass.
+    assert_eq!(work.draw_calls, 1);
+    assert_eq!(work.render_passes, 1);
     assert_eq!(work.copy_bytes, 0);
 }
 
@@ -920,5 +920,97 @@ fn numeric_snapshot_rejects_bitmap_changed_by_gpu_copy() {
     assert!(
         frozen.resolve(&mut renderer).is_err(),
         "a GPU write invalidates the captured content version"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn graph_normal_frames_draw_directly_and_resolve_msaa_without_a_copy_pass() {
+    for quality in [StageQuality::Low, StageQuality::High] {
+        let descriptors = gpu();
+        let target = TextureTarget::new(&descriptors.device, (32, 32)).unwrap();
+        let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+        renderer.set_quality(quality).unwrap();
+        let metrics = ruffle_render::profile::RenderMetrics::default();
+        let _scope = ruffle_render::profile::enter(Some(&metrics));
+        let mut commands = CommandList::new();
+        rect(&mut commands, 0.0, 0.0, 32.0, 32.0, Color::RED);
+        renderer
+            .submit_frame(Color::BLACK, commands, vec![])
+            .unwrap();
+        assert_eq!(
+            metrics.snapshot().work.render_passes,
+            1,
+            "normal drawing must use the final attachment"
+        );
+        assert_eq!(metrics.snapshot().work.draw_calls, 1);
+        let image = renderer.capture_frame().unwrap().unwrap();
+        assert!(image.pixels().all(|pixel| pixel.0 == [255, 0, 0, 255]));
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn shader_filter_preparation_error_is_returned_without_panicking() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, BitmapHandle, BitmapHandleImpl};
+    use ruffle_render::filters::{Filter, ShaderFilter, ShaderObject};
+    use ruffle_render::pixel_bender_support::{ImageInputTexture, PixelBenderShaderArgument};
+    #[derive(Debug, Clone)]
+    struct TestShaderObject;
+    impl ShaderObject for TestShaderObject {
+        fn clone_box(&self) -> Box<dyn ShaderObject> {
+            Box::new(self.clone())
+        }
+        fn equals(&self, _: &dyn ShaderObject) -> bool {
+            false
+        }
+    }
+    #[derive(Debug)]
+    struct ForeignBitmap;
+    impl BitmapHandleImpl for ForeignBitmap {}
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (4, 4)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let bitmap = renderer
+        .register_bitmap(Bitmap::new(4, 4, BitmapFormat::Rgba, vec![255; 64]))
+        .unwrap();
+    let shader = renderer
+        .compile_pixelbender_shader(
+            ruffle_render::pixel_bender::parse_shader(
+                include_bytes!(
+                    "../../../../tests/tests/swfs/visual/blend_modes/shader_as_mask/shader.pbj"
+                ),
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let filter = Filter::ShaderFilter(ShaderFilter {
+        bottom_extension: 0,
+        left_extension: 0,
+        right_extension: 0,
+        top_extension: 0,
+        shader_object: Box::new(TestShaderObject),
+        shader,
+        shader_args: vec![
+            PixelBenderShaderArgument::ImageInput {
+                index: 0,
+                channels: 4,
+                name: "background".into(),
+                texture: None,
+            },
+            PixelBenderShaderArgument::ImageInput {
+                index: 1,
+                channels: 4,
+                name: "foreground".into(),
+                texture: Some(ImageInputTexture::Bitmap(BitmapHandle(Arc::new(
+                    ForeignBitmap,
+                )))),
+            },
+        ],
+    });
+    let result = renderer.apply_filter(bitmap.clone(), (0, 0), (4, 4), bitmap, (0, 0), filter);
+    assert!(
+        matches!(result, Err(ruffle_render::error::Error::Render(error)) if error.kind() == crate::gpu_runtime::RenderFailureKind::Validation)
     );
 }

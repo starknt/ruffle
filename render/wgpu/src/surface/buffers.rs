@@ -288,7 +288,7 @@ impl ChunkBufferBuilder {
         self,
         staging_belt: &mut StagingBelt,
         device: &crate::gpu_resources::Device,
-        draw_encoder: &mut wgpu::CommandEncoder,
+        draw_encoder: &mut crate::gpu_resources::CommandEncoder,
         chunk_buffers: &mut ChunkBuffers,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
         self.transforms

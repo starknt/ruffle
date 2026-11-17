@@ -211,7 +211,7 @@ impl Filters {
     pub fn apply(
         &self,
         descriptors: &Descriptors,
-        draw_encoder: &mut wgpu::CommandEncoder,
+        draw_encoder: &mut crate::gpu_resources::CommandEncoder,
         texture_pool: &mut TexturePool,
         staging_belt: &mut StagingBelt,
         source: FilterSource,

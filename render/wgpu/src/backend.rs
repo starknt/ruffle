@@ -406,10 +406,29 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
     fn prepare_commands(
         &mut self,
         commands: &CommandList,
-    ) -> Result<crate::render_snapshot::RenderSnapshot, crate::gpu_runtime::RenderFailure> {
-        let prepared = crate::render_snapshot::PreparedSnapshot::capture(commands)?;
-        prepared.resolve(self)?;
-        Ok(prepared.snapshot)
+        width: u32,
+        height: u32,
+        quality: StageQuality,
+        format: wgpu::TextureFormat,
+        load: crate::pass_graph::Load,
+    ) -> Result<crate::graph_encoder::GraphEncoder, crate::gpu_runtime::RenderFailure> {
+        let samples = crate::utils::supported_sample_count(
+            &self.descriptors.adapter,
+            quality.sample_count(),
+            format,
+        );
+        crate::graph_encoder::GraphEncoder::prepare(
+            self,
+            commands,
+            ruffle_render::region::RenderRect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            samples,
+            load,
+        )
     }
 
     fn validate_bitmap_size(
@@ -660,10 +679,6 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         cache_entries: Vec<BitmapCacheEntry>,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
         self.descriptors.runtime.check_health()?;
-        for entry in &cache_entries {
-            self.prepare_commands(&entry.commands)?;
-        }
-        self.prepare_commands(&commands)?;
         let _render_backend =
             ruffle_render::profile::time(ruffle_render::profile::Phase::RenderBackend);
         let frame_output = {
@@ -684,6 +699,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         for entry in cache_entries {
             let texture = as_texture(&entry.handle, &self.descriptors.device)?;
+            let graph = self.prepare_commands(
+                &entry.commands,
+                texture.texture.width(),
+                texture.texture.height(),
+                self.surface.quality(),
+                wgpu::TextureFormat::Rgba8Unorm,
+                crate::pass_graph::Load::Clear(entry.clear),
+            )?;
+            let entry_commands = graph.into_commands()?;
             ruffle_render::profile::work(|w| {
                 w.offscreen_targets += 1;
                 w.offscreen_pixels +=
@@ -709,7 +733,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     ),
                     &self.descriptors,
                     &self.meshes,
-                    entry.commands,
+                    entry_commands,
                     &mut self.active_frame.staging_belt,
                     &mut self.chunk_buffers,
                     &mut self
@@ -738,7 +762,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     ),
                     &self.descriptors,
                     &self.meshes,
-                    entry.commands,
+                    entry_commands,
                     &mut self.active_frame.staging_belt,
                     &mut self.chunk_buffers,
                     &mut scope.scope("Draw to CAB"),
@@ -771,7 +795,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             self.active_frame.maybe_flush(&self.descriptors)?;
         }
 
-        self.surface.draw_commands_and_copy_to(
+        let graph = self.prepare_commands(
+            &commands,
+            self.target.width(),
+            self.target.height(),
+            self.surface.quality(),
+            self.target.format(),
+            crate::pass_graph::Load::Clear(clear),
+        )?;
+        self.surface.draw_graph_and_copy_to(
             frame_output.view(),
             RenderTargetMode::FreshWithColor(wgpu::Color {
                 r: f64::from(clear.r) / 255.0,
@@ -789,7 +821,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 self.active_frame.command_encoder.record(),
             ),
             &self.meshes,
-            commands,
+            graph,
             LayerRef::None,
             &mut self.texture_pool,
         )?;
@@ -991,7 +1023,6 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         bounds: PixelRegion,
     ) -> Result<Option<Box<dyn SyncHandle>>, BitmapError> {
         self.descriptors.runtime.check_health()?;
-        self.prepare_commands(&commands)?;
         let texture = as_texture(&handle, &self.descriptors.device)?;
 
         let extent = wgpu::Extent3d {
@@ -1024,7 +1055,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             texture.texture.height(),
             wgpu::TextureFormat::Rgba8Unorm,
         )?;
-        surface.draw_commands_and_copy_to(
+        let graph = self.prepare_commands(
+            &commands,
+            extent.width,
+            extent.height,
+            quality,
+            wgpu::TextureFormat::Rgba8Unorm,
+            crate::pass_graph::Load::Load,
+        )?;
+        surface.draw_graph_and_copy_to(
             frame_output.view(),
             RenderTargetMode::FreshWithTexture(target.get_texture()),
             &self.descriptors,
@@ -1035,7 +1074,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 self.active_frame.command_encoder.record(),
             ),
             &self.meshes,
-            commands,
+            graph,
             LayerRef::Current,
             &mut self.offscreen_texture_pool,
         )?;
@@ -1575,6 +1614,8 @@ pub enum RenderTargetMode {
     // or when applying a filter. In both cases, we have a fixed background color,
     // and don't need to blend with anything else
     FreshWithColor(wgpu::Color),
+    /// Final attachment selected by the pass graph (including explicit view format).
+    ExistingWithView(crate::gpu_resources::TextureView, wgpu::Color),
     // Construct a new frame buffer, cleared with an existing texture.
     // we will blend with the previous contents of the texture.
     // This is used in `render_offscreen`, as we need to blend with the previous
@@ -1587,7 +1628,8 @@ pub enum RenderTargetMode {
 impl RenderTargetMode {
     pub fn color(&self) -> Option<wgpu::Color> {
         match self {
-            RenderTargetMode::FreshWithColor(color) => Some(*color),
+            RenderTargetMode::FreshWithColor(color)
+            | RenderTargetMode::ExistingWithView(_, color) => Some(*color),
             RenderTargetMode::FreshWithTexture(_) => None,
             RenderTargetMode::ExistingWithColor(_, color) => Some(*color),
         }
@@ -1599,7 +1641,7 @@ struct TrackedEncoder {
     dirty: bool,
 }
 impl TrackedEncoder {
-    fn record(&mut self) -> &mut wgpu::CommandEncoder {
+    fn record(&mut self) -> &mut crate::gpu_resources::CommandEncoder {
         self.dirty = true;
         &mut self.raw
     }
@@ -1627,7 +1669,7 @@ impl ActiveFrame {
         })
     }
 
-    pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
+    pub(crate) fn encoder(&mut self) -> &mut crate::gpu_resources::CommandEncoder {
         self.command_encoder.record()
     }
     pub fn submit_for_target<T: RenderTarget>(

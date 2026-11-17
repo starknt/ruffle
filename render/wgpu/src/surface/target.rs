@@ -25,6 +25,14 @@ impl ResolveBuffer {
         })
     }
 
+    pub fn from_view(
+        view: crate::gpu_resources::TextureView,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        Ok(Self {
+            texture: PoolOrArcTexture::Manual((view.texture_handle()?, view)),
+        })
+    }
+
     pub fn new_manual(
         texture: crate::gpu_resources::Texture,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
@@ -112,6 +120,16 @@ impl FrameBuffer {
 
         Ok(Self {
             texture: PoolOrArcTexture::Pool(texture),
+            size,
+        })
+    }
+
+    pub fn from_view(
+        view: crate::gpu_resources::TextureView,
+        size: wgpu::Extent3d,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        Ok(Self {
+            texture: PoolOrArcTexture::Manual((view.texture_handle()?, view)),
             size,
         })
     }
@@ -240,7 +258,7 @@ impl CommandTarget {
         format: wgpu::TextureFormat,
         sample_count: u32,
         render_target_mode: RenderTargetMode,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut crate::gpu_resources::CommandEncoder,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let globals = pool.get_globals(descriptors, size.width, size.height)?;
 
@@ -263,7 +281,16 @@ impl CommandTarget {
         };
 
         let (frame_buffer, resolve_buffer) =
-            if let RenderTargetMode::ExistingWithColor(texture, _) = &render_target_mode {
+            if let RenderTargetMode::ExistingWithView(view, _) = &render_target_mode {
+                if sample_count > 1 {
+                    (
+                        make_pooled_frame_buffer()?,
+                        Some(ResolveBuffer::from_view(view.clone())?),
+                    )
+                } else {
+                    (FrameBuffer::from_view(view.clone(), size)?, None)
+                }
+            } else if let RenderTargetMode::ExistingWithColor(texture, _) = &render_target_mode {
                 if sample_count > 1 {
                     (
                         make_pooled_frame_buffer()?,
@@ -352,7 +379,7 @@ impl CommandTarget {
         self.size.height
     }
 
-    pub fn ensure_cleared(&self, encoder: &mut wgpu::CommandEncoder) {
+    pub fn ensure_cleared(&self, encoder: &mut crate::gpu_resources::CommandEncoder) {
         if self.color_needs_clear.get().is_some() {
             return;
         }
@@ -431,7 +458,7 @@ impl CommandTarget {
         &self,
         descriptors: &Descriptors,
         pool: &mut TexturePool,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut crate::gpu_resources::CommandEncoder,
     ) -> Result<&BlendBuffer, crate::gpu_runtime::RenderFailure> {
         let blend_buffer = crate::gpu_resources::try_cell(&self.blend_buffer, || {
             BlendBuffer::new(
@@ -474,7 +501,7 @@ impl CommandTarget {
         &self,
         descriptors: &Descriptors,
         pool: &mut TexturePool,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut crate::gpu_resources::CommandEncoder,
         region: ruffle_render::region::RenderRect,
     ) -> Result<BlendBuffer, crate::gpu_runtime::RenderFailure> {
         let size = wgpu::Extent3d {

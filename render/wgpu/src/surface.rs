@@ -12,6 +12,7 @@ use crate::blend::ComplexBlend;
 use crate::buffer_pool::TexturePool;
 use crate::filters::FilterSource;
 use crate::gpu_profiler::Scope;
+use crate::graph_encoder::PlannedList;
 use crate::mesh::Mesh;
 use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
 use crate::surface::buffers::ChunkBuffers;
@@ -22,7 +23,6 @@ use crate::utils::supported_sample_count;
 use crate::{Descriptors, Pipelines};
 use batches::CommandBatches;
 use chunk::{Chunk, CommandRenderer};
-use ruffle_render::commands::CommandList;
 use ruffle_render::pixel_bender_support::{ImageInputTexture, PixelBenderShaderArgument};
 use ruffle_render::quality::StageQuality;
 use std::sync::Arc;
@@ -78,19 +78,28 @@ impl Surface {
 
     #[expect(clippy::too_many_arguments)]
     #[instrument(level = "debug", skip_all)]
-    pub fn draw_commands_and_copy_to<'encoder, 'global: 'encoder>(
+    pub fn draw_graph_and_copy_to<'encoder, 'global: 'encoder>(
         &self,
         frame_view: &crate::gpu_resources::TextureView,
         render_target_mode: RenderTargetMode,
         descriptors: &'global Descriptors,
         staging_belt: &'global mut crate::gpu_resources::StagingBelt,
         chunk_buffers: &'global mut ChunkBuffers,
-        draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
+        draw_encoder: &'encoder mut Scope<'global, crate::gpu_resources::CommandEncoder>,
         meshes: &'global Vec<Mesh>,
-        commands: CommandList,
+        graph: crate::graph_encoder::GraphEncoder,
         layer: LayerRef<'encoder>,
         texture_pool: &'global mut TexturePool,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        let direct = graph.graph.direct_attachment()
+            && matches!(render_target_mode, RenderTargetMode::FreshWithColor(_));
+        let render_target_mode = match render_target_mode {
+            RenderTargetMode::FreshWithColor(color) if direct => {
+                RenderTargetMode::ExistingWithView(frame_view.clone(), color)
+            }
+            mode => mode,
+        };
+        let commands = graph.into_commands()?;
         let target = self.draw_commands(
             render_target_mode,
             descriptors,
@@ -103,6 +112,9 @@ impl Surface {
             texture_pool,
         )?;
 
+        if direct {
+            return Ok(());
+        }
         run_copy_pipeline(
             descriptors,
             self.format,
@@ -122,10 +134,10 @@ impl Surface {
         render_target_mode: RenderTargetMode,
         descriptors: &'encoder Descriptors,
         meshes: &'encoder Vec<Mesh>,
-        commands: CommandList,
+        commands: PlannedList,
         staging_belt: &'encoder mut crate::gpu_resources::StagingBelt,
         chunk_buffers: &'encoder mut ChunkBuffers,
-        draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
+        draw_encoder: &'encoder mut Scope<'global, crate::gpu_resources::CommandEncoder>,
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
     ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
@@ -140,7 +152,9 @@ impl Surface {
         )?;
 
         let mut mask_state = MaskState::empty();
-        for commands in CommandBatches::new(commands, target.width(), target.height()) {
+        for commands in
+            CommandBatches::new(commands, descriptors.runtime.config().transient_watermark)
+        {
             let chunks = chunk_blends(
                 commands,
                 descriptors,
@@ -244,7 +258,7 @@ impl Surface {
                             target.sample_count(),
                             &FilterSource::for_entire_texture(texture.texture()),
                         )
-                        .expect("Failed to run PixelBender blend mode");
+                        .map_err(ruffle_render::error::Error::into_render_failure)?;
                     }
                     Chunk::Blend {
                         texture,

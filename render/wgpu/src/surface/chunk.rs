@@ -178,7 +178,7 @@ impl<'encoder> CommandRenderer<'encoder> {
 
     pub fn execute(
         &mut self,
-        render_pass: &mut wgpu::RenderPass<'encoder>,
+        render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         command: &'encoder DrawCommand,
     ) {
         if self.needs_stencil {
@@ -217,7 +217,7 @@ impl<'encoder> CommandRenderer<'encoder> {
 
     pub fn set_pipeline(
         &mut self,
-        render_pass: &mut wgpu::RenderPass<'encoder>,
+        render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         pipeline: &'encoder crate::gpu_resources::RenderPipeline,
     ) {
         if self.current_pipeline != Some(pipeline) {
@@ -231,7 +231,7 @@ impl<'encoder> CommandRenderer<'encoder> {
 
     pub fn draw(
         &mut self,
-        render_pass: &mut wgpu::RenderPass<'encoder>,
+        render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         draw_offsets: &'encoder DrawOffsets,
     ) {
         if let Some(work) = &mut self.work {
@@ -263,7 +263,7 @@ impl<'encoder> CommandRenderer<'encoder> {
 
     pub fn render_texture(
         &mut self,
-        render_pass: &mut wgpu::RenderPass<'encoder>,
+        render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         bind_group: &'encoder crate::gpu_resources::BindGroup,
         blend_mode: TrivialBlend,
         render_stage3d: bool,
@@ -300,7 +300,7 @@ impl<'encoder> CommandRenderer<'encoder> {
 
     pub fn draw_gradient(
         &mut self,
-        render_pass: &mut wgpu::RenderPass<'encoder>,
+        render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         bind_group: &'encoder crate::gpu_resources::BindGroup,
         draw_offsets: &'encoder DrawOffsets,
     ) {
@@ -323,7 +323,7 @@ impl<'encoder> CommandRenderer<'encoder> {
 
     pub fn render_alpha_mask(
         &mut self,
-        render_pass: &mut wgpu::RenderPass<'encoder>,
+        render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         _maskee: &PoolOrArcTexture,
         _mask: &PoolOrArcTexture,
         bind_group: &'encoder crate::gpu_resources::BindGroup,
@@ -353,7 +353,7 @@ impl<'encoder> CommandRenderer<'encoder> {
 
     pub fn draw_color(
         &mut self,
-        render_pass: &mut wgpu::RenderPass<'encoder>,
+        render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         draw_offsets: &'encoder DrawOffsets,
     ) {
         self.set_pipeline(
@@ -370,7 +370,7 @@ impl<'encoder> CommandRenderer<'encoder> {
 
     pub fn draw_lines(
         &mut self,
-        render_pass: &mut wgpu::RenderPass<'encoder>,
+        render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         draw_offsets: &'encoder DrawOffsets,
     ) {
         self.set_pipeline(

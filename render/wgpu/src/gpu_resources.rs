@@ -2,20 +2,21 @@
 //! device's lookup table contains weak references only. Bindings retain leases
 //! for their parents, even after the caller releases its texture/buffer handle.
 //!
-//! Legacy encoders conservatively retain all live resources and resources
-//! created while recording. The pass graph supplies precise use sets later;
-//! until then this deliberately overestimates lifetimes, never underestimates.
+//! Encoders retain only resources referenced by actual commands and their
+//! dependency leases. Submission completion releases those exact use sets.
+mod encoding;
 use crate::gpu_runtime::{
     GpuRuntime, RenderFailure, RenderFailureKind, ResourceId, ResourceKind, ResourceLease,
     ResourceOwner, texture_storage_bytes,
 };
+pub use encoding::{ComputePass, RenderPass};
 use fnv::FnvHashMap;
 use std::{
     any::{Any, TypeId},
     fmt::Debug,
     future::Future,
     hash::{Hash, Hasher},
-    ops::{Deref, DerefMut},
+    ops::Deref,
     sync::{Arc, Mutex, Weak},
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -38,14 +39,17 @@ type UseSet = FnvHashMap<ResourceId, ResourceLease>;
 #[derive(Default)]
 struct Recording {
     uses: UseSet,
-    open: bool,
     transient_bytes: u64,
 }
 impl Recording {
     fn retain(&mut self, lease: ResourceLease) {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.uses.entry(lease.id()) {
             self.transient_bytes += lease.transient_bytes();
+            let dependencies = lease.dependencies().to_vec();
             entry.insert(lease);
+            for dependency in dependencies {
+                self.retain(dependency);
+            }
         }
     }
 }
@@ -115,7 +119,6 @@ struct DeviceInner {
     queue: wgpu::Queue,
     runtime: GpuRuntime,
     index: Mutex<FnvHashMap<ObjectKey, Vec<Weak<dyn Indexed>>>>,
-    recordings: Mutex<Vec<Weak<Mutex<Recording>>>>,
     pending_writes: Mutex<UseSet>,
     submission_gate: Mutex<()>,
     external_submission_lock: Mutex<Option<Arc<Mutex<()>>>>,
@@ -198,7 +201,6 @@ impl Device {
                 queue,
                 runtime,
                 index: Default::default(),
-                recordings: Default::default(),
                 pending_writes: Default::default(),
                 submission_gate: Default::default(),
                 external_submission_lock: Default::default(),
@@ -267,25 +269,6 @@ impl Device {
         }
         index.entry(key).or_default().push(Arc::downgrade(&erased));
         drop(index);
-        let mut recordings = self
-            .0
-            .inner()
-            .recordings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        recordings.retain(|weak| {
-            if let Some(recording) = weak.upgrade() {
-                let mut recording = recording
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if recording.open {
-                    recording.retain(object.lease.clone());
-                }
-                recording.open
-            } else {
-                false
-            }
-        });
         Resource(object)
     }
     fn create<T: Any + Eq + Hash + Send + Sync>(
@@ -678,27 +661,6 @@ impl Device {
         )
     }
 
-    fn live_uses(&self) -> UseSet {
-        let mut uses = UseSet::default();
-        let mut index = self
-            .0
-            .inner()
-            .index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        index.retain(|_, bucket| {
-            bucket.retain(|weak| {
-                if let Some(resource) = weak.upgrade() {
-                    uses.insert(resource.lease().id(), resource.lease().clone());
-                    true
-                } else {
-                    false
-                }
-            });
-            !bucket.is_empty()
-        });
-        uses
-    }
     pub fn create_command_encoder(
         &self,
         desc: &wgpu::CommandEncoderDescriptor<'_>,
@@ -708,26 +670,12 @@ impl Device {
         })?;
         let uses = Arc::new(Mutex::new(Recording {
             uses: UseSet::default(),
-            open: true,
             transient_bytes: 0,
         }));
-        {
-            let mut recordings = self
-                .0
-                .inner()
-                .recordings
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            recordings.retain(|recording| recording.strong_count() > 0);
-            recordings.push(Arc::downgrade(&uses));
-        }
         {
             let mut recording = uses
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for lease in self.live_uses().into_values() {
-                recording.retain(lease);
-            }
             recording.retain(lease);
         }
         Ok(CommandEncoder {
@@ -751,6 +699,23 @@ impl Texture {
     }
 }
 
+impl TextureView {
+    /// Recover the tracked parent even when only a surface view remains alive.
+    /// This aliases its lease and preserves the view's explicit color format.
+    pub fn texture_handle(&self) -> Result<Texture, RenderFailure> {
+        let parent = self.lease().dependencies().first().ok_or_else(|| {
+            RenderFailure::new(
+                RenderFailureKind::Validation,
+                "texture view has no tracked parent",
+            )
+        })?;
+        Ok(self
+            .0
+            .device
+            .wrap(self.raw().texture().clone(), parent.clone()))
+    }
+}
+
 pub struct CommandEncoder {
     raw: wgpu::CommandEncoder,
     uses: Arc<Mutex<Recording>>,
@@ -769,25 +734,14 @@ impl CommandEncoder {
                 .uses
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            recording.open = false;
             std::mem::take(&mut recording.uses)
         };
+        self.device.runtime().check_health()?;
         let raw = self.device.scoped(|_| Ok(self.raw.finish()))?;
         Ok(CommandBuffer {
             raw,
             uses: uses.into_values().collect(),
         })
-    }
-}
-impl Deref for CommandEncoder {
-    type Target = wgpu::CommandEncoder;
-    fn deref(&self) -> &Self::Target {
-        &self.raw
-    }
-}
-impl DerefMut for CommandEncoder {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.raw
     }
 }
 pub struct CommandBuffer {
@@ -1045,7 +999,7 @@ impl StagingBelt {
     }
     pub fn write_buffer(
         &mut self,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandEncoder,
         target: &wgpu::Buffer,
         offset: u64,
         size: wgpu::BufferSize,

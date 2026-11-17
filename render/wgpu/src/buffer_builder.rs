@@ -76,7 +76,7 @@ impl BufferBuilder {
     pub fn copy_to(
         self,
         staging_belt: &mut crate::gpu_resources::StagingBelt,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut crate::gpu_resources::CommandEncoder,
         buffer: &crate::gpu_resources::Buffer,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
         if let Some(length) = wgpu::BufferSize::new(self.inner.len() as u64) {

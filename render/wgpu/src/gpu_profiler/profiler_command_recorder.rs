@@ -1,4 +1,4 @@
-/// Trait for exposing the methods of `wgpu::CommandEncoder`, `wgpu::RenderPass` and `wgpu::ComputePass` that are used by the profiler.
+/// Trait for exposing the methods of `crate::gpu_resources::CommandEncoder`, `crate::gpu_resources::RenderPass` and `crate::gpu_resources::ComputePass` that are used by the profiler.
 pub trait ProfilerCommandRecorder {
     /// Returns `true` if it's a pass or `false` if it's an encoder
     fn is_pass(&self) -> bool;
@@ -10,7 +10,7 @@ pub trait ProfilerCommandRecorder {
 macro_rules! ImplProfilerCommandRecorder {
     ($($name:ident $(< $lt:lifetime >)? : $pass:literal,)*) => {
         $(
-            impl $(< $lt >)? ProfilerCommandRecorder for wgpu::$name $(< $lt >)? {
+            impl $(< $lt >)? ProfilerCommandRecorder for crate::gpu_resources::$name $(< $lt >)? {
                 fn is_pass(&self) -> bool { $pass }
 
                 fn write_timestamp(&mut self, query_set: &wgpu::QuerySet, query_index: u32) {

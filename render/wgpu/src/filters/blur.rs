@@ -2,6 +2,7 @@ use crate::backend::RenderTargetMode;
 use crate::buffer_pool::TexturePool;
 use crate::descriptors::Descriptors;
 use crate::filters::{FilterSource, FilterVertex, VERTEX_BUFFERS_DESCRIPTION_FILTERS};
+use crate::gpu_resources::CommandEncoder;
 use crate::gpu_resources::StagingBelt;
 use crate::gpu_resources::{RenderPipeline, TextureView};
 use crate::surface::target::CommandTarget;
@@ -9,7 +10,7 @@ use crate::utils::SampleCountMap;
 use bytemuck::{Pod, Zeroable};
 use std::sync::OnceLock;
 use swf::BlurFilter as BlurFilterArgs;
-use wgpu::{BufferSlice, CommandEncoder};
+use wgpu::BufferSlice;
 
 /// This is a 1:1 match of `struct Filter` in `blur.wgsl`. See that, and the usage below, for more info.
 /// Since WebGL requires 16 byte struct size (alignment), some of these fields (namely m2 and last_weight)
@@ -158,7 +159,7 @@ impl BlurFilter {
         &self,
         descriptors: &Descriptors,
         texture_pool: &mut TexturePool,
-        draw_encoder: &mut wgpu::CommandEncoder,
+        draw_encoder: &mut crate::gpu_resources::CommandEncoder,
         staging_belt: &mut StagingBelt,
         source: &FilterSource,
         filter: &BlurFilterArgs,

@@ -15,7 +15,11 @@ use ruffle_render::{
     shape_utils::OwnedDistilledShape,
     transform::Transform,
 };
-use std::{any::Any, collections::HashSet, sync::Arc};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use swf::{BlendMode, Color};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -176,6 +180,7 @@ fn foreign() -> RenderFailure {
 pub struct PreparedSnapshot {
     pub snapshot: RenderSnapshot,
     resources: Vec<(ResourceVersion, Handle)>,
+    resource_indices: HashMap<ResourceVersion, usize>,
 }
 #[derive(Default)]
 struct Capture {
@@ -292,6 +297,94 @@ impl Capture {
     }
 }
 impl PreparedSnapshot {
+    fn handle(&self, resource: ResourceVersion) -> Result<&Handle, RenderFailure> {
+        self.resource_indices
+            .get(&resource)
+            .map(|index| &self.resources[*index].1)
+            .ok_or_else(|| {
+                RenderFailure::new(
+                    RenderFailureKind::Validation,
+                    "graph refers to an absent snapshot resource",
+                )
+            })
+    }
+    pub fn blend_mode(&self, mode: &SnapshotBlend) -> Result<RenderBlendMode, RenderFailure> {
+        Ok(match mode {
+            SnapshotBlend::Builtin(mode) => RenderBlendMode::Builtin(*mode),
+            SnapshotBlend::Shader(resource) => match self.handle(*resource)? {
+                Handle::Shader(shader) => RenderBlendMode::Shader(shader.clone()),
+                _ => return Err(foreign()),
+            },
+        })
+    }
+    pub fn leaf(&self, node: &SnapshotNode) -> Result<Command, RenderFailure> {
+        Ok(match &node.command {
+            SnapshotCommand::Bitmap {
+                resource,
+                transform,
+                smoothing,
+                pixel_snapping,
+                region,
+            } => match self.handle(*resource)? {
+                Handle::Bitmap(bitmap) => Command::RenderBitmap {
+                    bitmap: bitmap.clone(),
+                    transform: transform.clone(),
+                    smoothing: *smoothing,
+                    pixel_snapping: *pixel_snapping,
+                    region: *region,
+                },
+                _ => return Err(foreign()),
+            },
+            SnapshotCommand::Stage3D {
+                resource,
+                transform,
+            } => match self.handle(*resource)? {
+                Handle::Bitmap(bitmap) => Command::RenderStage3D {
+                    bitmap: bitmap.clone(),
+                    transform: transform.clone(),
+                },
+                _ => return Err(foreign()),
+            },
+            SnapshotCommand::Shape {
+                resource,
+                transform,
+            } => match self.handle(*resource)? {
+                Handle::Shape(shape) => Command::RenderShape {
+                    shape: shape.clone(),
+                    transform: transform.clone(),
+                },
+                _ => return Err(foreign()),
+            },
+            SnapshotCommand::Rect { color, matrix } => Command::DrawRect {
+                color: *color,
+                matrix: *matrix,
+            },
+            SnapshotCommand::Line {
+                color,
+                matrix,
+                rectangle,
+            } => {
+                if *rectangle {
+                    Command::DrawLineRect {
+                        color: *color,
+                        matrix: *matrix,
+                    }
+                } else {
+                    Command::DrawLine {
+                        color: *color,
+                        matrix: *matrix,
+                    }
+                }
+            }
+            _ => {
+                return Err(RenderFailure::new(
+                    RenderFailureKind::Validation,
+                    "composite used as a graph leaf",
+                ));
+            }
+        })
+    }
+
     pub fn capture(commands: &CommandList) -> Result<Self, RenderFailure> {
         let mut capture = Capture::default();
         let commands = capture.commands(commands)?;
@@ -300,6 +393,12 @@ impl PreparedSnapshot {
                 commands,
                 recipes: capture.recipes,
             },
+            resource_indices: capture
+                .resources
+                .iter()
+                .enumerate()
+                .map(|(index, (version, _))| (*version, index))
+                .collect(),
             resources: capture.resources,
         })
     }

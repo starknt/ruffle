@@ -22,7 +22,7 @@ impl MaskState {
         }
     }
 
-    pub fn apply_stencil_reference(self, render_pass: &mut wgpu::RenderPass) {
+    pub fn apply_stencil_reference(self, render_pass: &mut crate::gpu_resources::RenderPass) {
         match self.mode {
             MaskMode::NoMask => {}
             MaskMode::DrawMaskStencil => {

@@ -316,7 +316,7 @@ fn profiler_queries_and_readback_storage_obey_the_device_ledger() {
     )
     .unwrap();
     {
-        let _scope = profiler.scope("measured frame", &mut *encoder);
+        let _scope = profiler.scope("measured frame", &mut encoder);
     }
     assert!(device.runtime().stats().kind_bytes[ResourceKind::QuerySet as usize] > 0);
     assert!(device.runtime().stats().kind_bytes[ResourceKind::ReadbackBuffer as usize] > 0);
@@ -352,7 +352,7 @@ fn profiler_admission_failure_refunds_partial_pool_and_latches_failure() {
     )
     .unwrap();
     {
-        let _scope = profiler.scope("cannot allocate a readback buffer", &mut *encoder);
+        let _scope = profiler.scope("cannot allocate a readback buffer", &mut encoder);
     }
     assert_eq!(
         device.runtime().failure().unwrap().kind(),
@@ -495,5 +495,46 @@ fn native_allocation_reclaims_idle_storage_before_exceeding_the_budget() {
     assert_eq!(device.runtime().stats().total_bytes, 768);
     assert!(budget.take(pool, |_: &Buffer| Some(())).is_none());
     drop((live, next));
+    assert_eq!(device.runtime().stats().total_bytes, 0);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn encoder_retains_only_used_resources_with_interleaved_recordings() {
+    let device = device(4096);
+    let buffer = |size| {
+        device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size,
+                usage: wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+            .unwrap()
+    };
+    let unused = buffer(1024);
+    let a = buffer(128);
+    let b = buffer(256);
+    let mut first = device.create_command_encoder(&Default::default()).unwrap();
+    let mut second = device.create_command_encoder(&Default::default()).unwrap();
+    first.clear_buffer(&a, 0, None);
+    second.clear_buffer(&b, 0, None);
+    drop(unused);
+    drop(a);
+    drop(b);
+    assert_eq!(
+        device.runtime().stats().total_bytes,
+        384,
+        "unrelated storage must not be retained by an encoder"
+    );
+    let first = first.finish().unwrap();
+    let second = second.finish().unwrap();
+    drop(first);
+    assert_eq!(
+        device.runtime().stats().total_bytes,
+        256,
+        "the second recording must not retain the first one's uses"
+    );
+    drop(second);
     assert_eq!(device.runtime().stats().total_bytes, 0);
 }

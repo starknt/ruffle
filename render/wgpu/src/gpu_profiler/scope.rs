@@ -44,7 +44,7 @@ impl<R: ProfilerCommandRecorder> Drop for OwningScope<'_, R> {
 /// Does NOT call [`GpuProfiler::end_query()`] on drop.
 /// This construct is just for completeness in cases where working with scopes is preferred but one can't rely on the Drop call in the right place.
 /// This is useful when the owned value needs to be recovered after the end of the scope.
-/// In particular, to submit a [`wgpu::CommandEncoder`] to a queue, ownership of the encoder is necessary.
+/// In particular, to submit a [`crate::gpu_resources::CommandEncoder`] to a queue, ownership of the encoder is necessary.
 pub struct ManualOwningScope<'a, Recorder: ProfilerCommandRecorder> {
     pub profiler: &'a GpuProfiler,
     pub recorder: Recorder,
@@ -89,7 +89,7 @@ macro_rules! impl_scope_ext {
             }
         }
 
-        impl<'a> $scope<'a, wgpu::CommandEncoder> {
+        impl<'a> $scope<'a, crate::gpu_resources::CommandEncoder> {
             /// Start a render pass wrapped in a [`OwningScope`].
             ///
             /// Ignores passed `wgpu::RenderPassDescriptor::timestamp_writes` and replaces it with
@@ -104,7 +104,7 @@ macro_rules! impl_scope_ext {
                 &mut self,
                 label: impl Into<String>,
                 pass_descriptor: wgpu::RenderPassDescriptor<'_>,
-            ) -> OwningScope<'_, wgpu::RenderPass<'_>> {
+            ) -> OwningScope<'_, crate::gpu_resources::RenderPass<'_>> {
                 let child_scope = self
                     .profiler
                     .begin_pass_query(label, &mut self.recorder)
@@ -135,7 +135,7 @@ macro_rules! impl_scope_ext {
             pub fn scoped_compute_pass(
                 &mut self,
                 label: impl Into<String>,
-            ) -> OwningScope<'_, wgpu::ComputePass<'_>> {
+            ) -> OwningScope<'_, crate::gpu_resources::ComputePass<'_>> {
                 let child_scope = self
                     .profiler
                     .begin_pass_query(label, &mut self.recorder)

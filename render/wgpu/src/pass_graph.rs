@@ -8,7 +8,6 @@ use crate::render_snapshot::{
 };
 use ruffle_render::region::RenderRect;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 use swf::{BlendMode, Color};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -108,7 +107,6 @@ struct AccessState {
 #[derive(Clone, Debug)]
 pub struct PassGraph {
     pub passes: Vec<Pass>,
-    pub commands: Arc<[SnapshotNode]>,
     states: HashMap<GraphResource, AccessState>,
     textures: HashMap<GraphResource, TextureKey>,
     shape_inputs: HashMap<ResourceKey, Vec<ResourceVersion>>,
@@ -131,7 +129,6 @@ impl PassGraph {
         }
         let mut graph = Self {
             passes: Vec::new(),
-            commands: snapshot.commands.clone(),
             states: HashMap::new(),
             textures: HashMap::new(),
             shape_inputs: HashMap::new(),
@@ -369,6 +366,13 @@ impl PassGraph {
         ancestor: Option<GraphResource>,
     ) -> Result<(), RenderFailure> {
         for node in commands {
+            if matches!(
+                node.command,
+                SnapshotCommand::Blend { .. } | SnapshotCommand::AlphaMask { .. }
+            ) && node.region.clip(attachment.bounds).is_none()
+            {
+                continue;
+            }
             let target = attachment.resource;
             let mut reads = vec![target];
             let mut writes = vec![target];
@@ -419,9 +423,7 @@ impl PassGraph {
                     if matches!(
                         mode,
                         SnapshotBlend::Shader(_)
-                            | SnapshotBlend::Builtin(
-                                BlendMode::Alpha | BlendMode::Erase | BlendMode::Layer
-                            )
+                            | SnapshotBlend::Builtin(BlendMode::Alpha | BlendMode::Erase)
                     ) || samples_ancestor(children)
                     {
                         bounds = attachment.bounds;
@@ -494,7 +496,7 @@ impl PassGraph {
                 }
                 _ => PassKind::Draw(node.clone()),
             };
-            if attachment.stencil_depth > 0 {
+            if attachment.stencil.is_some() {
                 reads.push(stencil);
             }
             self.add(

@@ -1,7 +1,8 @@
 use crate::buffer_pool::BufferDescription;
 use crate::descriptors::Descriptors;
+use crate::gpu_resources::CommandEncoder;
 use std::borrow::Cow;
-use wgpu::{CommandEncoder, TextureFormat};
+use wgpu::TextureFormat;
 
 macro_rules! create_debug_label {
     ($($arg:tt)*) => (
