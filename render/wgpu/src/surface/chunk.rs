@@ -32,7 +32,7 @@ pub enum DrawCommand {
         // We don't actually _need_ that texture though, thus the _
         _texture: Option<PoolOrArcTexture>,
         binds: crate::gpu_resources::BindGroup,
-        batch_sampler: Option<crate::gpu_resources::Sampler>,
+        batch_sampler: Option<(crate::gpu_resources::Sampler, crate::bitmap_batch::Source)>,
         blend_mode: TrivialBlend,
         render_stage3d: bool,
         draw_offsets: DrawOffsets,
@@ -72,7 +72,7 @@ impl DrawCommand {
         match self {
             Self::RenderTexture {
                 _texture: Some(texture),
-                batch_sampler: Some(sampler),
+                batch_sampler: Some((sampler, _)),
                 blend_mode: TrivialBlend::Normal,
                 render_stage3d: false,
                 draw_offsets,
@@ -184,10 +184,12 @@ pub(super) fn batch_bitmap_textures(
             commands.extend(run);
             continue;
         }
+        let mut sources = Vec::with_capacity(run.len());
         let mut textures = Vec::with_capacity(run.len());
         for command in run {
             let DrawCommand::RenderTexture {
                 _texture: Some(texture),
+                batch_sampler: Some((_, source)),
                 draw_offsets,
                 ..
             } = command
@@ -197,28 +199,15 @@ pub(super) fn batch_bitmap_textures(
             // The first instance may start anywhere in a chunk's uniform window.
             views[draw_offsets.instances.start as usize % N] = texture.view().clone();
             textures.push(texture);
+            sources.push(source);
         }
-        let mut entries: Vec<_> = views
-            .iter()
-            .enumerate()
-            .map(|(binding, view)| wgpu::BindGroupEntry {
-                binding: binding as u32,
-                resource: wgpu::BindingResource::TextureView(view),
-            })
-            .collect();
-        entries.push(wgpu::BindGroupEntry {
-            binding: N as u32,
-            resource: wgpu::BindingResource::Sampler(&sampler),
-        });
-        // A cross-frame material entry would retain evicted immutable uploads.
-        // The command owns this binding only through its submission lifetime.
-        let binds = descriptors
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Adjacent bitmap batch"),
-                layout: &descriptors.bind_layouts.bitmap_batch,
-                entries: &entries,
-            })?;
+        let binds = descriptors.bitmap_batches.get_or_create(
+            &descriptors.device,
+            &descriptors.bind_layouts.bitmap_batch,
+            &views,
+            &sampler,
+            &sources,
+        )?;
         commands.push(DrawCommand::RenderTextureBatch {
             _textures: textures,
             binds,

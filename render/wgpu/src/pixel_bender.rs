@@ -500,6 +500,7 @@ pub(super) fn run_pixelbender_shader_impl(
                                     _allocation: Default::default(),
                                     view: fresh_texture.create_view(&Default::default())?,
                                     texture: fresh_texture,
+                                    batch_source: Default::default(),
                                     repeating_linear: Default::default(),
                                     repeating_nearest: Default::default(),
                                     clamped_linear: Default::default(),

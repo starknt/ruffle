@@ -192,6 +192,75 @@ fn adjacent_bitmap_textures_batch_without_reordering_translucent_pixels() {
 
 #[test]
 #[ignore = "requires a real native adapter"]
+fn bitmap_batch_bindings_reuse_only_while_every_source_image_is_alive() {
+    use ruffle_render::bitmap::{PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (32, 32)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    let mut bitmaps: Vec<_> = (0..32)
+        .map(|_| {
+            renderer
+                .create_empty_texture(
+                    std::num::NonZeroU32::new(2).unwrap(),
+                    std::num::NonZeroU32::new(2).unwrap(),
+                )
+                .unwrap()
+        })
+        .collect();
+    let groups = || {
+        descriptors
+            .runtime
+            .resources()
+            .into_iter()
+            .filter(|r| {
+                r.kind == crate::gpu_runtime::ResourceKind::BindGroup
+                    && r.dependencies
+                        .contains(&descriptors.bind_layouts.bitmap_batch.lease().id())
+            })
+            .map(|r| r.id)
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let mut previous = None;
+    for _ in 0..6 {
+        let mut commands = CommandList::new();
+        for bitmap in &bitmaps {
+            commands.render_bitmap(
+                bitmap.clone(),
+                Transform::default(),
+                false,
+                PixelSnapping::Never,
+                PixelRegion::for_whole_size(2, 2),
+            );
+        }
+        renderer
+            .submit_frame(Color::WHITE, commands, vec![])
+            .unwrap();
+        renderer.capture_frame().unwrap().unwrap();
+        descriptors
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let live = groups();
+        assert_eq!(live.len(), 2, "reusable bindings outlive one submission");
+        if let Some(previous) = previous {
+            assert_eq!(
+                live, previous,
+                "stable images must reuse the same native bindings"
+            );
+        }
+        previous = Some(live);
+    }
+    // Dropping any source invalidates its shared binding even when the other
+    // source images and the descriptor cache stay alive.
+    bitmaps.pop();
+    assert_eq!(groups().len(), 1);
+    drop(bitmaps);
+    assert!(groups().is_empty());
+}
+
+#[test]
+#[ignore = "requires a real native adapter"]
 fn alpha_mask_samples_aligned_bitmap_content_without_an_intermediate_copy() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
     use ruffle_render::transform::Transform;

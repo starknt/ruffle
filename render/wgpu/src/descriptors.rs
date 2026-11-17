@@ -28,6 +28,7 @@ pub struct Descriptors {
     pub shaders: Shaders,
     pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), Arc<Pipelines>>>,
     pub filters: Filters,
+    pub(crate) bitmap_batches: crate::bitmap_batch::BitmapBatchCache,
     pub materials: crate::material_cache::MaterialCache,
 }
 
@@ -87,7 +88,9 @@ impl Descriptors {
 
         runtime.check_health()?;
         let materials = crate::material_cache::MaterialCache::new(&runtime, 128);
+        let bitmap_batches = crate::bitmap_batch::BitmapBatchCache::new(&runtime);
         Ok(Self {
+            bitmap_batches,
             materials,
             runtime,
             wgpu_instance: instance,

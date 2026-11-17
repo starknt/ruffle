@@ -285,10 +285,13 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                 ))),
                 binds: binds.bind_group.clone(),
                 batch_sampler: (texture.texture.mip_level_count() == 1).then(|| {
-                    self.descriptors
-                        .bitmap_samplers
-                        .get_sampler(false, smoothing)
-                        .clone()
+                    (
+                        self.descriptors
+                            .bitmap_samplers
+                            .get_sampler(false, smoothing)
+                            .clone(),
+                        texture.batch_source.clone(),
+                    )
                 }),
                 draw_offsets,
                 blend_mode: TrivialBlend::Normal,

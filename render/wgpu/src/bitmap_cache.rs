@@ -96,6 +96,7 @@ impl CacheImage {
                 ),
                 view: texture.create_view(&Default::default())?,
                 texture,
+                batch_source: Default::default(),
                 repeating_linear: Default::default(),
                 repeating_nearest: Default::default(),
                 clamped_linear: Default::default(),

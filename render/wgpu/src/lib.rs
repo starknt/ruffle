@@ -33,6 +33,7 @@ type Error = Box<dyn std::error::Error>;
 #[macro_use]
 pub mod utils;
 
+mod bitmap_batch;
 mod bitmap_cache;
 mod bitmap_recipe;
 mod bitmap_residency;
@@ -455,6 +456,7 @@ impl QueueSyncHandle {
 
 #[derive(Debug)]
 pub struct Texture {
+    batch_source: crate::bitmap_batch::Source,
     pub(crate) _allocation: ruffle_render::profile::GpuBitmap,
     pub(crate) texture: crate::gpu_resources::Texture,
     view: crate::gpu_resources::TextureView,
