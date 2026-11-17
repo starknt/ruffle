@@ -2751,66 +2751,84 @@ fn native_preparation_parallel_shapes_match_serial_pixels_and_join_before_encodi
         transform::Transform,
     };
     let descriptors = gpu();
-    let mut images = Vec::new();
-    for parallel in [false, true] {
-        let target = TextureTarget::new(&descriptors.device, (64, 64)).unwrap();
-        let mut renderer =
-            WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
-        let before = descriptors.runtime.preparation().stats().submitted;
-        let mut commands = CommandList::new();
-        for n in 0..20 {
-            let style = swf::FillStyle::Color(Color::from_rgb(0x70a0ee + n * 33, 153));
-            let point = |x, y| swf::Point::new(Twips::from_pixels(x), Twips::from_pixels(y));
-            let handle = renderer
-                .register_shape(
-                    DistilledShape {
-                        id: n as u16,
-                        shape_bounds: Default::default(),
-                        edge_bounds: Default::default(),
-                        paths: vec![DrawPath::Fill {
-                            style: &style,
-                            winding_rule: FillRule::EvenOdd,
-                            commands: vec![
-                                DrawCommand::MoveTo(point(0.0, 0.0)),
-                                DrawCommand::QuadraticCurveTo {
-                                    control: point(8.5, -4.25),
-                                    anchor: point(18.75, 1.0),
-                                },
-                                DrawCommand::LineTo(point(14.25, 19.5)),
-                                DrawCommand::LineTo(point(0.0, 0.0)),
-                            ],
-                        }],
-                    },
-                    &crate::shape_recipe::FrozenBitmapSource::default(),
-                )
-                .unwrap();
-            let mut transform = Transform::default();
-            transform.matrix.tx = Twips::from_pixels(f64::from(n) * 1.25 + 0.25);
-            transform.matrix.ty = Twips::from_pixels(f64::from(n) * 1.5 + 2.5);
-            commands.render_shape(handle, transform);
-        }
-        if parallel {
-            // Invisible, culled leaves cross the automatic work threshold without
-            // changing pixels or introducing a production test switch.
-            for _ in 0..256 {
-                rect(&mut commands, 1000.0, 1000.0, 1.0, 1.0, Color::TRANSPARENT);
+    for count in [20, 320] {
+        let mut images = Vec::new();
+        for parallel in [false, true] {
+            let target = TextureTarget::new(&descriptors.device, (64, 64)).unwrap();
+            let mut renderer =
+                WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+            let before = descriptors.runtime.preparation().stats().submitted;
+            let mut commands = CommandList::new();
+            for n in 0..count {
+                let style = swf::FillStyle::Color(Color::from_rgb(0x70a0ee + n * 33, 153));
+                let point = |x, y| swf::Point::new(Twips::from_pixels(x), Twips::from_pixels(y));
+                let handle = renderer
+                    .register_shape(
+                        DistilledShape {
+                            id: n as u16,
+                            shape_bounds: Default::default(),
+                            edge_bounds: Default::default(),
+                            paths: vec![DrawPath::Fill {
+                                style: &style,
+                                winding_rule: FillRule::EvenOdd,
+                                commands: vec![
+                                    DrawCommand::MoveTo(point(0.0, 0.0)),
+                                    DrawCommand::QuadraticCurveTo {
+                                        control: point(8.5, -4.25),
+                                        anchor: point(18.75, 1.0),
+                                    },
+                                    DrawCommand::LineTo(point(14.25, 19.5)),
+                                    DrawCommand::LineTo(point(0.0, 0.0)),
+                                ],
+                            }],
+                        },
+                        &crate::shape_recipe::FrozenBitmapSource::default(),
+                    )
+                    .unwrap();
+                if count == 320 && !parallel {
+                    // Publish each reference mesh serially on the owner thread.
+                    // Only the candidate queues the large set of CPU recipes.
+                    let recipe = (&*handle.0 as &dyn std::any::Any)
+                        .downcast_ref::<crate::shape_recipe::ShapeRecipe>()
+                        .unwrap();
+                    let input = crate::prepare::mesh::ShapeInput {
+                        geometry: recipe.geometry.borrow().as_ref().unwrap().clone(),
+                        scale: recipe.scale,
+                        bitmap_sizes: Vec::new(),
+                    };
+                    recipe
+                        .publish(&mut renderer, input.prepare_bounded(64 * 1024).unwrap())
+                        .unwrap();
+                }
+                let mut transform = Transform::default();
+                transform.matrix.tx = Twips::from_pixels(f64::from(n % 20) * 1.25 + 0.25);
+                transform.matrix.ty = Twips::from_pixels(f64::from(n % 20) * 1.5 + 2.5);
+                commands.render_shape(handle, transform);
             }
+            if parallel {
+                // Invisible, culled leaves cross the automatic work threshold without
+                // changing pixels or introducing a production test switch.
+                for _ in 0..256 {
+                    rect(&mut commands, 1000.0, 1000.0, 1.0, 1.0, Color::TRANSPARENT);
+                }
+            }
+            renderer
+                .submit_frame(Color::BLACK, commands, vec![])
+                .unwrap();
+            let stats = descriptors.runtime.preparation().stats();
+            assert!(stats.peak_active <= 4);
+            assert_eq!(stats.active, 0, "all CPU tasks joined in this frame");
+            assert_eq!(stats.bytes, 0, "scratch permits returned after publication");
+            assert_eq!(stats.submitted > before, parallel);
+            assert!(
+                count != 20 || stats.submitted - before <= 3,
+                "small shapes share deterministic preparation partitions"
+            );
+            images.push(renderer.capture_frame().unwrap().unwrap().into_raw());
         }
-        renderer
-            .submit_frame(Color::BLACK, commands, vec![])
-            .unwrap();
-        let stats = descriptors.runtime.preparation().stats();
-        assert_eq!(stats.active, 0, "all CPU tasks joined in this frame");
-        assert_eq!(stats.bytes, 0, "scratch permits returned after publication");
-        assert_eq!(stats.submitted > before, parallel);
-        assert!(
-            stats.submitted - before <= 3,
-            "small shapes share deterministic preparation partitions"
-        );
-        images.push(renderer.capture_frame().unwrap().unwrap().into_raw());
+        assert_eq!(images[0], images[1]);
+        assert!(images[0].chunks_exact(4).any(|p| p != [0, 0, 0, 255]));
     }
-    assert_eq!(images[0], images[1]);
-    assert!(images[0].chunks_exact(4).any(|p| p != [0, 0, 0, 255]));
 }
 
 #[test]
