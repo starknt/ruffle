@@ -16,13 +16,18 @@ const GRADIENT_SIZE: usize = 256;
 
 #[derive(Debug)]
 pub struct Mesh {
+    pub bounds: Option<[f64; 4]>,
     pub draws: Vec<Draw>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub _allocation: ruffle_render::profile::GpuMesh,
 }
 
-impl ShapeHandleImpl for Mesh {}
+impl ShapeHandleImpl for Mesh {
+    fn bounds(&self) -> Option<[f64; 4]> {
+        self.bounds
+    }
+}
 
 pub fn as_mesh(handle: &ShapeHandle) -> &Mesh {
     <dyn Any>::downcast_ref(&*handle.0).expect("Shape handle must be a WGPU ShapeData")

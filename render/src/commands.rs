@@ -2,6 +2,7 @@ use crate::backend::ShapeHandle;
 use crate::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
 use crate::matrix::Matrix;
 use crate::pixel_bender::PixelBenderShaderHandle;
+use crate::region::RenderRegion;
 use crate::transform::Transform;
 use swf::{BlendMode, Color};
 
@@ -41,7 +42,8 @@ pub enum RenderBlendMode {
 
 #[derive(Debug, Default, Clone)]
 pub struct CommandList {
-    pub commands: Vec<Command>,
+    commands: Vec<Command>,
+    region: RenderRegion,
 
     /// The number of mask regions in the process of being drawn.
     /// This is used to discard drawing commands of nested maskers, which Flash does not support.
@@ -49,6 +51,19 @@ pub struct CommandList {
 }
 
 impl CommandList {
+    pub fn iter(&self) -> std::slice::Iter<'_, Command> {
+        self.commands.iter()
+    }
+    pub fn into_commands(self) -> Vec<Command> {
+        self.commands
+    }
+    pub fn region(&self) -> RenderRegion {
+        self.region
+    }
+    pub fn push(&mut self, command: Command) {
+        self.region = self.region.union(command.region());
+        self.commands.push(command);
+    }
     #[inline]
     pub fn new() -> Self {
         Self::default()
@@ -105,7 +120,7 @@ impl CommandHandler for CommandList {
         region: PixelRegion,
     ) {
         if self.maskers_in_progress <= 1 {
-            self.commands.push(Command::RenderBitmap {
+            self.push(Command::RenderBitmap {
                 bitmap,
                 transform,
                 smoothing,
@@ -118,22 +133,20 @@ impl CommandHandler for CommandList {
     #[inline]
     fn render_stage3d(&mut self, bitmap: BitmapHandle, transform: Transform) {
         if self.maskers_in_progress <= 1 {
-            self.commands
-                .push(Command::RenderStage3D { bitmap, transform });
+            self.push(Command::RenderStage3D { bitmap, transform });
         }
     }
 
     #[inline]
     fn render_shape(&mut self, shape: ShapeHandle, transform: Transform) {
         if self.maskers_in_progress <= 1 {
-            self.commands
-                .push(Command::RenderShape { shape, transform });
+            self.push(Command::RenderShape { shape, transform });
         }
     }
 
     fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList) {
         if self.maskers_in_progress <= 1 {
-            self.commands.push(Command::RenderAlphaMask {
+            self.push(Command::RenderAlphaMask {
                 maskee_commands,
                 mask_commands,
             });
@@ -143,28 +156,28 @@ impl CommandHandler for CommandList {
     #[inline]
     fn draw_rect(&mut self, color: Color, matrix: Matrix) {
         if self.maskers_in_progress <= 1 {
-            self.commands.push(Command::DrawRect { color, matrix });
+            self.push(Command::DrawRect { color, matrix });
         }
     }
 
     #[inline]
     fn draw_line(&mut self, color: Color, matrix: Matrix) {
         if self.maskers_in_progress <= 1 {
-            self.commands.push(Command::DrawLine { color, matrix });
+            self.push(Command::DrawLine { color, matrix });
         }
     }
 
     #[inline]
     fn draw_line_rect(&mut self, color: Color, matrix: Matrix) {
         if self.maskers_in_progress <= 1 {
-            self.commands.push(Command::DrawLineRect { color, matrix });
+            self.push(Command::DrawLineRect { color, matrix });
         }
     }
 
     #[inline]
     fn push_mask(&mut self) {
         if self.maskers_in_progress == 0 {
-            self.commands.push(Command::PushMask);
+            self.push(Command::PushMask);
         }
         self.maskers_in_progress += 1;
     }
@@ -173,14 +186,14 @@ impl CommandHandler for CommandList {
     fn activate_mask(&mut self) {
         self.maskers_in_progress -= 1;
         if self.maskers_in_progress == 0 {
-            self.commands.push(Command::ActivateMask);
+            self.push(Command::ActivateMask);
         }
     }
 
     #[inline]
     fn deactivate_mask(&mut self) {
         if self.maskers_in_progress == 0 {
-            self.commands.push(Command::DeactivateMask);
+            self.push(Command::DeactivateMask);
         }
         self.maskers_in_progress += 1;
     }
@@ -189,14 +202,14 @@ impl CommandHandler for CommandList {
     fn pop_mask(&mut self) {
         self.maskers_in_progress -= 1;
         if self.maskers_in_progress == 0 {
-            self.commands.push(Command::PopMask);
+            self.push(Command::PopMask);
         }
     }
 
     #[inline]
     fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) {
         if self.maskers_in_progress <= 1 {
-            self.commands.push(Command::Blend(commands, blend_mode));
+            self.push(Command::Blend(commands, blend_mode));
         }
     }
 }
@@ -239,4 +252,55 @@ pub enum Command {
     DeactivateMask,
     PopMask,
     Blend(CommandList, RenderBlendMode),
+}
+
+impl Command {
+    fn region(&self) -> RenderRegion {
+        match self {
+            Self::RenderBitmap {
+                transform,
+                pixel_snapping,
+                region,
+                ..
+            } => {
+                if transform.perspective_projection.is_some() || transform.tz != 0.0 {
+                    return RenderRegion::Full;
+                }
+                let mut matrix = transform.matrix;
+                pixel_snapping.apply(&mut matrix);
+                RenderRegion::transformed(
+                    [0.0, 0.0, region.width().into(), region.height().into()],
+                    &matrix,
+                )
+            }
+            Self::RenderShape { shape, transform } => {
+                if transform.perspective_projection.is_some() || transform.tz != 0.0 {
+                    return RenderRegion::Full;
+                }
+                shape.0.bounds().map_or(RenderRegion::Full, |b| {
+                    RenderRegion::transformed(b, &transform.matrix)
+                })
+            }
+            Self::DrawRect { matrix, .. }
+            | Self::DrawLine { matrix, .. }
+            | Self::DrawLineRect { matrix, .. } => {
+                RenderRegion::transformed([0.0, 0.0, 1.0, 1.0], matrix)
+            }
+            Self::RenderStage3D { .. }
+            | Self::Blend(_, RenderBlendMode::Shader(_))
+            | Self::Blend(_, RenderBlendMode::Builtin(BlendMode::Alpha | BlendMode::Erase)) => {
+                RenderRegion::Full
+            }
+            Self::Blend(commands, _) => commands.region(),
+            // A union is deliberately conservative, and propagates dependencies
+            // even when one input is empty or disjoint.
+            Self::RenderAlphaMask {
+                maskee_commands,
+                mask_commands,
+            } => maskee_commands.region().union(mask_commands.region()),
+            Self::PushMask | Self::ActivateMask | Self::DeactivateMask | Self::PopMask => {
+                RenderRegion::Empty
+            }
+        }
+    }
 }

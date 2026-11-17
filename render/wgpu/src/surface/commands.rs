@@ -15,6 +15,7 @@ use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::lines::{emulate_line, emulate_line_rect};
 use ruffle_render::matrix::Matrix;
 use ruffle_render::quality::StageQuality;
+use ruffle_render::region::{RenderRect, RenderRegion};
 use ruffle_render::transform::Transform;
 use std::mem;
 use swf::{BlendMode, Color, ColorTransform, Twips};
@@ -41,6 +42,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     quality: StageQuality,
     width: u32,
     height: u32,
+    origin: [u32; 2],
     nearest_layer: LayerRef,
     texture_pool: &'encoder mut TexturePool,
     mask_state: MaskState,
@@ -54,6 +56,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         quality,
         width,
         height,
+        origin,
         nearest_layer,
         texture_pool,
         mask_state,
@@ -66,6 +69,7 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     quality: StageQuality,
     width: u32,
     height: u32,
+    origin: [u32; 2],
     nearest_layer: LayerRef<'encoder>,
     meshes: &'encoder Vec<Mesh>,
     staging_belt: &'encoder mut wgpu::util::StagingBelt,
@@ -92,6 +96,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         quality: StageQuality,
         width: u32,
         height: u32,
+        origin: [u32; 2],
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
         mask_state: MaskState,
@@ -108,6 +113,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             quality,
             width,
             height,
+            origin,
             nearest_layer,
             meshes,
             staging_belt,
@@ -148,6 +154,15 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         result
     }
 
+    fn region(&self, region: RenderRegion) -> Option<RenderRect> {
+        region.clip(RenderRect {
+            x: self.origin[0],
+            y: self.origin[1],
+            width: self.width,
+            height: self.height,
+        })
+    }
+
     fn push_command(&mut self, command: DrawCommand) {
         if let Some(existing) = self.current.last_mut()
             && existing.try_merge(&command)
@@ -164,6 +179,10 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         vertices: DrawVertices,
         command_builder: impl FnOnce(DrawOffsets) -> DrawCommand,
     ) {
+        let mut local_transform = transform.clone();
+        local_transform.matrix.tx -= Twips::from_pixels(self.origin[0] as f64);
+        local_transform.matrix.ty -= Twips::from_pixels(self.origin[1] as f64);
+        let transform = &local_transform;
         let result = match *instance {
             Some(existing) => Ok(existing),
             None => self.chunk_buffer_builder.add_transform(transform),
@@ -209,17 +228,26 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
     fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) {
+        let region = match &blend_mode {
+            RenderBlendMode::Builtin(BlendMode::Alpha | BlendMode::Erase)
+            | RenderBlendMode::Shader(_) => RenderRegion::Full,
+            _ => commands.region(),
+        };
+        let Some(region) = self.region(region) else {
+            return;
+        };
         ruffle_render::profile::work(|w| {
             w.offscreen_targets += 1;
-            w.offscreen_pixels += u64::from(self.width) * u64::from(self.height);
+            w.offscreen_pixels += u64::from(region.width) * u64::from(region.height);
         });
         let surface = Surface::new(
             self.descriptors,
             self.quality,
-            self.width,
-            self.height,
+            region.width,
+            region.height,
             wgpu::TextureFormat::Rgba8Unorm,
-        );
+        )
+        .with_origin([region.x, region.y]);
         let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
             LayerRef::Current
         } else {
@@ -255,7 +283,11 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         match blend_type {
             BlendType::Trivial(blend_mode) => {
                 let transform = Transform {
-                    matrix: Matrix::scale(target.width() as f32, target.height() as f32),
+                    matrix: Matrix {
+                        tx: Twips::from_pixels(region.x as f64),
+                        ty: Twips::from_pixels(region.y as f64),
+                        ..Matrix::scale(target.width() as f32, target.height() as f32)
+                    },
                     tz: 0.0,
                     color_transform: Default::default(),
                     perspective_projection: None,
@@ -310,6 +342,11 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                     _ => unreachable!(),
                 };
                 self.result.push(Chunk::Blend {
+                    region: RenderRect {
+                        x: region.x - self.origin[0],
+                        y: region.y - self.origin[1],
+                        ..region
+                    },
                     texture: target.take_color_texture(),
                     blend_mode: chunk_blend_mode,
                     needs_stencil: self.mask_state.count > 0,
@@ -558,18 +595,23 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
     }
 
     fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList) {
+        let Some(region) = self.region(maskee_commands.region().union(mask_commands.region()))
+        else {
+            return;
+        };
         ruffle_render::profile::work(|w| {
             w.offscreen_targets += 2;
             w.mask_passes += 2;
-            w.offscreen_pixels += 2 * u64::from(self.width) * u64::from(self.height);
+            w.offscreen_pixels += 2 * u64::from(region.width) * u64::from(region.height);
         });
         let surface = Surface::new(
             self.descriptors,
             self.quality,
-            self.width,
-            self.height,
+            region.width,
+            region.height,
             wgpu::TextureFormat::Rgba8Unorm,
-        );
+        )
+        .with_origin([region.x, region.y]);
 
         let maskee = surface.draw_commands(
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
@@ -583,7 +625,11 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             self.texture_pool,
         );
         maskee.ensure_cleared(self.draw_encoder);
-        let matrix = Matrix::scale(maskee.width() as f32, maskee.height() as f32);
+        let matrix = Matrix {
+            tx: Twips::from_pixels(region.x as f64),
+            ty: Twips::from_pixels(region.y as f64),
+            ..Matrix::scale(maskee.width() as f32, maskee.height() as f32)
+        };
         let maskee = maskee.take_color_texture();
 
         let mask = surface.draw_commands(

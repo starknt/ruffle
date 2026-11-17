@@ -714,7 +714,12 @@ pub enum Context3DCommand<'a> {
 #[derive(Clone, Debug)]
 pub struct ShapeHandle(pub Arc<dyn ShapeHandleImpl>);
 
-pub trait ShapeHandleImpl: Any + Debug {}
+pub trait ShapeHandleImpl: Any + Debug {
+    /// Local pixel bounds of all rasterized geometry, including strokes.
+    fn bounds(&self) -> Option<[f64; 4]> {
+        None
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

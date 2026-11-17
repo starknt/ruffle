@@ -35,6 +35,7 @@ use chunk::ChunkBlendMode;
 #[derive(Debug)]
 pub struct Surface {
     size: wgpu::Extent3d,
+    origin: [u32; 2],
     quality: StageQuality,
     sample_count: u32,
     pipelines: Arc<Pipelines>,
@@ -42,6 +43,10 @@ pub struct Surface {
 }
 
 impl Surface {
+    pub fn with_origin(mut self, origin: [u32; 2]) -> Self {
+        self.origin = origin;
+        self
+    }
     pub fn new(
         descriptors: &Descriptors,
         quality: StageQuality,
@@ -62,6 +67,7 @@ impl Surface {
         );
         let pipelines = descriptors.pipelines(sample_count, frame_buffer_format);
         Self {
+            origin: [0, 0],
             size,
             quality,
             sample_count,
@@ -143,6 +149,7 @@ impl Surface {
                 self.quality,
                 target.width(),
                 target.height(),
+                self.origin,
                 match nearest_layer {
                     LayerRef::Current => LayerRef::Parent(&target),
                     layer => layer,
@@ -204,6 +211,7 @@ impl Surface {
                         texture,
                         blend_mode: ChunkBlendMode::Shader(shader),
                         needs_stencil,
+                        region: _,
                     } => {
                         assert!(!needs_stencil, "Shader blend mode not implemented in masks");
                         let parent_blend_buffer =
@@ -240,6 +248,7 @@ impl Surface {
                         texture,
                         blend_mode: ChunkBlendMode::Complex(blend_mode),
                         needs_stencil,
+                        region,
                     } => {
                         let parent = match blend_mode {
                             ComplexBlend::Alpha | ComplexBlend::Erase => {
@@ -255,8 +264,22 @@ impl Surface {
                             _ => &target,
                         };
 
-                        let parent_blend_buffer =
-                            parent.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                        let bounded_buffer;
+                        let parent_blend_buffer = if region.x == 0
+                            && region.y == 0
+                            && region.width == parent.width()
+                            && region.height == parent.height()
+                        {
+                            parent.update_blend_buffer(descriptors, texture_pool, draw_encoder)
+                        } else {
+                            bounded_buffer = parent.copy_blend_region(
+                                descriptors,
+                                texture_pool,
+                                draw_encoder,
+                                region,
+                            );
+                            &bounded_buffer
+                        };
 
                         let blend_bind_group =
                             descriptors
@@ -339,6 +362,20 @@ impl Surface {
                             );
                         }
 
+                        render_pass.set_viewport(
+                            region.x as f32,
+                            region.y as f32,
+                            region.width as f32,
+                            region.height as f32,
+                            0.0,
+                            1.0,
+                        );
+                        render_pass.set_scissor_rect(
+                            region.x,
+                            region.y,
+                            region.width,
+                            region.height,
+                        );
                         render_pass.set_bind_group(2, &blend_bind_group, &[]);
 
                         render_pass.set_vertex_buffer(

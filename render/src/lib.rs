@@ -22,6 +22,7 @@ pub mod utils;
 
 pub mod commands;
 pub mod quality;
+pub mod region;
 #[cfg(feature = "tessellator")]
 pub mod tessellator;
 

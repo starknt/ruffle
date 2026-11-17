@@ -12,6 +12,7 @@ pub enum Chunk {
         chunk_buffer_builder: ChunkBufferBuilder,
     },
     Blend {
+        region: ruffle_render::region::RenderRect,
         texture: PoolOrArcTexture,
         blend_mode: ChunkBlendMode,
         needs_stencil: bool,

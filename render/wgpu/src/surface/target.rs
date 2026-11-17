@@ -439,6 +439,53 @@ impl CommandTarget {
         blend_buffer
     }
 
+    pub fn copy_blend_region(
+        &self,
+        descriptors: &Descriptors,
+        pool: &mut TexturePool,
+        encoder: &mut wgpu::CommandEncoder,
+        region: ruffle_render::region::RenderRect,
+    ) -> BlendBuffer {
+        let size = wgpu::Extent3d {
+            width: region.width,
+            height: region.height,
+            depth_or_array_layers: 1,
+        };
+        let buffer = BlendBuffer::new(
+            descriptors,
+            size,
+            self.format,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            pool,
+        );
+        self.ensure_cleared(encoder);
+        ruffle_render::profile::work(|w| {
+            w.copy_bytes += u64::from(region.width) * u64::from(region.height) * 4
+        });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: self.color_texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: region.x,
+                    y: region.y,
+                    z: 0,
+                },
+                aspect: Default::default(),
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: buffer.texture(),
+                mip_level: 0,
+                origin: Default::default(),
+                aspect: Default::default(),
+            },
+            size,
+        );
+        buffer
+    }
+
     pub fn color_view(&self) -> &wgpu::TextureView {
         self.resolve_buffer
             .as_ref()

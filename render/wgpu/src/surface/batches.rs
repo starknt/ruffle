@@ -17,7 +17,7 @@ impl CommandBatches {
         let rgba_bytes = u64::from(width).max(1) * u64::from(height).max(1) * 4;
         let limit = ((32 * 1024 * 1024 / rgba_bytes) as usize).clamp(1, 8);
         let mut inputs = 0;
-        let needs_batches = commands.commands.iter().any(|command| {
+        let needs_batches = commands.iter().any(|command| {
             inputs += temporary_inputs(command);
             inputs > limit
         });
@@ -31,7 +31,7 @@ impl CommandBatches {
         let (unbatched, commands) = if max_inputs == usize::MAX {
             (Some(commands), Vec::new())
         } else {
-            (None, commands.commands)
+            (None, commands.into_commands())
         };
         if fallback {
             ruffle_render::profile::blend_batch_fallback();
@@ -60,7 +60,7 @@ impl Iterator for CommandBatches {
                 break;
             }
             inputs += cost;
-            batch.commands.push(self.commands.next().unwrap());
+            batch.push(self.commands.next().unwrap());
         }
         (!batch.is_empty()).then_some(batch)
     }
@@ -75,7 +75,7 @@ fn temporary_inputs(command: &Command) -> usize {
 }
 
 fn samples_ancestor_layer(commands: &CommandList) -> bool {
-    commands.commands.iter().any(|command| match command {
+    commands.iter().any(|command| match command {
         Command::Blend(_, RenderBlendMode::Builtin(BlendMode::Alpha | BlendMode::Erase)) => true,
         Command::Blend(children, _) => samples_ancestor_layer(children),
         Command::RenderAlphaMask {

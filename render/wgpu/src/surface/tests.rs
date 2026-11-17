@@ -42,6 +42,70 @@ fn measurement_counts_encoded_draws_and_passes() {
     assert_eq!(work.copy_bytes, 0);
 }
 
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn bounded_compositing_matches_full_target_pixels() {
+    let descriptors = gpu();
+    for quality in [StageQuality::Low, StageQuality::High] {
+        for alpha_mask in [false, true] {
+            let mut results = Vec::new();
+            for full in [true, false] {
+                let target = TextureTarget::new(&descriptors.device, (128, 128)).unwrap();
+                let mut renderer =
+                    WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+                renderer.set_quality(quality);
+                let metrics = ruffle_render::profile::RenderMetrics::default();
+                let _scope = ruffle_render::profile::enter(Some(&metrics));
+                let mut foreground = CommandList::new();
+                if full {
+                    rect(&mut foreground, 0.0, 0.0, 128.0, 128.0, Color::TRANSPARENT);
+                }
+                rect(
+                    &mut foreground,
+                    37.25,
+                    19.5,
+                    13.5,
+                    21.25,
+                    Color::from_rgb(0x63a1ce, 193),
+                );
+                let mut commands = CommandList::new();
+                if alpha_mask {
+                    let mut mask = CommandList::new();
+                    rect(
+                        &mut mask,
+                        32.0,
+                        22.25,
+                        16.0,
+                        28.0,
+                        Color::from_rgb(0xffffff, 127),
+                    );
+                    commands.render_alpha_mask(foreground, mask);
+                } else {
+                    // Nested origins must compose correctly as well.
+                    let mut inner = CommandList::new();
+                    inner.blend(foreground, RenderBlendMode::Builtin(BlendMode::Multiply));
+                    commands.blend(inner, RenderBlendMode::Builtin(BlendMode::Layer));
+                }
+                renderer.submit_frame(Color::from_rgb(0x96b052, 255), commands, vec![]);
+                let pixels = renderer.capture_frame().unwrap().into_raw();
+                results.push((pixels, metrics.snapshot().work));
+            }
+            assert_eq!(
+                results[0].0, results[1].0,
+                "quality {quality:?}, mask {alpha_mask}"
+            );
+            assert!(results[1].1.offscreen_pixels * 4 < results[0].1.offscreen_pixels);
+            if !alpha_mask {
+                // Capture copies the whole output once in both runs.
+                let capture = 128 * 128 * 4;
+                assert!(
+                    (results[1].1.copy_bytes - capture) * 4 < results[0].1.copy_bytes - capture
+                );
+            }
+        }
+    }
+}
+
 fn gpu() -> Arc<Descriptors> {
     let mut options = wgpu::InstanceDescriptor::new_without_display_handle();
     options.backends = wgpu::Backends::VULKAN;
