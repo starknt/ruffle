@@ -109,6 +109,17 @@ impl BufferBuilder {
         )
     }
 
+    /// Append an already aligned immutable section without adding per-item padding.
+    pub fn append_section(&mut self, other: &Self) -> Result<Range<u64>, BufferFull> {
+        let start = self.inner.len();
+        let end = start.checked_add(other.inner.len()).ok_or(BufferFull)?;
+        if end as u64 > self.limit {
+            return Err(BufferFull);
+        }
+        self.inner.extend_from_slice(&other.inner);
+        Ok(start as u64..end as u64)
+    }
+
     pub fn copy_to_at(
         self,
         staging_belt: &mut crate::gpu_resources::StagingBelt,

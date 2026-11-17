@@ -356,37 +356,81 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             }
         }
 
-        let uniform_buffer = uniform_buffer.finish(
-            &device,
-            create_debug_label!("Shape {} uniforms", shape_id),
-            wgpu::BufferUsages::UNIFORM,
-        )?;
-        let vertex_buffer = vertex_buffer.finish(
-            &device,
-            create_debug_label!("Shape {} vertices", shape_id),
-            wgpu::BufferUsages::VERTEX,
-        )?;
-        let index_buffer = index_buffer.finish(
-            &device,
-            create_debug_label!("Shape {} indices", shape_id),
-            wgpu::BufferUsages::INDEX,
-        )?;
+        // Immutable sections share one allocation and lease. Uniform offsets
+        // keep their original alignment; draw ranges select the vertex/index
+        // sections. Avoid two extra scoped creations for every small shape.
+        let packed_indices = uniform_buffer.len().checked_add(vertex_buffer.len());
+        let packed_size = packed_indices.and_then(|start| start.checked_add(index_buffer.len()));
+        let packed = packed_indices
+            .zip(packed_size)
+            .filter(|(index_start, bytes)| {
+                uniform_buffer.len().is_multiple_of(4)
+                    && index_start.is_multiple_of(4)
+                    && *bytes as u64 <= self.descriptors.limits.max_buffer_size
+                    && u32::try_from(*index_start / 4)
+                        .ok()
+                        .and_then(|base| base.checked_add(indices_so_far))
+                        .is_some()
+            });
+        let (uniform_buffer, vertex_buffer, index_buffer, storage_bytes) =
+            if let Some((index_start, _)) = packed {
+                let vertex_start = uniform_buffer.len() as u64;
+                let index_start = (index_start / 4) as u32;
+                let mut packed = uniform_buffer;
+                let invalid = |_| {
+                    crate::gpu_runtime::RenderFailure::new(
+                        crate::gpu_runtime::RenderFailureKind::Internal,
+                        "checked immutable mesh sections no longer fit",
+                    )
+                };
+                packed.append_section(&vertex_buffer).map_err(invalid)?;
+                packed.append_section(&index_buffer).map_err(invalid)?;
+                for draw in &mut draws {
+                    draw.vertices.start += vertex_start;
+                    draw.vertices.end += vertex_start;
+                    draw.index_offset += index_start;
+                }
+                let buffer = packed.finish(
+                    &device,
+                    create_debug_label!("Shape {} storage", shape_id),
+                    wgpu::BufferUsages::UNIFORM
+                        | wgpu::BufferUsages::VERTEX
+                        | wgpu::BufferUsages::INDEX,
+                )?;
+                let bytes = buffer.size();
+                (buffer.clone(), buffer.clone(), buffer, bytes)
+            } else {
+                // A legal mesh can exceed the device's single-buffer limit in
+                // aggregate. Choose separate storage before any allocation or
+                // writes; allocation failures themselves are never retried here.
+                let uniforms = uniform_buffer.finish(
+                    &device,
+                    create_debug_label!("Shape {} uniforms", shape_id),
+                    wgpu::BufferUsages::UNIFORM,
+                )?;
+                let vertices = vertex_buffer.finish(
+                    &device,
+                    create_debug_label!("Shape {} vertices", shape_id),
+                    wgpu::BufferUsages::VERTEX,
+                )?;
+                let indices = index_buffer.finish(
+                    &device,
+                    create_debug_label!("Shape {} indices", shape_id),
+                    wgpu::BufferUsages::INDEX,
+                )?;
+                let bytes = uniforms.size() + vertices.size() + indices.size();
+                (uniforms, vertices, indices, bytes)
+            };
 
         let draws: Vec<_> = draws
             .into_iter()
             .map(|d| d.finish(&self.descriptors, &uniform_buffer, &gradients))
             .collect::<Result<_, _>>()?;
 
-        let allocation = ruffle_render::profile::GpuMesh::new(
-            uniform_buffer.size() + vertex_buffer.size() + index_buffer.size(),
-        );
+        let allocation = ruffle_render::profile::GpuMesh::new(storage_bytes);
 
         let retained_bytes = retainable.then_some(()).and_then(|()| {
-            let buffers = uniform_buffer
-                .size()
-                .checked_add(vertex_buffer.size())?
-                .checked_add(index_buffer.size())?;
-            crate::mesh::retained_mesh_bytes(buffers, gradient_count, draws.capacity())
+            crate::mesh::retained_mesh_bytes(storage_bytes, gradient_count, draws.capacity())
         });
         Ok(Mesh {
             retained_bytes,

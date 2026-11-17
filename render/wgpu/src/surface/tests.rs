@@ -879,10 +879,24 @@ fn shape_registration_owns_styles_and_allocates_only_when_visible() {
     };
     assert_eq!(descriptors.runtime.stats().total_bytes, before);
     let mut commands = CommandList::new();
-    commands.render_shape(handle, Transform::default());
+    commands.render_shape(handle.clone(), Transform::default());
     renderer
         .submit_frame(Color::BLACK, commands, vec![])
         .unwrap();
+    let recipe = (&*handle.0 as &dyn std::any::Any)
+        .downcast_ref::<crate::shape_recipe::ShapeRecipe>()
+        .unwrap();
+    let buffers: Vec<_> = descriptors
+        .runtime
+        .resources()
+        .into_iter()
+        .filter(|r| r.owner == recipe.owner && r.kind == crate::gpu_runtime::ResourceKind::Buffer)
+        .collect();
+    assert_eq!(
+        buffers.len(),
+        1,
+        "one immutable mesh fits in one native allocation"
+    );
     let image = renderer.capture_frame().unwrap().unwrap();
     assert!(image.pixels().all(|p| p.0 == [255, 0, 0, 255]));
 }
