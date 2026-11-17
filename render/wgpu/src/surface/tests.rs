@@ -1123,6 +1123,77 @@ fn compositing_uses_copyable_final_targets_without_a_full_surface_copy() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn resolved_compositing_preserves_msaa_samples_outside_modified_regions() {
+    let descriptors = gpu();
+    for quality in [StageQuality::Low, StageQuality::High] {
+        for overlap in [false, true] {
+            let mut images = Vec::new();
+            for stencil_reference in [true, false] {
+                let target = TextureTarget::new(&descriptors.device, (96, 48)).unwrap();
+                let mut renderer =
+                    WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+                renderer.set_quality(quality).unwrap();
+                let mut commands = CommandList::new();
+                if stencil_reference {
+                    commands.push_mask();
+                    rect(&mut commands, 0.0, 0.0, 96.0, 48.0, Color::WHITE);
+                    commands.activate_mask();
+                }
+                // Partially covered samples outside the composite regions must
+                // survive until the final translucent geometry is drawn.
+                rect(
+                    &mut commands,
+                    0.25,
+                    1.25,
+                    94.0,
+                    39.5,
+                    Color::from_rgb(0x30b040, 144),
+                );
+                for (i, mode) in [BlendMode::Multiply, BlendMode::Lighten, BlendMode::Overlay]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let x = if overlap && i == 1 {
+                        12.0
+                    } else {
+                        4.0 + i as f32 * 28.0
+                    };
+                    let mut child = CommandList::new();
+                    rect(
+                        &mut child,
+                        x + 0.25,
+                        5.5,
+                        12.0,
+                        24.0,
+                        Color::from_rgb(0x4070c0 + i as u32 * 0x302010, 160),
+                    );
+                    commands.blend(child, RenderBlendMode::Builtin(mode));
+                }
+                rect(
+                    &mut commands,
+                    0.5,
+                    1.75,
+                    94.0,
+                    39.25,
+                    Color::from_rgb(0xe04090, 128),
+                );
+                if stencil_reference {
+                    commands.deactivate_mask();
+                    rect(&mut commands, 0.0, 0.0, 96.0, 48.0, Color::WHITE);
+                    commands.pop_mask();
+                }
+                renderer
+                    .submit_frame(Color::from_rgb(0xc09060, 255), commands, vec![])
+                    .unwrap();
+                images.push(renderer.capture_frame().unwrap().unwrap().into_raw());
+            }
+            assert_eq!(images[0], images[1], "{quality:?}, overlap={overlap}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn shader_filter_preparation_error_is_returned_without_panicking() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, BitmapHandle, BitmapHandleImpl};
     use ruffle_render::filters::{Filter, ShaderFilter, ShaderObject};

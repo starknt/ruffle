@@ -232,6 +232,26 @@ pub fn run_copy_pipeline(
     sample_count: u32,
     encoder: &mut CommandEncoder,
 ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+    run_copy_regions_pipeline(
+        descriptors,
+        format,
+        frame_view,
+        input,
+        sample_count,
+        encoder,
+        None,
+    )
+}
+
+pub fn run_copy_regions_pipeline(
+    descriptors: &Descriptors,
+    format: wgpu::TextureFormat,
+    frame_view: &crate::gpu_resources::TextureView,
+    input: &crate::gpu_resources::TextureView,
+    sample_count: u32,
+    encoder: &mut CommandEncoder,
+    regions: Option<&[ruffle_render::region::RenderRect]>,
+) -> Result<(), crate::gpu_runtime::RenderFailure> {
     let copy_bind_group = descriptors.cached_bind_group(&wgpu::BindGroupDescriptor {
         layout: &descriptors.bind_layouts.bitmap,
         entries: &[
@@ -253,11 +273,15 @@ pub fn run_copy_pipeline(
 
     // We overwrite the pixels in the target texture (no blending at all),
     // so this doesn't matter.
-    let load = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+    let load = if regions.is_some() {
+        wgpu::LoadOp::Load
+    } else {
+        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+    };
 
     ruffle_render::profile::work(|w| {
         w.render_passes += 1;
-        w.draw_calls += 1;
+        w.draw_calls += regions.map_or(1, |regions| regions.len() as u64);
         w.pipeline_changes += 1;
         w.material_binds += 1;
         w.pass_pixels +=
@@ -280,7 +304,14 @@ pub fn run_copy_pipeline(
     render_pass.set_pipeline(&pipeline);
     render_pass.set_bind_group(2, (&copy_bind_group).raw(), &[]);
 
-    render_pass.draw(0..3, 0..1);
+    if let Some(regions) = regions {
+        for region in regions {
+            render_pass.set_scissor_rect(region.x, region.y, region.width, region.height);
+            render_pass.draw(0..3, 0..1);
+        }
+    } else {
+        render_pass.draw(0..3, 0..1);
+    }
     drop(render_pass);
 
     Ok(())

@@ -3,7 +3,7 @@ use crate::buffer_pool::{AlwaysCompatible, PoolEntry, TexturePool};
 use crate::descriptors::Descriptors;
 use crate::globals::Globals;
 use crate::utils::run_copy_pipeline;
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -248,6 +248,7 @@ pub struct CommandTarget {
     sample_count: u32,
     color_needs_clear: OnceCell<bool>,
     render_target_mode: RenderTargetMode,
+    resolved_changes: RefCell<Vec<ruffle_render::region::RenderRect>>,
 }
 
 impl CommandTarget {
@@ -368,6 +369,7 @@ impl CommandTarget {
             sample_count,
             color_needs_clear: OnceCell::new(),
             render_target_mode,
+            resolved_changes: RefCell::default(),
         })
     }
 
@@ -406,6 +408,57 @@ impl CommandTarget {
 
     pub fn globals(&self) -> &Globals {
         &self.globals
+    }
+
+    pub fn can_composite_resolved(&self) -> bool {
+        self.resolve_buffer.as_ref().is_some_and(|buffer| {
+            buffer
+                .texture()
+                .usage()
+                .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+        })
+    }
+
+    /// Pointwise compositing writes the same value to every MSAA sample. Keep
+    /// those writes in the resolve image until geometry needs individual samples.
+    pub fn resolved_attachment(
+        &self,
+        region: ruffle_render::region::RenderRect,
+    ) -> Option<wgpu::RenderPassColorAttachment<'_>> {
+        self.resolved_changes.borrow_mut().push(region);
+        Some(wgpu::RenderPassColorAttachment {
+            view: self.color_view(),
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })
+    }
+
+    pub fn restore_multisample_regions(
+        &self,
+        descriptors: &Descriptors,
+        encoder: &mut crate::gpu_resources::CommandEncoder,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        let mut regions = self.resolved_changes.borrow_mut();
+        if regions.is_empty() {
+            return Ok(());
+        }
+        // Never restore a bounding union: gaps may still contain distinct AA
+        // samples. Each changed rectangle was fully overwritten by a blend quad.
+        crate::utils::run_copy_regions_pipeline(
+            descriptors,
+            self.format,
+            self.frame_buffer.view(),
+            self.color_view(),
+            self.sample_count,
+            encoder,
+            Some(&regions),
+        )?;
+        regions.clear();
+        Ok(())
     }
 
     pub fn color_attachments(&self) -> Option<wgpu::RenderPassColorAttachment<'_>> {

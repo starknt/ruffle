@@ -189,6 +189,7 @@ impl Surface {
                         needs_stencil,
                         chunk_buffer_builder,
                     } => {
+                        target.restore_multisample_regions(descriptors, draw_encoder)?;
                         chunk_buffer_builder.copy_to(
                             staging_belt,
                             descriptors,
@@ -239,6 +240,7 @@ impl Surface {
                     } => {
                         let parent_blend_buffer =
                             target.update_blend_buffer(descriptors, texture_pool, draw_encoder)?;
+                        target.restore_multisample_regions(descriptors, draw_encoder)?;
                         run_pixelbender_shader_impl(
                             descriptors,
                             shader,
@@ -346,6 +348,14 @@ impl Surface {
                                 ],
                             })?;
 
+                        let resolved = !needs_stencil && target.can_composite_resolved();
+                        let pipelines = if resolved {
+                            target.ensure_cleared(draw_encoder);
+                            descriptors.pipelines(1, self.format)?
+                        } else {
+                            target.restore_multisample_regions(descriptors, draw_encoder)?;
+                            self.pipelines.clone()
+                        };
                         ruffle_render::profile::work(|w| {
                             w.render_passes += 1;
                             w.blend_passes += 1;
@@ -367,7 +377,11 @@ impl Surface {
                                     }
                                 )
                                 .as_deref(),
-                                color_attachments: &[target.color_attachments()],
+                                color_attachments: &[if resolved {
+                                    target.resolved_attachment(region)
+                                } else {
+                                    target.color_attachments()
+                                }],
                                 depth_stencil_attachment: if needs_stencil {
                                     target.stencil_attachment(descriptors, texture_pool)?
                                 } else {
@@ -380,12 +394,11 @@ impl Surface {
                         if needs_stencil {
                             mask_state.apply_stencil_reference(&mut render_pass);
                             render_pass.set_pipeline(
-                                self.pipelines.complex_blends[blend_mode]
-                                    .pipeline_for(mask_state.mode),
+                                pipelines.complex_blends[blend_mode].pipeline_for(mask_state.mode),
                             );
                         } else {
                             render_pass.set_pipeline(
-                                self.pipelines.complex_blends[blend_mode].stencilless_pipeline(),
+                                pipelines.complex_blends[blend_mode].stencilless_pipeline(),
                             );
                         }
 
