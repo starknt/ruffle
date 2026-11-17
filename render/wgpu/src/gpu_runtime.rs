@@ -1,0 +1,605 @@
+//! Device-scoped resource accounting independent of optional profiling.
+//!
+//! The registry owns metadata only. Leases accompany the actual resource owners
+//! and binding dependencies. Once the last lease dies, bytes remain charged until
+//! the last recorded submission completes, even though wgpu owns GPU retirement.
+
+use fnv::{FnvHashMap, FnvHashSet};
+pub use ruffle_render::error::{RenderFailure, RenderFailureKind};
+use std::sync::{
+    Arc, Mutex, MutexGuard, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
+
+const MIB: u64 = 1024 * 1024;
+static NEXT_DEVICE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug)]
+pub struct GpuBudgetConfig {
+    pub hard_limit: u64,
+    pub soft_limit: u64,
+    pub cache_limit: u64,
+    pub idle_limit: u64,
+    pub staging_limit: u64,
+    pub transient_watermark: u64,
+    /// Also bounds metadata for zero-storage views, bindings and samplers.
+    pub resource_limit: usize,
+}
+
+impl GpuBudgetConfig {
+    pub fn for_adapter(adapter: wgpu::DeviceType, android: bool) -> Self {
+        let (hard, cache, idle, staging, transient, resources) = if android {
+            (512, 64, 16, 16, 32, 65_536)
+        } else if adapter == wgpu::DeviceType::DiscreteGpu {
+            (2048, 256, 64, 64, 128, 262_144)
+        } else {
+            (1024, 128, 32, 32, 64, 131_072)
+        };
+        Self {
+            hard_limit: hard * MIB,
+            soft_limit: hard * MIB / 4 * 3,
+            cache_limit: cache * MIB,
+            idle_limit: idle * MIB,
+            staging_limit: staging * MIB,
+            transient_watermark: transient * MIB,
+            resource_limit: resources,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[repr(usize)]
+pub enum ResourceKind {
+    Texture,
+    Buffer,
+    TextureView,
+    BindGroup,
+    Sampler,
+    Pipeline,
+    ShapeMesh,
+    GlyphMesh,
+    OffscreenTarget,
+    ReadbackBuffer,
+    StagingBuffer,
+    Stage3D,
+    Shader,
+    HostTarget,
+    QuerySet,
+}
+
+impl ResourceKind {
+    pub const COUNT: usize = 15;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum OwnerKind {
+    #[default]
+    Renderer,
+    Movie,
+    BitmapData,
+    Graphic,
+    Glyph,
+    Filter,
+    BitmapCache,
+    ShaderJob,
+    Scene,
+    Host,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct ResourceOwner {
+    pub kind: OwnerKind,
+    pub id: u64,
+}
+
+impl ResourceOwner {
+    pub const fn new(kind: OwnerKind, id: u64) -> Self {
+        Self { kind, id }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ResourceId {
+    device: u64,
+    index: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubmissionSerial {
+    device: u64,
+    index: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MemoryPressure {
+    #[default]
+    Normal,
+    Soft,
+    Hard,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceState {
+    Reserved,
+    Active,
+    Idle,
+    Retiring,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResourceInfo {
+    pub id: ResourceId,
+    pub owner: ResourceOwner,
+    pub kind: ResourceKind,
+    pub bytes: u64,
+    pub state: ResourceState,
+    pub created_submission: u64,
+    pub last_submission: u64,
+    pub dependencies: Vec<ResourceId>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuMemoryStats {
+    pub reserved_bytes: u64,
+    pub active_bytes: u64,
+    pub idle_bytes: u64,
+    pub retiring_bytes: u64,
+    pub total_bytes: u64,
+    pub peak_bytes: u64,
+    /// Includes reservations, so pending zero-byte objects cannot bypass limits.
+    pub resources: usize,
+    pub kind_bytes: [u64; ResourceKind::COUNT],
+    pub kind_counts: [usize; ResourceKind::COUNT],
+    pub pressure: MemoryPressure,
+    pub submitted: u64,
+    pub completed: u64,
+}
+
+#[derive(Default)]
+struct Ledger {
+    records: FnvHashMap<ResourceId, ResourceInfo>,
+    stats: GpuMemoryStats,
+    next_resource: u64,
+}
+
+struct Inner {
+    device: u64,
+    config: GpuBudgetConfig,
+    ledger: Mutex<Ledger>,
+    failure: OnceLock<RenderFailure>,
+}
+
+impl Inner {
+    fn ledger(&self) -> MutexGuard<'_, Ledger> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn healthy(&self) -> Result<(), RenderFailure> {
+        self.failure
+            .get()
+            .map_or(Ok(()), |error| Err(error.clone()))
+    }
+}
+
+#[derive(Clone)]
+pub struct GpuRuntime(Arc<Inner>);
+
+impl std::fmt::Debug for GpuRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuRuntime")
+            .field("device", &self.0.device)
+            .field("stats", &self.stats())
+            .finish_non_exhaustive()
+    }
+}
+
+fn failure(kind: RenderFailureKind, message: impl Into<Arc<str>>) -> RenderFailure {
+    RenderFailure::new(kind, message)
+}
+
+impl GpuRuntime {
+    pub fn new(config: GpuBudgetConfig) -> Result<Self, RenderFailure> {
+        if config.soft_limit > config.hard_limit || config.resource_limit == 0 {
+            return Err(failure(
+                RenderFailureKind::Validation,
+                "invalid GPU budget configuration",
+            ));
+        }
+        let device = NEXT_DEVICE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+            .map_err(|_| {
+                failure(
+                    RenderFailureKind::Internal,
+                    "device identity space exhausted",
+                )
+            })?;
+        Ok(Self(Arc::new(Inner {
+            device,
+            config,
+            ledger: Mutex::default(),
+            failure: OnceLock::new(),
+        })))
+    }
+
+    pub fn config(&self) -> GpuBudgetConfig {
+        self.0.config
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.0.device
+    }
+
+    pub fn failure(&self) -> Option<RenderFailure> {
+        self.0.failure.get().cloned()
+    }
+
+    /// Preserve the initiating cause rather than cascading invalid-resource errors.
+    pub fn fail(&self, error: RenderFailure) -> bool {
+        self.0.failure.set(error).is_ok()
+    }
+
+    pub fn check_health(&self) -> Result<(), RenderFailure> {
+        self.0.healthy()
+    }
+
+    pub fn reserve(
+        &self,
+        kind: ResourceKind,
+        owner: ResourceOwner,
+        bytes: u64,
+    ) -> Result<ResourceReservation, RenderFailure> {
+        let mut ledger = self.0.ledger();
+        self.0.healthy()?;
+        let total = ledger
+            .stats
+            .total_bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= self.0.config.hard_limit);
+        if total.is_none() || ledger.stats.resources >= self.0.config.resource_limit {
+            return Err(failure(
+                RenderFailureKind::BudgetExceeded,
+                format!(
+                    "GPU {:?} request {bytes} bytes exceeds budget ({} used, {} limit, {} resources)",
+                    kind,
+                    ledger.stats.total_bytes,
+                    self.0.config.hard_limit,
+                    ledger.stats.resources
+                ),
+            ));
+        }
+        if kind == ResourceKind::StagingBuffer
+            && ledger.stats.kind_bytes[kind as usize]
+                .checked_add(bytes)
+                .is_none_or(|size| size > self.0.config.staging_limit)
+        {
+            return Err(failure(
+                RenderFailureKind::BudgetExceeded,
+                "GPU staging budget exceeded",
+            ));
+        }
+        ledger.next_resource = ledger.next_resource.checked_add(1).ok_or_else(|| {
+            failure(
+                RenderFailureKind::Internal,
+                "resource identity space exhausted",
+            )
+        })?;
+        let id = ResourceId {
+            device: self.0.device,
+            index: ledger.next_resource,
+        };
+        let created_submission = ledger.stats.submitted;
+        ledger.insert(ResourceInfo {
+            id,
+            owner,
+            kind,
+            bytes,
+            state: ResourceState::Reserved,
+            created_submission,
+            last_submission: 0,
+            dependencies: Vec::new(),
+        });
+        Ok(ResourceReservation {
+            runtime: self.clone(),
+            id: Some(id),
+        })
+    }
+
+    pub fn stats(&self) -> GpuMemoryStats {
+        let mut stats = self.0.ledger().stats;
+        stats.pressure = if stats.total_bytes >= self.0.config.hard_limit {
+            MemoryPressure::Hard
+        } else if stats.total_bytes >= self.0.config.soft_limit {
+            MemoryPressure::Soft
+        } else {
+            MemoryPressure::Normal
+        };
+        stats
+    }
+
+    pub fn owner_bytes(&self, owner: ResourceOwner) -> u64 {
+        self.0
+            .ledger()
+            .records
+            .values()
+            .filter(|r| r.owner == owner)
+            .map(|r| r.bytes)
+            .sum()
+    }
+
+    /// Detailed attribution is opt-in; frame gauges do not clone the registry.
+    pub fn resources(&self) -> Vec<ResourceInfo> {
+        self.0.ledger().records.values().cloned().collect()
+    }
+
+    /// Call under the queue's submission ordering gate. Include all resources
+    /// recorded in the encoder; binding dependencies are visited transitively.
+    pub fn register_submission(
+        &self,
+        resources: &[ResourceLease],
+    ) -> Result<SubmissionSerial, RenderFailure> {
+        self.0.healthy()?;
+        if resources
+            .iter()
+            .any(|r| !Arc::ptr_eq(&r.0.runtime.0, &self.0))
+        {
+            return Err(failure(
+                RenderFailureKind::Validation,
+                "submission references another device",
+            ));
+        }
+        let mut ledger = self.0.ledger();
+        let serial = ledger.stats.submitted.checked_add(1).ok_or_else(|| {
+            failure(
+                RenderFailureKind::Internal,
+                "submission identity space exhausted",
+            )
+        })?;
+        let mut pending: Vec<_> = resources.iter().map(ResourceLease::id).collect();
+        let mut visited = FnvHashSet::default();
+        while let Some(id) = pending.pop() {
+            if visited.insert(id) {
+                let record = ledger.records.get_mut(&id).ok_or_else(|| {
+                    failure(
+                        RenderFailureKind::Validation,
+                        "submission references a retired resource",
+                    )
+                })?;
+                record.last_submission = serial;
+                pending.extend_from_slice(&record.dependencies);
+            }
+        }
+        ledger.stats.submitted = serial;
+        Ok(SubmissionSerial {
+            device: self.0.device,
+            index: serial,
+        })
+    }
+
+    /// Queue completion is a prefix: completion of N also completes older work.
+    /// Reject foreign or unissued tokens, including stale device callbacks.
+    pub fn complete_submission(&self, serial: SubmissionSerial) -> bool {
+        if serial.device != self.0.device {
+            return false;
+        }
+        let mut ledger = self.0.ledger();
+        if serial.index <= ledger.stats.completed || serial.index > ledger.stats.submitted {
+            return false;
+        }
+        ledger.stats.completed = serial.index;
+        let retired: Vec<_> = ledger
+            .records
+            .values()
+            .filter(|r| r.state == ResourceState::Retiring && r.last_submission <= serial.index)
+            .map(|r| r.id)
+            .collect();
+        for id in retired {
+            ledger.remove(id);
+        }
+        true
+    }
+}
+
+impl Ledger {
+    fn bucket(&mut self, state: ResourceState) -> &mut u64 {
+        match state {
+            ResourceState::Reserved => &mut self.stats.reserved_bytes,
+            ResourceState::Active => &mut self.stats.active_bytes,
+            ResourceState::Idle => &mut self.stats.idle_bytes,
+            ResourceState::Retiring => &mut self.stats.retiring_bytes,
+        }
+    }
+
+    fn insert(&mut self, record: ResourceInfo) {
+        *self.bucket(record.state) += record.bytes;
+        self.stats.total_bytes += record.bytes;
+        self.stats.peak_bytes = self.stats.peak_bytes.max(self.stats.total_bytes);
+        self.stats.resources += 1;
+        self.stats.kind_bytes[record.kind as usize] += record.bytes;
+        self.stats.kind_counts[record.kind as usize] += 1;
+        self.records.insert(record.id, record);
+    }
+
+    fn transition(&mut self, id: ResourceId, state: ResourceState) {
+        if let Some(record) = self.records.get_mut(&id) {
+            let old = record.state;
+            let bytes = record.bytes;
+            record.state = state;
+            *self.bucket(old) -= bytes;
+            *self.bucket(state) += bytes;
+        }
+    }
+
+    fn remove(&mut self, id: ResourceId) {
+        if let Some(record) = self.records.remove(&id) {
+            *self.bucket(record.state) -= record.bytes;
+            self.stats.total_bytes -= record.bytes;
+            self.stats.resources -= 1;
+            self.stats.kind_bytes[record.kind as usize] -= record.bytes;
+            self.stats.kind_counts[record.kind as usize] -= 1;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ResourceReservation {
+    runtime: GpuRuntime,
+    id: Option<ResourceId>,
+}
+
+impl ResourceReservation {
+    pub fn commit(
+        mut self,
+        dependencies: &[ResourceLease],
+    ) -> Result<ResourceLease, RenderFailure> {
+        self.runtime.check_health()?;
+        if dependencies
+            .iter()
+            .any(|r| !Arc::ptr_eq(&r.0.runtime.0, &self.runtime.0))
+        {
+            return Err(failure(
+                RenderFailureKind::Validation,
+                "binding depends on another device",
+            ));
+        }
+        // A reservation is consumed once; its ID remains present until this call
+        // succeeds, so every error path is rolled back by Drop.
+        let id = self
+            .id
+            .ok_or_else(|| failure(RenderFailureKind::Internal, "reservation already consumed"))?;
+        {
+            let mut ledger = self.runtime.0.ledger();
+            ledger.transition(id, ResourceState::Active);
+            if let Some(record) = ledger.records.get_mut(&id) {
+                record.dependencies = dependencies.iter().map(ResourceLease::id).collect();
+            }
+        }
+        self.id = None;
+        Ok(ResourceLease(Arc::new(Allocation {
+            runtime: self.runtime.clone(),
+            id,
+            _dependencies: dependencies.to_vec(),
+        })))
+    }
+}
+
+impl Drop for ResourceReservation {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.runtime.0.ledger().remove(id);
+        }
+    }
+}
+
+struct Allocation {
+    runtime: GpuRuntime,
+    id: ResourceId,
+    // These mirror the owning GPU object's references, not registry ownership.
+    _dependencies: Vec<ResourceLease>,
+}
+
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        let mut ledger = self.runtime.0.ledger();
+        let pending = ledger
+            .records
+            .get(&self.id)
+            .is_some_and(|r| r.last_submission > ledger.stats.completed);
+        if pending {
+            ledger.transition(self.id, ResourceState::Retiring);
+        } else {
+            ledger.remove(self.id);
+        }
+        // Release the mutex before fields (and their dependency leases) drop.
+    }
+}
+
+#[derive(Clone)]
+pub struct ResourceLease(Arc<Allocation>);
+
+impl std::fmt::Debug for ResourceLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ResourceLease").field(&self.id()).finish()
+    }
+}
+
+impl ResourceLease {
+    pub fn id(&self) -> ResourceId {
+        self.0.id
+    }
+
+    pub fn set_idle(&self, idle: bool) {
+        self.0.runtime.0.ledger().transition(
+            self.id(),
+            if idle {
+                ResourceState::Idle
+            } else {
+                ResourceState::Active
+            },
+        );
+    }
+
+    pub fn is_reusable(&self) -> bool {
+        let ledger = self.0.runtime.0.ledger();
+        ledger
+            .records
+            .get(&self.id())
+            .is_some_and(|r| r.last_submission <= ledger.stats.completed)
+    }
+}
+
+/// Conservative storage accounting, not the driver's allocation/block overhead.
+pub fn texture_storage_bytes(desc: &wgpu::TextureDescriptor<'_>) -> Result<u64, RenderFailure> {
+    let invalid = || {
+        failure(
+            RenderFailureKind::Validation,
+            "invalid or overflowing texture extent",
+        )
+    };
+    let size = desc.size;
+    if size.width == 0
+        || size.height == 0
+        || size.depth_or_array_layers == 0
+        || desc.mip_level_count == 0
+        || desc.sample_count == 0
+        || !desc.sample_count.is_power_of_two()
+    {
+        return Err(invalid());
+    }
+    let max_dimension = match desc.dimension {
+        wgpu::TextureDimension::D1 => size.width,
+        wgpu::TextureDimension::D2 => size.width.max(size.height),
+        wgpu::TextureDimension::D3 => size.width.max(size.height).max(size.depth_or_array_layers),
+    };
+    if desc.mip_level_count > max_dimension.ilog2() + 1 {
+        return Err(invalid());
+    }
+    let block_bytes = match desc.format {
+        wgpu::TextureFormat::Depth24Plus => 4,
+        wgpu::TextureFormat::Depth24PlusStencil8 | wgpu::TextureFormat::Depth32FloatStencil8 => 8,
+        format => format.block_copy_size(None).ok_or_else(invalid)?,
+    };
+    let (block_width, block_height) = desc.format.block_dimensions();
+    let mut total = 0u64;
+    for level in 0..desc.mip_level_count {
+        let width = u64::from((size.width >> level).max(1)).div_ceil(u64::from(block_width));
+        let height = u64::from((size.height >> level).max(1)).div_ceil(u64::from(block_height));
+        let depth = if desc.dimension == wgpu::TextureDimension::D3 {
+            (size.depth_or_array_layers >> level).max(1)
+        } else {
+            size.depth_or_array_layers
+        };
+        let bytes = width
+            .checked_mul(height)
+            .and_then(|v| v.checked_mul(u64::from(depth)))
+            .and_then(|v| v.checked_mul(u64::from(block_bytes)))
+            .and_then(|v| v.checked_mul(u64::from(desc.sample_count)))
+            .ok_or_else(invalid)?;
+        total = total.checked_add(bytes).ok_or_else(invalid)?;
+    }
+    Ok(total)
+}
+
+#[cfg(test)]
+mod tests;

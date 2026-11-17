@@ -36,6 +36,7 @@ mod bitmap_residency;
 mod bitmaps;
 mod context3d;
 mod globals;
+pub mod gpu_runtime;
 mod pipelines;
 mod pixel_bender;
 pub mod target;
