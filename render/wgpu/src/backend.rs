@@ -769,16 +769,14 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     LayerRef::None,
                     &mut self.offscreen_texture_pool,
                 )?;
-                for filter in entry.filters {
-                    target = self.descriptors.filters.apply(
-                        &self.descriptors,
-                        &mut scope.scope(filter.name()),
-                        &mut self.offscreen_texture_pool,
-                        &mut self.active_frame.staging_belt,
-                        FilterSource::for_entire_texture(target.color_texture()),
-                        filter,
-                    )?;
-                }
+                target = self.descriptors.filters.apply_chain(
+                    &self.descriptors,
+                    &mut scope.scope("Filter chain"),
+                    &mut self.offscreen_texture_pool,
+                    &mut self.active_frame.staging_belt,
+                    FilterSource::for_entire_texture(target.color_texture()),
+                    entry.filters,
+                )?;
                 run_copy_pipeline(
                     &self.descriptors,
                     texture.texture.format(),
@@ -1421,6 +1419,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 },
                 depth_slice: None,
             }),
+            None,
             1,
             // When running a standalone shader, we always process the entire image
             &FilterSource::for_entire_texture(&target_texture.texture),

@@ -164,6 +164,11 @@ impl BlurFilter {
         source: &FilterSource,
         filter: &BlurFilterArgs,
     ) -> Result<Option<CommandTarget>, crate::gpu_runtime::RenderFailure> {
+        if filter.num_passes() == 0
+            || (filter.blur_x.to_f32() <= 1.0 && filter.blur_y.to_f32() <= 1.0)
+        {
+            return Ok(None);
+        }
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
         let pipeline = self.pipeline(descriptors, sample_count)?;

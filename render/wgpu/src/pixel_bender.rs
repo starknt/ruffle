@@ -1,4 +1,5 @@
 use crate::gpu_resources::CommandEncoder;
+use crate::surface::mask::{MaskMode, MaskState};
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -32,7 +33,7 @@ use crate::{
 pub struct PixelBenderWgpuShader {
     bind_group_layout: crate::gpu_resources::BindGroupLayout,
     pipeline_layout: PipelineLayout,
-    pipelines: RefCell<HashMap<(u32, wgpu::TextureFormat), RenderPipeline>>,
+    pipelines: RefCell<HashMap<(u32, wgpu::TextureFormat, Option<MaskMode>), RenderPipeline>>,
     vertex_shader: crate::gpu_resources::ShaderModule,
     fragment_shader: crate::gpu_resources::ShaderModule,
     shader: PixelBenderShader,
@@ -55,10 +56,11 @@ impl PixelBenderWgpuShader {
         descriptors: &Descriptors,
         samples: u32,
         format: TextureFormat,
+        mask: Option<MaskMode>,
     ) -> Result<crate::gpu_resources::RenderPipeline, crate::gpu_runtime::RenderFailure> {
         Ok(crate::gpu_resources::try_cached(
             &mut self.pipelines.borrow_mut(),
-            (samples, format),
+            (samples, format, mask),
             || {
                 descriptors
                     .device
@@ -81,12 +83,12 @@ impl PixelBenderWgpuShader {
                                     color: BlendComponent::OVER,
                                     alpha: BlendComponent::OVER,
                                 }),
-                                write_mask: ColorWrites::all(),
+                                write_mask: mask.map_or(ColorWrites::ALL, MaskMode::color_writes),
                             })],
                             compilation_options: Default::default(),
                         }),
                         primitive: Default::default(),
-                        depth_stencil: None,
+                        depth_stencil: mask.map(MaskMode::pipeline_stencil),
                         multisample: wgpu::MultisampleState {
                             count: samples,
                             mask: !0,
@@ -369,6 +371,7 @@ pub(super) fn run_pixelbender_shader_impl(
     target: &crate::gpu_resources::Texture,
     render_command_encoder: &mut CommandEncoder,
     color_attachment: Option<wgpu::RenderPassColorAttachment>,
+    stencil: Option<(MaskState, wgpu::RenderPassDepthStencilAttachment)>,
     sample_count: u32,
     // FIXME - do we cover the whole source or the whole dest?
     source: &FilterSource,
@@ -661,7 +664,12 @@ pub(super) fn run_pixelbender_shader_impl(
             usage: BufferUsages::VERTEX,
         })?;
 
-    let pipeline = compiled_shader.get_pipeline(descriptors, sample_count, target.format())?;
+    let pipeline = compiled_shader.get_pipeline(
+        descriptors,
+        sample_count,
+        target.format(),
+        stencil.as_ref().map(|(mask, _)| mask.mode),
+    )?;
 
     ruffle_render::profile::work(|w| {
         w.render_passes += 1;
@@ -671,14 +679,18 @@ pub(super) fn run_pixelbender_shader_impl(
         w.material_binds += 1;
         w.pass_pixels += u64::from(target.width()) * u64::from(target.height());
     });
+    let mask = stencil.as_ref().map(|(mask, _)| *mask);
     let mut render_pass = render_command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("PixelBender render pass"),
         color_attachments: &[color_attachment],
-        depth_stencil_attachment: None,
+        depth_stencil_attachment: stencil.map(|(_, attachment)| attachment),
         ..Default::default()
     });
     render_pass.set_bind_group(0, (&bind_group).raw(), &[]);
     render_pass.set_pipeline(&pipeline);
+    if let Some(mask) = mask {
+        mask.apply_stencil_reference(&mut render_pass);
+    }
 
     render_pass.set_vertex_buffer(0, vertices.slice(..));
     render_pass.set_index_buffer(

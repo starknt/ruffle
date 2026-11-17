@@ -229,7 +229,6 @@ impl Surface {
                         needs_stencil,
                         region: _,
                     } => {
-                        assert!(!needs_stencil, "Shader blend mode not implemented in masks");
                         let parent_blend_buffer =
                             target.update_blend_buffer(descriptors, texture_pool, draw_encoder)?;
                         run_pixelbender_shader_impl(
@@ -255,6 +254,13 @@ impl Surface {
                             parent_blend_buffer.texture(),
                             draw_encoder,
                             target.color_attachments(),
+                            if needs_stencil {
+                                target
+                                    .stencil_attachment(descriptors, texture_pool)?
+                                    .map(|attachment| (mask_state, attachment))
+                            } else {
+                                None
+                            },
                             target.sample_count(),
                             &FilterSource::for_entire_texture(texture.texture()),
                         )

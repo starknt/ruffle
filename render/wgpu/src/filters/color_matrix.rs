@@ -8,6 +8,13 @@ use crate::utils::SampleCountMap;
 use std::sync::OnceLock;
 use swf::ColorMatrixFilter as ColorMatrixFilterArgs;
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MatrixChain {
+    channels: [u32; 4],
+    matrix: [f32; 20],
+}
+
 pub struct ColorMatrixFilter {
     bind_group_layout: crate::gpu_resources::BindGroupLayout,
     pipeline_layout: crate::gpu_resources::PipelineLayout,
@@ -22,7 +29,7 @@ impl ColorMatrixFilter {
     pub fn new(
         device: &crate::gpu_resources::Device,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
-        let uniform_size = std::mem::size_of::<[f32; 20]>() as u64;
+        let uniform_size = std::mem::size_of::<MatrixChain>() as u64;
 
         let bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -143,6 +150,47 @@ impl ColorMatrixFilter {
         source: &FilterSource,
         filter: &ColorMatrixFilterArgs,
     ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
+        self.apply_chain(
+            descriptors,
+            texture_pool,
+            draw_encoder,
+            staging_belt,
+            source,
+            std::slice::from_ref(filter),
+        )
+    }
+
+    pub fn apply_chain(
+        &self,
+        descriptors: &Descriptors,
+        texture_pool: &mut TexturePool,
+        draw_encoder: &mut crate::gpu_resources::CommandEncoder,
+        staging_belt: &mut StagingBelt,
+        source: &FilterSource,
+        filters: &[ColorMatrixFilterArgs],
+    ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
+        if filters.is_empty() || filters.len() > super::graph::MAX_POINTWISE_FILTERS {
+            return Err(crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::Validation,
+                "invalid pointwise filter chain length",
+            ));
+        }
+        let mut uniforms = MatrixChain {
+            channels: [0, 1, 2, 3],
+            matrix: filters[filters.len() - 1].matrix,
+        };
+        for filter in &filters[..filters.len() - 1] {
+            let channels = super::graph::channel_permutation(filter).ok_or_else(|| {
+                crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Validation,
+                    "inexact intermediate color matrix fusion",
+                )
+            })?;
+            let previous = uniforms.channels;
+            for (output, input) in channels.into_iter().enumerate() {
+                uniforms.channels[output] = previous[input as usize];
+            }
+        }
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
         let pipeline = self.pipeline(descriptors, sample_count)?;
@@ -163,7 +211,7 @@ impl ColorMatrixFilter {
         let source_view = source.texture.create_view(&Default::default())?;
         staging_belt
             .write_buffer(draw_encoder, &self.uniform_buffer, 0, self.uniform_size)?
-            .copy_from_slice(bytemuck::cast_slice(&filter.matrix));
+            .copy_from_slice(bytemuck::bytes_of(&uniforms));
         staging_belt
             .write_buffer(draw_encoder, &self.vertex_buffer, 0, self.vertices_size)?
             .copy_from_slice(bytemuck::cast_slice(&[source.vertices()]));

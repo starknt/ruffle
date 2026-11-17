@@ -1014,3 +1014,349 @@ fn shader_filter_preparation_error_is_returned_without_panicking() {
         matches!(result, Err(ruffle_render::error::Error::Render(error)) if error.kind() == crate::gpu_runtime::RenderFailureKind::Validation)
     );
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn pointwise_filter_chain_preserves_intermediate_rgba8_quantization() {
+    let width = 256;
+    let height = 16;
+    let mut pixels = Vec::new();
+    for alpha in [
+        0u32, 1, 2, 3, 7, 16, 31, 63, 64, 127, 128, 192, 223, 254, 255, 201,
+    ] {
+        for x in 0..width {
+            pixels.extend([
+                (x * alpha / 255) as u8,
+                ((255 - x) * alpha / 255) as u8,
+                (((x * 17) % 256) * alpha / 255) as u8,
+                alpha as u8,
+            ]);
+        }
+    }
+    let filters = vec![
+        swf::ColorMatrixFilter {
+            matrix: [
+                1.13, 0.07, -0.1, 0.0, 5.25, 0.0, 0.93, 0.12, 0.0, -3.75, 0.0, -0.13, 1.1, 0.0,
+                2.5, 0.0, 0.0, 0.0, 0.8, 3.25,
+            ],
+        },
+        swf::ColorMatrixFilter {
+            matrix: [
+                0.79, 0.0, 0.0, 0.0, -2.5, 0.0, 1.17, 0.0, 0.0, 1.5, 0.11, 0.0, 0.88, 0.0, 0.5,
+                0.0, 0.0, 0.0, 1.1, -1.25,
+            ],
+        },
+        swf::ColorMatrixFilter {
+            matrix: [
+                1.01, 0.0, 0.0, 0.0, 0.5, 0.0, 0.99, 0.0, 0.0, -0.5, 0.0, 0.0, 1.02, 0.0, 0.25,
+                0.0, 0.0, 0.0, 0.75, 0.0,
+            ],
+        },
+    ];
+    let results = render_color_matrix_test(&filters, pixels, width, height);
+    let mismatch = results[0]
+        .0
+        .iter()
+        .zip(&results[1].0)
+        .enumerate()
+        .find(|(_, (a, b))| a != b);
+    assert!(
+        mismatch.is_none(),
+        "fusion changed intermediate quantization at {mismatch:?}"
+    );
+    assert_eq!(results[0].1, 3);
+    assert_eq!(
+        results[1].1, 3,
+        "general matrices must retain native attachment quantization"
+    );
+}
+
+fn render_color_matrix_test(
+    filters: &[swf::ColorMatrixFilter],
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> Vec<(Vec<u8>, u64)> {
+    let filters: Vec<_> = filters
+        .iter()
+        .cloned()
+        .map(ruffle_render::filters::Filter::ColorMatrixFilter)
+        .collect();
+    render_filter_chain_test(&filters, pixels, width, height)
+}
+
+fn render_filter_chain_test(
+    filters: &[ruffle_render::filters::Filter],
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> Vec<(Vec<u8>, u64)> {
+    use ruffle_render::{
+        backend::BitmapCacheEntry,
+        bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping},
+        transform::Transform,
+    };
+    let descriptors = gpu();
+    let mut results = Vec::new();
+    for chain in [false, true] {
+        let target = TextureTarget::new(&descriptors.device, (width, height)).unwrap();
+        let mut renderer =
+            WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+        renderer.set_quality(StageQuality::Low).unwrap();
+        let source = renderer
+            .register_bitmap(Bitmap::new(
+                width,
+                height,
+                BitmapFormat::Rgba,
+                pixels.clone(),
+            ))
+            .unwrap();
+        let empty = || {
+            Bitmap::new(
+                width,
+                height,
+                BitmapFormat::Rgba,
+                vec![0; (width * height * 4) as usize],
+            )
+        };
+        let draw = |bitmap| {
+            let mut list = CommandList::new();
+            list.render_bitmap(
+                bitmap,
+                Transform::default(),
+                false,
+                PixelSnapping::Never,
+                PixelRegion::for_whole_size(width, height),
+            );
+            list
+        };
+        let metrics = ruffle_render::profile::RenderMetrics::default();
+        let _scope = ruffle_render::profile::enter(Some(&metrics));
+        if chain {
+            let destination = renderer.register_bitmap(empty()).unwrap();
+            renderer
+                .submit_frame(
+                    Color::TRANSPARENT,
+                    draw(destination.clone()),
+                    vec![BitmapCacheEntry {
+                        handle: destination,
+                        commands: draw(source),
+                        clear: Color::TRANSPARENT,
+                        filters: filters.to_vec(),
+                    }],
+                )
+                .unwrap();
+        } else {
+            let mut source = source;
+            for filter in filters {
+                let destination = renderer.register_bitmap(empty()).unwrap();
+                renderer
+                    .apply_filter(
+                        source,
+                        (0, 0),
+                        (width, height),
+                        destination.clone(),
+                        (0, 0),
+                        filter.clone(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                source = destination;
+            }
+            renderer
+                .submit_frame(Color::TRANSPARENT, draw(source), vec![])
+                .unwrap();
+        }
+        results.push((
+            renderer.capture_frame().unwrap().unwrap().into_raw(),
+            metrics.snapshot().work.filter_passes,
+        ));
+    }
+    results
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn pointwise_filter_chain_matches_rgba8_rounding_at_half_steps() {
+    let filters = [
+        swf::ColorMatrixFilter {
+            matrix: [
+                0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 2.5, 0.0,
+                0.0, 0.0, 0.0, 255.0,
+            ],
+        },
+        swf::ColorMatrixFilter::default(),
+    ];
+    let results = render_color_matrix_test(&filters, vec![255; 4], 1, 1);
+    assert_eq!(results[1].0, results[0].0);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn pointwise_channel_permutations_fuse_without_changing_alpha_or_bytes() {
+    let mut rotate = swf::ColorMatrixFilter::default();
+    rotate.matrix[0] = 0.0;
+    rotate.matrix[1] = 1.0;
+    rotate.matrix[6] = 0.0;
+    rotate.matrix[7] = 1.0;
+    rotate.matrix[12] = 0.0;
+    rotate.matrix[10] = 1.0;
+    let mut last = swf::ColorMatrixFilter::default();
+    last.matrix[0] = 1.13;
+    last.matrix[4] = 5.25;
+    last.matrix[6] = 0.93;
+    last.matrix[9] = -3.75;
+    last.matrix[18] = 0.8;
+    last.matrix[19] = 3.25;
+    let mut pixels = Vec::new();
+    for alpha in 0..=255u32 {
+        for x in 0..=255u32 {
+            pixels.extend([
+                (x * alpha / 255) as u8,
+                ((255 - x) * alpha / 255) as u8,
+                (((x * 17) % 256) * alpha / 255) as u8,
+                alpha as u8,
+            ]);
+        }
+    }
+    let results = render_color_matrix_test(&[rotate.clone(), rotate, last], pixels, 256, 256);
+    let mismatch = results[0]
+        .0
+        .iter()
+        .zip(&results[1].0)
+        .enumerate()
+        .find(|(_, (a, b))| a != b);
+    assert!(
+        mismatch.is_none(),
+        "channel fusion changed a byte: {mismatch:?}"
+    );
+    assert_eq!(results[0].1, 3);
+    assert_eq!(results[1].1, 1);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn shader_blend_keeps_shader_pixels_inside_a_stencil_mask() {
+    for quality in [StageQuality::Low, StageQuality::High] {
+        let descriptors = gpu();
+        let mut images = Vec::new();
+        for masked in [false, true] {
+            let target = TextureTarget::new(&descriptors.device, (32, 32)).unwrap();
+            let mut renderer =
+                WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+            renderer.set_quality(quality).unwrap();
+            let shader = renderer.compile_pixelbender_shader(ruffle_render::pixel_bender::parse_shader(include_bytes!("../../../../tests/tests/swfs/visual/blend_modes/shader_as_mask/shader.pbj"), false).unwrap()).unwrap();
+            let mut commands = CommandList::new();
+            rect(&mut commands, 0.0, 0.0, 32.0, 32.0, Color::BLUE);
+            if masked {
+                commands.push_mask();
+                rect(&mut commands, 0.0, 0.0, 16.0, 32.0, Color::WHITE);
+                commands.activate_mask();
+            }
+            let mut foreground = CommandList::new();
+            rect(&mut foreground, 0.0, 0.0, 32.0, 32.0, Color::RED);
+            commands.blend(foreground, RenderBlendMode::Shader(shader));
+            if masked {
+                commands.deactivate_mask();
+                rect(&mut commands, 0.0, 0.0, 16.0, 32.0, Color::WHITE);
+                commands.pop_mask();
+            }
+            rect(&mut commands, 0.0, 28.0, 32.0, 4.0, Color::GREEN);
+            renderer
+                .submit_frame(Color::BLACK, commands, vec![])
+                .unwrap();
+            images.push(renderer.capture_frame().unwrap().unwrap());
+        }
+        let expected = images[0].get_pixel(8, 16);
+        assert!(
+            expected.0[0] > 0 && expected.0[2] > 0,
+            "reference must blend both inputs"
+        );
+        assert_eq!(images[1].get_pixel(8, 16), expected);
+        assert_eq!(images[1].get_pixel(24, 16).0, [0, 0, 255, 255]);
+        assert_eq!(images[1].get_pixel(8, 30).0, [0, 255, 0, 255]);
+        assert_eq!(images[1].get_pixel(24, 30).0, [0, 255, 0, 255]);
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn noop_blur_does_not_allocate_intermediates() {
+    let descriptors = gpu();
+    let source = descriptors
+        .device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .unwrap();
+    let mut pool = crate::buffer_pool::TexturePool::new(crate::idle_pool::Budget::with_runtime(
+        &descriptors.runtime,
+    ));
+    let mut encoder = descriptors
+        .device
+        .create_command_encoder(&Default::default())
+        .unwrap();
+    let mut belt = crate::gpu_resources::StagingBelt::new(descriptors.device.clone(), 64);
+    let before = descriptors.runtime.stats();
+    let result = descriptors
+        .filters
+        .blur
+        .apply(
+            &descriptors,
+            &mut pool,
+            &mut encoder,
+            &mut belt,
+            &crate::filters::FilterSource::for_entire_texture(&source),
+            &swf::BlurFilter {
+                blur_x: swf::Fixed16::ONE,
+                blur_y: swf::Fixed16::ONE,
+                flags: swf::BlurFilterFlags::from_passes(3),
+            },
+        )
+        .unwrap();
+    assert!(result.is_none());
+    assert_eq!(descriptors.runtime.stats().total_bytes, before.total_bytes);
+    assert_eq!(descriptors.runtime.stats().resources, before.resources);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn filter_chain_preserves_fractional_blur_halos_at_image_edges() {
+    use ruffle_render::filters::Filter;
+    let filters = [
+        Filter::BlurFilter(swf::BlurFilter {
+            blur_x: swf::Fixed16::from_f32(5.5),
+            blur_y: swf::Fixed16::from_f32(3.5),
+            flags: swf::BlurFilterFlags::from_passes(2),
+        }),
+        Filter::ColorMatrixFilter(Default::default()),
+        Filter::BlurFilter(swf::BlurFilter {
+            blur_x: swf::Fixed16::from_f32(2.5),
+            blur_y: swf::Fixed16::ONE,
+            flags: swf::BlurFilterFlags::from_passes(1),
+        }),
+    ];
+    let graph = crate::filters::graph::FilterGraph::new(&filters, true);
+    assert_eq!(
+        graph.required_input([1, 1, 3, 3], [0, 0, 32, 32]),
+        [0, 0, 10, 7]
+    );
+    let mut pixels = vec![0; 32 * 32 * 4];
+    for (x, y) in [(0, 0), (0, 15), (15, 31), (31, 31), (16, 16)] {
+        pixels[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4].copy_from_slice(&[255; 4]);
+    }
+    let results = render_filter_chain_test(&filters, pixels, 32, 32);
+    assert_eq!(results[0].0, results[1].0);
+    assert!(results[1].0[3] > 0, "edge contribution must survive");
+}

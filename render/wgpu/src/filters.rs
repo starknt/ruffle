@@ -4,6 +4,7 @@ mod color_matrix;
 mod displacement_map;
 mod drop_shadow;
 mod glow;
+pub(crate) mod graph;
 mod shader;
 
 use std::collections::HashSet;
@@ -205,6 +206,72 @@ impl Filters {
             glow: GlowFilter::new(device)?,
             bevel: BevelFilter::new(device)?,
             displacement_map: DisplacementMapFilter::new(device)?,
+        })
+    }
+
+    pub fn apply_chain(
+        &self,
+        descriptors: &Descriptors,
+        draw_encoder: &mut crate::gpu_resources::CommandEncoder,
+        texture_pool: &mut TexturePool,
+        staging_belt: &mut StagingBelt,
+        source: FilterSource,
+        filters: Vec<Filter>,
+    ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
+        let graph = graph::FilterGraph::new(
+            &filters,
+            source.texture.sample_count() == 1
+                && source.texture.format() == wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let mut current: Option<CommandTarget> = None;
+        for step in graph.steps {
+            let input = current
+                .as_ref()
+                .map(|target| FilterSource::for_entire_texture(target.color_texture()));
+            let source = input.as_ref().unwrap_or(&source);
+            let next = match step {
+                graph::FilterStep::Pointwise(range) => {
+                    let matrices: smallvec::SmallVec<[swf::ColorMatrixFilter; 16]> = filters[range]
+                        .iter()
+                        .filter_map(|filter| {
+                            if let Filter::ColorMatrixFilter(matrix) = filter {
+                                Some(matrix.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    self.color_matrix.apply_chain(
+                        descriptors,
+                        texture_pool,
+                        draw_encoder,
+                        staging_belt,
+                        source,
+                        &matrices,
+                    )?
+                }
+                graph::FilterStep::Single(index) => self.apply(
+                    descriptors,
+                    draw_encoder,
+                    texture_pool,
+                    staging_belt,
+                    FilterSource {
+                        texture: source.texture,
+                        point: source.point,
+                        size: source.size,
+                    },
+                    filters[index].clone(),
+                )?,
+            };
+            // Encoding consumed the old input; returning its exact-key pool
+            // entry here makes the following operation a legal ping-pong reuse.
+            current = Some(next);
+        }
+        current.ok_or_else(|| {
+            crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::Validation,
+                "empty filter graph",
+            )
         })
     }
 

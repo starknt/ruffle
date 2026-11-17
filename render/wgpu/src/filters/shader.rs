@@ -63,6 +63,7 @@ impl ShaderFilter {
             target.color_texture(),
             draw_encoder,
             target.color_attachments(),
+            None,
             target.sample_count(),
             source,
         )
