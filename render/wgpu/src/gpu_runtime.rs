@@ -189,6 +189,7 @@ struct Ledger {
 }
 
 struct Inner {
+    preparation: crate::prepare::NativePreparation,
     scheduler: crate::resource_scheduler::ResourceScheduler,
     device: u64,
     config: GpuBudgetConfig,
@@ -282,7 +283,12 @@ impl GpuRuntime {
                     "device identity space exhausted",
                 )
             })?;
+        let failure = RendererHealth::default();
         Ok(Self(Arc::new(Inner {
+            preparation: crate::prepare::NativePreparation::for_device(
+                config.staging_limit,
+                failure.clone(),
+            ),
             scheduler: crate::resource_scheduler::ResourceScheduler::new(
                 config.idle_limit,
                 config.cache_limit,
@@ -290,12 +296,16 @@ impl GpuRuntime {
             device,
             config,
             ledger: Mutex::default(),
-            failure: RendererHealth::default(),
+            failure,
         })))
     }
 
     pub(crate) fn scheduler(&self) -> &crate::resource_scheduler::ResourceScheduler {
         &self.0.scheduler
+    }
+
+    pub(crate) fn preparation(&self) -> &crate::prepare::NativePreparation {
+        &self.0.preparation
     }
 
     pub fn config(&self) -> GpuBudgetConfig {

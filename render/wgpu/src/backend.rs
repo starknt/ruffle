@@ -29,7 +29,6 @@ use ruffle_render::pixel_bender::{PixelBenderShader, PixelBenderShaderHandle};
 use ruffle_render::pixel_bender_support::PixelBenderShaderArgument;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::shape_utils::DistilledShape;
-use ruffle_render::tessellator::ShapeTessellator;
 use std::any::Any;
 use std::borrow::Cow;
 use std::num::NonZeroU32;
@@ -79,7 +78,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     target: T,
     surface: Surface,
     meshes: Vec<Mesh>,
-    shape_tessellator: ShapeTessellator,
+    pub(crate) preparation_generation: crate::prepare::PreparationGeneration,
     // This is currently unused - we just store it to report in
     // `get_viewport_dimensions`
     viewport_scale_factor: f64,
@@ -97,6 +96,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
 
 impl<T: RenderTarget> Drop for WgpuRenderBackend<T> {
     fn drop(&mut self) {
+        self.preparation_generation.cancel();
         // Descriptors may outlive a movie/renderer in a shared-device host.
         // Cached bindings must not keep that renderer's targets alive there.
         self.descriptors.materials.clear();
@@ -282,7 +282,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             target,
             surface,
             meshes: Vec::new(),
-            shape_tessellator: ShapeTessellator::new(),
+            preparation_generation: crate::prepare::PreparationGeneration::default(),
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(budget.clone()),
             offscreen_texture_pool: TexturePool::new(budget),
@@ -307,34 +307,21 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         });
     }
 
-    pub(crate) fn register_shape_internal(
+    pub(crate) fn register_prepared_shape(
         &mut self,
-        shape: DistilledShape,
+        prepared: crate::prepare::mesh::PreparedMesh,
+        shape_id: swf::CharacterId,
         bitmap_source: &dyn BitmapSource,
-        scale: f32,
         owner: crate::gpu_runtime::ResourceOwner,
     ) -> Result<Mesh, crate::gpu_runtime::RenderFailure> {
         let device = self.descriptors.device.with_owner(owner);
-        let shape_id = shape.id;
-        let lyon_mesh =
-            self.shape_tessellator
-                .tessellate_shape_with_scale(shape, bitmap_source, scale);
-
-        let retainable = !lyon_mesh
+        let retainable = !prepared
             .draws
             .iter()
             .any(|d| matches!(d.draw_type, ruffle_render::tessellator::DrawType::Bitmap(_)));
-        let gradient_count = lyon_mesh.gradients.len();
-        let mut bounds: Option<[f64; 4]> = None;
-        for vertex in lyon_mesh.draws.iter().flat_map(|draw| &draw.vertices) {
-            let (x, y) = (f64::from(vertex.x), f64::from(vertex.y));
-            let b = bounds.get_or_insert([x, y, x, y]);
-            b[0] = b[0].min(x);
-            b[1] = b[1].min(y);
-            b[2] = b[2].max(x);
-            b[3] = b[3].max(y);
-        }
-        let mut draws = Vec::with_capacity(lyon_mesh.draws.len());
+        let gradient_count = prepared.gradients.len();
+        let bounds = prepared.bounds;
+        let mut draws = Vec::with_capacity(prepared.draws.len());
         let mut uniform_buffer = BufferBuilder::new(
             &self.descriptors.limits,
             self.descriptors.limits.min_uniform_buffer_offset_alignment,
@@ -342,9 +329,9 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         let mut vertex_buffer = BufferBuilder::new(&self.descriptors.limits, 0);
         let mut index_buffer = BufferBuilder::new(&self.descriptors.limits, 0);
         let mut indices_so_far = 0;
-        let mut gradients = Vec::with_capacity(lyon_mesh.gradients.len());
+        let mut gradients = Vec::with_capacity(prepared.gradients.len());
 
-        for gradient in lyon_mesh.gradients {
+        for gradient in prepared.gradients {
             gradients.push(CommonGradient::new(
                 &self.descriptors,
                 &device,
@@ -353,7 +340,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             )?);
         }
 
-        for draw in lyon_mesh.draws {
+        for draw in prepared.draws {
             let draw_id = draws.len();
             if let Some(draw) = PendingDraw::new(
                 self,
@@ -542,6 +529,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         &mut self,
         dimensions: ViewportDimensions,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.preparation_generation.invalidate();
         self.descriptors.runtime.check_health()?;
         if dimensions.width > self.descriptors.limits.max_texture_dimension_2d
             || dimensions.height > self.descriptors.limits.max_texture_dimension_2d
@@ -618,6 +606,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         &mut self,
         quality: StageQuality,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.preparation_generation.invalidate();
         self.descriptors.runtime.check_health()?;
         self.surface = Surface::new(
             &self.descriptors,

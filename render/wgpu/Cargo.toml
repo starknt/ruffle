@@ -31,6 +31,7 @@ parking_lot = "0.12"
 thiserror.workspace = true
 tracy-client = { version = "0.18", optional = true }
 futures = { workspace = true }
+rayon = { workspace = true }
 
 [features]
 render_debug_labels = []

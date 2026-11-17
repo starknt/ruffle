@@ -871,7 +871,21 @@ fn numeric_snapshot_freezes_pixels_and_rejects_a_changed_version_before_allocati
         panic!("expected owned pixel recipe");
     };
     assert_eq!(&pixels.data()[..4], &[255, 0, 0, 255]);
-    assert!(frozen.resolve(&mut renderer).is_err());
+    assert!(
+        frozen
+            .prepare(
+                &mut renderer,
+                ruffle_render::region::RenderRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4
+                },
+                1,
+                crate::pass_graph::Load::Load
+            )
+            .is_err()
+    );
     assert_eq!(descriptors.runtime.stats().total_bytes, before);
 }
 
@@ -918,7 +932,19 @@ fn numeric_snapshot_rejects_bitmap_changed_by_gpu_copy() {
         .unwrap()
         .unwrap();
     assert!(
-        frozen.resolve(&mut renderer).is_err(),
+        frozen
+            .prepare(
+                &mut renderer,
+                ruffle_render::region::RenderRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4
+                },
+                1,
+                crate::pass_graph::Load::Load
+            )
+            .is_err(),
         "a GPU write invalidates the captured content version"
     );
 }
@@ -1847,5 +1873,107 @@ fn bitmap_cache_filtered_dirty_halo_matches_full_redraw_at_edges_and_with_msaa()
                 );
             }
         }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn native_preparation_parallel_shapes_match_serial_pixels_and_join_before_encoding() {
+    use ruffle_render::{
+        shape_utils::{DistilledShape, DrawCommand, DrawPath, FillRule},
+        transform::Transform,
+    };
+    let descriptors = gpu();
+    let mut images = Vec::new();
+    for parallel in [false, true] {
+        let target = TextureTarget::new(&descriptors.device, (64, 64)).unwrap();
+        let mut renderer =
+            WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+        let before = descriptors.runtime.preparation().stats().submitted;
+        let mut commands = CommandList::new();
+        for n in 0..20 {
+            let style = swf::FillStyle::Color(Color::from_rgb(0x70a0ee + n * 33, 153));
+            let point = |x, y| swf::Point::new(Twips::from_pixels(x), Twips::from_pixels(y));
+            let handle = renderer
+                .register_shape(
+                    DistilledShape {
+                        id: n as u16,
+                        shape_bounds: Default::default(),
+                        edge_bounds: Default::default(),
+                        paths: vec![DrawPath::Fill {
+                            style: &style,
+                            winding_rule: FillRule::EvenOdd,
+                            commands: vec![
+                                DrawCommand::MoveTo(point(0.0, 0.0)),
+                                DrawCommand::QuadraticCurveTo {
+                                    control: point(8.5, -4.25),
+                                    anchor: point(18.75, 1.0),
+                                },
+                                DrawCommand::LineTo(point(14.25, 19.5)),
+                                DrawCommand::LineTo(point(0.0, 0.0)),
+                            ],
+                        }],
+                    },
+                    &crate::shape_recipe::FrozenBitmapSource::default(),
+                )
+                .unwrap();
+            let mut transform = Transform::default();
+            transform.matrix.tx = Twips::from_pixels(f64::from(n) * 1.25 + 0.25);
+            transform.matrix.ty = Twips::from_pixels(f64::from(n) * 1.5 + 2.5);
+            commands.render_shape(handle, transform);
+        }
+        if parallel {
+            // Invisible, culled leaves cross the automatic work threshold without
+            // changing pixels or introducing a production test switch.
+            for _ in 0..256 {
+                rect(&mut commands, 1000.0, 1000.0, 1.0, 1.0, Color::TRANSPARENT);
+            }
+        }
+        renderer
+            .submit_frame(Color::BLACK, commands, vec![])
+            .unwrap();
+        let stats = descriptors.runtime.preparation().stats();
+        assert_eq!(stats.active, 0, "all CPU tasks joined in this frame");
+        assert_eq!(stats.bytes, 0, "scratch permits returned after publication");
+        assert_eq!(stats.submitted > before, parallel);
+        images.push(renderer.capture_frame().unwrap().unwrap().into_raw());
+    }
+    assert_eq!(images[0], images[1]);
+    assert!(images[0].chunks_exact(4).any(|p| p != [0, 0, 0, 255]));
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn native_preparation_resize_and_unload_cancel_captured_generations() {
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (16, 16)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    let before_resize = renderer.preparation_generation.capture();
+    renderer
+        .set_viewport_dimensions(ruffle_render::backend::ViewportDimensions {
+            width: 32,
+            height: 32,
+            scale_factor: 1.0,
+        })
+        .unwrap();
+    let before_unload = renderer.preparation_generation.capture();
+    drop(renderer);
+    for generation in [before_resize, before_unload] {
+        assert!(
+            !descriptors
+                .runtime
+                .preparation()
+                .for_each_batch(
+                    &generation,
+                    true,
+                    [crate::prepare::Work {
+                        value: 42,
+                        bytes: 64
+                    }],
+                    |_| panic!("stale task must not run"),
+                    |_: Vec<()>| panic!("stale output must not publish"),
+                )
+                .unwrap()
+        );
     }
 }

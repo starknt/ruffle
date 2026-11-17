@@ -33,31 +33,26 @@ pub struct ShapeRecipe {
     pub scale: f32,
 }
 impl ShapeRecipe {
-    pub fn resolve<T: RenderTarget>(
+    pub fn publish<T: RenderTarget>(
         &self,
         backend: &mut WgpuRenderBackend<T>,
+        prepared: crate::prepare::mesh::PreparedMesh,
     ) -> Result<(), RenderFailure> {
         if self.mesh.get().is_some() {
             return Ok(());
         }
-        if self.device_generation != backend.descriptors.runtime.generation() {
-            return Err(RenderFailure::new(
-                crate::gpu_runtime::RenderFailureKind::Validation,
-                "shape recipe belongs to another device",
-            ));
-        }
-        let geometry = self.geometry.borrow().as_ref().cloned().ok_or_else(|| {
-            RenderFailure::new(
-                crate::gpu_runtime::RenderFailureKind::Internal,
-                "shape recipe was consumed without a mesh",
-            )
-        })?;
-        let mesh = backend.register_shape_internal(
-            geometry.as_distilled(),
-            &self.bitmaps,
-            self.scale,
-            self.owner,
-        )?;
+        let id = self
+            .geometry
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| {
+                RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Internal,
+                    "missing shape geometry at publication",
+                )
+            })?
+            .id;
+        let mesh = backend.register_prepared_shape(prepared, id, &self.bitmaps, self.owner)?;
         let _ = self.mesh.set(mesh);
         self.geometry.borrow_mut().take();
         Ok(())

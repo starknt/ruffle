@@ -85,9 +85,7 @@ impl GraphEncoder {
         samples: u32,
         load: Load,
     ) -> Result<Self, RenderFailure> {
-        let graph = PassGraph::compile(&prepared.snapshot, bounds, samples, load)?;
-        // All numeric versions are checked before the first upload/allocation.
-        prepared.resolve(backend)?;
+        let graph = prepared.prepare(backend, bounds, samples, load)?;
         Ok(Self { graph, prepared })
     }
     /// Lower stable dependency scopes to the existing adjacent chunk builder.

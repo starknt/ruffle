@@ -1,3 +1,4 @@
+mod bounded;
 use crate::bitmap::BitmapSource;
 use crate::shape_utils::{DistilledShape, DrawCommand, DrawPath, GradientType};
 use indexmap::IndexSet;
@@ -18,6 +19,8 @@ pub struct ShapeTessellator {
     lyon_mesh: VertexBuffers<Vertex, u32>,
     mask_index_count: Option<u32>,
     is_stroke: bool,
+    output_budget: Option<u64>,
+    output_budget_exhausted: bool,
 }
 
 const TESSELLATION_EPSILON: f32 = 0.0000001;
@@ -32,6 +35,8 @@ impl ShapeTessellator {
             lyon_mesh: VertexBuffers::new(),
             mask_index_count: None,
             is_stroke: false,
+            output_budget: None,
+            output_budget_exhausted: false,
         }
     }
 
@@ -42,6 +47,30 @@ impl ShapeTessellator {
         bitmap_source: &dyn BitmapSource,
     ) -> Mesh {
         self.tessellate_shape_with_scale(shape, bitmap_source, 1.0)
+    }
+
+    /// Bound native CPU output before Lyon can grow its geometry buffers. A
+    /// failed budget discards the entire result, never a partially drawn shape.
+    pub fn tessellate_shape_with_scale_bounded(
+        &mut self,
+        shape: DistilledShape,
+        bitmap_source: &dyn BitmapSource,
+        scale: f32,
+        bytes: u64,
+    ) -> Result<Mesh, crate::error::RenderFailure> {
+        self.output_budget = Some(bytes);
+        self.output_budget_exhausted = false;
+        let mesh = self.tessellate_shape_with_scale(shape, bitmap_source, scale);
+        self.output_budget = None;
+        let exhausted = std::mem::take(&mut self.output_budget_exhausted);
+        if exhausted {
+            Err(crate::error::RenderFailure::new(
+                crate::error::RenderFailureKind::BudgetExceeded,
+                "native tessellation exceeds the CPU preparation output budget",
+            ))
+        } else {
+            Ok(mesh)
+        }
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -160,8 +189,11 @@ impl ShapeTessellator {
             }
             self.is_stroke = next_is_stroke;
 
-            let mut buffers_builder =
-                BuffersBuilder::new(&mut self.lyon_mesh, RuffleVertexCtor { color });
+            let mut buffers_builder = bounded::BoundedBuilder {
+                inner: BuffersBuilder::new(&mut self.lyon_mesh, RuffleVertexCtor { color }),
+                remaining: &mut self.output_budget,
+                exhausted: &mut self.output_budget_exhausted,
+            };
             let result = match path {
                 DrawPath::Fill { winding_rule, .. } => {
                     // Larger scales require more precise tessellation to avoid artifacts
@@ -223,6 +255,9 @@ impl ShapeTessellator {
                     )
                 }
             };
+            if self.output_budget_exhausted {
+                break;
+            }
             match result {
                 Ok(_) => {
                     if needs_flush {

@@ -47,6 +47,7 @@ mod graph_encoder;
 mod pass_graph;
 mod pipelines;
 mod pixel_bender;
+mod prepare;
 mod render_snapshot;
 mod resource_scheduler;
 mod shape_recipe;
@@ -145,7 +146,7 @@ impl From<TessVertex> for PosVertex {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct PosUvVertex {
+pub(crate) struct PosUvVertex {
     position: [f32; 2],
     uv: [f32; 3],
 }
@@ -174,7 +175,7 @@ impl PosUvVertex {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct PosColorVertex {
+pub(crate) struct PosColorVertex {
     position: [f32; 2],
     color: [f32; 4],
 }

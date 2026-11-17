@@ -1,13 +1,13 @@
 use crate::backend::WgpuRenderBackend;
 use crate::target::RenderTarget;
-use crate::{Descriptors, GradientUniforms, PosColorVertex, PosUvVertex, as_texture};
+use crate::{Descriptors, GradientUniforms, as_texture};
 use std::any::Any;
 use std::ops::Range;
 
 use crate::buffer_builder::BufferBuilder;
 use ruffle_render::backend::{ShapeHandle, ShapeHandleImpl};
 use ruffle_render::bitmap::BitmapSource;
-use ruffle_render::tessellator::{Bitmap, Draw as LyonDraw, DrawType as TessDrawType, Gradient};
+use ruffle_render::tessellator::{Bitmap, DrawType as TessDrawType, Gradient};
 use swf::{CharacterId, GradientInterpolation};
 
 /// How big to make gradient textures. Larger will keep more detail, but be slower and use more memory.
@@ -122,54 +122,19 @@ impl PendingDraw {
     pub fn new<T: RenderTarget>(
         backend: &mut WgpuRenderBackend<T>,
         source: &dyn BitmapSource,
-        draw: LyonDraw,
+        draw: crate::prepare::mesh::PackedDraw,
         shape_id: CharacterId,
         draw_id: usize,
         vertex_buffer: &mut BufferBuilder,
         index_buffer: &mut BufferBuilder,
         indices_so_far: &mut u32,
     ) -> Result<Option<Self>, crate::gpu_runtime::RenderFailure> {
-        let vertices = match &draw.draw_type {
-            TessDrawType::Color => {
-                let vertices: Vec<_> = draw
-                    .vertices
-                    .into_iter()
-                    .map(PosColorVertex::from)
-                    .collect();
-                vertex_buffer.add(&vertices).map_err(|_| {
-                    crate::gpu_runtime::RenderFailure::new(
-                        crate::gpu_runtime::RenderFailureKind::BudgetExceeded,
-                        "shape buffer exceeds the native device limit",
-                    )
-                })?
-            }
-            TessDrawType::Gradient { matrix, .. } => {
-                let vertices: Vec<_> = draw
-                    .vertices
-                    .into_iter()
-                    .map(|v| PosUvVertex::from_tessellator(v, matrix))
-                    .collect();
-                vertex_buffer.add(&vertices).map_err(|_| {
-                    crate::gpu_runtime::RenderFailure::new(
-                        crate::gpu_runtime::RenderFailureKind::BudgetExceeded,
-                        "shape buffer exceeds the native device limit",
-                    )
-                })?
-            }
-            TessDrawType::Bitmap(bitmap) => {
-                let vertices: Vec<_> = draw
-                    .vertices
-                    .into_iter()
-                    .map(|v| PosUvVertex::from_tessellator(v, &bitmap.matrix))
-                    .collect();
-                vertex_buffer.add(&vertices).map_err(|_| {
-                    crate::gpu_runtime::RenderFailure::new(
-                        crate::gpu_runtime::RenderFailureKind::BudgetExceeded,
-                        "shape buffer exceeds the native device limit",
-                    )
-                })?
-            }
-        };
+        let vertices = vertex_buffer.add(draw.vertices.bytes()).map_err(|_| {
+            crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::BudgetExceeded,
+                "shape buffer exceeds the native device limit",
+            )
+        })?;
 
         index_buffer.add(&draw.indices).map_err(|_| {
             crate::gpu_runtime::RenderFailure::new(
@@ -178,9 +143,19 @@ impl PendingDraw {
             )
         })?;
 
-        let index_count = draw.indices.len() as u32;
+        let index_count = u32::try_from(draw.indices.len()).map_err(|_| {
+            crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::BudgetExceeded,
+                "shape index count exceeds the native device limit",
+            )
+        })?;
         let index_offset = *indices_so_far;
-        *indices_so_far += index_count;
+        *indices_so_far = indices_so_far.checked_add(index_count).ok_or_else(|| {
+            crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::BudgetExceeded,
+                "shape index offset exceeds the native device limit",
+            )
+        })?;
         let draw_type = match draw.draw_type {
             TessDrawType::Color => PendingDrawType::color(),
             TessDrawType::Gradient {

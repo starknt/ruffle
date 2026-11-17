@@ -51,6 +51,7 @@ pub enum ResourceRecipe {
         resource: ResourceVersion,
         geometry: Option<Arc<OwnedDistilledShape>>,
         scale: f32,
+        bitmap_sizes: Vec<(u16, ruffle_render::bitmap::BitmapSize)>,
         bitmaps: Vec<(u16, ResourceVersion)>,
     },
     Resident(ResourceVersion),
@@ -232,6 +233,12 @@ impl Capture {
                         resource,
                         geometry: shape.geometry.borrow().clone(),
                         scale: shape.scale,
+                        bitmap_sizes: shape
+                            .bitmaps
+                            .0
+                            .iter()
+                            .map(|(id, (size, _))| (*id, *size))
+                            .collect(),
                         bitmaps,
                     }
                 } else {
@@ -414,9 +421,9 @@ impl PreparedSnapshot {
             resources: capture.resources,
         })
     }
-    pub fn resolve<T: crate::target::RenderTarget>(
+    fn validate<T: crate::target::RenderTarget>(
         &self,
-        backend: &mut crate::backend::WgpuRenderBackend<T>,
+        backend: &crate::backend::WgpuRenderBackend<T>,
     ) -> Result<(), RenderFailure> {
         // Reject the whole snapshot before any candidate uploads or allocations.
         backend.descriptors.runtime.check_health()?;
@@ -430,19 +437,142 @@ impl PreparedSnapshot {
                 ));
             }
         }
-        for (_, handle) in &self.resources {
-            match handle {
-                Handle::Shape(handle) => {
-                    if let Some(recipe) = (&*handle.0 as &dyn Any).downcast_ref::<ShapeRecipe>() {
-                        recipe.resolve(backend)?;
+        Ok(())
+    }
+    pub fn prepare<T: crate::target::RenderTarget>(
+        &self,
+        backend: &mut crate::backend::WgpuRenderBackend<T>,
+        bounds: ruffle_render::region::RenderRect,
+        samples: u32,
+        load: crate::pass_graph::Load,
+    ) -> Result<crate::pass_graph::PassGraph, RenderFailure> {
+        use crate::pass_graph::PassGraph;
+        use crate::prepare::{
+            Work,
+            mesh::{ShapeInput, input_vertices},
+        };
+        self.validate(backend)?;
+        enum Input {
+            Graph(RenderSnapshot),
+            Shape(ResourceVersion, ShapeInput, u64),
+        }
+        enum Output {
+            Graph(PassGraph),
+            Shape(ResourceVersion, crate::prepare::mesh::PreparedMesh),
+        }
+        fn command_count(nodes: &[SnapshotNode]) -> usize {
+            nodes
+                .iter()
+                .map(|node| {
+                    1usize.saturating_add(match &node.command {
+                        SnapshotCommand::Shared(children)
+                        | SnapshotCommand::Blend { children, .. } => command_count(children),
+                        SnapshotCommand::AlphaMask { maskee, mask } => {
+                            command_count(maskee).saturating_add(command_count(mask))
+                        }
+                        _ => 0,
+                    })
+                })
+                .fold(0usize, usize::saturating_add)
+        }
+        let commands = command_count(&self.snapshot.commands);
+        let vertices = self
+            .snapshot
+            .recipes
+            .iter()
+            .filter_map(|r| match r {
+                ResourceRecipe::Shape {
+                    geometry: Some(geometry),
+                    ..
+                } => Some(input_vertices(geometry)),
+                _ => None,
+            })
+            .fold(0usize, usize::saturating_add);
+        let parallel = crate::prepare::parallel_workload(commands, vertices);
+        let output_budget =
+            (backend.descriptors.runtime.config().staging_limit / 4).clamp(4096, 16 * 1024 * 1024);
+        let jobs = std::iter::once(Work {
+            bytes: (commands as u64).saturating_mul(4096).saturating_add(4096),
+            value: Input::Graph(self.snapshot.clone()),
+        })
+        .chain(self.snapshot.recipes.iter().filter_map(|r| {
+            match r {
+                ResourceRecipe::Shape {
+                    resource,
+                    geometry: Some(geometry),
+                    scale,
+                    bitmap_sizes,
+                    ..
+                } => Some(Work {
+                    bytes: (input_vertices(geometry) as u64)
+                        .saturating_mul(1024)
+                        .saturating_add(output_budget),
+                    value: Input::Shape(
+                        *resource,
+                        ShapeInput {
+                            geometry: geometry.clone(),
+                            scale: *scale,
+                            bitmap_sizes: bitmap_sizes.clone(),
+                        },
+                        output_budget,
+                    ),
+                }),
+                _ => None,
+            }
+        }));
+        let preparation = backend.descriptors.runtime.preparation().clone();
+        let generation = backend.preparation_generation.capture();
+        let mut graph = None;
+        let current = preparation.for_each_batch(
+            &generation,
+            parallel,
+            jobs,
+            |input| match input {
+                Input::Graph(snapshot) => {
+                    PassGraph::compile(&snapshot, bounds, samples, load).map(Output::Graph)
+                }
+                Input::Shape(resource, input, budget) => input
+                    .prepare_bounded(budget)
+                    .map(|mesh| Output::Shape(resource, mesh)),
+            },
+            |batch| {
+                // Recheck after join before GPU publication; only this closure
+                // can access backend handles, bindings, or the device.
+                self.validate(backend)?;
+                for result in batch {
+                    match result {
+                        Output::Graph(value) => graph = Some(value),
+                        Output::Shape(resource, mesh) => {
+                            let Handle::Shape(handle) = self.handle(resource)? else {
+                                return Err(foreign());
+                            };
+                            let recipe = (&*handle.0 as &dyn Any)
+                                .downcast_ref::<ShapeRecipe>()
+                                .ok_or_else(foreign)?;
+                            recipe.publish(backend, mesh)?;
+                        }
                     }
                 }
-                Handle::Bitmap(handle) => {
-                    crate::as_texture(handle, &backend.descriptors.device)?;
-                }
-                Handle::Shader(_) => {}
+                Ok(())
+            },
+        )?;
+        if !current {
+            return Err(RenderFailure::new(
+                RenderFailureKind::Validation,
+                "stale native preparation generation",
+            ));
+        }
+        for (_, handle) in &self.resources {
+            if let Handle::Bitmap(handle) = handle {
+                crate::as_texture(handle, &backend.descriptors.device)?;
             }
         }
-        backend.descriptors.runtime.check_health()
+        backend.descriptors.runtime.check_health()?;
+        graph.ok_or_else(|| {
+            RenderFailure::new(
+                RenderFailureKind::Internal,
+                "native preparation produced no graph",
+            )
+        })
     }
 }

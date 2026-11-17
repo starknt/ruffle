@@ -4996,6 +4996,7 @@ dependencies = [
  "naga-pixelbender",
  "parking_lot",
  "profiling",
+ "rayon",
  "ruffle_render",
  "smallvec",
  "swf 0.4.0",
