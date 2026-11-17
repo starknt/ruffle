@@ -81,6 +81,70 @@ fn measurement_counts_mask_passes_not_mask_inputs() {
 }
 
 #[test]
+#[ignore = "requires a real native adapter"]
+fn small_alpha_masks_share_a_pass_within_the_transient_byte_budget() {
+    let split = gpu_with_watermark(Some(2048));
+    let combined = gpu_with_watermark(Some(1024 * 1024));
+    for quality in [StageQuality::Low, StageQuality::High] {
+        let mut images = Vec::new();
+        for (index, descriptors) in [&split, &combined].into_iter().enumerate() {
+            let target = TextureTarget::new(&descriptors.device, (96, 64)).unwrap();
+            let mut renderer =
+                WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+            renderer.set_quality(quality).unwrap();
+            let metrics = ruffle_render::profile::RenderMetrics::default();
+            let _scope = ruffle_render::profile::enter(Some(&metrics));
+            let mut commands = CommandList::new();
+            for i in 0..24 {
+                let x = 3.25 + (i % 6) as f32 * 9.0;
+                let y = 4.5 + (i / 6) as f32 * 9.0;
+                let mut content = CommandList::new();
+                rect(
+                    &mut content,
+                    x,
+                    y,
+                    12.5,
+                    12.0,
+                    Color::from_rgb(if i % 2 == 0 { 0xc35b28 } else { 0x3583dc }, 179),
+                );
+                let mut mask = CommandList::new();
+                rect(
+                    &mut mask,
+                    x + 2.5,
+                    y + 1.25,
+                    10.0,
+                    10.5,
+                    Color::from_rgb(0xffffff, 127),
+                );
+                commands.render_alpha_mask(content, mask);
+            }
+            renderer
+                .submit_frame(Color::WHITE, commands, vec![])
+                .unwrap();
+            let snapshot = metrics.snapshot();
+            if index == 0 {
+                assert!(
+                    snapshot.blend_batch_splits > 0,
+                    "byte budget must split masks"
+                );
+            } else {
+                assert_eq!(
+                    snapshot.work.mask_passes, 1,
+                    "small inputs fit one composite pass"
+                );
+                assert_eq!(snapshot.work.render_passes, 49);
+                assert_eq!(snapshot.blend_batch_splits, 0);
+            }
+            let image = renderer.capture_frame().unwrap().unwrap();
+            assert_eq!(image.get_pixel(95, 63).0, [255, 255, 255, 255]);
+            assert_ne!(image.get_pixel(8, 8).0, [255, 255, 255, 255]);
+            images.push(image);
+        }
+        assert_eq!(images[0], images[1], "quality {quality:?}");
+    }
+}
+
+#[test]
 #[ignore = "requires a Vulkan adapter"]
 fn bounded_compositing_matches_full_target_pixels() {
     let descriptors = gpu();

@@ -1,5 +1,9 @@
 use crate::graph_encoder::{PlannedCommand, PlannedList};
 
+// Small regions should not force repeated resolves of the entire destination.
+// Storage is bounded by the byte watermark; this independent cap bounds metadata.
+const MAX_INPUTS: usize = 64;
+
 /// Consume graph scopes before preparing the next sibling set. Region-aware
 /// storage costs include MSAA/resolve; a small object cap also bounds bindings.
 /// Ancestor-layer sampling keeps its established preparation boundary intact.
@@ -11,7 +15,7 @@ pub(super) struct CommandBatches {
 impl CommandBatches {
     pub fn new(commands: PlannedList, watermark: u64) -> Self {
         let needs_batches =
-            commands.temporary_inputs() > 8 || commands.temporary_bytes() > watermark;
+            commands.temporary_inputs() > MAX_INPUTS || commands.temporary_bytes() > watermark;
         let opaque_layer = needs_batches && commands.samples_ancestor_layer();
         let (unbatched, commands) = if !needs_batches || opaque_layer {
             (Some(commands), Vec::new())
@@ -38,7 +42,7 @@ impl Iterator for CommandBatches {
         while let Some(command) = self.commands.peek() {
             if command.inputs != 0
                 && batch.temporary_inputs() != 0
-                && (batch.temporary_inputs().saturating_add(command.inputs) > 8
+                && (batch.temporary_inputs().saturating_add(command.inputs) > MAX_INPUTS
                     || batch
                         .temporary_bytes()
                         .saturating_add(command.transient_bytes)
