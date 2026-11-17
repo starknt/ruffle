@@ -903,6 +903,108 @@ fn shape_registration_owns_styles_and_allocates_only_when_visible() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn equal_small_meshes_batch_without_retaining_unloaded_shape_owners() {
+    use ruffle_render::{
+        bitmap::{BitmapHandle, BitmapSize, BitmapSource},
+        shape_utils::{DistilledShape, DrawCommand, DrawPath, FillRule},
+        transform::Transform,
+    };
+    struct NoBitmaps;
+    impl BitmapSource for NoBitmaps {
+        fn bitmap_size(&self, _: u16) -> Option<BitmapSize> {
+            None
+        }
+        fn bitmap_handle(&self, _: u16, _: &mut dyn RenderBackend) -> Option<BitmapHandle> {
+            None
+        }
+    }
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (24, 8)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    let mut handles = Vec::new();
+    for (id, color) in [(1, Color::RED), (2, Color::RED), (3, Color::BLUE)] {
+        let style = swf::FillStyle::Color(color);
+        let point = |x, y| swf::Point::new(Twips::from_pixels(x), Twips::from_pixels(y));
+        handles.push(
+            renderer
+                .register_shape(
+                    DistilledShape {
+                        id,
+                        shape_bounds: Default::default(),
+                        edge_bounds: Default::default(),
+                        paths: vec![DrawPath::Fill {
+                            style: &style,
+                            winding_rule: FillRule::EvenOdd,
+                            commands: vec![
+                                DrawCommand::MoveTo(point(0.0, 0.0)),
+                                DrawCommand::LineTo(point(8.0, 0.0)),
+                                DrawCommand::LineTo(point(8.0, 8.0)),
+                                DrawCommand::LineTo(point(0.0, 8.0)),
+                                DrawCommand::LineTo(point(0.0, 0.0)),
+                            ],
+                        }],
+                    },
+                    &NoBitmaps,
+                )
+                .unwrap(),
+        );
+    }
+    let metrics = ruffle_render::profile::RenderMetrics::default();
+    let _scope = ruffle_render::profile::enter(Some(&metrics));
+    let mut commands = CommandList::new();
+    for (i, handle) in handles.iter().enumerate() {
+        let mut transform = Transform::default();
+        transform.matrix.tx = Twips::from_pixels(i as f64 * 8.0);
+        commands.render_shape(handle.clone(), transform);
+    }
+    renderer
+        .submit_frame(Color::BLACK, commands, vec![])
+        .unwrap();
+    assert_eq!(
+        metrics.snapshot().work.draw_calls,
+        2,
+        "equal immutable geometry must form one instance batch"
+    );
+    let image = renderer.capture_frame().unwrap().unwrap();
+    for (x, _, pixel) in image.enumerate_pixels() {
+        assert_eq!(
+            pixel.0,
+            if x < 16 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            }
+        );
+    }
+    let buffers: std::collections::HashSet<_> = handles
+        .iter()
+        .map(|h| crate::mesh::as_mesh(h).unwrap().vertex_buffer.lease().id())
+        .collect();
+    assert_eq!(buffers.len(), 2);
+    drop(handles);
+    // Keep the renderer/cache alive. It must not keep any shape's GPU allocation.
+    renderer
+        .submit_frame(Color::BLACK, CommandList::new(), vec![])
+        .unwrap();
+    descriptors
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(2)),
+        })
+        .unwrap();
+    descriptors.runtime.purge_idle_and_cached_resources();
+    assert!(
+        descriptors
+            .runtime
+            .resources()
+            .iter()
+            .all(|r| !buffers.contains(&r.id))
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn numeric_snapshot_freezes_pixels_and_rejects_a_changed_version_before_allocation() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
     use ruffle_render::transform::Transform;

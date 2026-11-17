@@ -27,7 +27,7 @@ impl BitmapSource for FrozenBitmapSource {
 pub struct ShapeRecipe {
     pub owner: ResourceOwner,
     pub device_generation: u64,
-    pub mesh: OnceCell<Mesh>,
+    pub mesh: OnceCell<Arc<Mesh>>,
     pub geometry: RefCell<Option<Arc<OwnedDistilledShape>>>,
     pub bitmaps: FrozenBitmapSource,
     pub scale: f32,

@@ -23,6 +23,67 @@ pub struct Mesh {
     pub _allocation: ruffle_render::profile::GpuMesh,
 }
 
+/// Identical small solid meshes can use the existing adjacent instance batching.
+/// Only weak references live here: a cache lookup cannot extend an unloaded
+/// graphic's lifetime. Keys are exact bytes, including all index/mask boundaries.
+#[derive(Default)]
+pub(crate) struct SmallMeshCache {
+    entries: fnv::FnvHashMap<Vec<u8>, std::sync::Weak<Mesh>>,
+    lookups: u32,
+}
+
+impl SmallMeshCache {
+    pub fn key(mesh: &crate::prepare::mesh::PreparedMesh) -> Option<Vec<u8>> {
+        if !mesh.gradients.is_empty() {
+            return None;
+        }
+        let mut bytes = 4usize;
+        for draw in &mesh.draws {
+            if !matches!(draw.draw_type, TessDrawType::Color) {
+                return None;
+            }
+            bytes = bytes
+                .checked_add(12)?
+                .checked_add(draw.vertices.bytes().len())?
+                .checked_add(draw.indices.len().checked_mul(4)?)?;
+            // Large/curved meshes avoid hashing and retaining a second CPU copy.
+            if bytes > 512 {
+                return None;
+            }
+        }
+        let mut key = Vec::with_capacity(bytes);
+        key.extend_from_slice(&(mesh.draws.len() as u32).to_le_bytes());
+        for draw in &mesh.draws {
+            key.extend_from_slice(&(draw.vertices.bytes().len() as u32).to_le_bytes());
+            key.extend_from_slice(&(draw.indices.len() as u32).to_le_bytes());
+            key.extend_from_slice(&draw.mask_index_count.to_le_bytes());
+            key.extend_from_slice(draw.vertices.bytes());
+            key.extend_from_slice(bytemuck::cast_slice(&draw.indices));
+        }
+        Some(key)
+    }
+
+    pub fn get(&mut self, key: &[u8]) -> Option<std::sync::Arc<Mesh>> {
+        self.lookups = self.lookups.wrapping_add(1);
+        if self.lookups.is_multiple_of(64) {
+            self.entries.retain(|_, mesh| mesh.strong_count() > 0);
+        }
+        let mesh = self.entries.get(key).and_then(std::sync::Weak::upgrade);
+        if mesh.is_none() {
+            self.entries.remove(key);
+        }
+        mesh
+    }
+
+    pub fn insert(&mut self, key: Vec<u8>, mesh: &std::sync::Arc<Mesh>) {
+        // At most 512 KiB of byte keys plus bounded hash/weak metadata. This is
+        // an identity index, with no GPU residency or strong owner retention.
+        if self.entries.len() < 1024 {
+            self.entries.insert(key, std::sync::Arc::downgrade(mesh));
+        }
+    }
+}
+
 impl ShapeHandleImpl for Mesh {
     fn retained_bytes(&self) -> Option<usize> {
         self.retained_bytes
@@ -74,6 +135,7 @@ pub fn as_mesh(handle: &ShapeHandle) -> Result<&Mesh, crate::gpu_runtime::Render
     value
         .downcast_ref::<crate::shape_recipe::ShapeRecipe>()
         .and_then(|recipe| recipe.mesh.get())
+        .map(std::sync::Arc::as_ref)
         .ok_or_else(|| {
             crate::gpu_runtime::RenderFailure::new(
                 crate::gpu_runtime::RenderFailureKind::Internal,

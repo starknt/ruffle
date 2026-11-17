@@ -78,6 +78,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     target: T,
     surface: Surface,
     meshes: Vec<Mesh>,
+    small_meshes: crate::mesh::SmallMeshCache,
     pub(crate) preparation_generation: crate::prepare::PreparationGeneration,
     // This is currently unused - we just store it to report in
     // `get_viewport_dimensions`
@@ -282,6 +283,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             target,
             surface,
             meshes: Vec::new(),
+            small_meshes: Default::default(),
             preparation_generation: crate::prepare::PreparationGeneration::default(),
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(budget.clone()),
@@ -313,7 +315,14 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         shape_id: swf::CharacterId,
         bitmap_source: &dyn BitmapSource,
         owner: crate::gpu_runtime::ResourceOwner,
-    ) -> Result<Mesh, crate::gpu_runtime::RenderFailure> {
+    ) -> Result<Arc<Mesh>, crate::gpu_runtime::RenderFailure> {
+        let key = crate::mesh::SmallMeshCache::key(&prepared);
+        if let Some(key) = &key
+            && let Some(mesh) = self.small_meshes.get(key)
+        {
+            self.descriptors.runtime.check_health()?;
+            return Ok(mesh);
+        }
         let device = self.descriptors.device.with_owner(owner);
         let retainable = !prepared
             .draws
@@ -432,14 +441,18 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         let retained_bytes = retainable.then_some(()).and_then(|()| {
             crate::mesh::retained_mesh_bytes(storage_bytes, gradient_count, draws.capacity())
         });
-        Ok(Mesh {
+        let mesh = Arc::new(Mesh {
             retained_bytes,
             bounds,
             draws,
             vertex_buffer,
             index_buffer,
             _allocation: allocation,
-        })
+        });
+        if let Some(key) = key {
+            self.small_meshes.insert(key, &mesh);
+        }
+        Ok(mesh)
     }
 
     fn prepare_commands(
