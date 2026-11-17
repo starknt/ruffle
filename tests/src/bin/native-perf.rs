@@ -43,6 +43,10 @@ struct Opt {
     /// Pace a long-lived correctness/memory soak; never use for throughput comparisons.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
     pace_fps: Option<u32>,
+    /// Request full GC work at existing frame boundaries, drain, and purge caches.
+    /// Memory-soak checkpoints are deliberately unavailable in throughput runs.
+    #[arg(long, requires = "pace_fps", value_parser = clap::value_parser!(u32).range(1..))]
+    reclaim_every: Option<u32>,
     /// Measure instrumentation-disabled overhead. Optimizations stay enabled.
     #[arg(long)]
     profile_off: bool,
@@ -292,10 +296,12 @@ fn main() -> Result<()> {
         "backend":format!("{:?}", info.backend), "device":info.name, "driver":info.driver_info,
         "warmup":opt.warmup, "frames":opt.frames, "inFlightLimit":2, "readback":false, "paceFps":opt.pace_fps,
         "profilingEnabled":!opt.profile_off, "runId":run_id, "settings":settings,
+        "reclaimEvery":opt.reclaim_every,
         "workloadSha256":workload_digest(&path)?})
     )?;
     let mut inflight = VecDeque::new();
     let mut measured_start = None;
+    let mut descriptor_baseline = HashSet::new();
     let mut previous = metrics.snapshot();
     let mut last_rss = Instant::now();
     let mut frame = 0;
@@ -317,6 +323,14 @@ fn main() -> Result<()> {
                     .unwrap();
             renderer.collect_gpu_samples();
             metrics.take_gpu_samples();
+            descriptor_baseline = environment
+                .descriptors
+                .runtime
+                .resources()
+                .into_iter()
+                .filter(|r| r.owner == environment.descriptors.descriptor_owner)
+                .map(|r| r.id)
+                .collect();
             previous = metrics.snapshot();
             writeln!(
                 output,
@@ -326,6 +340,25 @@ fn main() -> Result<()> {
             )?;
             measured_start = Some(Instant::now());
         }
+        let reclaim_gc_before = if frame >= opt.warmup
+            && opt
+                .reclaim_every
+                .is_some_and(|interval| (frame - opt.warmup + 1) % interval == 0)
+        {
+            let mut player = runner.player().lock().unwrap();
+            Some(player.mutate_with_update_context(|context| {
+                let gc = context.gc().metrics();
+                let count = gc.total_gc_count();
+                // With Player's normal pacing, all work per object is below one
+                // unit. This pays the current partial cycle, the sleep threshold,
+                // and a complete cycle in the upcoming normal Player::update.
+                // No extra VM update or production-only cleanup API is needed.
+                gc.adjust_debt(count as f64 * 4.0 + 1024.0);
+                count
+            }))
+        } else {
+            None
+        };
         let start = Instant::now();
         ensure!(
             !matches!(runner.tick()?, TestStatus::Finished),
@@ -398,6 +431,28 @@ fn main() -> Result<()> {
                 )?;
             }
         }
+        if let Some(gc_before) = reclaim_gc_before {
+            wait(&environment.descriptors, None)?;
+            inflight.clear();
+            let gc_after = runner.player().lock().unwrap().gc_object_count();
+            environment
+                .descriptors
+                .runtime
+                .purge_idle_and_cached_resources();
+            wait(&environment.descriptors, None)?;
+            writeln!(
+                output,
+                "{}",
+                json!({
+                    "event":"reclaim", "measuredFrame":frame - opt.warmup + 1,
+                    "gcBefore":gc_before, "gcAfter":gc_after,
+                    "resources":environment.descriptors.runtime.diagnostic_snapshot(),
+                    "allocator":allocator_stats(&environment.descriptors.device),
+                    "rssBytes":resident_memory().map(|r| r.0),
+                })
+            )?;
+            output.flush()?;
+        }
         previous = current;
         frame += 1;
         if let Some(fps) = opt.pace_fps {
@@ -436,17 +491,22 @@ fn main() -> Result<()> {
         .runtime
         .resources()
         .into_iter()
-        .filter(|r| {
-            !matches!(
-                r.owner.kind,
-                ruffle_render_wgpu::gpu_runtime::OwnerKind::Renderer
-                    | ruffle_render_wgpu::gpu_runtime::OwnerKind::Host
-            )
-        })
+        .filter(|r| r.owner != environment.descriptors.descriptor_owner)
         .collect();
     ensure!(
         unloaded_owner_resources.is_empty(),
         "unloaded owners retain resources: {unloaded_owner_resources:?}"
+    );
+    let remaining: HashSet<_> = environment
+        .descriptors
+        .runtime
+        .resources()
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    ensure!(
+        remaining == descriptor_baseline,
+        "shared descriptor resource identities changed after warmup; the warmed baseline must cover the full workload"
     );
     let memory = resident_memory();
     writeln!(
@@ -458,7 +518,8 @@ fn main() -> Result<()> {
         "resourcesAfterDrain":resources_after_drain, "allocatorAfterDrain":allocator_after_drain,
         "resourcesAfterUnload":environment.descriptors.runtime.diagnostic_snapshot(),
         "allocatorAfterUnload":allocator_stats(&environment.descriptors.device),
-        "unloadedOwnerResources":unloaded_owner_resources.len()})
+        "unloadedOwnerResources":unloaded_owner_resources.len(),
+        "descriptorBaselineResources":descriptor_baseline.len()})
     )?;
     output.flush()?;
     Ok(())
@@ -482,5 +543,22 @@ mod tests {
         let manifest =
             Manifest::parse("[[case]]\nname='sparse-blend'\npath='../workload'").unwrap();
         assert_eq!(manifest.case[0].name, "sparse-blend");
+    }
+
+    #[test]
+    fn reclamation_checkpoints_require_a_paced_soak() {
+        let args = [
+            "native-perf",
+            "--manifest",
+            "soak.toml",
+            "--case",
+            "cache_soak",
+            "--output",
+            "soak.jsonl",
+            "--reclaim-every",
+            "3600",
+        ];
+        assert!(Opt::try_parse_from(args).is_err());
+        assert!(Opt::try_parse_from(args.into_iter().chain(["--pace-fps", "60"])).is_ok());
     }
 }

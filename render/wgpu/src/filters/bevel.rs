@@ -121,7 +121,7 @@ impl BevelFilter {
         self.pipeline.get_or_init(msaa_sample_count, || {
             let label = create_debug_label!("Bevel Filter ({} msaa)", msaa_sample_count);
             descriptors
-                .device
+                .persistent_device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: label.as_deref(),
                     layout: Some(&self.pipeline_layout),

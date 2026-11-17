@@ -24,6 +24,7 @@ pub fn _set_byte_code<'gc>(
     this: Value<'gc>,
     args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
+    activation.context.renderer.health().check()?;
     let this = this.as_object().unwrap();
 
     let bytecode = args.get_object(activation, 0, "bytecode")?;
@@ -82,10 +83,89 @@ pub fn _set_byte_code<'gc>(
         .context
         .renderer
         .compile_pixelbender_shader(shader)
-        .expect("Failed to compile PixelBender shader");
+        .map_err(|error| {
+            activation
+                .context
+                .renderer
+                .health()
+                .record(error.into_render_failure())
+        })?;
+    activation.context.renderer.health().check()?;
 
     this.as_shader_data()
         .unwrap()
         .set_pixel_bender_shader(shader_handle);
     Ok(Value::Undefined)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shader_bytecode_allocation_failure_is_terminal_without_panic_or_replay() {
+        use crate::avm2::{bytearray::ByteArrayStorage, object::ByteArrayObject};
+        use ruffle_render::error::{RenderFailure, RenderFailureKind};
+        let mut renderer = crate::bitmap::symbol_pixels::tests::renderer(false);
+        renderer.allocation_failure = Some(RenderFailure::new(
+            RenderFailureKind::OutOfMemory,
+            "shader allocation fault",
+        ));
+        let calls = renderer.allocation_calls.clone();
+        let player = crate::PlayerBuilder::new()
+            .with_movie(crate::tag_utils::SwfMovieData::empty(10, None))
+            .with_renderer(renderer)
+            .build();
+        let mut player = player.lock().unwrap();
+        player.mutate_with_update_context(|context| {
+            let bytes = ByteArrayStorage::from_vec(
+                context,
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../tests/tests/swfs/avm2/pixelbender_logicalnot/logicalnot.pbj"
+                ))
+                .to_vec(),
+            );
+            let bytes = ByteArrayObject::from_storage(context, bytes);
+            let mut activation = Activation::from_nothing(context);
+            let domain = activation.avm2().playerglobals_domain();
+            let name = domain
+                .get_defined_names()
+                .into_iter()
+                .find(|name| name.local_name().as_wstr() == b"ShaderData")
+                .expect("ShaderData exists in playerglobals");
+            let class = domain
+                .get_defined_value(&mut activation, name)
+                .unwrap_or_else(|error| panic!("{}", error.to_string(&mut activation)))
+                .as_object()
+                .unwrap()
+                .as_class_object()
+                .unwrap();
+            let shader = shader_data_allocator(class, &mut activation).unwrap();
+            for _ in 0..2 {
+                let args = [bytes.into()];
+                assert!(
+                    _set_byte_code(
+                        &mut activation,
+                        shader.into(),
+                        FunctionArgs::from_slice(&args)
+                    )
+                    .is_err()
+                );
+            }
+            assert!(
+                shader
+                    .as_shader_data()
+                    .unwrap()
+                    .pixel_bender_shader()
+                    .is_none()
+            );
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            player.render_failure().unwrap().kind(),
+            RenderFailureKind::OutOfMemory
+        );
+        assert!(player.render().is_err());
+    }
 }

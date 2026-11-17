@@ -2244,3 +2244,51 @@ fn native_gl_initialized_and_staged_buffers_preserve_bytes() {
     drop(bytes);
     output.unmap();
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn pixelbender_allocations_are_attributed_to_the_shader_until_drop() {
+    use crate::gpu_runtime::OwnerKind;
+    let descriptors = gpu();
+    let baseline: std::collections::HashSet<_> = descriptors
+        .runtime
+        .resources()
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    let parsed = ruffle_render::pixel_bender::parse_shader(
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/tests/swfs/avm2/pixelbender_logicalnot/logicalnot.pbj"
+        )),
+        true,
+    )
+    .unwrap();
+    let shader = crate::pixel_bender::PixelBenderWgpuShader::new(&descriptors, parsed).unwrap();
+    let shader_resources: Vec<_> = descriptors
+        .runtime
+        .resources()
+        .into_iter()
+        .filter(|r| !baseline.contains(&r.id))
+        .collect();
+    assert!(!shader_resources.is_empty());
+    assert!(
+        shader_resources
+            .iter()
+            .all(|r| r.owner.kind == OwnerKind::ShaderJob),
+        "shader allocations must be visible to the unload oracle: {shader_resources:?}"
+    );
+    assert!(
+        shader_resources
+            .iter()
+            .all(|r| r.owner == shader_resources[0].owner)
+    );
+    drop(shader);
+    assert!(
+        descriptors
+            .runtime
+            .resources()
+            .iter()
+            .all(|r| baseline.contains(&r.id))
+    );
+}

@@ -75,6 +75,21 @@ impl<'gc> Context3DObject<'gc> {
         })
     }
 
+    fn with_context_3d_render_result<R>(
+        self,
+        f: impl FnOnce(&mut dyn Context3D) -> Result<R, ruffle_render::error::Error>,
+    ) -> Result<R, ruffle_render::error::Error> {
+        self.with_context_3d(|ctx| {
+            ctx.health().check()?;
+            let result = f(ctx).map_err(|error| match error {
+                ruffle_render::error::Error::Render(failure) => ctx.health().record(failure).into(),
+                other => other,
+            })?;
+            ctx.health().check()?;
+            Ok(result)
+        })
+    }
+
     pub fn configure_back_buffer(
         self,
         width: u32,
@@ -126,7 +141,7 @@ impl<'gc> Context3DObject<'gc> {
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
         check_texture_stub(activation, format);
-        let texture = self.with_context_3d(|ctx| {
+        let texture = self.with_context_3d_render_result(|ctx| {
             ctx.create_texture(
                 width,
                 height,
@@ -503,7 +518,7 @@ impl<'gc> Context3DObject<'gc> {
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
         check_texture_stub(activation, format);
-        let texture = self.with_context_3d(|ctx| {
+        let texture = self.with_context_3d_render_result(|ctx| {
             ctx.create_cube_texture(
                 size,
                 format,
@@ -632,5 +647,182 @@ fn check_texture_stub(activation: &mut Activation<'_, '_>, format: Context3DText
             );
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    use ruffle_render::backend::{Context3DProfile, IndexBuffer, ShaderModule, VertexBuffer};
+    use ruffle_render::bitmap::BitmapHandle;
+    use ruffle_render::error::{
+        Error as RenderError, RenderFailure, RenderFailureKind, RendererHealth,
+    };
+    use std::cell::RefCell;
+
+    struct FailingTextures {
+        health: RendererHealth,
+        calls: Rc<Cell<usize>>,
+        failure: Option<RenderFailure>,
+    }
+    impl FailingTextures {
+        fn allocate(&self) -> Result<Rc<dyn Texture>, RenderError> {
+            self.calls.set(self.calls.get() + 1);
+            Err(self.failure.clone().map_or_else(
+                || RenderError::Unimplemented("unsupported format".into()),
+                RenderError::from,
+            ))
+        }
+    }
+    impl Context3D for FailingTextures {
+        fn health(&self) -> &RendererHealth {
+            &self.health
+        }
+        fn profile(&self) -> Context3DProfile {
+            Context3DProfile::Baseline
+        }
+        fn bitmap_handle(&self) -> BitmapHandle {
+            unreachable!()
+        }
+        fn back_buffer_handle(&self) -> Option<BitmapHandle> {
+            None
+        }
+        fn back_buffer_size(&self) -> Option<(u32, u32)> {
+            None
+        }
+        fn buffers_cleared(&self) -> bool {
+            false
+        }
+        fn should_render(&self) -> bool {
+            false
+        }
+        fn disposed_index_buffer_handle(&self) -> Rc<dyn IndexBuffer> {
+            unreachable!()
+        }
+        fn disposed_vertex_buffer_handle(&self) -> Rc<dyn VertexBuffer> {
+            unreachable!()
+        }
+        fn create_index_buffer(
+            &mut self,
+            _: BufferUsage,
+            _: u32,
+        ) -> Result<Box<dyn IndexBuffer>, RenderFailure> {
+            unreachable!()
+        }
+        fn create_vertex_buffer(
+            &mut self,
+            _: BufferUsage,
+            _: u32,
+            _: u8,
+        ) -> Result<Rc<dyn VertexBuffer>, RenderFailure> {
+            unreachable!()
+        }
+        fn create_texture(
+            &mut self,
+            _: u32,
+            _: u32,
+            _: Context3DTextureFormat,
+            _: bool,
+            _: u32,
+        ) -> Result<Rc<dyn Texture>, RenderError> {
+            self.allocate()
+        }
+        fn create_cube_texture(
+            &mut self,
+            _: u32,
+            _: Context3DTextureFormat,
+            _: bool,
+            _: u32,
+        ) -> Result<Rc<dyn Texture>, RenderError> {
+            self.allocate()
+        }
+        fn upload_shaders(
+            &mut self,
+            _: &RefCell<Option<Rc<dyn ShaderModule>>>,
+            _: Vec<u8>,
+            _: Vec<u8>,
+        ) -> Result<(), AgalError> {
+            unreachable!()
+        }
+        fn process_command(&mut self, _: Context3DCommand<'_>) -> Result<(), RenderFailure> {
+            unreachable!()
+        }
+        fn present(&mut self) {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn texture_allocation_failures_latch_health_and_are_never_replayed() {
+        for cube in [false, true] {
+            let player = crate::PlayerBuilder::new().build();
+            let mut player = player.lock().unwrap();
+            let calls = Rc::new(Cell::new(0));
+            player.mutate_with_update_context(|context| {
+                let stage = Stage3DObject::new(context);
+                let render_context = FailingTextures {
+                    health: context.renderer.health().clone(),
+                    calls: calls.clone(),
+                    failure: Some(RenderFailure::new(
+                        RenderFailureKind::OutOfMemory,
+                        "texture allocation fault",
+                    )),
+                };
+                let object =
+                    Context3DObject::from_context(context, Box::new(render_context), stage);
+                let mut activation = Activation::from_nothing(context);
+                for _ in 0..2 {
+                    let class = activation.avm2().classes().texture;
+                    let result = if cube {
+                        object.create_cube_texture(
+                            8,
+                            Context3DTextureFormat::Bgra,
+                            false,
+                            0,
+                            &mut activation,
+                        )
+                    } else {
+                        object.create_texture(
+                            8,
+                            8,
+                            Context3DTextureFormat::Bgra,
+                            false,
+                            0,
+                            class,
+                            &mut activation,
+                        )
+                    };
+                    assert!(result.is_err());
+                }
+            });
+            assert_eq!(calls.get(), 1);
+            assert_eq!(
+                player.render_failure().unwrap().kind(),
+                RenderFailureKind::OutOfMemory
+            );
+            assert!(player.render().is_err());
+        }
+    }
+
+    #[test]
+    fn unsupported_texture_capability_does_not_latch_a_resource_failure() {
+        let player = crate::PlayerBuilder::new().build();
+        let mut player = player.lock().unwrap();
+        player.mutate_with_update_context(|context| {
+            let stage = Stage3DObject::new(context);
+            let render_context = FailingTextures {
+                health: context.renderer.health().clone(),
+                calls: Default::default(),
+                failure: None,
+            };
+            let object = Context3DObject::from_context(context, Box::new(render_context), stage);
+            let mut activation = Activation::from_nothing(context);
+            assert!(
+                object
+                    .create_cube_texture(8, Context3DTextureFormat::Bgra, false, 0, &mut activation)
+                    .is_err()
+            );
+        });
+        assert!(player.render_failure().is_none());
     }
 }

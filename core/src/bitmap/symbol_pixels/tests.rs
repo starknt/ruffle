@@ -31,6 +31,8 @@ pub struct TestRenderer {
     sync_reads: usize,
     copies: usize,
     fail_read: bool,
+    pub(crate) allocation_failure: Option<ruffle_render::error::RenderFailure>,
+    pub(crate) allocation_calls: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +165,10 @@ impl RenderBackend for TestRenderer {
         &mut self,
         _profile: Context3DProfile,
     ) -> Result<Box<dyn Context3D>, Error> {
+        self.allocation_calls.set(self.allocation_calls.get() + 1);
+        if let Some(error) = &self.allocation_failure {
+            return Err(error.clone().into());
+        }
         Err(Error::Unimplemented("createContext3D".into()))
     }
 
@@ -243,6 +249,10 @@ impl RenderBackend for TestRenderer {
         &mut self,
         _shader: PixelBenderShader,
     ) -> Result<PixelBenderShaderHandle, Error> {
+        self.allocation_calls.set(self.allocation_calls.get() + 1);
+        if let Some(error) = &self.allocation_failure {
+            return Err(error.clone().into());
+        }
         Err(Error::Unimplemented(
             "Pixel bender shader compilation".into(),
         ))
@@ -300,6 +310,8 @@ pub(crate) fn renderer(managed: bool) -> TestRenderer {
         sync_reads: 0,
         copies: 0,
         fail_read: false,
+        allocation_failure: None,
+        allocation_calls: Default::default(),
     }
 }
 fn test_handle(handle: &BitmapHandle) -> &TestBitmapHandle {

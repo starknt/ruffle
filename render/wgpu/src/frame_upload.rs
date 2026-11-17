@@ -431,6 +431,106 @@ impl FrameUploadArena {
         );
         Ok(view)
     }
+    /// Upload tightly packed rows without retaining a full-image staging buffer.
+    /// Every rollover submits only the already recorded command prefix.
+    pub fn write_texture(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        destination: wgpu::TexelCopyTextureInfo<'_>,
+        source: &[u8],
+        size: wgpu::Extent3d,
+    ) -> Result<(), RenderFailure> {
+        let invalid =
+            || RenderFailure::new(RenderFailureKind::Validation, "invalid staged texture rows");
+        let format = destination.texture.format();
+        let (block_width, block_height) = format.block_dimensions();
+        let block_bytes = format
+            .block_copy_size(Some(destination.aspect))
+            .ok_or_else(invalid)?;
+        if size.width == 0 || size.height == 0 || size.depth_or_array_layers != 1 {
+            return Err(invalid());
+        }
+        let row_bytes = u64::from(size.width.div_ceil(block_width)) * u64::from(block_bytes);
+        let rows = size.height.div_ceil(block_height);
+        let needed = row_bytes.checked_mul(u64::from(rows)).ok_or_else(invalid)?;
+        if needed != source.len() as u64 {
+            return Err(invalid());
+        }
+        let padded = row_bytes.next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+        if padded > self.device.runtime().config().staging_limit || padded > u64::from(u32::MAX) {
+            return Err(RenderFailure::new(
+                RenderFailureKind::BudgetExceeded,
+                "one texture block row exceeds staging budget",
+            ));
+        }
+        let rows_per_slice = (self.page_size / padded).max(1).min(u64::from(rows)) as u32;
+        let mut first_row = 0;
+        while first_row < rows {
+            let count = rows_per_slice.min(rows - first_row);
+            let bytes = padded * u64::from(count);
+            encoder.flush_uploads_if_needed(bytes.max(self.page_size))?;
+            let allocation = self.reserve(
+                bytes,
+                bytes,
+                wgpu::MAP_ALIGNMENT,
+                wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                true,
+            )?;
+            let guard = self
+                .active
+                .buffers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let view = allocation
+                .buffer
+                .get_mapped_range_mut(allocation.offset..allocation.offset + bytes)
+                .map_err(|error| {
+                    RenderFailure::new(RenderFailureKind::MapFailed, error.to_string())
+                })?;
+            self.active.views.fetch_add(1, Ordering::AcqRel);
+            drop(guard);
+            let mut view = UploadViewMut {
+                view: Some(view),
+                owner: self.active.clone(),
+            };
+            // Register the unsubmitted use while the mapped-view guard prevents
+            // another renderer's pressure drain from recycling this page.
+            let mut target = destination;
+            target.origin.y = target
+                .origin
+                .y
+                .checked_add(first_row * block_height)
+                .ok_or_else(invalid)?;
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &allocation.buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: allocation.offset,
+                        bytes_per_row: Some(padded as u32),
+                        rows_per_image: None,
+                    },
+                },
+                target,
+                wgpu::Extent3d {
+                    width: size.width,
+                    height: (count * block_height).min(size.height - first_row * block_height),
+                    depth_or_array_layers: 1,
+                },
+            );
+            for row in 0..count {
+                let start = ((first_row + row) as u64 * row_bytes) as usize;
+                let target = (u64::from(row) * padded) as usize;
+                let mapped_row = view.slice(target..target + padded as usize);
+                let (mut pixels, mut padding) = mapped_row.split_at(row_bytes as usize);
+                pixels.copy_from_slice(&source[start..start + row_bytes as usize]);
+                padding.fill(0);
+            }
+            drop(view);
+            first_row += count;
+        }
+        Ok(())
+    }
+
     pub fn finish(&mut self) {
         if let Err(error) = self.active.seal() {
             self.device.runtime().fail(error);

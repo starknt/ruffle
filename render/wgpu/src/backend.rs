@@ -1351,9 +1351,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 // FIXME - cache this texture somehow. We might also want to consider using
                 // a compute shader
                 let texture_label = create_debug_label!("Temporary pixelbender output texture");
-                let texture = self
-                    .descriptors
-                    .device
+                let texture = crate::pixel_bender::as_cache_holder(&shader)
+                    .device()
                     .create_texture(&wgpu::TextureDescriptor {
                         label: texture_label.as_deref(),
                         size: extent,

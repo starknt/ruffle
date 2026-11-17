@@ -88,6 +88,7 @@ const FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
 // we don't actually store the `crate::gpu_resources::RenderPipeline` in `CurrentPipeline` - it's
 // instead stored in `WgpuContext3D`.
 pub struct CurrentPipeline {
+    device: crate::gpu_resources::Device,
     shaders: Option<Rc<ShaderPairAgal>>,
 
     culling: Context3DTriangleFace,
@@ -138,15 +139,17 @@ pub struct BoundTextureData {
 }
 
 impl CurrentPipeline {
-    pub fn new(descriptors: &Descriptors) -> Result<Self, crate::gpu_runtime::RenderFailure> {
-        let vertex_shader_uniforms = descriptors.device.create_buffer(&BufferDescriptor {
+    pub fn new(
+        device: &crate::gpu_resources::Device,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        let vertex_shader_uniforms = device.create_buffer(&BufferDescriptor {
             label: Some("Vertex shader uniforms"),
             size: VERTEX_SHADER_UNIFORMS_BUFFER_SIZE,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })?;
 
-        let fragment_shader_uniforms = descriptors.device.create_buffer(&BufferDescriptor {
+        let fragment_shader_uniforms = device.create_buffer(&BufferDescriptor {
             label: Some("Fragment shader uniforms"),
             size: FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
@@ -154,6 +157,7 @@ impl CurrentPipeline {
         })?;
 
         Ok(CurrentPipeline {
+            device: device.clone(),
             shaders: None,
             bound_textures: std::array::from_fn(|_| None),
             vertex_shader_uniforms,
@@ -406,7 +410,7 @@ impl CurrentPipeline {
         }
 
         let compiled_shaders = self.shaders.as_ref().expect("Missing shaders!").compile(
-            descriptors,
+            &self.device,
             ShaderCompileData {
                 vertex_attributes: agal_attributes,
                 texture_infos,
@@ -417,21 +421,18 @@ impl CurrentPipeline {
 
         let pipeline_layout_label = create_debug_label!("Pipeline layout");
         let pipeline_layout =
-            descriptors
-                .device
+            self.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: pipeline_layout_label.as_deref(),
                     bind_group_layouts: &[Some(&compiled_shaders.bind_group_layout)],
                     immediate_size: 0,
                 })?;
 
-        let bind_group = descriptors
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: bind_group_label.as_deref(),
-                layout: &compiled_shaders.bind_group_layout,
-                entries: &bind_group_entries,
-            })?;
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: bind_group_label.as_deref(),
+            layout: &compiled_shaders.bind_group_layout,
+            entries: &bind_group_entries,
+        })?;
 
         struct BufferData {
             buffer: Rc<VertexBufferWrapper>,
@@ -554,7 +555,7 @@ impl CurrentPipeline {
             })
             .collect::<Vec<_>>();
 
-        let compiled = descriptors
+        let compiled = self
             .device
             .create_render_pipeline(&RenderPipelineDescriptor {
                 label: create_debug_label!("RenderPipeline").as_deref(),

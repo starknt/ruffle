@@ -14,8 +14,8 @@ use crate::gpu_resources::{BindGroup, TextureView};
 use crate::gpu_resources::{CommandEncoder, RenderPass};
 use wgpu::Extent3d;
 use wgpu::{
-    BufferDescriptor, BufferUsages, COPY_BUFFER_ALIGNMENT, COPY_BYTES_PER_ROW_ALIGNMENT,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
+    BufferDescriptor, BufferUsages, COPY_BUFFER_ALIGNMENT, TextureDescriptor, TextureDimension,
+    TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 
 use crate::Texture;
@@ -30,6 +30,8 @@ use tracing::instrument;
 
 mod current_pipeline;
 mod shader_pair;
+#[cfg(test)]
+mod tests;
 
 use current_pipeline::CurrentPipeline;
 
@@ -45,6 +47,7 @@ pub struct WgpuContext3D {
     // store an entire `Arc<Descriptors>` rather than wrapping the fields
     // we need in individual `Arc`s.
     descriptors: Arc<Descriptors>,
+    device: crate::gpu_resources::Device,
     profile: Context3DProfile,
 
     buffer_staging_belt: StagingBelt,
@@ -96,25 +99,28 @@ impl WgpuContext3D {
         descriptors: Arc<Descriptors>,
         profile: Context3DProfile,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        let device = descriptors.device.with_owner(
+            descriptors
+                .runtime
+                .issue_owner(crate::gpu_runtime::OwnerKind::Scene)?,
+        );
         let make_dummy_handle = || -> Result<_, crate::gpu_runtime::RenderFailure> {
             let texture_label = create_debug_label!("Render target texture");
             let format = wgpu::TextureFormat::Rgba8Unorm;
-            let dummy_texture = descriptors
-                .device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: texture_label.as_deref(),
-                    size: Extent3d {
-                        width: 1,
-                        height: 1,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    view_formats: &[format],
-                    usage: wgpu::TextureUsages::COPY_SRC,
-                })?;
+            let dummy_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: texture_label.as_deref(),
+                size: Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                view_formats: &[format],
+                usage: wgpu::TextureUsages::COPY_SRC,
+            })?;
 
             Ok(BitmapHandle(Arc::new(Texture {
                 _allocation: Default::default(),
@@ -133,19 +139,18 @@ impl WgpuContext3D {
         let front_buffer_raw_texture_handle = make_dummy_handle()?;
 
         // FIXME - determine the best chunk size for this
-        let buffer_staging_belt = StagingBelt::new(descriptors.device.clone(), 1024);
-        let current_pipeline = CurrentPipeline::new(&descriptors)?;
+        let buffer_staging_belt = StagingBelt::new(device.clone(), 1024);
+        let current_pipeline = CurrentPipeline::new(&device)?;
 
         let buffer_command_encoder =
-            descriptors
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: create_debug_label!("Buffer command encoder").as_deref(),
-                })?;
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: create_debug_label!("Buffer command encoder").as_deref(),
+            })?;
 
         Ok(Self {
             profile,
             descriptors,
+            device,
             buffer_staging_belt,
             back_buffer_raw_texture_handle,
             front_buffer_raw_texture_handle,
@@ -395,7 +400,7 @@ impl Context3D for WgpuContext3D {
         num_indices: u32,
     ) -> Result<Box<dyn IndexBuffer>, crate::gpu_runtime::RenderFailure> {
         let size = (u64::from(num_indices) * 2).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
-        let buffer = self.descriptors.device.create_buffer(&BufferDescriptor {
+        let buffer = self.device.create_buffer(&BufferDescriptor {
             label: None,
             size: size as u64,
             usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
@@ -413,7 +418,7 @@ impl Context3D for WgpuContext3D {
         num_vertices: u32,
         data_32_per_vertex: u8,
     ) -> Result<Rc<dyn VertexBuffer>, crate::gpu_runtime::RenderFailure> {
-        let buffer = self.descriptors.device.create_buffer(&BufferDescriptor {
+        let buffer = self.device.create_buffer(&BufferDescriptor {
             label: None,
             // Each data value is 4 bytes
             size: num_vertices as u64 * data_32_per_vertex as u64 * 4,
@@ -458,7 +463,7 @@ impl Context3D for WgpuContext3D {
             ));
         }
 
-        let texture = self.descriptors.device.create_texture(&TextureDescriptor {
+        let texture = self.device.create_texture(&TextureDescriptor {
             label: None,
             size: Extent3d {
                 width,
@@ -491,7 +496,7 @@ impl Context3D for WgpuContext3D {
             );
         }
 
-        let texture = self.descriptors.device.create_texture(&TextureDescriptor {
+        let texture = self.device.create_texture(&TextureDescriptor {
             label: None,
             size: Extent3d {
                 width: size,
@@ -579,53 +584,47 @@ impl Context3D for WgpuContext3D {
 
                 let make_it = || -> Result<_, crate::gpu_runtime::RenderFailure> {
                     // TODO - see if we can deduplicate this with the code in `CommandTarget`
-                    let wgpu_texture =
-                        self.descriptors
-                            .device
-                            .create_texture(&wgpu::TextureDescriptor {
-                                label: texture_label.as_deref(),
-                                size: Extent3d {
-                                    width,
-                                    height,
-                                    depth_or_array_layers: 1,
-                                },
-                                mip_level_count: 1,
-                                sample_count,
-                                dimension: wgpu::TextureDimension::D2,
-                                format,
-                                view_formats: &[format],
-                                usage: if sample_count > 1 {
-                                    wgpu::TextureUsages::RENDER_ATTACHMENT
-                                } else {
-                                    wgpu::TextureUsages::RENDER_ATTACHMENT
-                                        | wgpu::TextureUsages::COPY_SRC
-                                        | wgpu::TextureUsages::TEXTURE_BINDING
-                                },
-                            })?;
-
-                    let resolve_texture =
-                        if sample_count > 1 {
-                            Some(self.descriptors.device.create_texture(
-                                &wgpu::TextureDescriptor {
-                                    label: texture_label.as_deref(),
-                                    size: Extent3d {
-                                        width,
-                                        height,
-                                        depth_or_array_layers: 1,
-                                    },
-                                    mip_level_count: 1,
-                                    sample_count: 1,
-                                    dimension: wgpu::TextureDimension::D2,
-                                    format,
-                                    view_formats: &[format],
-                                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                                        | wgpu::TextureUsages::COPY_SRC
-                                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                                },
-                            )?)
+                    let wgpu_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: texture_label.as_deref(),
+                        size: Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        view_formats: &[format],
+                        usage: if sample_count > 1 {
+                            wgpu::TextureUsages::RENDER_ATTACHMENT
                         } else {
-                            None
-                        };
+                            wgpu::TextureUsages::RENDER_ATTACHMENT
+                                | wgpu::TextureUsages::COPY_SRC
+                                | wgpu::TextureUsages::TEXTURE_BINDING
+                        },
+                    })?;
+
+                    let resolve_texture = if sample_count > 1 {
+                        Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: texture_label.as_deref(),
+                            size: Extent3d {
+                                width,
+                                height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format,
+                            view_formats: &[format],
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                                | wgpu::TextureUsages::COPY_SRC
+                                | wgpu::TextureUsages::TEXTURE_BINDING,
+                        })?)
+                    } else {
+                        None
+                    };
                     Ok((wgpu_texture, resolve_texture))
                 };
 
@@ -830,27 +829,22 @@ impl Context3D for WgpuContext3D {
                 if sample_count != 1 {
                     let texture_label = create_debug_label!("Render target texture MSAA");
 
-                    let msaa_texture =
-                        self.descriptors
-                            .device
-                            .create_texture(&wgpu::TextureDescriptor {
-                                label: texture_label.as_deref(),
-                                size: Extent3d {
-                                    width: texture_wrapper.texture.width(),
-                                    height: texture_wrapper.texture.height(),
-                                    depth_or_array_layers: texture_wrapper
-                                        .texture
-                                        .depth_or_array_layers(),
-                                },
-                                mip_level_count: 1,
-                                sample_count,
-                                dimension: texture_wrapper.texture.dimension(),
-                                format: texture_wrapper.texture.format(),
-                                view_formats: &[texture_wrapper.texture.format()],
-                                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                                    | wgpu::TextureUsages::COPY_SRC
-                                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                            })?;
+                    let msaa_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: texture_label.as_deref(),
+                        size: Extent3d {
+                            width: texture_wrapper.texture.width(),
+                            height: texture_wrapper.texture.height(),
+                            depth_or_array_layers: texture_wrapper.texture.depth_or_array_layers(),
+                        },
+                        mip_level_count: 1,
+                        sample_count,
+                        dimension: texture_wrapper.texture.dimension(),
+                        format: texture_wrapper.texture.format(),
+                        view_formats: &[texture_wrapper.texture.format()],
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::COPY_SRC
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                    })?;
 
                     self.current_texture_resolve_view =
                         Some(texture_wrapper.texture.create_view(&view_desc)?);
@@ -924,11 +918,11 @@ impl Context3D for WgpuContext3D {
                 }
 
                 self.buffer_staging_belt.finish();
-                let new_encoder = self.descriptors.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor {
-                        label: create_debug_label!("Buffer command encoder").as_deref(),
-                    },
-                )?;
+                let new_encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: create_debug_label!("Buffer command encoder").as_deref(),
+                        })?;
                 let finished_buffer_command_encoder =
                     std::mem::replace(&mut self.buffer_command_encoder, new_encoder);
 
@@ -940,11 +934,11 @@ impl Context3D for WgpuContext3D {
                     self.bind_group = Some(new_bind_group);
                 }
 
-                let mut render_command_encoder = self.descriptors.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor {
-                        label: create_debug_label!("Render command encoder").as_deref(),
-                    },
-                )?;
+                let mut render_command_encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: create_debug_label!("Render command encoder").as_deref(),
+                        })?;
 
                 let mut render_pass = self.make_render_pass(&mut render_command_encoder);
 
@@ -1041,62 +1035,8 @@ impl Context3D for WgpuContext3D {
                 // If we were to use `self.buffer_command_encoder.copy_texture_to_texture`, the
                 // BitmapData's gpu texture might be modified before we actually submit
                 // `buffer_command_encoder` to the device.
-                let dest_format = dest.texture.format();
-                let src_bytes_per_row = dest_format.block_copy_size(None).unwrap()
-                    * (source_width / dest_format.block_dimensions().0);
-
-                let rows_per_image = source_height / dest_format.block_dimensions().1;
-
-                // Wgpu requires us to pad the image rows to a multiple of COPY_BYTES_PER_ROW_ALIGNMENT
-                let dest_bytes_per_row =
-                    if matches!(dest.texture.format(), wgpu::TextureFormat::Rgba8Unorm) {
-                        (source_width * 4).next_multiple_of(COPY_BYTES_PER_ROW_ALIGNMENT)
-                    } else {
-                        src_bytes_per_row
-                    };
-                let dest_size = dest_bytes_per_row as u64 * rows_per_image as u64;
-                assert!(
-                    dest_bytes_per_row >= src_bytes_per_row && dest_size >= source.len() as u64
-                );
-
-                let texture_buffer = self.descriptors.device.create_buffer(&BufferDescriptor {
-                    label: None,
-                    size: dest_size,
-                    usage: BufferUsages::COPY_SRC,
-                    mapped_at_creation: true,
-                })?;
-
-                let mut texture_buffer_view = texture_buffer
-                    .slice(..)
-                    .get_mapped_range_mut()
-                    .expect("Texture buffer must be mappable");
-                if dest_bytes_per_row == src_bytes_per_row {
-                    // No padding, we can copy everything in one go.
-                    texture_buffer_view.copy_from_slice(source);
-                } else {
-                    // Copy row by row.
-                    for (row, src) in source.chunks_exact(src_bytes_per_row as usize).enumerate() {
-                        let row_start = row * dest_bytes_per_row as usize;
-                        let (mut dest, mut padding) = texture_buffer_view
-                            .slice(row_start..row_start + dest_bytes_per_row as usize)
-                            .split_at(src_bytes_per_row as usize);
-                        dest.copy_from_slice(src);
-                        padding.fill(0);
-                    }
-                }
-                drop(texture_buffer_view);
-                texture_buffer.unmap();
-
-                self.buffer_command_encoder.copy_buffer_to_texture(
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &texture_buffer,
-                        // The copy source uses the padded image data, with larger rows
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(dest_bytes_per_row),
-                            rows_per_image: Some(rows_per_image),
-                        },
-                    },
+                self.buffer_staging_belt.write_texture(
+                    &mut self.buffer_command_encoder,
                     wgpu::TexelCopyTextureInfo {
                         texture: &dest.texture,
                         mip_level: 0,
@@ -1107,13 +1047,13 @@ impl Context3D for WgpuContext3D {
                         },
                         aspect: wgpu::TextureAspect::All,
                     },
-                    // The copy size uses the original image, with the original row size
+                    source,
                     wgpu::Extent3d {
                         width: source_width,
                         height: source_height,
                         depth_or_array_layers: 1,
                     },
-                );
+                )?;
             }
             Context3DCommand::SetTextureAt {
                 sampler,

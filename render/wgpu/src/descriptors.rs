@@ -14,6 +14,9 @@ pub struct Descriptors {
     pub wgpu_instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: crate::gpu_resources::Device,
+    /// Only factories for storage retained by these shared descriptors use this owner.
+    pub descriptor_owner: crate::gpu_runtime::ResourceOwner,
+    pub(crate) persistent_device: crate::gpu_resources::Device,
     pub limits: wgpu::Limits,
     pub backend: Backend,
     pub queue: crate::gpu_resources::Queue,
@@ -70,15 +73,16 @@ impl Descriptors {
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let runtime = device.runtime().clone();
         runtime.check_health()?;
-        let device =
-            device.with_owner(runtime.issue_owner(crate::gpu_runtime::OwnerKind::Renderer)?);
+        let descriptor_owner = runtime.issue_owner(crate::gpu_runtime::OwnerKind::Renderer)?;
+        let persistent_device = device.with_owner(descriptor_owner);
+        let device = device.with_owner(runtime.issue_owner(crate::gpu_runtime::OwnerKind::Scene)?);
         let queue = device.queue();
         let limits = device.limits();
-        let bind_layouts = BindLayouts::new(&device)?;
-        let bitmap_samplers = BitmapSamplers::new(&device)?;
-        let shaders = Shaders::new(&device)?;
-        let quad = Quad::new(&device)?;
-        let filters = Filters::new(&device)?;
+        let bind_layouts = BindLayouts::new(&persistent_device)?;
+        let bitmap_samplers = BitmapSamplers::new(&persistent_device)?;
+        let shaders = Shaders::new(&persistent_device)?;
+        let quad = Quad::new(&persistent_device)?;
+        let filters = Filters::new(&persistent_device)?;
         let backend = adapter.get_info().backend;
 
         runtime.check_health()?;
@@ -89,6 +93,8 @@ impl Descriptors {
             wgpu_instance: instance,
             adapter,
             device,
+            descriptor_owner,
+            persistent_device,
             limits,
             backend,
             queue,
@@ -120,15 +126,14 @@ impl Descriptors {
             .expect("Pipelines should not be already locked");
         Ok(
             crate::gpu_resources::try_cached(&mut pipelines, (msaa_sample_count, format), || {
-                let copy_texture_pipeline_layout =
-                    &self
-                        .device
-                        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                            label: create_debug_label!("Copy pipeline layout").as_deref(),
-                            bind_group_layouts: &[None, None, Some(&self.bind_layouts.bitmap)],
-                            immediate_size: 0,
-                        })?;
-                self.device
+                let copy_texture_pipeline_layout = &self.persistent_device.create_pipeline_layout(
+                    &wgpu::PipelineLayoutDescriptor {
+                        label: create_debug_label!("Copy pipeline layout").as_deref(),
+                        bind_group_layouts: &[None, None, Some(&self.bind_layouts.bitmap)],
+                        immediate_size: 0,
+                    },
+                )?;
+                self.persistent_device
                     .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                         label: create_debug_label!("Copy pipeline").as_deref(),
                         layout: Some(copy_texture_pipeline_layout),
@@ -185,7 +190,7 @@ impl Descriptors {
         Ok(
             crate::gpu_resources::try_cached(&mut pipelines, (msaa_sample_count, format), || {
                 Ok::<_, crate::gpu_runtime::RenderFailure>(Arc::new(Pipelines::new(
-                    &self.device,
+                    &self.persistent_device,
                     &self.shaders,
                     format,
                     msaa_sample_count,
