@@ -220,7 +220,11 @@ impl Surface {
                             },
                         );
                         render_pass.set_bind_group(0, (target.globals().bind_group()).raw(), &[]);
-                        render_pass.set_bind_group(1, (&chunk_buffers.bind_group).raw(), &[]);
+                        render_pass.set_bind_group(
+                            1,
+                            chunk_buffers.bind_group.raw(),
+                            &[chunk_buffers.transform_offset],
+                        );
                         let mut renderer = CommandRenderer::new(
                             &self.pipelines,
                             chunk_buffers,

@@ -82,6 +82,45 @@ fn measurement_counts_mask_passes_not_mask_inputs() {
 
 #[test]
 #[ignore = "requires a real native adapter"]
+fn chunk_uniform_windows_reuse_the_same_buffer_binding() {
+    let descriptors = gpu();
+    let mut buffers = super::buffers::ChunkBuffers::new(&descriptors).unwrap();
+    let mut staging = crate::gpu_resources::StagingBelt::new(descriptors.device.clone(), 65536);
+    let mut encoder = descriptors
+        .device
+        .create_command_encoder(&Default::default())
+        .unwrap();
+    let mut bindings = Vec::new();
+    for x in [3.0, 19.0, 7.0] {
+        let mut chunk = super::buffers::ChunkBufferBuilder::new(&buffers, &descriptors.limits);
+        chunk
+            .add_transform(&ruffle_render::transform::Transform {
+                matrix: Matrix::translate(Twips::from_pixels(x), Twips::ZERO),
+                ..Default::default()
+            })
+            .unwrap();
+        chunk
+            .copy_to(&mut staging, &descriptors, &mut encoder, &mut buffers)
+            .unwrap();
+        bindings.push(buffers.bind_group.lease().id());
+    }
+    assert!(
+        bindings.iter().all(|id| *id == bindings[0]),
+        "one arena page needs one transform binding, independent of slice offsets: {bindings:?}"
+    );
+    staging.finish();
+    descriptors
+        .queue
+        .submit([encoder.finish().unwrap()])
+        .unwrap();
+    descriptors
+        .device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires a real native adapter"]
 fn small_alpha_masks_share_a_pass_within_the_transient_byte_budget() {
     let split = gpu_with_watermark(Some(2048));
     let combined = gpu_with_watermark(Some(1024 * 1024));

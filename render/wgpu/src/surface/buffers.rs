@@ -13,6 +13,7 @@ pub struct ChunkBuffers {
     pub transforms: crate::gpu_resources::Buffer,
     pub vertex_buffer: crate::gpu_resources::Buffer,
     pub bind_group: crate::gpu_resources::BindGroup,
+    pub transform_offset: u32,
     pub vertex_offset: u64,
     arena: crate::frame_upload::FrameUploadArena,
     scratch: crate::buffer_builder::ScratchPool,
@@ -51,6 +52,7 @@ impl ChunkBuffers {
                 }],
             })?;
         Ok(Self {
+            transform_offset: 0,
             vertex_offset: 0,
             arena: crate::frame_upload::FrameUploadArena::new(descriptors.device.clone(), 65536),
             scratch: Default::default(),
@@ -303,6 +305,12 @@ impl ChunkBufferBuilder {
         let vertices = chunk_buffers
             .arena
             .allocate_dynamic(self.vertices.len() as u64, 4)?;
+        let transform_offset = u32::try_from(uniforms.offset).map_err(|_| {
+            crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::Validation,
+                "transform slice exceeds dynamic offset range",
+            )
+        })?;
         // Reserve both destinations before encoding either write.
         let bind_group = descriptors.cached_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Paged chunk transforms"),
@@ -311,7 +319,9 @@ impl ChunkBufferBuilder {
                 binding: 0,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &uniforms.buffer,
-                    offset: uniforms.offset,
+                    // All aligned windows in this page share the same binding.
+                    // The pass selects the reserved window through a dynamic offset.
+                    offset: 0,
                     size: wgpu::BufferSize::new(uniform_size),
                 }),
             }],
@@ -329,6 +339,7 @@ impl ChunkBufferBuilder {
             vertices.offset,
         )?;
         chunk_buffers.transforms = uniforms.buffer;
+        chunk_buffers.transform_offset = transform_offset;
         chunk_buffers.vertex_buffer = vertices.buffer;
         chunk_buffers.vertex_offset = vertices.offset;
         chunk_buffers.bind_group = bind_group;
