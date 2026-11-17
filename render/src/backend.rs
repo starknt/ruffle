@@ -1,6 +1,8 @@
 pub mod null;
 
-use crate::bitmap::{Bitmap, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle};
+use crate::bitmap::{
+    Bitmap, BitmapHandle, BitmapInfo, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
+};
 use crate::commands::CommandList;
 use crate::error::{Error, RenderFailure, RendererHealth};
 use crate::filters::Filter;
@@ -23,6 +25,12 @@ pub struct BitmapCacheEntry {
     pub commands: CommandList,
     pub clear: Color,
     pub filters: Vec<Filter>,
+}
+
+/// Reclaimable ownership of an optional raster cache. Display-list commands own
+/// their handles independently, so eviction only affects later reuse.
+pub trait BitmapCacheLease: Debug {
+    fn bitmap(&self) -> Option<BitmapInfo>;
 }
 
 pub trait RenderBackend: Any {
@@ -105,6 +113,21 @@ pub trait RenderBackend: Any {
     /// it after eviction. Never offer mutable BitmapData or GPU-written targets.
     fn cache_immutable_bitmap(&mut self, _bitmap: &BitmapHandle) -> bool {
         false
+    }
+
+    /// Register a lazily allocated raster target with display-cache ownership.
+    fn create_bitmap_cache(
+        &mut self,
+        width: NonZeroU32,
+        height: NonZeroU32,
+    ) -> Result<BitmapHandle, Error> {
+        self.create_empty_texture(width, height)
+    }
+
+    /// None means unmanaged retention. A managed lease may contain no bitmap
+    /// after admission fails or the global cache governor evicts it.
+    fn retain_bitmap_cache(&mut self, _handle: &BitmapHandle) -> Option<Arc<dyn BitmapCacheLease>> {
+        None
     }
 
     fn update_texture(

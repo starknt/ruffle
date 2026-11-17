@@ -706,77 +706,82 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         };
 
         for entry in cache_entries {
+            let prepared = crate::render_snapshot::PreparedSnapshot::capture(&entry.commands)?;
+            let cache =
+                (&*entry.handle.0 as &dyn Any).downcast_ref::<crate::bitmap_cache::CacheImage>();
             let texture = as_texture(&entry.handle, &self.descriptors.device)?;
-            let graph = self.prepare_commands(
-                &entry.commands,
-                texture.texture.width(),
-                texture.texture.height(),
-                self.surface.quality(),
-                wgpu::TextureFormat::Rgba8Unorm,
-                crate::pass_graph::Load::Clear(entry.clear),
-            )?;
-            let entry_commands = graph.into_commands()?;
-            ruffle_render::profile::work(|w| {
-                w.offscreen_targets += 1;
-                w.offscreen_pixels +=
-                    u64::from(texture.texture.width()) * u64::from(texture.texture.height());
-            });
+            let valid = ruffle_render::region::RenderRect {
+                x: 0,
+                y: 0,
+                width: texture.texture.width(),
+                height: texture.texture.height(),
+            };
+            let (dirty, history) = if let Some(cache) = cache {
+                cache.prepare_redraw(
+                    &prepared.snapshot,
+                    entry.clear,
+                    self.surface.quality(),
+                    &entry.filters,
+                    self.descriptors.runtime.scheduler(),
+                )
+            } else {
+                (ruffle_render::region::RenderRegion::Full, None)
+            };
+            let Some(dirty) = dirty.clip(valid) else {
+                if let Some(cache) = cache {
+                    cache.finish_redraw(history);
+                }
+                continue;
+            };
+            let (input, output) = crate::bitmap_cache::filter_regions(dirty, valid, &entry.filters);
+            let partial = input != valid;
             let surface = Surface::new(
                 &self.descriptors,
                 self.surface.quality(),
-                texture.texture.width(),
-                texture.texture.height(),
+                input.width,
+                input.height,
                 wgpu::TextureFormat::Rgba8Unorm,
+            )?
+            .with_origin([input.x, input.y]);
+            let graph = crate::graph_encoder::GraphEncoder::from_prepared(
+                self,
+                prepared,
+                input,
+                surface.sample_count(),
+                crate::pass_graph::Load::Clear(entry.clear),
             )?;
-            if entry.filters.is_empty() {
-                surface.draw_commands(
-                    RenderTargetMode::ExistingWithColor(
-                        texture.texture.clone(),
-                        wgpu::Color {
-                            r: f64::from(entry.clear.r) / 255.0,
-                            g: f64::from(entry.clear.g) / 255.0,
-                            b: f64::from(entry.clear.b) / 255.0,
-                            a: f64::from(entry.clear.a) / 255.0,
-                        },
-                    ),
-                    &self.descriptors,
-                    &self.meshes,
-                    entry_commands,
-                    &mut self.active_frame.staging_belt,
-                    &mut self.chunk_buffers,
-                    &mut self
-                        .profiler
-                        .scope("Draw to CAB", self.active_frame.command_encoder.record()),
-                    LayerRef::None,
-                    &mut self.offscreen_texture_pool,
-                )?;
+            let commands = graph.into_commands()?;
+            ruffle_render::profile::work(|w| {
+                w.offscreen_targets += 1;
+                w.offscreen_pixels += u64::from(input.width) * u64::from(input.height);
+            });
+            let color = wgpu::Color {
+                r: f64::from(entry.clear.r) / 255.0,
+                g: f64::from(entry.clear.g) / 255.0,
+                b: f64::from(entry.clear.b) / 255.0,
+                a: f64::from(entry.clear.a) / 255.0,
+            };
+            let mode = if partial {
+                RenderTargetMode::FreshWithColor(color)
             } else {
-                let mut scope = self
-                    .profiler
-                    .scope("Filters", self.active_frame.command_encoder.record());
-                // We're relying on there being no impotent filters here,
-                // so that we can safely start by using the actual CAB texture.
-                // It's guaranteed that at least one filter would have used it and moved the target to something else,
-                // letting us safely copy back to it later.
-                let mut target = surface.draw_commands(
-                    RenderTargetMode::ExistingWithColor(
-                        texture.texture.clone(),
-                        wgpu::Color {
-                            r: f64::from(entry.clear.r) / 255.0,
-                            g: f64::from(entry.clear.g) / 255.0,
-                            b: f64::from(entry.clear.b) / 255.0,
-                            a: f64::from(entry.clear.a) / 255.0,
-                        },
-                    ),
-                    &self.descriptors,
-                    &self.meshes,
-                    entry_commands,
-                    &mut self.active_frame.staging_belt,
-                    &mut self.chunk_buffers,
-                    &mut scope.scope("Draw to CAB"),
-                    LayerRef::None,
-                    &mut self.offscreen_texture_pool,
-                )?;
+                RenderTargetMode::ExistingWithColor(texture.texture.clone(), color)
+            };
+            let mut scope = self
+                .profiler
+                .scope("Draw to CAB", self.active_frame.command_encoder.record());
+            let mut target = surface.draw_commands(
+                mode,
+                &self.descriptors,
+                &self.meshes,
+                commands,
+                &mut self.active_frame.staging_belt,
+                &mut self.chunk_buffers,
+                &mut scope,
+                LayerRef::None,
+                &mut self.offscreen_texture_pool,
+            )?;
+            let filtered = !entry.filters.is_empty();
+            if filtered {
                 target = self.descriptors.filters.apply_chain(
                     &self.descriptors,
                     &mut scope.scope("Filter chain"),
@@ -785,6 +790,36 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     FilterSource::for_entire_texture(target.color_texture()),
                     entry.filters,
                 )?;
+            }
+            if partial {
+                scope.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: target.color_texture(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: output.x - input.x,
+                            y: output.y - input.y,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: output.x,
+                            y: output.y,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: output.width,
+                        height: output.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            } else if filtered {
                 run_copy_pipeline(
                     &self.descriptors,
                     texture.texture.format(),
@@ -794,10 +829,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     &mut scope.scope("Copy filtered to CAB"),
                 )?;
             }
+            drop(scope);
             crate::record_bitmap_write(&entry.handle)?;
-            // Periodically flush GPU work to prevent OOM when many cache entries
-            // accumulate (e.g. when a large container's cacheAsBitmap is skipped
-            // but its hundreds of children each have their own bitmap caches).
+            if let Some(cache) = cache {
+                cache.finish_redraw(history);
+            }
             self.active_frame.maybe_flush(&self.descriptors)?;
         }
 
@@ -937,6 +973,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             extent,
         )?;
 
+        crate::record_bitmap_write(handle)?;
         self.descriptors.runtime.check_health()?;
         Ok(())
     }
@@ -1349,6 +1386,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     clamped_linear: Default::default(),
                     clamped_nearest: Default::default(),
                     copy_count: Default::default(),
+                    version: Default::default(),
                 }))
             }
         };
@@ -1447,6 +1485,25 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         }
     }
 
+    fn create_bitmap_cache(
+        &mut self,
+        width: NonZeroU32,
+        height: NonZeroU32,
+    ) -> Result<BitmapHandle, BitmapError> {
+        Ok(BitmapHandle(crate::bitmap_cache::CacheImage::new(
+            width.get(),
+            height.get(),
+            &self.descriptors.device,
+        )?))
+    }
+    fn retain_bitmap_cache(
+        &mut self,
+        handle: &BitmapHandle,
+    ) -> Option<Arc<dyn ruffle_render::backend::BitmapCacheLease>> {
+        let cache = (&*handle.0 as &dyn Any).downcast_ref::<crate::bitmap_cache::CacheImage>()?;
+        Some(cache.retain(self.descriptors.runtime.scheduler()))
+    }
+
     fn create_empty_texture(
         &mut self,
         width: NonZeroU32,
@@ -1507,6 +1564,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             clamped_linear: Default::default(),
             clamped_nearest: Default::default(),
             copy_count: Default::default(),
+            version: Default::default(),
         })))
     }
 

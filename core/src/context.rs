@@ -585,6 +585,7 @@ impl Default for ActionQueue<'_> {
 /// As a convenience, this type can be deref-coerced to `Mutation<'gc>`, but note that explicitly
 /// writing `context.gc()` can be sometimes necessary to satisfy the borrow checker.
 pub struct RenderContext<'a, 'gc> {
+    pub render_epoch: u64,
     pub snapshots: Option<&'a mut crate::display_object::snapshot::Cache>,
     pub snapshot_allowed: bool,
     /// An ancestor is currently recording a block, so leaf eligibility must

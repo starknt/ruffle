@@ -186,6 +186,7 @@ impl BitmapRecipe {
                 clamped_linear: Default::default(),
                 clamped_nearest: Default::default(),
                 copy_count: Default::default(),
+                version: Default::default(),
             })
         })?;
         let (version, pending) = {

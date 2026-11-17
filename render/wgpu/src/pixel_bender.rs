@@ -508,6 +508,7 @@ pub(super) fn run_pixelbender_shader_impl(
                                     clamped_linear: Default::default(),
                                     clamped_nearest: Default::default(),
                                     copy_count: Default::default(),
+                                    version: Default::default(),
                                 },
                             )))
                         })?;

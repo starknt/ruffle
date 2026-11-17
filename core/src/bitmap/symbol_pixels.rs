@@ -17,7 +17,7 @@ use std::{
 };
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[derive(Debug)]
 pub struct SymbolImage {

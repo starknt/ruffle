@@ -248,6 +248,10 @@ impl RenderBackend for TestRenderer {
         ))
     }
 
+    fn is_offscreen_supported(&self) -> bool {
+        true
+    }
+
     fn create_empty_texture(
         &mut self,
         _width: NonZeroU32,
@@ -278,7 +282,7 @@ fn source() -> Rc<SymbolImage> {
         },
     )))
 }
-fn renderer(managed: bool) -> TestRenderer {
+pub(crate) fn renderer(managed: bool) -> TestRenderer {
     TestRenderer {
         health: Default::default(),
         dimensions: ViewportDimensions {

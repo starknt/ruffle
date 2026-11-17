@@ -1507,3 +1507,345 @@ fn bitmap_region_readback_does_not_capture_unrequested_rows() {
         "readback may pad its row but must not copy unrelated rows"
     );
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn bitmap_cache_partial_redraw_clears_old_pixels_and_replays_all_translucent_contributors() {
+    use ruffle_render::{
+        backend::BitmapCacheEntry,
+        bitmap::{PixelRegion, PixelSnapping},
+    };
+    let descriptors = gpu();
+    for quality in [StageQuality::Low, StageQuality::High] {
+        let mut renderer = WgpuRenderBackend::with_options(
+            descriptors.clone(),
+            TextureTarget::new(&descriptors.device, (128, 128)).unwrap(),
+            false,
+        )
+        .unwrap();
+        renderer.set_quality(quality).unwrap();
+        let cache = renderer
+            .create_bitmap_cache(128.try_into().unwrap(), 128.try_into().unwrap())
+            .unwrap();
+        let contents = |position: Option<f32>| {
+            let mut commands = CommandList::new();
+            rect(
+                &mut commands,
+                0.0,
+                0.0,
+                128.0,
+                128.0,
+                Color {
+                    r: 20,
+                    g: 40,
+                    b: 80,
+                    a: 255,
+                },
+            );
+            if let Some(x) = position {
+                rect(
+                    &mut commands,
+                    x,
+                    8.25,
+                    14.5,
+                    12.5,
+                    Color {
+                        r: 200,
+                        g: 0,
+                        b: 0,
+                        a: 120,
+                    },
+                );
+            }
+            rect(
+                &mut commands,
+                12.25,
+                10.5,
+                16.25,
+                15.25,
+                Color {
+                    r: 0,
+                    g: 200,
+                    b: 0,
+                    a: 100,
+                },
+            );
+            commands
+        };
+        for (index, position) in [Some(6.25), Some(18.75), None].into_iter().enumerate() {
+            let metrics = ruffle_render::profile::RenderMetrics::default();
+            let pixels = {
+                let _scope = ruffle_render::profile::enter(Some(&metrics));
+                let mut stage = CommandList::new();
+                stage.render_bitmap(
+                    cache.clone(),
+                    Default::default(),
+                    false,
+                    PixelSnapping::Never,
+                    PixelRegion::for_whole_size(128, 128),
+                );
+                renderer
+                    .submit_frame(
+                        Color::BLACK,
+                        stage,
+                        vec![BitmapCacheEntry {
+                            handle: cache.clone(),
+                            commands: contents(position),
+                            clear: Color::TRANSPARENT,
+                            filters: vec![],
+                        }],
+                    )
+                    .unwrap();
+                renderer.capture_frame().unwrap().unwrap().into_raw()
+            };
+            let mut reference = WgpuRenderBackend::with_options(
+                descriptors.clone(),
+                TextureTarget::new(&descriptors.device, (128, 128)).unwrap(),
+                false,
+            )
+            .unwrap();
+            reference.set_quality(quality).unwrap();
+            let fresh = reference
+                .create_bitmap_cache(128.try_into().unwrap(), 128.try_into().unwrap())
+                .unwrap();
+            let mut stage = CommandList::new();
+            stage.render_bitmap(
+                fresh.clone(),
+                Default::default(),
+                false,
+                PixelSnapping::Never,
+                PixelRegion::for_whole_size(128, 128),
+            );
+            reference
+                .submit_frame(
+                    Color::BLACK,
+                    stage,
+                    vec![BitmapCacheEntry {
+                        handle: fresh,
+                        commands: contents(position),
+                        clear: Color::TRANSPARENT,
+                        filters: vec![],
+                    }],
+                )
+                .unwrap();
+            assert_eq!(
+                pixels,
+                reference.capture_frame().unwrap().unwrap().into_raw(),
+                "quality {quality:?}, update {index}"
+            );
+            if index > 0 {
+                assert!(
+                    metrics.snapshot().work.offscreen_pixels < 128 * 128,
+                    "dirty redraw still rasterized the entire cache"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn bitmap_cache_retention_is_reclaimable_without_invalidating_recorded_commands() {
+    use ruffle_render::bitmap::{PixelRegion, PixelSnapping};
+    let descriptors = gpu();
+    let mut renderer = WgpuRenderBackend::with_options(
+        descriptors.clone(),
+        TextureTarget::new(&descriptors.device, (32, 32)).unwrap(),
+        false,
+    )
+    .unwrap();
+    let bitmap = renderer
+        .create_bitmap_cache(32.try_into().unwrap(), 32.try_into().unwrap())
+        .unwrap();
+    let lease = renderer.retain_bitmap_cache(&bitmap).unwrap();
+    let weak = Arc::downgrade(&bitmap.0);
+    let mut stage = CommandList::new();
+    stage.render_bitmap(
+        bitmap,
+        Default::default(),
+        false,
+        PixelSnapping::Never,
+        PixelRegion::for_whole_size(32, 32),
+    );
+    assert!(lease.bitmap().is_some());
+    descriptors.runtime.scheduler().reclaim();
+    assert!(
+        lease.bitmap().is_none(),
+        "governor did not reclaim cache ownership"
+    );
+    assert!(
+        weak.upgrade().is_some(),
+        "already-recorded draw lost its resource"
+    );
+    renderer.submit_frame(Color::BLACK, stage, vec![]).unwrap();
+    renderer.capture_frame().unwrap();
+    assert!(weak.upgrade().is_none());
+
+    let bitmap = renderer
+        .create_bitmap_cache(16.try_into().unwrap(), 16.try_into().unwrap())
+        .unwrap();
+    let lease = renderer.retain_bitmap_cache(&bitmap).unwrap();
+    let weak = Arc::downgrade(&bitmap.0);
+    drop(bitmap);
+    drop(lease);
+    assert!(
+        weak.upgrade().is_none(),
+        "unloaded display owner retained a cache"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn bitmap_cache_filtered_dirty_halo_matches_full_redraw_at_edges_and_with_msaa() {
+    use ruffle_render::{
+        backend::BitmapCacheEntry,
+        bitmap::{PixelRegion, PixelSnapping},
+        filters::Filter,
+    };
+    let descriptors = gpu();
+    let blur = Filter::BlurFilter(swf::BlurFilter {
+        blur_x: swf::Fixed16::from_f32(5.25),
+        blur_y: swf::Fixed16::from_f32(3.75),
+        flags: swf::BlurFilterFlags::from_passes(2),
+    });
+    let glow = Filter::GlowFilter(swf::GlowFilter {
+        color: Color {
+            r: 50,
+            g: 120,
+            b: 255,
+            a: 170,
+        },
+        blur_x: swf::Fixed16::from_f32(7.25),
+        blur_y: swf::Fixed16::from_f32(5.5),
+        strength: swf::Fixed8::from_f32(1.3),
+        flags: swf::GlowFilterFlags::from_passes(2) | swf::GlowFilterFlags::COMPOSITE_SOURCE,
+    });
+    let shadow = Filter::DropShadowFilter(swf::DropShadowFilter {
+        color: Color {
+            r: 30,
+            g: 90,
+            b: 120,
+            a: 170,
+        },
+        blur_x: swf::Fixed16::from_f32(5.25),
+        blur_y: swf::Fixed16::from_f32(3.75),
+        angle: swf::Fixed16::from_f32(0.6),
+        distance: swf::Fixed16::from_f32(4.25),
+        strength: swf::Fixed8::ONE,
+        flags: swf::DropShadowFilterFlags::from_passes(2)
+            | swf::DropShadowFilterFlags::COMPOSITE_SOURCE,
+    });
+    let bevel = Filter::BevelFilter(swf::BevelFilter {
+        shadow_color: Color::BLACK,
+        highlight_color: Color::WHITE,
+        blur_x: swf::Fixed16::from_f32(4.5),
+        blur_y: swf::Fixed16::from_f32(3.5),
+        angle: swf::Fixed16::from_f32(0.6),
+        distance: swf::Fixed16::from_f32(3.25),
+        strength: swf::Fixed8::ONE,
+        flags: swf::BevelFilterFlags::from_passes(2) | swf::BevelFilterFlags::COMPOSITE_SOURCE,
+    });
+    let mut matrix = swf::ColorMatrixFilter::default();
+    matrix.matrix[0] = 0.75;
+    matrix.matrix[6] = 1.25;
+    let filters = [
+        vec![Filter::ColorMatrixFilter(matrix.clone())],
+        vec![blur.clone()],
+        vec![glow],
+        vec![shadow],
+        vec![bevel],
+        vec![Filter::ColorMatrixFilter(matrix), blur],
+    ];
+    for quality in [StageQuality::Low, StageQuality::High] {
+        for (filter_index, filters) in filters.iter().enumerate() {
+            let mut renderer = WgpuRenderBackend::with_options(
+                descriptors.clone(),
+                TextureTarget::new(&descriptors.device, (96, 96)).unwrap(),
+                false,
+            )
+            .unwrap();
+            renderer.set_quality(quality).unwrap();
+            let cache = renderer
+                .create_bitmap_cache(96.try_into().unwrap(), 96.try_into().unwrap())
+                .unwrap();
+            for (step, x) in [1.25, 14.75, 27.35].into_iter().enumerate() {
+                let scene = || {
+                    let mut commands = CommandList::new();
+                    rect(
+                        &mut commands,
+                        x,
+                        16.25,
+                        18.5,
+                        13.75,
+                        Color {
+                            r: 171,
+                            g: 80,
+                            b: 41,
+                            a: 173,
+                        },
+                    );
+                    rect(
+                        &mut commands,
+                        24.25,
+                        20.75,
+                        9.5,
+                        20.25,
+                        Color {
+                            r: 40,
+                            g: 161,
+                            b: 203,
+                            a: 137,
+                        },
+                    );
+                    commands
+                };
+                let render =
+                    |renderer: &mut WgpuRenderBackend<TextureTarget>,
+                     handle: ruffle_render::bitmap::BitmapHandle| {
+                        let mut stage = CommandList::new();
+                        stage.render_bitmap(
+                            handle.clone(),
+                            Default::default(),
+                            false,
+                            PixelSnapping::Never,
+                            PixelRegion::for_whole_size(96, 96),
+                        );
+                        renderer
+                            .submit_frame(
+                                Color::TRANSPARENT,
+                                stage,
+                                vec![BitmapCacheEntry {
+                                    handle,
+                                    commands: scene(),
+                                    clear: Color::TRANSPARENT,
+                                    filters: filters.clone(),
+                                }],
+                            )
+                            .unwrap();
+                        renderer.capture_frame().unwrap().unwrap().into_raw()
+                    };
+                let actual = render(&mut renderer, cache.clone());
+                let mut reference = WgpuRenderBackend::with_options(
+                    descriptors.clone(),
+                    TextureTarget::new(&descriptors.device, (96, 96)).unwrap(),
+                    false,
+                )
+                .unwrap();
+                reference.set_quality(quality).unwrap();
+                let fresh = reference
+                    .create_bitmap_cache(96.try_into().unwrap(), 96.try_into().unwrap())
+                    .unwrap();
+                let expected = render(&mut reference, fresh);
+                let difference = actual
+                    .iter()
+                    .zip(&expected)
+                    .enumerate()
+                    .find(|(_, (a, b))| a != b);
+                assert!(
+                    difference.is_none(),
+                    "filter {filter_index}, quality {quality:?}, step {step}: first differing byte {difference:?}"
+                );
+            }
+        }
+    }
+}

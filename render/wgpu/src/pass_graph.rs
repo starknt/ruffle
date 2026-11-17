@@ -374,9 +374,9 @@ impl PassGraph {
         ancestor: Option<GraphResource>,
     ) -> Result<(), RenderFailure> {
         for node in commands {
-            if matches!(
+            if !matches!(
                 node.command,
-                SnapshotCommand::Blend { .. } | SnapshotCommand::AlphaMask { .. }
+                SnapshotCommand::Mask(_) | SnapshotCommand::Shared(_)
             ) && node.region.clip(attachment.bounds).is_none()
             {
                 continue;

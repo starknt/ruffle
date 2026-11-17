@@ -76,6 +76,15 @@ impl GraphEncoder {
         load: Load,
     ) -> Result<Self, RenderFailure> {
         let prepared = PreparedSnapshot::capture(commands)?;
+        Self::from_prepared(backend, prepared, bounds, samples, load)
+    }
+    pub fn from_prepared<T: crate::target::RenderTarget>(
+        backend: &mut crate::backend::WgpuRenderBackend<T>,
+        prepared: PreparedSnapshot,
+        bounds: RenderRect,
+        samples: u32,
+        load: Load,
+    ) -> Result<Self, RenderFailure> {
         let graph = PassGraph::compile(&prepared.snapshot, bounds, samples, load)?;
         // All numeric versions are checked before the first upload/allocation.
         prepared.resolve(backend)?;

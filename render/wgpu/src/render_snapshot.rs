@@ -55,19 +55,19 @@ pub enum ResourceRecipe {
     },
     Resident(ResourceVersion),
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SnapshotBlend {
     Builtin(BlendMode),
     Shader(ResourceVersion),
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MaskCommand {
     Push,
     Activate,
     Deactivate,
     Pop,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SnapshotCommand {
     Bitmap {
         resource: ResourceVersion,
@@ -104,7 +104,7 @@ pub enum SnapshotCommand {
         mask: Arc<[SnapshotNode]>,
     },
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SnapshotNode {
     pub command: SnapshotCommand,
     pub region: RenderRegion,
@@ -136,10 +136,19 @@ impl Handle {
                         },
                         version: recipe.version(),
                     })
+                } else if let Some(cache) = value.downcast_ref::<crate::bitmap_cache::CacheImage>()
+                {
+                    Ok(ResourceVersion {
+                        key: ResourceKey::Recipe {
+                            device: cache.device_generation,
+                            owner: cache.owner,
+                        },
+                        version: cache.version(),
+                    })
                 } else if let Some(texture) = value.downcast_ref::<crate::Texture>() {
                     Ok(ResourceVersion {
                         key: ResourceKey::Native(texture.texture.lease().id()),
-                        version: 0,
+                        version: texture.version.load(std::sync::atomic::Ordering::Relaxed),
                     })
                 } else {
                     Err(foreign())

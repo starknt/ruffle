@@ -111,7 +111,7 @@ use self::loader_display::LoaderDisplayWeak;
 /// Flash isn't very good at always recognising when it should be invalidated,
 /// and there's cases such as changing the blend mode which don't always trigger it.
 ///
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct BitmapCache {
     /// The `Matrix.a` value that was last used with this cache
     matrix_a: f32,
@@ -134,25 +134,63 @@ pub struct BitmapCache {
     /// The current contents of the cache, if any. Values are post-filters.
     bitmap: Option<BitmapInfo>,
 
-    /// Whether we warned that this bitmap was too large to be cached
-    warned_for_oversize: bool,
+    retained: Option<std::sync::Arc<dyn ruffle_render::backend::BitmapCacheLease>>,
+    transient: Option<(
+        u64,
+        u32,
+        u32,
+        std::sync::Weak<dyn ruffle_render::bitmap::BitmapHandleImpl>,
+    )>,
+    retention: AdaptiveBitmapCache,
+    quality: Option<ruffle_render::quality::StageQuality>,
 }
 
-// cacheAsBitmap is an optimization. Keep the optimized path bounded so a
-// long-lived SWF cannot retain an unbounded set of large offscreen textures.
-const OPTIMIZED_MAX_CACHE_PIXELS_AVM1: u64 = 2_000_000;
-const OPTIMIZED_MAX_CACHE_PIXELS_AVM2: u64 = 4_000_000;
+// Instantiation clones display state, never another object's writable raster.
+impl Clone for BitmapCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
 
-fn cache_size_is_acceptable(swf_version: u8, width: u32, height: u32) -> bool {
-    let max_dimension = if swf_version > 9 { 8191 } else { 2880 };
-    let max_pixels = if swf_version > 9 {
-        OPTIMIZED_MAX_CACHE_PIXELS_AVM2
-    } else {
-        OPTIMIZED_MAX_CACHE_PIXELS_AVM1
-    };
-    width < max_dimension
-        && height < max_dimension
-        && u64::from(width) * u64::from(height) < max_pixels
+/// Retention changes storage lifetime only. Every visible frame still uses the
+/// same cache rasterization, filters, color transform and pixel snapping.
+#[derive(Clone, Debug)]
+struct AdaptiveBitmapCache {
+    frame: Option<u64>,
+    dirty_frames: u8,
+    stable_frames: u8,
+    retain: bool,
+}
+impl Default for AdaptiveBitmapCache {
+    fn default() -> Self {
+        Self {
+            frame: None,
+            dirty_frames: 0,
+            stable_frames: 0,
+            retain: true,
+        }
+    }
+}
+impl AdaptiveBitmapCache {
+    fn observe(&mut self, frame: u64, changed: bool) {
+        if self.frame == Some(frame) {
+            return;
+        }
+        self.frame = Some(frame);
+        if changed {
+            self.stable_frames = 0;
+            self.dirty_frames = self.dirty_frames.saturating_add(1);
+            if self.dirty_frames >= 8 {
+                self.retain = false;
+            }
+        } else {
+            self.dirty_frames = 0;
+            self.stable_frames = self.stable_frames.saturating_add(1);
+            if self.stable_frames >= 30 {
+                self.retain = true;
+            }
+        }
+    }
 }
 
 impl BitmapCache {
@@ -164,14 +202,13 @@ impl BitmapCache {
         self.matrix_a = f32::NAN;
     }
 
-    fn is_dirty(&self, other: &Matrix, source_width: u32, source_height: u32) -> bool {
+    fn content_changed(&self, other: &Matrix, source_width: u32, source_height: u32) -> bool {
         self.matrix_a != other.a
             || self.matrix_b != other.b
             || self.matrix_c != other.c
             || self.matrix_d != other.d
             || self.source_width != source_width
             || self.source_height != source_height
-            || self.bitmap.is_none()
     }
 
     /// Clears any dirtiness and ensure there's an appropriately sized texture allocated
@@ -185,7 +222,7 @@ impl BitmapCache {
         actual_width: u32,
         actual_height: u32,
         draw_offset: Point<i32>,
-        swf_version: u8,
+        _swf_version: u8,
     ) {
         self.matrix_a = matrix.a;
         self.matrix_b = matrix.b;
@@ -194,20 +231,20 @@ impl BitmapCache {
         self.source_width = source_width;
         self.source_height = source_height;
         self.draw_offset = draw_offset;
-        if let Some(current) = &mut self.bitmap
-            && current.width == actual_width
-            && current.height == actual_height
+        self.bitmap = self.bitmap();
+        self.retained = None;
+        if self
+            .bitmap
+            .as_ref()
+            .is_some_and(|current| current.width == actual_width && current.height == actual_height)
         {
-            return; // No need to resize it
+            return;
         }
-        let acceptable_size = cache_size_is_acceptable(swf_version, actual_width, actual_height);
-
         if renderer.is_offscreen_supported()
             && let Some(actual_width) = NonZero::new(actual_width)
             && let Some(actual_height) = NonZero::new(actual_height)
-            && acceptable_size
         {
-            let handle = renderer.create_empty_texture(actual_width, actual_height);
+            let handle = renderer.create_bitmap_cache(actual_width, actual_height);
             self.bitmap = match handle {
                 Ok(handle) => Some(BitmapInfo {
                     width: actual_width.get(),
@@ -229,23 +266,258 @@ impl BitmapCache {
     /// temporarily disabled.
     fn clear(&mut self) {
         self.bitmap = None;
+        self.retained = None;
+        self.transient = None;
     }
 
     fn bitmap(&self) -> Option<BitmapInfo> {
-        self.bitmap.clone()
+        self.bitmap
+            .clone()
+            .or_else(|| self.retained.as_ref()?.bitmap())
+            .or_else(|| {
+                let (frame, width, height, handle) = self.transient.as_ref()?;
+                (self.retention.frame == Some(*frame)).then_some(())?;
+                Some(BitmapInfo {
+                    width: *width,
+                    height: *height,
+                    handle: ruffle_render::bitmap::BitmapHandle(handle.upgrade()?),
+                })
+            })
+    }
+
+    fn finish_frame(&mut self, renderer: &mut dyn RenderBackend) {
+        if !self.retention.retain {
+            let transient = self.bitmap().map(|bitmap| {
+                (
+                    self.retention.frame.unwrap_or(0),
+                    bitmap.width,
+                    bitmap.height,
+                    std::sync::Arc::downgrade(&bitmap.handle.0),
+                )
+            });
+            self.clear();
+            self.transient = transient;
+            return;
+        }
+        if let Some(bitmap) = self.bitmap.take() {
+            if let Some(lease) = renderer.retain_bitmap_cache(&bitmap.handle) {
+                self.retained = Some(lease);
+            } else {
+                self.bitmap = Some(bitmap);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod bitmap_cache_tests {
-    use super::cache_size_is_acceptable;
+    use super::*;
+    use crate::bitmap::symbol_pixels::tests::renderer;
 
     #[test]
-    fn optimized_cache_budget_rejects_large_gpu_surfaces() {
-        assert!(cache_size_is_acceptable(10, 1999, 1999));
-        assert!(!cache_size_is_acceptable(10, 2000, 2000));
-        assert!(cache_size_is_acceptable(9, 1400, 1400));
-        assert!(!cache_size_is_acceptable(9, 1500, 1500));
+    fn bitmap_cache_large_required_surface_is_admitted_by_renderer_not_silently_skipped() {
+        let mut renderer = renderer(false);
+        let mut cache = BitmapCache::default();
+        cache.update(
+            &mut renderer,
+            Matrix::IDENTITY,
+            2000,
+            2000,
+            2000,
+            2000,
+            Point::new(0, 0),
+            10,
+        );
+        assert!(
+            cache.bitmap().is_some(),
+            "cacheAsBitmap/filter rasterization must not disappear at an arbitrary pixel budget"
+        );
+    }
+
+    #[test]
+    fn bitmap_cache_adaptive_retention_releases_changing_results_and_retains_stable_results() {
+        let mut renderer = renderer(false);
+        let mut cache = BitmapCache::default();
+        for frame in 1..=38 {
+            if frame <= 8 {
+                cache.make_dirty();
+            }
+            let changed = cache.content_changed(&Matrix::IDENTITY, 8, 8);
+            cache.retention.observe(frame, changed);
+            cache.update(
+                &mut renderer,
+                Matrix::IDENTITY,
+                8,
+                8,
+                8,
+                8,
+                Point::new(0, 0),
+                10,
+            );
+            let result = cache.bitmap().unwrap();
+            let visible_command = result.handle.clone();
+            let weak = std::sync::Arc::downgrade(&result.handle.0);
+            drop(result);
+            cache.finish_frame(&mut renderer);
+            assert!(
+                weak.upgrade().is_some(),
+                "visible command lost its transient result"
+            );
+            drop(visible_command);
+            assert_eq!(
+                cache.bitmap().is_some(),
+                frame < 8 || frame == 38,
+                "frame {frame}"
+            );
+            if (8..38).contains(&frame) {
+                assert!(weak.upgrade().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn bitmap_cache_cloned_display_objects_have_independent_raster_targets() {
+        let mut renderer = renderer(false);
+        let mut original = BitmapCache::default();
+        original.update(
+            &mut renderer,
+            Matrix::IDENTITY,
+            8,
+            8,
+            8,
+            8,
+            Point::new(0, 0),
+            10,
+        );
+        let first = original.bitmap().unwrap();
+        let mut cloned = original.clone();
+        cloned.make_dirty();
+        cloned.update(
+            &mut renderer,
+            Matrix::IDENTITY,
+            8,
+            8,
+            8,
+            8,
+            Point::new(0, 0),
+            10,
+        );
+        assert_ne!(
+            first.handle,
+            cloned.bitmap().unwrap().handle,
+            "a clone would overwrite the original instance's cached pixels"
+        );
+    }
+
+    #[test]
+    fn bitmap_cache_transient_result_reuses_within_the_same_frame_only() {
+        let mut renderer = renderer(false);
+        let mut cache = BitmapCache::default();
+        for frame in 1..=8 {
+            cache.retention.observe(frame, true);
+        }
+        cache.update(
+            &mut renderer,
+            Matrix::IDENTITY,
+            8,
+            8,
+            8,
+            8,
+            Point::new(0, 0),
+            10,
+        );
+        let visible = cache.bitmap().unwrap();
+        cache.finish_frame(&mut renderer);
+        assert_eq!(cache.bitmap().unwrap().handle, visible.handle);
+        cache.retention.observe(9, false);
+        assert!(
+            cache.bitmap().is_none(),
+            "transient storage survived into another frame"
+        );
+    }
+
+    #[test]
+    fn bitmap_cache_shader_replacement_invalidates_parent_even_when_mode_is_unchanged() {
+        use ruffle_render::pixel_bender::{PixelBenderShader, PixelBenderShaderImpl};
+        #[derive(Debug)]
+        struct Shader(PixelBenderShader);
+        impl PixelBenderShaderImpl for Shader {
+            fn parsed_shader(&self) -> &PixelBenderShader {
+                &self.0
+            }
+        }
+        let shader = |name: &str| {
+            PixelBenderShaderHandle(std::sync::Arc::new(Shader(PixelBenderShader {
+                name: name.into(),
+                version: 1,
+                params: vec![],
+                metadata: vec![],
+                operations: vec![],
+            })))
+        };
+        let player = crate::player::PlayerBuilder::new().build();
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                let parent = MovieClip::new(context.stage.movie(), context.gc());
+                let child = Graphic::empty(context);
+                parent.replace_at_depth(context, child.into(), 1);
+                parent.set_bitmap_cached_preference(true);
+                child.set_blend_shader(Some(shader("first")));
+                parent.base().clear_invalidate_flag();
+                child.base().clear_invalidate_flag();
+                let mut renderer = renderer(false);
+                parent.base().bitmap_cache_mut().as_mut().unwrap().update(
+                    &mut renderer,
+                    Matrix::IDENTITY,
+                    8,
+                    8,
+                    8,
+                    8,
+                    Point::new(0, 0),
+                    10,
+                );
+                child.set_blend_shader(Some(shader("replacement")));
+                assert!(
+                    parent
+                        .base()
+                        .bitmap_cache_mut()
+                        .as_ref()
+                        .unwrap()
+                        .content_changed(&Matrix::IDENTITY, 8, 8)
+                );
+            });
+    }
+
+    #[test]
+    fn bitmap_cache_retention_counts_frames_and_translation_reuses_rasterization() {
+        let mut cache = BitmapCache::default();
+        let mut renderer = renderer(false);
+        for frame in 1..=7 {
+            cache.make_dirty();
+            for _ in 0..3 {
+                cache.retention.observe(frame, true);
+            }
+            cache.update(
+                &mut renderer,
+                Matrix::IDENTITY,
+                8,
+                8,
+                8,
+                8,
+                Point::new(0, 0),
+                10,
+            );
+            cache.finish_frame(&mut renderer);
+            assert!(cache.bitmap().is_some());
+        }
+        assert!(!cache.content_changed(
+            &Matrix::translate(Twips::from_pixels(4.5), Twips::ZERO),
+            8,
+            8
+        ));
+        assert!(cache.content_changed(&Matrix::scale(2.0, 1.0), 8, 8));
     }
 }
 
@@ -879,8 +1151,11 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.cell.borrow().blend_shader.clone()
     }
 
-    fn set_blend_shader(&self, value: Option<PixelBenderShaderHandle>) {
-        self.cell.borrow_mut().blend_shader = value;
+    fn set_blend_shader(&self, value: Option<PixelBenderShaderHandle>) -> bool {
+        let mut cell = self.cell.borrow_mut();
+        let changed = cell.blend_shader != value;
+        cell.blend_shader = value;
+        changed
     }
 
     /// The opaque background color of this display object.
@@ -1339,7 +1614,6 @@ fn render_base_inner<'gc>(
             false, // we want to do the filter growth for this object ourselves, to know the offsets
             &context.stage.view_matrix(),
         );
-        let name = this.name();
         let mut filters: Vec<Filter> = this.filters().to_owned();
         let swf_version = this.swf_version();
         filters.retain(|f| !f.impotent());
@@ -1369,7 +1643,13 @@ fn render_base_inner<'gc>(
                     y_max: filter_rect.y_max.to_pixels().ceil() as i32,
                 };
                 let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
-                if cache.is_dirty(&base_transform.matrix, width, height) {
+                if cache.quality != Some(context.stage.quality()) {
+                    cache.make_dirty();
+                    cache.quality = Some(context.stage.quality());
+                }
+                let changed = cache.content_changed(&base_transform.matrix, width, height);
+                cache.retention.observe(context.render_epoch, changed);
+                if changed || cache.bitmap().is_none() {
                     cache.update(
                         context.renderer,
                         base_transform.matrix,
@@ -1399,13 +1679,13 @@ fn render_base_inner<'gc>(
                     });
                 }
             } else {
-                if !cache.warned_for_oversize {
-                    tracing::warn!(
-                        "Skipping cacheAsBitmap for large object {:?} ({width} x {height})",
-                        name
-                    );
-                    cache.warned_for_oversize = true;
-                }
+                context
+                    .renderer
+                    .health()
+                    .record(ruffle_render::error::RenderFailure::new(
+                        ruffle_render::error::RenderFailureKind::Validation,
+                        "cacheAsBitmap/filter bounds exceed native texture limits",
+                    ));
                 cache.clear();
                 cache_info = None;
             }
@@ -1439,6 +1719,7 @@ fn render_base_inner<'gc>(
                 tz: Default::default(),
             });
             let mut offscreen_context = RenderContext {
+                render_epoch: context.render_epoch,
                 snapshots: None,
                 snapshot_allowed: false,
                 snapshot_barriers: 0,
@@ -1463,6 +1744,10 @@ fn render_base_inner<'gc>(
             });
         } else {
             ruffle_render::profile::work(|w| w.cache_hits += 1);
+        }
+
+        if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
+            cache.finish_frame(context.renderer);
         }
 
         // When rendering it back, ensure we're only keeping the translation - scale/rotation is within the image already
@@ -2544,8 +2829,14 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn set_blend_shader(self, value: Option<PixelBenderShaderHandle>) {
-        self.base().set_blend_shader(value);
+        let changed = self.base().set_blend_shader(value);
         self.set_blend_mode(ExtendedBlendMode::Shader);
+        if changed {
+            self.base().invalidate_render();
+            if let Some(parent) = self.parent() {
+                parent.invalidate_cached_bitmap();
+            }
+        }
     }
 
     #[no_dynamic]

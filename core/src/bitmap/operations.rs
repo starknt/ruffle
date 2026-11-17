@@ -1592,6 +1592,7 @@ pub fn draw<'gc>(
 
     let mut cache_draws = vec![];
     let mut render_context = RenderContext {
+        render_epoch: 0,
         snapshots: None,
         snapshot_allowed: false,
         snapshot_barriers: 0,

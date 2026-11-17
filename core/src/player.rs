@@ -323,6 +323,7 @@ enum RunState {
 }
 
 pub struct Player {
+    render_epoch: u64,
     snapshots: crate::display_object::snapshot::Cache,
     /// The version of the player we're emulating.
     ///
@@ -2380,6 +2381,7 @@ impl Player {
             });
         }
 
+        self.render_epoch = self.render_epoch.wrapping_add(1);
         let mut background_color = Color::WHITE;
 
         let (cache_draws, commands) = self.enter_arena_mut(|gc_context, gc_root, this| {
@@ -2390,6 +2392,7 @@ impl Player {
             let mut cache_draws = vec![];
             this.snapshots.prune();
             let mut render_context = RenderContext {
+                render_epoch: this.render_epoch,
                 snapshots: Some(&mut this.snapshots),
                 snapshot_allowed: stage
                     .stage3ds()
@@ -3407,6 +3410,7 @@ impl PlayerBuilder {
         let forced_frame_rate = self.frame_rate.is_some();
         let player = Arc::new_cyclic(|self_ref| {
             Mutex::new(Player {
+                render_epoch: 0,
                 snapshots: Default::default(),
                 // Backends
                 audio,

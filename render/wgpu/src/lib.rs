@@ -33,6 +33,7 @@ type Error = Box<dyn std::error::Error>;
 #[macro_use]
 pub mod utils;
 
+mod bitmap_cache;
 mod bitmap_recipe;
 mod bitmap_residency;
 mod bitmaps;
@@ -78,6 +79,9 @@ pub fn as_texture<'a>(
     if let Some(recipe) = value.downcast_ref::<crate::bitmap_recipe::BitmapRecipe>() {
         return recipe.resolve(device);
     }
+    if let Some(cache) = value.downcast_ref::<crate::bitmap_cache::CacheImage>() {
+        return cache.resolve(device);
+    }
     value.downcast_ref::<Texture>().ok_or_else(|| {
         crate::gpu_runtime::RenderFailure::new(
             crate::gpu_runtime::RenderFailureKind::Validation,
@@ -91,6 +95,24 @@ fn record_bitmap_write(handle: &BitmapHandle) -> Result<(), crate::gpu_runtime::
         (&*handle.0 as &dyn Any).downcast_ref::<crate::bitmap_recipe::BitmapRecipe>()
     {
         recipe.record_gpu_write()?;
+    } else if let Some(cache) =
+        (&*handle.0 as &dyn Any).downcast_ref::<crate::bitmap_cache::CacheImage>()
+    {
+        cache.written()?;
+    } else if let Some(texture) = (&*handle.0 as &dyn Any).downcast_ref::<Texture>() {
+        texture
+            .version
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| v.checked_add(1),
+            )
+            .map_err(|_| {
+                crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Internal,
+                    "texture content version exhausted",
+                )
+            })?;
     }
     Ok(())
 }
@@ -420,6 +442,7 @@ pub struct Texture {
     clamped_linear: OnceLock<BitmapBinds>,
     clamped_nearest: OnceLock<BitmapBinds>,
     copy_count: std::sync::atomic::AtomicU8,
+    version: std::sync::atomic::AtomicU64,
 }
 
 impl Texture {
