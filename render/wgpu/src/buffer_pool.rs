@@ -89,9 +89,8 @@ impl TexturePool {
                 0,
                 Box::new(move |_| bytes),
                 Box::new(move |descriptors, _description| {
-                    let texture = descriptors
-                        .device
-                        .create_texture(&wgpu::TextureDescriptor {
+                    let texture = descriptors.device.create_texture_with_kind(
+                        &wgpu::TextureDescriptor {
                             label: label.as_deref(),
                             size,
                             mip_level_count: 1,
@@ -100,7 +99,9 @@ impl TexturePool {
                             format,
                             view_formats: &[format],
                             usage,
-                        })?;
+                        },
+                        crate::gpu_runtime::ResourceKind::OffscreenTarget,
+                    )?;
                     let view = texture.create_view(&Default::default())?;
                     Ok((texture, view))
                 }),
@@ -152,7 +153,7 @@ struct GlobalsKey {
     viewport_height: u32,
 }
 
-pub trait BufferDescription: Clone + Debug + 'static {
+pub trait BufferDescription: Clone + Debug + Send + Sync + 'static {
     type Cost: Ord;
 
     /// If the potential buffer represented by this description (`self`)
@@ -192,17 +193,17 @@ impl<T, D> Drop for Owner<T, D> {
         }
     }
 }
-pub struct BufferPool<T: 'static, D: BufferDescription> {
+pub struct BufferPool<T: PooledResource, D: BufferDescription> {
     owner: Rc<Owner<T, D>>,
     constructor: Constructor<T, D>,
     bytes: Box<dyn Fn(&D) -> u64>,
 }
-impl<T, D: BufferDescription> Debug for BufferPool<T, D> {
+impl<T: PooledResource, D: BufferDescription> Debug for BufferPool<T, D> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BufferPool").finish()
     }
 }
-impl<T: 'static, D: BufferDescription> BufferPool<T, D> {
+impl<T: PooledResource, D: BufferDescription> BufferPool<T, D> {
     pub fn new(
         budget: Budget,
         kind: usize,
@@ -249,6 +250,7 @@ impl<T: 'static, D: BufferDescription> BufferPool<T, D> {
             None => ((self.constructor)(descriptors, &description)?, description),
         };
         let bytes = (self.bytes)(&description);
+        item.set_idle(false);
         Ok(PoolEntry {
             item: Some(item),
             description,
@@ -257,31 +259,32 @@ impl<T: 'static, D: BufferDescription> BufferPool<T, D> {
         })
     }
 }
-pub struct PoolEntry<T: 'static, D: BufferDescription> {
+pub struct PoolEntry<T: PooledResource, D: BufferDescription> {
     item: Option<T>,
     description: D,
     owner: Weak<Owner<T, D>>,
     bytes: u64,
 }
-impl<T: PartialEq, D: BufferDescription> PartialEq for PoolEntry<T, D> {
+impl<T: PooledResource + PartialEq, D: BufferDescription> PartialEq for PoolEntry<T, D> {
     fn eq(&self, other: &Self) -> bool {
         Weak::ptr_eq(&self.owner, &other.owner) && self.item == other.item
     }
 }
-impl<T: Debug, D: BufferDescription> Debug for PoolEntry<T, D> {
+impl<T: PooledResource + Debug, D: BufferDescription> Debug for PoolEntry<T, D> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("PoolEntry").field(&self.item).finish()
     }
 }
-impl<T, D: BufferDescription> Deref for PoolEntry<T, D> {
+impl<T: PooledResource, D: BufferDescription> Deref for PoolEntry<T, D> {
     type Target = T;
     fn deref(&self) -> &T {
         self.item.as_ref().unwrap()
     }
 }
-impl<T, D: BufferDescription> Drop for PoolEntry<T, D> {
+impl<T: PooledResource, D: BufferDescription> Drop for PoolEntry<T, D> {
     fn drop(&mut self) {
         if let (Some(item), Some(owner)) = (self.item.take(), self.owner.upgrade()) {
+            item.set_idle(true);
             if let Some(stock) = &owner.stock {
                 stock
                     .borrow_mut()
@@ -296,5 +299,25 @@ impl<T, D: BufferDescription> Drop for PoolEntry<T, D> {
                 );
             }
         }
+    }
+}
+
+pub trait PooledResource: Send + Sync + 'static {
+    fn set_idle(&self, idle: bool);
+}
+impl PooledResource for crate::gpu_resources::Buffer {
+    fn set_idle(&self, idle: bool) {
+        self.lease().set_idle(idle);
+    }
+}
+impl PooledResource
+    for (
+        crate::gpu_resources::Texture,
+        crate::gpu_resources::TextureView,
+    )
+{
+    fn set_idle(&self, idle: bool) {
+        self.0.lease().set_idle(idle);
+        self.1.lease().set_idle(idle);
     }
 }

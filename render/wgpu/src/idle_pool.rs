@@ -3,23 +3,24 @@
 //! wait for queue completion before handing ownership to another operation.
 use std::{
     any::Any,
-    cell::RefCell,
     collections::BTreeMap,
-    rc::Rc,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
-pub const IDLE_LIMIT: u64 = 64 * 1024 * 1024;
 #[derive(Clone)]
-pub struct Budget(Rc<RefCell<State>>);
+pub struct Budget(
+    Arc<Mutex<State>>,
+    Option<crate::resource_scheduler::ResourceScheduler>,
+);
 struct Item {
     pool: u64,
     kind: usize,
     bytes: u64,
     epoch: u64,
-    value: Box<dyn Any>,
+    value: Box<dyn Any + Send + Sync>,
+    _ticket: Option<crate::resource_scheduler::CacheTicket>,
 }
 struct State {
     limit: Option<u64>,
@@ -35,43 +36,79 @@ struct State {
 impl std::fmt::Debug for Budget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Budget")
-            .field("idle", &self.0.borrow().idle)
+            .field(
+                "idle",
+                &self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .idle,
+            )
             .finish()
     }
 }
 impl Budget {
     pub fn new(limit: Option<u64>) -> Self {
-        Self(Rc::new(RefCell::new(State {
-            limit,
-            next: 0,
-            epoch: 1,
-            completed: Arc::default(),
-            items: Default::default(),
-            by_pool: Default::default(),
-            idle: [0; 2],
-            peak: [0; 2],
-            peak_total: 0,
-        })))
+        Self(
+            Arc::new(Mutex::new(State {
+                limit,
+                next: 0,
+                epoch: 1,
+                completed: Arc::default(),
+                items: Default::default(),
+                by_pool: Default::default(),
+                idle: [0; 2],
+                peak: [0; 2],
+                peak_total: 0,
+            })),
+            None,
+        )
+    }
+    pub fn with_runtime(runtime: &crate::gpu_runtime::GpuRuntime) -> Self {
+        let mut budget = Self::new(Some(runtime.config().idle_limit));
+        budget.1 = Some(runtime.scheduler().clone());
+        runtime.scheduler().register(
+            crate::resource_scheduler::ReclaimClass::Idle,
+            budget.0.clone(),
+        );
+        budget
     }
     pub fn contains(&self, key: u64) -> bool {
-        self.0.borrow().by_pool.contains_key(&key)
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_pool
+            .contains_key(&key)
     }
     pub fn limited(&self) -> bool {
-        self.0.borrow().limit.is_some()
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .limit
+            .is_some()
     }
     pub fn stock_delta(&self, kind: usize, add: u64, remove: u64) {
-        let mut s = self.0.borrow_mut();
+        let mut s = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.idle[kind] = s.idle[kind] - remove + add;
         s.peak[kind] = s.peak[kind].max(s.idle[kind]);
         s.peak_total = s.peak_total.max(s.idle.iter().sum());
     }
     pub fn key(&self) -> u64 {
-        let mut s = self.0.borrow_mut();
+        let mut s = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.next += 1;
         s.next
     }
     pub fn submitted(&self, queue: &crate::gpu_resources::Queue) {
-        let mut s = self.0.borrow_mut();
+        let mut s = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if s.limit.is_none() {
             return;
         }
@@ -82,8 +119,20 @@ impl Budget {
             complete.fetch_max(epoch, Ordering::Release);
         });
     }
-    pub fn put<T: 'static>(&self, pool: u64, kind: usize, bytes: u64, item: T) {
-        let mut s = self.0.borrow_mut();
+    pub fn put<T: Send + Sync + 'static>(&self, pool: u64, kind: usize, bytes: u64, item: T) {
+        let ticket = match &self.1 {
+            Some(scheduler) => {
+                match scheduler.admit(crate::resource_scheduler::ReclaimClass::Idle, bytes) {
+                    Some(ticket) => Some(ticket),
+                    None => return,
+                }
+            }
+            None => None,
+        };
+        let mut s = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if s.limit.is_some_and(|l| bytes > l) {
             return;
         }
@@ -95,7 +144,7 @@ impl Budget {
             s.remove(id);
         }
         s.next += 1;
-        let id = s.next;
+        let id = self.1.as_ref().map_or(s.next, |scheduler| scheduler.tick());
         let epoch = s.epoch;
         s.items.insert(
             id,
@@ -105,6 +154,7 @@ impl Budget {
                 bytes,
                 epoch,
                 value: Box::new(item),
+                _ticket: ticket,
             },
         );
         s.by_pool.entry(pool).or_default().push(id);
@@ -112,8 +162,15 @@ impl Budget {
         s.peak[kind] = s.peak[kind].max(s.idle[kind]);
         s.peak_total = s.peak_total.max(s.idle.iter().sum());
     }
-    pub fn take<T: 'static, C: Ord>(&self, pool: u64, cost: impl Fn(&T) -> Option<C>) -> Option<T> {
-        let mut s = self.0.borrow_mut();
+    pub fn take<T: Send + Sync + 'static, C: Ord>(
+        &self,
+        pool: u64,
+        cost: impl Fn(&T) -> Option<C>,
+    ) -> Option<T> {
+        let mut s = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let completed = s.completed.load(Ordering::Acquire);
         let id = s
             .by_pool
@@ -132,7 +189,10 @@ impl Budget {
         s.remove(id).value.downcast().ok().map(|v| *v)
     }
     pub fn clear_pool(&self, pool: u64) {
-        let mut s = self.0.borrow_mut();
+        let mut s = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(ids) = s.by_pool.remove(&pool) {
             for id in ids {
                 let i = s.items.remove(&id).unwrap();
@@ -141,7 +201,10 @@ impl Budget {
         }
     }
     pub fn stats(&self) -> ([u64; 2], [u64; 2], u64) {
-        let s = self.0.borrow();
+        let s = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         (s.idle, s.peak, s.peak_total)
     }
 }
@@ -155,6 +218,28 @@ impl State {
         }
         self.idle[i.kind] -= i.bytes;
         i
+    }
+}
+impl crate::resource_scheduler::Reclaim for Mutex<State> {
+    fn oldest(&self) -> Option<u64> {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .items
+            .first_key_value()
+            .map(|(id, _)| *id)
+    }
+    fn evict_oldest(&self) -> bool {
+        let item = {
+            let mut state = self
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .items
+                .first_key_value()
+                .map(|(id, _)| *id)
+                .map(|id| state.remove(id))
+        };
+        item.is_some()
     }
 }
 #[cfg(test)]
@@ -172,9 +257,14 @@ mod tests {
         b.put(a, 0, 3, 12u8);
         assert_eq!(b.take(r, |_: &u8| Some(())), None);
         assert_eq!(b.stats().0, [7, 0]);
-        b.0.borrow_mut().epoch += 1;
+        b.0.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .epoch += 1;
         assert_eq!(b.take(a, |_: &u8| Some(())), None);
-        b.0.borrow().completed.store(1, Ordering::Release);
+        b.0.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .completed
+            .store(1, Ordering::Release);
         assert!(b.take(a, |_: &u8| Some(())).is_some());
         b.clear_pool(a);
         assert_eq!(b.stats().0, [0, 0]);

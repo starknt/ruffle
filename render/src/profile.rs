@@ -274,7 +274,10 @@ pub fn record_bitmap_residency(stats: BitmapResidencyStats) {
     });
 }
 #[derive(Clone, Default, Debug)]
-pub struct RenderMetrics(Rc<RefCell<Counters>>);
+pub struct RenderMetrics(
+    Rc<RefCell<Counters>>,
+    std::sync::Arc<std::sync::Mutex<GpuBitmapStats>>,
+);
 thread_local! {
     static CURRENT: RefCell<Option<RenderMetrics>> = const { RefCell::new(None) };
 }
@@ -295,7 +298,15 @@ impl RenderMetrics {
         std::mem::take(&mut self.0.borrow_mut().gpu_samples)
     }
     pub fn snapshot(&self) -> Counters {
-        self.0.borrow().clone()
+        let mut snapshot = self.0.borrow().clone();
+        let bitmaps = self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.gpu_bitmaps = bitmaps.count;
+        snapshot.gpu_bitmap_bytes = bitmaps.bytes;
+        snapshot.peak_gpu_bitmap_bytes = bitmaps.peak;
+        snapshot
     }
 
     pub fn take_async_events(&self) -> Vec<AsyncEvent> {
@@ -489,28 +500,37 @@ pub fn pool(idle: [u64; 2], peak: [u64; 2], combined: u64) {
 }
 
 #[derive(Debug, Default)]
-pub struct GpuBitmap(Option<(RenderMetrics, u64)>);
+struct GpuBitmapStats {
+    count: u64,
+    bytes: u64,
+    peak: u64,
+}
+#[derive(Debug, Default)]
+pub struct GpuBitmap(Option<(std::sync::Arc<std::sync::Mutex<GpuBitmapStats>>, u64)>);
 impl GpuBitmap {
     pub fn new(bytes: u64) -> Self {
-        Self(CURRENT.with_borrow(|m| {
-            m.clone().map(|m| {
-                {
-                    let mut c = m.0.borrow_mut();
-                    c.gpu_bitmaps += 1;
-                    c.gpu_bitmap_bytes += bytes;
-                    c.peak_gpu_bitmap_bytes = c.peak_gpu_bitmap_bytes.max(c.gpu_bitmap_bytes);
-                }
-                (m, bytes)
+        Self(CURRENT.with_borrow(|current| {
+            current.as_ref().map(|metrics| {
+                let mut counts = metrics
+                    .1
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                counts.count += 1;
+                counts.bytes += bytes;
+                counts.peak = counts.peak.max(counts.bytes);
+                (metrics.1.clone(), bytes)
             })
         }))
     }
 }
 impl Drop for GpuBitmap {
     fn drop(&mut self) {
-        if let Some((m, b)) = &self.0 {
-            let mut c = m.0.borrow_mut();
-            c.gpu_bitmaps -= 1;
-            c.gpu_bitmap_bytes -= b;
+        if let Some((metrics, bytes)) = &self.0 {
+            let mut counts = metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            counts.count -= 1;
+            counts.bytes -= bytes;
         }
     }
 }
@@ -729,5 +749,21 @@ mod tests {
         );
         assert_eq!(first.values.iter().flatten().sum::<u64>(), 11);
         assert_eq!(second.values.iter().flatten().sum::<u64>(), 4);
+    }
+}
+
+#[cfg(test)]
+mod gpu_bitmap_thread_tests {
+    #[test]
+    fn cache_eviction_updates_bitmap_metrics_from_the_device_owner() {
+        let metrics = super::RenderMetrics::default();
+        let _scope = super::enter(Some(&metrics));
+        let allocation = super::GpuBitmap::new(64);
+        assert_eq!(metrics.snapshot().gpu_bitmap_bytes, 64);
+        std::thread::spawn(move || drop(allocation)).join().unwrap();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.gpu_bitmap_bytes, 0);
+        assert_eq!(snapshot.gpu_bitmaps, 0);
+        assert_eq!(snapshot.peak_gpu_bitmap_bytes, 64);
     }
 }

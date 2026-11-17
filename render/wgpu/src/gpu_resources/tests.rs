@@ -396,3 +396,104 @@ fn stage3d_buffer_failure_preserves_the_ledger_and_typed_cause() {
     context.health().fail(failure.clone());
     assert_eq!(context.health().check().unwrap_err(), failure);
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn retryable_creation_reclaims_before_exactly_one_retry() {
+    let device = device(4096);
+    let mut attempts = 0;
+    let result = device.create(ResourceKind::Buffer, 256, &[], |raw| {
+        attempts += 1;
+        if attempts == 1 {
+            return Err(RenderFailure::new(
+                RenderFailureKind::OutOfMemory,
+                "injected creation failure",
+            ));
+        }
+        Ok(raw.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }))
+    });
+    assert!(
+        result.is_ok(),
+        "a clean candidate creation can retry: {result:?}"
+    );
+    assert_eq!(attempts, 2);
+    assert_eq!(device.runtime().stats().reserved_bytes, 0);
+    assert_eq!(device.runtime().stats().total_bytes, 256);
+    drop(result);
+    assert_eq!(device.runtime().stats().total_bytes, 0);
+    let mut attempts = 0;
+    let result: Result<Buffer, _> = device.create(ResourceKind::Buffer, 256, &[], |_| {
+        attempts += 1;
+        Err(RenderFailure::new(
+            RenderFailureKind::OutOfMemory,
+            "persistent creation failure",
+        ))
+    });
+    assert_eq!(result.unwrap_err().kind(), RenderFailureKind::OutOfMemory);
+    assert_eq!(attempts, 2);
+    assert_eq!(device.runtime().stats().total_bytes, 0);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn native_submissions_never_exceed_two_in_flight() {
+    let device = device(4096);
+    for _ in 0..16 {
+        let commands = device
+            .create_command_encoder(&Default::default())
+            .unwrap()
+            .finish()
+            .unwrap();
+        device.queue().submit([commands]).unwrap();
+        let stats = device.runtime().stats();
+        assert!(
+            stats.submitted - stats.completed <= 2,
+            "own queue depth must be bounded"
+        );
+        assert!(device.0.inner().pending_submissions.lock().unwrap().len() <= 2);
+    }
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    assert_eq!(
+        device.runtime().stats().submitted,
+        device.runtime().stats().completed
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn native_allocation_reclaims_idle_storage_before_exceeding_the_budget() {
+    let device = device(1024);
+    let budget = crate::idle_pool::Budget::with_runtime(device.runtime());
+    let make = |size| {
+        device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size,
+                usage: wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+            .unwrap()
+    };
+    let cached = make(512);
+    cached.lease().set_idle(true);
+    let pool = budget.key();
+    budget.put(pool, 0, 512, cached);
+    let live = make(512);
+    assert_eq!(device.runtime().stats().idle_bytes, 512);
+    let next = make(256);
+    assert_eq!(device.runtime().stats().idle_bytes, 0);
+    assert_eq!(device.runtime().stats().total_bytes, 768);
+    assert!(budget.take(pool, |_: &Buffer| Some(())).is_none());
+    drop((live, next));
+    assert_eq!(device.runtime().stats().total_bytes, 0);
+}

@@ -6,7 +6,7 @@ use ruffle_render::backend::{
 use ruffle_render::bitmap::BitmapHandle;
 use ruffle_render::error::Error;
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use swf::{Rectangle, Twips};
 
 use crate::gpu_resources::StagingBelt;
@@ -123,7 +123,8 @@ impl WgpuContext3D {
                 clamped_nearest: Default::default(),
                 view: dummy_texture.create_view(&Default::default())?,
                 texture: dummy_texture,
-                copy_count: Cell::new(0),
+                copy_count: Default::default(),
+                weak_self: Default::default(),
             })))
         };
 
@@ -686,7 +687,8 @@ impl Context3D for WgpuContext3D {
                         repeating_nearest: Default::default(),
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
-                        copy_count: Cell::new(0),
+                        copy_count: Default::default(),
+                        weak_self: Default::default(),
                     }));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
                         _allocation: Default::default(),
@@ -696,7 +698,8 @@ impl Context3D for WgpuContext3D {
                         repeating_nearest: Default::default(),
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
-                        copy_count: Cell::new(0),
+                        copy_count: Default::default(),
+                        weak_self: Default::default(),
                     }));
                 } else {
                     // In non-multisample mode, we don't have a separate resolve buffer,
@@ -710,7 +713,8 @@ impl Context3D for WgpuContext3D {
                         repeating_nearest: Default::default(),
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
-                        copy_count: Cell::new(0),
+                        copy_count: Default::default(),
+                        weak_self: Default::default(),
                     }));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
                         _allocation: Default::default(),
@@ -720,7 +724,8 @@ impl Context3D for WgpuContext3D {
                         repeating_nearest: Default::default(),
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
-                        copy_count: Cell::new(0),
+                        copy_count: Default::default(),
+                        weak_self: Default::default(),
                     }));
                     self.current_texture_resolve_view = None;
                 }
@@ -953,7 +958,6 @@ impl Context3D for WgpuContext3D {
                 // easily re-use it across multiple `DrawTriangles` calls.
                 drop(render_pass);
 
-                let _submission = self.descriptors.lock_submission();
                 self.descriptors.queue.submit([
                     finished_buffer_command_encoder.finish()?,
                     render_command_encoder.finish()?,

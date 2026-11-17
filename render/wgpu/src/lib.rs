@@ -20,7 +20,7 @@ use ruffle_render::bitmap::{BitmapHandle, BitmapHandleImpl, PixelRegion, SyncHan
 use ruffle_render::shape_utils::GradientType;
 use ruffle_render::tessellator::{Gradient as TessGradient, Vertex as TessVertex};
 use std::any::Any;
-use std::cell::{Cell, OnceCell};
+use std::sync::OnceLock;
 use std::sync::{
     Arc,
     mpsc::{Receiver, TryRecvError},
@@ -42,6 +42,7 @@ pub mod gpu_resources;
 pub mod gpu_runtime;
 mod pipelines;
 mod pixel_bender;
+mod resource_scheduler;
 pub mod target;
 pub use ruffle_render::profile;
 mod idle_pool;
@@ -402,9 +403,11 @@ impl QueueSyncHandle {
 
                 // After we've read pixels from a texture enough times, we'll store this buffer so that
                 // future reads will be faster (it'll copy as part of the draw process instead)
-                texture
-                    .copy_count
-                    .set(texture.copy_count.get().saturating_add(1));
+                let _ = texture.copy_count.try_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |count| Some(count.saturating_add(1)),
+                );
 
                 image
             }
@@ -414,14 +417,15 @@ impl QueueSyncHandle {
 
 #[derive(Debug)]
 pub struct Texture {
+    weak_self: std::sync::Weak<Texture>,
     pub(crate) _allocation: ruffle_render::profile::GpuBitmap,
     pub(crate) texture: crate::gpu_resources::Texture,
     view: crate::gpu_resources::TextureView,
-    repeating_linear: OnceCell<BitmapBinds>,
-    repeating_nearest: OnceCell<BitmapBinds>,
-    clamped_linear: OnceCell<BitmapBinds>,
-    clamped_nearest: OnceCell<BitmapBinds>,
-    copy_count: Cell<u8>,
+    repeating_linear: OnceLock<BitmapBinds>,
+    repeating_nearest: OnceLock<BitmapBinds>,
+    clamped_linear: OnceLock<BitmapBinds>,
+    clamped_nearest: OnceLock<BitmapBinds>,
+    copy_count: std::sync::atomic::AtomicU8,
 }
 
 impl Texture {
@@ -440,7 +444,7 @@ impl Texture {
             (false, true) => &self.clamped_linear,
             (false, false) => &self.clamped_nearest,
         };
-        crate::gpu_resources::try_cell(bind, || {
+        crate::gpu_resources::try_sync_cell(bind, || {
             BitmapBinds::new(
                 device,
                 layout,

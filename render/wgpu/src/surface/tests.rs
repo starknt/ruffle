@@ -140,6 +140,10 @@ fn bounded_compositing_matches_full_target_pixels() {
 }
 
 fn gpu() -> Arc<Descriptors> {
+    gpu_with_watermark(None)
+}
+
+fn gpu_with_watermark(watermark: Option<u64>) -> Arc<Descriptors> {
     let mut options = wgpu::InstanceDescriptor::new_without_display_handle();
     options.backends = wgpu::Backends::VULKAN;
     let instance = wgpu::Instance::new(options);
@@ -151,7 +155,17 @@ fn gpu() -> Arc<Descriptors> {
     ))
     .expect("explicit GPU regressions require a Vulkan adapter");
     eprintln!("native GPU regression adapter: {:?}", adapter.get_info());
-    Arc::new(Descriptors::new(instance, adapter, device, queue).expect("GPU operation failed"))
+    let mut config =
+        crate::gpu_runtime::GpuBudgetConfig::for_adapter(adapter.get_info().device_type, false);
+    if let Some(watermark) = watermark {
+        config.transient_watermark = watermark;
+    }
+    let runtime = crate::gpu_runtime::GpuRuntime::new(config).unwrap();
+    runtime.install_device_callbacks(&device);
+    Arc::new(
+        Descriptors::with_runtime(instance, adapter, device, queue, runtime)
+            .expect("GPU operation failed"),
+    )
 }
 
 fn rect(list: &mut CommandList, x: f32, y: f32, w: f32, h: f32, color: Color) {
@@ -586,4 +600,75 @@ fn destroyed_readback_buffer_returns_error_without_publishing_pixels()
     assert!(!published.get());
 
     Ok(())
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn cheap_operations_do_not_force_a_draw_count_submission() {
+    let descriptors = gpu();
+    let budget = crate::idle_pool::Budget::with_runtime(&descriptors.runtime);
+    let mut frame = crate::backend::ActiveFrame::new(&descriptors, budget).unwrap();
+    let buffer = descriptors
+        .device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    for _ in 0..120 {
+        frame.encoder().clear_buffer(&buffer, 0, None);
+        frame.maybe_flush(&descriptors).unwrap();
+    }
+    assert_eq!(descriptors.runtime.stats().submitted, 0);
+    frame.submit_direct(&descriptors).unwrap();
+    assert_eq!(descriptors.runtime.stats().submitted, 1);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn transient_bytes_trigger_submission_at_an_operation_boundary() {
+    let descriptors = gpu_with_watermark(Some(64));
+    let budget = crate::idle_pool::Budget::with_runtime(&descriptors.runtime);
+    let mut frame = crate::backend::ActiveFrame::new(&descriptors, budget).unwrap();
+    let texture = descriptors
+        .device
+        .create_texture_with_kind(
+            &wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: 8,
+                    height: 8,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            },
+            crate::gpu_runtime::ResourceKind::OffscreenTarget,
+        )
+        .unwrap();
+    let view = texture.create_view(&Default::default()).unwrap();
+    {
+        let _pass = frame
+            .encoder()
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::RED),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+    }
+    frame.maybe_flush(&descriptors).unwrap();
+    assert_eq!(descriptors.runtime.stats().submitted, 1);
 }

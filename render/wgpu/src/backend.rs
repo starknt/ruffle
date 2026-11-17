@@ -32,7 +32,6 @@ use ruffle_render::shape_utils::DistilledShape;
 use ruffle_render::tessellator::ShapeTessellator;
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use swf::Color;
@@ -66,6 +65,10 @@ pub fn create_wgpu_instance(
             .difference(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL)
             .with_env(),
         backend_options,
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds {
+            for_resource_creation: Some(90),
+            for_device_loss: None,
+        },
         ..descriptor
     })
 }
@@ -88,7 +91,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     active_frame: ActiveFrame,
     profiler: GpuProfiler,
     last_submission: Option<SubmissionIndex>,
-    bitmap_residency: Option<crate::bitmap_residency::BitmapResidency>,
+    bitmap_residency: Option<crate::bitmap_residency::BitmapResidency<Texture>>,
 }
 
 impl WgpuRenderBackend<SwapChainTarget> {
@@ -221,7 +224,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             target.format(),
         )?;
 
-        let budget = crate::idle_pool::Budget::new(Some(crate::idle_pool::IDLE_LIMIT));
+        let budget = crate::idle_pool::Budget::with_runtime(&descriptors.runtime);
         let offscreen_buffer_pool = BufferPool::new(
             budget.clone(),
             1,
@@ -259,6 +262,10 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         #[cfg(not(feature = "profile-with-tracy"))]
         let profiler = GpuProfiler::new(&descriptors.device, profiler_settings)?;
 
+        let bitmap_residency = crate::bitmap_residency::BitmapResidency::with_runtime(
+            &descriptors.runtime,
+            descriptors.runtime.config().cache_limit,
+        );
         descriptors.runtime.check_health()?;
         Ok(Self {
             budget: budget.clone(),
@@ -275,9 +282,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             active_frame,
             profiler,
             last_submission: None,
-            bitmap_residency: Some(crate::bitmap_residency::BitmapResidency::new(
-                DEFAULT_IMMUTABLE_BITMAP_CACHE_LIMIT,
-            )),
+            bitmap_residency: Some(bitmap_residency),
         })
     }
 
@@ -285,9 +290,9 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
     /// writable bitmaps are separate owners and are not constrained by this cache.
     /// A zero or absent limit disables the cache for focused renderer tests.
     pub fn set_immutable_bitmap_cache_limit(&mut self, limit: Option<u64>) {
-        self.bitmap_residency = limit
-            .filter(|limit| *limit > 0)
-            .map(crate::bitmap_residency::BitmapResidency::new);
+        self.bitmap_residency = limit.filter(|limit| *limit > 0).map(|limit| {
+            crate::bitmap_residency::BitmapResidency::with_runtime(&self.descriptors.runtime, limit)
+        });
     }
 
     fn register_shape_internal(
@@ -824,19 +829,21 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             extent,
         )?;
 
-        let handle = BitmapHandle(Arc::new(Texture {
+        let view = texture.create_view(&Default::default())?;
+        let handle = BitmapHandle(Arc::new_cyclic(|weak_self| Texture {
             _allocation: ruffle_render::profile::GpuBitmap::new(
                 u64::from(texture.width())
                     * u64::from(texture.height())
                     * u64::from(texture.format().block_copy_size(None).unwrap_or(4)),
             ),
-            view: texture.create_view(&Default::default())?,
+            view,
             texture,
             repeating_linear: Default::default(),
             repeating_nearest: Default::default(),
             clamped_linear: Default::default(),
             clamped_nearest: Default::default(),
-            copy_count: Cell::new(0),
+            copy_count: Default::default(),
+            weak_self: weak_self.clone(),
         }));
 
         self.descriptors.runtime.check_health()?;
@@ -851,7 +858,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         let bytes = u64::from(texture.texture.width())
             * u64::from(texture.texture.height())
             * u64::from(texture.texture.format().block_copy_size(None).unwrap_or(4));
-        cache.retain(bitmap, bytes);
+        let Some(retained) = texture.weak_self.upgrade() else {
+            return false;
+        };
+        texture.texture.lease().set_reconstructible(true);
+        cache.retain(&retained, bytes);
         ruffle_render::profile::record_bitmap_residency(cache.stats());
         true
     }
@@ -1323,7 +1334,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     repeating_nearest: Default::default(),
                     clamped_linear: Default::default(),
                     clamped_nearest: Default::default(),
-                    copy_count: Cell::new(0),
+                    copy_count: Default::default(),
+                    weak_self: Default::default(),
                 }))
             }
         };
@@ -1479,7 +1491,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             repeating_nearest: Default::default(),
             clamped_linear: Default::default(),
             clamped_nearest: Default::default(),
-            copy_count: Cell::new(0),
+            copy_count: Default::default(),
+            weak_self: Default::default(),
         })))
     }
 
@@ -1611,13 +1624,9 @@ pub struct ActiveFrame {
     pub staging_belt: crate::gpu_resources::StagingBelt,
     command_encoder: TrackedEncoder,
     budget: crate::idle_pool::Budget,
-
-    draws_since_flush: u32,
 }
 
 impl ActiveFrame {
-    const MAX_DRAWS_PER_FLUSH: u32 = 100;
-
     pub fn new(
         descriptors: &Descriptors,
         budget: crate::idle_pool::Budget,
@@ -1631,7 +1640,6 @@ impl ActiveFrame {
                     .create_command_encoder(&Default::default())?,
             },
             staging_belt: crate::gpu_resources::StagingBelt::new(descriptors.device.clone(), 65536),
-            draws_since_flush: 0,
         })
     }
 
@@ -1645,7 +1653,6 @@ impl ActiveFrame {
         frame: T::Frame,
     ) -> Result<SubmissionIndex, crate::gpu_runtime::RenderFailure> {
         descriptors.runtime.check_health()?;
-        self.draws_since_flush = 0;
         self.staging_belt.finish();
         let draw_encoder = std::mem::replace(
             &mut self.command_encoder.raw,
@@ -1660,12 +1667,6 @@ impl ActiveFrame {
                     ruffle_render::profile::NativePhase::EncoderFinish,
                 );
                 draw_encoder.finish()?
-            };
-            let _submission = {
-                let _timer = ruffle_render::profile::native_time(
-                    ruffle_render::profile::NativePhase::SubmitLock,
-                );
-                descriptors.lock_submission()
             };
             target.submit(
                 &descriptors.device,
@@ -1687,7 +1688,6 @@ impl ActiveFrame {
         descriptors: &Descriptors,
     ) -> Result<SubmissionIndex, crate::gpu_runtime::RenderFailure> {
         descriptors.runtime.check_health()?;
-        self.draws_since_flush = 0;
         self.staging_belt.finish();
         let draw_encoder = std::mem::replace(
             &mut self.command_encoder.raw,
@@ -1702,12 +1702,6 @@ impl ActiveFrame {
                     ruffle_render::profile::NativePhase::EncoderFinish,
                 );
                 draw_encoder.finish()?
-            };
-            let _submission = {
-                let _timer = ruffle_render::profile::native_time(
-                    ruffle_render::profile::NativePhase::SubmitLock,
-                );
-                descriptors.lock_submission()
             };
             let _timer = ruffle_render::profile::native_time(
                 ruffle_render::profile::NativePhase::QueueSubmit,
@@ -1726,13 +1720,13 @@ impl ActiveFrame {
         descriptors: &Descriptors,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
         descriptors.runtime.check_health()?;
-        // [NA] This is kind of a hack.
-        // If we do "too much" during one frame, the submission ends up being way too large and goes OutOfMemory.
-        // What it is that we're OOMing on is likely buffers and temporary textures and such from render_offscreen
-        // Hard to track that though... so let's just flush it out if we do more than X draws per frame
-        self.draws_since_flush += 1;
-
-        if self.draws_since_flush > Self::MAX_DRAWS_PER_FLUSH {
+        let pending = self
+            .command_encoder
+            .raw
+            .transient_bytes()
+            .saturating_add(descriptors.queue.pending_upload_bytes());
+        if self.command_encoder.dirty && pending >= descriptors.runtime.config().transient_watermark
+        {
             self.submit_direct(descriptors)?;
         }
 

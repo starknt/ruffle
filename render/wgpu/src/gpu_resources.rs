@@ -39,6 +39,15 @@ type UseSet = FnvHashMap<ResourceId, ResourceLease>;
 struct Recording {
     uses: UseSet,
     open: bool,
+    transient_bytes: u64,
+}
+impl Recording {
+    fn retain(&mut self, lease: ResourceLease) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.uses.entry(lease.id()) {
+            self.transient_bytes += lease.transient_bytes();
+            entry.insert(lease);
+        }
+    }
 }
 
 trait Indexed: Any + Send + Sync {
@@ -109,6 +118,10 @@ struct DeviceInner {
     recordings: Mutex<Vec<Weak<Mutex<Recording>>>>,
     pending_writes: Mutex<UseSet>,
     submission_gate: Mutex<()>,
+    external_submission_lock: Mutex<Option<Arc<Mutex<()>>>>,
+    pending_submissions: Mutex<
+        std::collections::VecDeque<(crate::gpu_runtime::SubmissionSerial, wgpu::SubmissionIndex)>,
+    >,
 }
 #[derive(Clone)]
 pub struct Device(Arc<dyn DeviceAccess>, ResourceOwner);
@@ -169,6 +182,13 @@ fn resolve_scope(
     }
 }
 
+fn retryable(error: &RenderFailure) -> bool {
+    matches!(
+        error.kind(),
+        RenderFailureKind::BudgetExceeded | RenderFailureKind::OutOfMemory
+    )
+}
+
 impl Device {
     /// The caller installs device callbacks exactly once before constructing this.
     pub fn new(raw: wgpu::Device, queue: wgpu::Queue, runtime: GpuRuntime) -> Self {
@@ -181,6 +201,8 @@ impl Device {
                 recordings: Default::default(),
                 pending_writes: Default::default(),
                 submission_gate: Default::default(),
+                external_submission_lock: Default::default(),
+                pending_submissions: Default::default(),
             }),
             ResourceOwner::default(),
         )
@@ -257,9 +279,7 @@ impl Device {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if recording.open {
-                    recording
-                        .uses
-                        .insert(object.lease.id(), object.lease.clone());
+                    recording.retain(object.lease.clone());
                 }
                 recording.open
             } else {
@@ -273,12 +293,137 @@ impl Device {
         kind: ResourceKind,
         bytes: u64,
         dependencies: &[ResourceLease],
-        create: impl FnOnce(&wgpu::Device) -> Result<T, RenderFailure>,
+        create: impl FnMut(&wgpu::Device) -> Result<T, RenderFailure>,
     ) -> Result<Resource<T>, RenderFailure> {
-        let reservation = self.runtime().reserve(kind, self.1, bytes)?;
-        let raw = self.scoped(create)?;
-        let lease = reservation.commit(dependencies)?;
+        let (raw, lease) = self.allocate(kind, bytes, dependencies, create)?;
         Ok(self.wrap(raw, lease))
+    }
+    fn allocate<T>(
+        &self,
+        kind: ResourceKind,
+        bytes: u64,
+        dependencies: &[ResourceLease],
+        mut create: impl FnMut(&wgpu::Device) -> Result<T, RenderFailure>,
+    ) -> Result<(T, ResourceLease), RenderFailure> {
+        self.reclaim_soft(bytes);
+        self.recover(|| {
+            let reservation = self.runtime().reserve(kind, self.1, bytes)?;
+            let raw = self.scoped(&mut create)?;
+            Ok((raw, reservation.commit(dependencies)?))
+        })
+    }
+    fn recover<T>(
+        &self,
+        mut attempt: impl FnMut() -> Result<T, RenderFailure>,
+    ) -> Result<T, RenderFailure> {
+        match attempt() {
+            Err(error) if retryable(&error) => {
+                self.reclaim_and_drain()?;
+                attempt()
+            }
+            result => result,
+        }
+    }
+
+    fn reclaim_soft(&self, bytes: u64) {
+        use crate::resource_scheduler::ReclaimClass;
+        let scheduler = self.runtime().scheduler();
+        while self.runtime().stats().total_bytes.saturating_add(bytes)
+            > self.runtime().config().soft_limit
+        {
+            if !scheduler.evict_one(ReclaimClass::Idle) && !scheduler.evict_one(ReclaimClass::Cache)
+            {
+                break;
+            }
+        }
+    }
+    fn reclaim_and_drain(&self) -> Result<(), RenderFailure> {
+        self.runtime().check_health()?;
+        self.runtime().scheduler().reclaim();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // Wait through the oldest own submission first. Consumer completion on
+        // the shared queue may still retain imported stage slots after that.
+        if self.runtime().stats().submitted > self.runtime().stats().completed {
+            self.wait_for_oldest(deadline)?;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(RenderFailure::new(
+                RenderFailureKind::Timeout,
+                "GPU reclamation timed out",
+            ));
+        }
+        // No submission gate, cache mutex, or shared UI lock is held while polling.
+        self.raw()
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(remaining),
+            })
+            .map_err(crate::utils::poll_failure)?;
+        self.runtime().check_health()
+    }
+    fn reserve_with_reclaim(
+        &self,
+        kind: ResourceKind,
+        bytes: u64,
+    ) -> Result<crate::gpu_runtime::ResourceReservation, RenderFailure> {
+        self.reclaim_soft(bytes);
+        match self.runtime().reserve(kind, self.1, bytes) {
+            Err(error) if retryable(&error) => {
+                self.reclaim_and_drain()?;
+                self.runtime().reserve(kind, self.1, bytes)
+            }
+            result => result,
+        }
+    }
+    pub fn set_submission_lock(&self, lock: Arc<Mutex<()>>) {
+        *self
+            .0
+            .inner()
+            .external_submission_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lock);
+    }
+    fn submission_lock(&self) -> Option<Arc<Mutex<()>>> {
+        self.0
+            .inner()
+            .external_submission_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    fn wait_for_oldest(&self, deadline: Instant) -> Result<(), RenderFailure> {
+        self.runtime().check_health()?;
+        let completed = self.runtime().stats().completed;
+        let oldest = {
+            let mut pending = self
+                .0
+                .inner()
+                .pending_submissions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while pending
+                .front()
+                .is_some_and(|(serial, _)| serial.sequence() <= completed)
+            {
+                pending.pop_front();
+            }
+            pending.front().map(|(_, index)| index.clone())
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(RenderFailure::new(
+                RenderFailureKind::Timeout,
+                "GPU submission limit wait timed out",
+            ));
+        }
+        self.raw()
+            .poll(wgpu::PollType::Wait {
+                submission_index: oldest,
+                timeout: Some(remaining),
+            })
+            .map_err(crate::utils::poll_failure)?;
+        self.runtime().check_health()
     }
 
     fn scoped<T>(
@@ -311,9 +456,11 @@ impl Device {
         surface: &wgpu::Surface<'_>,
         config: &wgpu::SurfaceConfiguration,
     ) -> Result<(), RenderFailure> {
-        self.scoped(|device| {
-            surface.configure(device, config);
-            Ok(())
+        self.recover(|| {
+            self.scoped(|device| {
+                surface.configure(device, config);
+                Ok(())
+            })
         })
     }
 
@@ -410,7 +557,7 @@ impl Device {
             usage: texture.usage(),
             view_formats: &[],
         })?;
-        let reservation = self.runtime().reserve(kind, self.1, bytes)?;
+        let reservation = self.reserve_with_reclaim(kind, bytes)?;
         Ok(self.wrap(texture, reservation.commit(&[])?))
     }
     pub fn create_sampler(
@@ -489,7 +636,7 @@ impl Device {
         desc: wgpu::ShaderModuleDescriptor<'_>,
     ) -> Result<ShaderModule, RenderFailure> {
         self.create(ResourceKind::Shader, 0, &[], |device| {
-            Ok(device.create_shader_module(desc))
+            Ok(device.create_shader_module(desc.clone()))
         })
     }
     pub fn create_render_pipeline(
@@ -556,14 +703,13 @@ impl Device {
         &self,
         desc: &wgpu::CommandEncoderDescriptor<'_>,
     ) -> Result<CommandEncoder, RenderFailure> {
-        let reservation = self
-            .runtime()
-            .reserve(ResourceKind::CommandEncoder, self.1, 0)?;
-        let raw = self.scoped(|device| Ok(device.create_command_encoder(desc)))?;
-        let lease = reservation.commit(&[])?;
+        let (raw, lease) = self.allocate(ResourceKind::CommandEncoder, 0, &[], |device| {
+            Ok(device.create_command_encoder(desc))
+        })?;
         let uses = Arc::new(Mutex::new(Recording {
             uses: UseSet::default(),
             open: true,
+            transient_bytes: 0,
         }));
         {
             let mut recordings = self
@@ -575,15 +721,15 @@ impl Device {
             recordings.retain(|recording| recording.strong_count() > 0);
             recordings.push(Arc::downgrade(&uses));
         }
-        let live = self.live_uses();
-        uses.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .uses
-            .extend(live);
-        uses.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .uses
-            .insert(lease.id(), lease);
+        {
+            let mut recording = uses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for lease in self.live_uses().into_values() {
+                recording.retain(lease);
+            }
+            recording.retain(lease);
+        }
         Ok(CommandEncoder {
             raw,
             uses,
@@ -611,6 +757,12 @@ pub struct CommandEncoder {
     device: Device,
 }
 impl CommandEncoder {
+    pub fn transient_bytes(&self) -> u64 {
+        self.uses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .transient_bytes
+    }
     pub fn finish(self) -> Result<CommandBuffer, RenderFailure> {
         let uses = {
             let mut recording = self
@@ -653,6 +805,17 @@ impl Deref for Queue {
     }
 }
 impl Queue {
+    pub fn pending_upload_bytes(&self) -> u64 {
+        self.0
+            .0
+            .inner()
+            .pending_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(ResourceLease::transient_bytes)
+            .sum()
+    }
     pub fn raw(&self) -> &wgpu::Queue {
         &self.0.0.inner().queue
     }
@@ -665,30 +828,30 @@ impl Queue {
     ) -> Result<(), RenderFailure> {
         let staging = self
             .0
-            .runtime()
-            .reserve(ResourceKind::StagingBuffer, self.0.1, bytes)?
+            .reserve_with_reclaim(ResourceKind::StagingBuffer, bytes)?
             .commit(&[destination])?;
-        let _gate = self
-            .0
-            .0
-            .inner()
-            .submission_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Keep admitted writes until the next submission even when the backend
-        // reports an error; a partially enqueued mutable write cannot be retried.
         self.0
-            .0
-            .inner()
-            .pending_writes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(staging.id(), staging);
-        self.0.scoped(|_| {
-            write(self.raw());
-            Ok(())
-        })
+            .scoped(|_| {
+                let _gate = self
+                    .0
+                    .0
+                    .inner()
+                    .submission_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.0
+                    .0
+                    .inner()
+                    .pending_writes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(staging.id(), staging);
+                write(self.raw());
+                Ok(())
+            })
+            .map_err(|error| self.0.runtime().health().record(error))
     }
+
     pub fn write_buffer(
         &self,
         buffer: &wgpu::Buffer,
@@ -737,66 +900,113 @@ impl Queue {
         commands: impl IntoIterator<Item = wgpu::CommandBuffer>,
         resources: &[ResourceLease],
     ) -> Result<wgpu::SubmissionIndex, RenderFailure> {
-        self.0.runtime().check_health()?;
-        let _gate = self
-            .0
-            .0
-            .inner()
-            .submission_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut retained = std::mem::take(
-            &mut *self
-                .0
-                .0
-                .inner()
-                .pending_writes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        retained.extend(resources.iter().map(|lease| (lease.id(), lease.clone())));
-        let index = self.raw().submit(commands);
-        self.raw().on_submitted_work_done(move || drop(retained));
-        self.0.runtime().check_health()?;
-        Ok(index)
+        self.0
+            .scoped(|_| {
+                let _gate = self
+                    .0
+                    .0
+                    .inner()
+                    .submission_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let shared = self.0.submission_lock();
+                let _shared = shared.as_ref().map(|lock| {
+                    lock.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                });
+                let mut retained = std::mem::take(
+                    &mut *self
+                        .0
+                        .0
+                        .inner()
+                        .pending_writes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                retained.extend(resources.iter().map(|lease| (lease.id(), lease.clone())));
+                let index = self.raw().submit(commands);
+                self.raw().on_submitted_work_done(move || drop(retained));
+                Ok(index)
+            })
+            .map_err(|error| self.0.runtime().health().record(error))
     }
     pub fn submit(
         &self,
         commands: impl IntoIterator<Item = CommandBuffer>,
     ) -> Result<wgpu::SubmissionIndex, RenderFailure> {
-        self.0.runtime().check_health()?;
-        let _gate = self
-            .0
-            .0
-            .inner()
-            .submission_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut raw = Vec::new();
-        let mut uses = std::mem::take(
-            &mut *self
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let gate = loop {
+            self.0.runtime().check_health()?;
+            let gate = self
                 .0
                 .0
                 .inner()
-                .pending_writes
+                .submission_gate
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for command in commands {
-            raw.push(command.raw);
-            uses.extend(command.uses.into_iter().map(|lease| (lease.id(), lease)));
-        }
-        let leases: Vec<_> = uses.into_values().collect();
-        let serial = self.0.runtime().register_submission(&leases)?;
-        let index = self.raw().submit(raw);
-        let runtime = self.0.runtime().clone();
-        self.raw().on_submitted_work_done(move || {
-            runtime.complete_submission(serial);
-        });
-        self.0.runtime().check_health()?;
-        Ok(index)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stats = self.0.runtime().stats();
+            if stats.submitted - stats.completed < 2 {
+                break gate;
+            }
+            drop(gate);
+            self.0
+                .wait_for_oldest(deadline)
+                .map_err(|error| self.0.runtime().health().record(error))?;
+        };
+        // Scopes resolve after the closure has released both submission locks.
+        self.0
+            .scoped(|_| {
+                let shared = self.0.submission_lock();
+                let shared = shared.as_ref().map(|lock| {
+                    lock.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                });
+                let mut raw = Vec::new();
+                let mut uses = std::mem::take(
+                    &mut *self
+                        .0
+                        .0
+                        .inner()
+                        .pending_writes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                for command in commands {
+                    raw.push(command.raw);
+                    uses.extend(command.uses.into_iter().map(|lease| (lease.id(), lease)));
+                }
+                let leases: Vec<_> = uses.into_values().collect();
+                let serial = self.0.runtime().register_submission(&leases)?;
+                let index = self.raw().submit(raw);
+                {
+                    let completed = self.0.runtime().stats().completed;
+                    let mut pending = self
+                        .0
+                        .0
+                        .inner()
+                        .pending_submissions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while pending
+                        .front()
+                        .is_some_and(|(serial, _)| serial.sequence() <= completed)
+                    {
+                        pending.pop_front();
+                    }
+                    pending.push_back((serial, index.clone()));
+                }
+                let runtime = self.0.runtime().clone();
+                self.raw().on_submitted_work_done(move || {
+                    runtime.complete_submission(serial);
+                });
+                drop(shared);
+                drop(gate);
+                Ok(index)
+            })
+            .map_err(|error| self.0.runtime().health().record(error))
     }
 }
+
 impl RenderPipeline {
     pub fn get_bind_group_layout(&self, index: u32) -> Result<BindGroupLayout, RenderFailure> {
         self.0
@@ -948,6 +1158,16 @@ pub(crate) fn try_cached<K: Eq + Hash, V, S: std::hash::BuildHasher, E>(
 
 pub(crate) fn try_cell<T, E>(
     cell: &std::cell::OnceCell<T>,
+    init: impl FnOnce() -> Result<T, E>,
+) -> Result<&T, E> {
+    if let Some(value) = cell.get() {
+        return Ok(value);
+    }
+    let value = init()?;
+    Ok(cell.get_or_init(|| value))
+}
+pub(crate) fn try_sync_cell<T, E>(
+    cell: &std::sync::OnceLock<T>,
     init: impl FnOnce() -> Result<T, E>,
 ) -> Result<&T, E> {
     if let Some(value) = cell.get() {

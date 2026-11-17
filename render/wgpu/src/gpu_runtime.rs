@@ -111,6 +111,12 @@ pub struct SubmissionSerial {
     index: u64,
 }
 
+impl SubmissionSerial {
+    pub(crate) fn sequence(self) -> u64 {
+        self.index
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MemoryPressure {
     #[default]
@@ -127,6 +133,13 @@ pub enum ResourceState {
     Retiring,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourcePriority {
+    Visible,
+    Reconstructible,
+    Idle,
+}
+
 #[derive(Clone, Debug)]
 pub struct ResourceInfo {
     pub id: ResourceId,
@@ -137,6 +150,8 @@ pub struct ResourceInfo {
     pub created_submission: u64,
     pub last_submission: u64,
     pub dependencies: Vec<ResourceId>,
+    pub priority: ResourcePriority,
+    pub reconstructible: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -147,6 +162,8 @@ pub struct GpuMemoryStats {
     pub retiring_bytes: u64,
     pub total_bytes: u64,
     pub peak_bytes: u64,
+    pub cache_retained_bytes: u64,
+    pub pool_retained_bytes: u64,
     /// Includes reservations, so pending zero-byte objects cannot bypass limits.
     pub resources: usize,
     pub kind_bytes: [u64; ResourceKind::COUNT],
@@ -165,6 +182,7 @@ struct Ledger {
 }
 
 struct Inner {
+    scheduler: crate::resource_scheduler::ResourceScheduler,
     device: u64,
     config: GpuBudgetConfig,
     ledger: Mutex<Ledger>,
@@ -258,11 +276,19 @@ impl GpuRuntime {
                 )
             })?;
         Ok(Self(Arc::new(Inner {
+            scheduler: crate::resource_scheduler::ResourceScheduler::new(
+                config.idle_limit,
+                config.cache_limit,
+            ),
             device,
             config,
             ledger: Mutex::default(),
             failure: RendererHealth::default(),
         })))
+    }
+
+    pub(crate) fn scheduler(&self) -> &crate::resource_scheduler::ResourceScheduler {
+        &self.0.scheduler
     }
 
     pub fn config(&self) -> GpuBudgetConfig {
@@ -357,6 +383,8 @@ impl GpuRuntime {
             created_submission,
             last_submission: 0,
             dependencies: Vec::new(),
+            priority: ResourcePriority::Visible,
+            reconstructible: false,
         });
         Ok(ResourceReservation {
             runtime: self.clone(),
@@ -366,6 +394,12 @@ impl GpuRuntime {
 
     pub fn stats(&self) -> GpuMemoryStats {
         let mut stats = self.0.ledger().stats;
+        stats.cache_retained_bytes = self
+            .scheduler()
+            .bytes(crate::resource_scheduler::ReclaimClass::Cache);
+        stats.pool_retained_bytes = self
+            .scheduler()
+            .bytes(crate::resource_scheduler::ReclaimClass::Idle);
         stats.pressure = if stats.total_bytes >= self.0.config.hard_limit {
             MemoryPressure::Hard
         } else if stats.total_bytes >= self.0.config.soft_limit {
@@ -408,6 +442,13 @@ impl GpuRuntime {
             ));
         }
         let mut ledger = self.0.ledger();
+        if ledger.stats.submitted - ledger.stats.completed >= 2 {
+            return Err(failure(
+                RenderFailureKind::BudgetExceeded,
+                "two Ruffle submissions are already in flight",
+            ));
+        }
+
         let serial = ledger.stats.submitted.checked_add(1).ok_or_else(|| {
             failure(
                 RenderFailureKind::Internal,
@@ -526,17 +567,30 @@ impl ResourceReservation {
         let id = self
             .id
             .ok_or_else(|| failure(RenderFailureKind::Internal, "reservation already consumed"))?;
-        {
+        let transient_bytes = {
             let mut ledger = self.runtime.0.ledger();
             ledger.transition(id, ResourceState::Active);
             if let Some(record) = ledger.records.get_mut(&id) {
                 record.dependencies = dependencies.iter().map(ResourceLease::id).collect();
+                if matches!(
+                    record.kind,
+                    ResourceKind::OffscreenTarget
+                        | ResourceKind::StagingBuffer
+                        | ResourceKind::ReadbackBuffer
+                ) {
+                    record.bytes
+                } else {
+                    0
+                }
+            } else {
+                0
             }
-        }
+        };
         self.id = None;
         Ok(ResourceLease(Arc::new(Allocation {
             runtime: self.runtime.clone(),
             id,
+            transient_bytes,
             _dependencies: dependencies.to_vec(),
         })))
     }
@@ -553,6 +607,7 @@ impl Drop for ResourceReservation {
 struct Allocation {
     runtime: GpuRuntime,
     id: ResourceId,
+    transient_bytes: u64,
     // These mirror the owning GPU object's references, not registry ownership.
     _dependencies: Vec<ResourceLease>,
 }
@@ -583,12 +638,33 @@ impl std::fmt::Debug for ResourceLease {
 }
 
 impl ResourceLease {
+    pub(crate) fn transient_bytes(&self) -> u64 {
+        self.0.transient_bytes
+    }
     pub fn id(&self) -> ResourceId {
         self.0.id
     }
 
+    pub fn set_reconstructible(&self, reconstructible: bool) {
+        if let Some(record) = self.0.runtime.0.ledger().records.get_mut(&self.id()) {
+            record.reconstructible = reconstructible;
+            record.priority = if reconstructible {
+                ResourcePriority::Reconstructible
+            } else {
+                ResourcePriority::Visible
+            };
+        }
+    }
     pub fn set_idle(&self, idle: bool) {
-        self.0.runtime.0.ledger().transition(
+        let mut ledger = self.0.runtime.0.ledger();
+        if let Some(record) = ledger.records.get_mut(&self.id()) {
+            record.priority = if idle {
+                ResourcePriority::Idle
+            } else {
+                ResourcePriority::Visible
+            };
+        }
+        ledger.transition(
             self.id(),
             if idle {
                 ResourceState::Idle

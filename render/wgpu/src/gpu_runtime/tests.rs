@@ -331,3 +331,16 @@ fn device_issues_distinct_owner_ids_for_recreated_movies() {
     drop(lease);
     assert_eq!(runtime.owner_bytes(first), 0);
 }
+
+#[test]
+fn third_pending_submission_is_rejected_until_the_oldest_completes() {
+    let gpu = runtime(1024);
+    let first = gpu.register_submission(&[]).unwrap();
+    gpu.register_submission(&[]).unwrap();
+    assert_eq!(
+        gpu.register_submission(&[]).unwrap_err().kind(),
+        RenderFailureKind::BudgetExceeded
+    );
+    assert!(gpu.complete_submission(first));
+    assert!(gpu.register_submission(&[]).is_ok());
+}

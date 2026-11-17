@@ -1,60 +1,119 @@
-//! Strong references to reconstructible uploads, bounded independently of AS3 GC.
-//! Dropping our reference never destroys resources still owned by recorded draws.
+//! Reconstructible native uploads. Only concrete native storage crosses a
+//! reclamation boundary; public bitmap/GC handle traits remain thread confined.
+use crate::resource_scheduler::{CacheTicket, Reclaim, ReclaimClass, ResourceScheduler};
 use lru::LruCache;
-use ruffle_render::{bitmap::BitmapHandle, profile::BitmapResidencyStats};
-use std::{num::NonZeroUsize, sync::Arc};
+use ruffle_render::profile::BitmapResidencyStats;
+use std::{
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
+};
 
-pub struct BitmapResidency {
-    entries: LruCache<usize, (BitmapHandle, u64)>,
-    limit: u64,
+type Entry<T> = (Arc<T>, u64, u64, CacheTicket);
+struct State<T> {
+    entries: LruCache<usize, Entry<T>>,
     stats: BitmapResidencyStats,
 }
-impl BitmapResidency {
+pub struct BitmapResidency<T: Send + Sync + 'static> {
+    state: Arc<Mutex<State<T>>>,
+    scheduler: ResourceScheduler,
+    limit: u64,
+}
+impl<T: Send + Sync + 'static> BitmapResidency<T> {
+    #[cfg(test)]
     pub fn new(limit: u64) -> Self {
-        Self {
+        Self::with_scheduler(limit, ResourceScheduler::new(0, limit))
+    }
+    pub fn with_runtime(runtime: &crate::gpu_runtime::GpuRuntime, limit: u64) -> Self {
+        Self::with_scheduler(limit, runtime.scheduler().clone())
+    }
+    fn with_scheduler(limit: u64, scheduler: ResourceScheduler) -> Self {
+        let state = Arc::new(Mutex::new(State {
             entries: LruCache::new(NonZeroUsize::new(4096).unwrap()),
-            limit,
             stats: Default::default(),
+        }));
+        scheduler.register(ReclaimClass::Cache, state.clone());
+        Self {
+            state,
+            scheduler,
+            limit,
         }
     }
-    pub fn retain(&mut self, handle: &BitmapHandle, bytes: u64) {
-        // Each cached identity is owned by its entry, so allocator reuse cannot
-        // alias another live entry. No GC pointer or source identifier is stored.
-        let key = Arc::as_ptr(&handle.0) as *const () as usize;
-        if self.entries.get(&key).is_some() {
-            self.stats.hits += 1;
-            return;
+    pub fn retain(&mut self, handle: &Arc<T>, bytes: u64) {
+        let key = Arc::as_ptr(handle) as usize;
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = state.entries.get_mut(&key) {
+                entry.2 = self.scheduler.tick();
+                state.stats.hits += 1;
+                return;
+            }
         }
         if bytes > self.limit {
-            return; // One oversized image must not flush the useful working set.
+            return;
         }
-        while self.stats.retained_bytes > self.limit - bytes {
-            let (_, (_, bytes)) = self.entries.pop_lru().unwrap();
-            self.stats.retained_bytes -= bytes;
-            self.stats.evictions += 1;
+        while self.stats().retained_bytes > self.limit - bytes {
+            self.state.evict_oldest();
         }
-        if let Some((_, (_, bytes))) = self.entries.push(key, (handle.clone(), bytes)) {
-            self.stats.retained_bytes -= bytes;
-            self.stats.evictions += 1;
+        let Some(ticket) = self.scheduler.admit(ReclaimClass::Cache, bytes) else {
+            return;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, (_, old, _, _))) = state
+            .entries
+            .push(key, (handle.clone(), bytes, self.scheduler.tick(), ticket))
+        {
+            state.stats.retained_bytes -= old;
+            state.stats.evictions += 1;
         }
-        self.stats.retained_bytes += bytes;
-        self.stats.insertions += 1;
-        self.stats.retained_entries = self.entries.len();
+        state.stats.retained_bytes += bytes;
+        state.stats.insertions += 1;
+        state.stats.retained_entries = state.entries.len();
     }
     pub fn stats(&self) -> BitmapResidencyStats {
-        self.stats
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stats
+    }
+}
+impl<T: Send + Sync> Reclaim for Mutex<State<T>> {
+    fn oldest(&self) -> Option<u64> {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .peek_lru()
+            .map(|(_, entry)| entry.2)
+    }
+    fn evict_oldest(&self) -> bool {
+        let entry = {
+            let mut state = self
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = state.entries.pop_lru();
+            if let Some((_, (_, bytes, _, _))) = &entry {
+                state.stats.retained_bytes -= bytes;
+                state.stats.evictions += 1;
+                state.stats.retained_entries = state.entries.len();
+            }
+            entry
+        };
+        entry.is_some()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ruffle_render::bitmap::BitmapHandleImpl;
     #[derive(Debug)]
     struct Image;
-    impl BitmapHandleImpl for Image {}
-    fn image() -> BitmapHandle {
-        BitmapHandle(Arc::new(Image))
+    fn image() -> Arc<Image> {
+        Arc::new(Image)
     }
 
     #[test]
@@ -63,7 +122,7 @@ mod tests {
         let first = image();
         let second = image();
         let third = image();
-        let second_weak = Arc::downgrade(&second.0);
+        let second_weak = Arc::downgrade(&second);
         cache.retain(&first, 4);
         cache.retain(&second, 4);
         cache.retain(&first, 4); // First is now most recently drawn.
@@ -77,7 +136,7 @@ mod tests {
         );
         drop(second);
         assert!(second_weak.upgrade().is_none());
-        let first_weak = Arc::downgrade(&first.0);
+        let first_weak = Arc::downgrade(&first);
         drop(first);
         assert!(first_weak.upgrade().is_some());
         cache.retain(&image(), 9);

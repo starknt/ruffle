@@ -2,7 +2,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::{borrow::Cow, cell::Cell, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 use crate::gpu_resources::StagingBelt;
 use crate::gpu_resources::{PipelineLayout, RenderPipeline, TextureView};
@@ -497,7 +497,8 @@ pub(super) fn run_pixelbender_shader_impl(
                                     repeating_nearest: Default::default(),
                                     clamped_linear: Default::default(),
                                     clamped_nearest: Default::default(),
-                                    copy_count: Cell::new(0),
+                                    copy_count: Default::default(),
+                                    weak_self: Default::default(),
                                 },
                             )))
                         })?;
