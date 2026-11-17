@@ -1,18 +1,18 @@
 use crate::buffer_builder::{BufferBuilder, BufferFull};
 use crate::descriptors::{Descriptors, Quad};
+use crate::gpu_resources::StagingBelt;
 use crate::{PosColorVertex, PosUvVertex, PosVertex, Transforms};
 use ruffle_render::transform::Transform;
 use std::ops::Range;
-use wgpu::util::StagingBelt;
 
 // [NA] The higher this value is, the more memory we'll reserve - ideally we can dynamically allocate this
 // but for now this feels reasonable
 const MAX_TRANSFORMS_PER_CHUNK: u64 = 512;
 
 pub struct ChunkBuffers {
-    pub transforms: wgpu::Buffer,
-    pub vertex_buffer: wgpu::Buffer,
-    pub bind_group: wgpu::BindGroup,
+    pub transforms: crate::gpu_resources::Buffer,
+    pub vertex_buffer: crate::gpu_resources::Buffer,
+    pub bind_group: crate::gpu_resources::BindGroup,
 }
 
 pub fn transforms_per_draw(limits: &wgpu::Limits) -> u64 {
@@ -24,19 +24,19 @@ pub fn transforms_per_draw(limits: &wgpu::Limits) -> u64 {
 }
 
 impl ChunkBuffers {
-    pub fn new(descriptors: &Descriptors) -> Self {
+    pub fn new(descriptors: &Descriptors) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let transforms = descriptors.device.create_buffer(&wgpu::BufferDescriptor {
             label: create_debug_label!("Chunk transform buffer").as_deref(),
             size: transforms_per_draw(&descriptors.limits) * size_of::<Transforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        })?;
         let vertex_buffer = descriptors.device.create_buffer(&wgpu::BufferDescriptor {
             label: create_debug_label!("Chunk vertex buffer").as_deref(),
             size: 1024,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        })?;
         let bind_group = descriptors
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -46,23 +46,29 @@ impl ChunkBuffers {
                     binding: 0,
                     resource: transforms.as_entire_binding(),
                 }],
-            });
-        Self {
+            })?;
+        Ok(Self {
             transforms,
             bind_group,
             vertex_buffer,
-        }
+        })
     }
 
-    pub fn ensure_vertex_buffer_fit(&mut self, device: &wgpu::Device, required_size: u64) {
+    pub fn ensure_vertex_buffer_fit(
+        &mut self,
+        device: &crate::gpu_resources::Device,
+        required_size: u64,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
         if self.vertex_buffer.size() < required_size {
             self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: create_debug_label!("Chunk vertex buffer").as_deref(),
                 size: required_size,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            });
+            })?;
         }
+
+        Ok(())
     }
 }
 
@@ -75,17 +81,17 @@ pub enum DrawVertices<'a> {
     Line,
     RectLine,
     CustomBuffers {
-        vertex_buffer: wgpu::Buffer,
+        vertex_buffer: crate::gpu_resources::Buffer,
         vertex_range: Range<wgpu::BufferAddress>,
-        index_buffer: wgpu::Buffer,
+        index_buffer: crate::gpu_resources::Buffer,
         indices: Range<u32>,
     },
 }
 
 #[derive(Clone, Debug)]
 pub struct DrawOffsets {
-    pub vertex_buffer: Option<wgpu::Buffer>,
-    pub index_buffer: wgpu::Buffer,
+    pub vertex_buffer: Option<crate::gpu_resources::Buffer>,
+    pub index_buffer: crate::gpu_resources::Buffer,
     pub vertices: Range<wgpu::BufferAddress>,
     pub indices: Range<u32>,
     pub instances: Range<u32>,
@@ -281,14 +287,16 @@ impl ChunkBufferBuilder {
     pub fn copy_to(
         self,
         staging_belt: &mut StagingBelt,
-        device: &wgpu::Device,
+        device: &crate::gpu_resources::Device,
         draw_encoder: &mut wgpu::CommandEncoder,
         chunk_buffers: &mut ChunkBuffers,
-    ) {
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
         self.transforms
-            .copy_to(staging_belt, draw_encoder, &chunk_buffers.transforms);
-        chunk_buffers.ensure_vertex_buffer_fit(device, self.vertices.len() as u64);
+            .copy_to(staging_belt, draw_encoder, &chunk_buffers.transforms)?;
+        chunk_buffers.ensure_vertex_buffer_fit(device, self.vertices.len() as u64)?;
         self.vertices
-            .copy_to(staging_belt, draw_encoder, &chunk_buffers.vertex_buffer);
+            .copy_to(staging_belt, draw_encoder, &chunk_buffers.vertex_buffer)?;
+
+        Ok(())
     }
 }

@@ -314,3 +314,20 @@ fn impossible_texture_sizes_are_rejected_before_resource_creation() {
         );
     }
 }
+
+#[test]
+fn device_issues_distinct_owner_ids_for_recreated_movies() {
+    let runtime = runtime(4096);
+    let first = runtime.issue_owner(OwnerKind::Movie).unwrap();
+    let next = runtime.issue_owner(OwnerKind::Movie).unwrap();
+    assert_ne!(first, next);
+    let lease = runtime
+        .reserve(ResourceKind::Buffer, first, 512)
+        .unwrap()
+        .commit(&[])
+        .unwrap();
+    assert_eq!(runtime.owner_bytes(first), 512);
+    assert_eq!(runtime.owner_bytes(next), 0);
+    drop(lease);
+    assert_eq!(runtime.owner_bytes(first), 0);
+}

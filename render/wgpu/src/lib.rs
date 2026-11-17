@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 // Renderer ownership stays on the player thread; preparation workers use owned CPU data.
 #![allow(clippy::arc_with_non_send_sync)]
 
@@ -13,6 +14,7 @@ use crate::target::{RenderTarget, SwapChainTarget};
 use crate::utils::{BufferDimensions, capture_image, format_list, get_backend_names};
 use bytemuck::{Pod, Zeroable};
 use descriptors::Descriptors;
+pub use gpu_profiler as wgpu_profiler;
 use ruffle_render::backend::RawTexture;
 use ruffle_render::bitmap::{BitmapHandle, BitmapHandleImpl, PixelRegion, SyncHandle};
 use ruffle_render::shape_utils::GradientType;
@@ -25,7 +27,6 @@ use std::sync::{
 };
 use swf::GradientSpread;
 pub use wgpu;
-pub use wgpu_profiler;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -36,6 +37,8 @@ mod bitmap_residency;
 mod bitmaps;
 mod context3d;
 mod globals;
+pub mod gpu_profiler;
+pub mod gpu_resources;
 pub mod gpu_runtime;
 mod pipelines;
 mod pixel_bender;
@@ -62,7 +65,7 @@ pub fn as_texture(handle: &BitmapHandle) -> &Texture {
     <dyn Any>::downcast_ref(&*handle.0).unwrap()
 }
 
-pub fn raw_texture_as_texture(handle: &dyn RawTexture) -> &wgpu::Texture {
+pub fn raw_texture_as_texture(handle: &dyn RawTexture) -> &crate::gpu_resources::Texture {
     <dyn Any>::downcast_ref(handle).unwrap()
 }
 
@@ -167,7 +170,7 @@ impl From<TessGradient> for GradientUniforms {
 }
 
 pub struct AsyncReadback {
-    buffer: PoolEntry<wgpu::Buffer, BufferDimensions>,
+    buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
     dimensions: BufferDimensions,
     descriptors: Arc<Descriptors>,
     receiver: Receiver<Result<(), wgpu::BufferAsyncError>>,
@@ -176,7 +179,7 @@ pub struct AsyncReadback {
 
 impl AsyncReadback {
     fn new(
-        buffer: PoolEntry<wgpu::Buffer, BufferDimensions>,
+        buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
         dimensions: BufferDimensions,
         descriptors: Arc<Descriptors>,
         index: Option<wgpu::SubmissionIndex>,
@@ -258,7 +261,7 @@ impl Drop for AsyncReadback {
 pub enum QueueSyncHandle {
     AlreadyCopied {
         index: Option<wgpu::SubmissionIndex>,
-        buffer: PoolEntry<wgpu::Buffer, BufferDimensions>,
+        buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
         copy_dimensions: BufferDimensions,
         descriptors: Arc<Descriptors>,
     },
@@ -266,7 +269,7 @@ pub enum QueueSyncHandle {
         handle: BitmapHandle,
         copy_area: PixelRegion,
         descriptors: Arc<Descriptors>,
-        pool: Arc<BufferPool<wgpu::Buffer, BufferDimensions>>,
+        pool: Arc<BufferPool<crate::gpu_resources::Buffer, BufferDimensions>>,
     },
 }
 
@@ -296,7 +299,7 @@ impl QueueSyncHandle {
                     copy_area.height() as usize,
                     texture.texture.format(),
                 );
-                let buffer = pool.take(&descriptors, dimensions.clone());
+                let buffer = pool.take(&descriptors, dimensions.clone())?;
                 frame.encoder().copy_texture_to_buffer(
                     wgpu::TexelCopyTextureInfo {
                         texture: &texture.texture,
@@ -361,7 +364,7 @@ impl QueueSyncHandle {
                     texture.texture.format(),
                 );
 
-                let buffer = pool.take(&descriptors, buffer_dimensions.clone());
+                let buffer = pool.take(&descriptors, buffer_dimensions.clone())?;
                 frame.encoder().copy_texture_to_buffer(
                     wgpu::TexelCopyTextureInfo {
                         texture: &texture.texture,
@@ -412,8 +415,8 @@ impl QueueSyncHandle {
 #[derive(Debug)]
 pub struct Texture {
     pub(crate) _allocation: ruffle_render::profile::GpuBitmap,
-    pub(crate) texture: wgpu::Texture,
-    view: wgpu::TextureView,
+    pub(crate) texture: crate::gpu_resources::Texture,
+    view: crate::gpu_resources::TextureView,
     repeating_linear: OnceCell<BitmapBinds>,
     repeating_nearest: OnceCell<BitmapBinds>,
     clamped_linear: OnceCell<BitmapBinds>,
@@ -426,18 +429,18 @@ impl Texture {
         &self,
         repeating: bool,
         smoothed: bool,
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
+        device: &crate::gpu_resources::Device,
+        layout: &crate::gpu_resources::BindGroupLayout,
         handle: BitmapHandle,
         samplers: &BitmapSamplers,
-    ) -> &BitmapBinds {
+    ) -> Result<&BitmapBinds, crate::gpu_runtime::RenderFailure> {
         let bind = match (repeating, smoothed) {
             (true, true) => &self.repeating_linear,
             (true, false) => &self.repeating_nearest,
             (false, true) => &self.clamped_linear,
             (false, false) => &self.clamped_nearest,
         };
-        bind.get_or_init(|| {
+        crate::gpu_resources::try_cell(bind, || {
             BitmapBinds::new(
                 device,
                 layout,

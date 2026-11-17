@@ -5,10 +5,10 @@ use ruffle_render::backend::{
     Context3DVertexBufferFormat, Context3DWrapMode, Texture,
 };
 
-use wgpu::{
-    BindGroupEntry, BindingResource, BufferDescriptor, BufferUsages, FrontFace, TextureView,
-};
-use wgpu::{Buffer, DepthStencilState};
+use crate::gpu_resources::Buffer;
+use crate::gpu_resources::TextureView;
+use wgpu::DepthStencilState;
+use wgpu::{BindGroupEntry, BindingResource, BufferDescriptor, BufferUsages, FrontFace};
 use wgpu::{ColorTargetState, RenderPipelineDescriptor, TextureFormat, VertexState};
 
 pub(super) trait IntoWgpu {
@@ -80,12 +80,12 @@ const FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
 //
 // To match up these APIs, we store the current state in `CurrentPipeline`.
 // Whenever a state-changing `Context3DCommand` is executed, we mark the `CurrentPipeline`
-// as dirty. When a `wgpu::RenderPipeline` is actually needed by `drawTriangles`,
-// we build a new `wgpu::RenderPipeline` from the `CurrentPipeline` state (if it's dirty).
+// as dirty. When a `crate::gpu_resources::RenderPipeline` is actually needed by `drawTriangles`,
+// we build a new `crate::gpu_resources::RenderPipeline` from the `CurrentPipeline` state (if it's dirty).
 //
-// The `CurrentPipeline` state (including the compiled `wgpu::RenderPipeline`) is stored
+// The `CurrentPipeline` state (including the compiled `crate::gpu_resources::RenderPipeline`) is stored
 // in `WgpuContext3D`, and is re-used across calls to `present`. Due to lifetime issues,
-// we don't actually store the `wgpu::RenderPipeline` in `CurrentPipeline` - it's
+// we don't actually store the `crate::gpu_resources::RenderPipeline` in `CurrentPipeline` - it's
 // instead stored in `WgpuContext3D`.
 pub struct CurrentPipeline {
     shaders: Option<Rc<ShaderPairAgal>>,
@@ -138,22 +138,22 @@ pub struct BoundTextureData {
 }
 
 impl CurrentPipeline {
-    pub fn new(descriptors: &Descriptors) -> Self {
+    pub fn new(descriptors: &Descriptors) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let vertex_shader_uniforms = descriptors.device.create_buffer(&BufferDescriptor {
             label: Some("Vertex shader uniforms"),
             size: VERTEX_SHADER_UNIFORMS_BUFFER_SIZE,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        })?;
 
         let fragment_shader_uniforms = descriptors.device.create_buffer(&BufferDescriptor {
             label: Some("Fragment shader uniforms"),
             size: FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        })?;
 
-        CurrentPipeline {
+        Ok(CurrentPipeline {
             shaders: None,
             bound_textures: std::array::from_fn(|_| None),
             vertex_shader_uniforms,
@@ -183,7 +183,7 @@ impl CurrentPipeline {
             target_format: TextureFormat::Rgba8Unorm,
 
             sampler_configs: [SamplerConfig::default(); 8],
-        }
+        })
     }
 
     pub fn stencil_ref_value(&self) -> u32 {
@@ -283,7 +283,13 @@ impl CurrentPipeline {
         &self,
         descriptors: &Descriptors,
         vertex_attributes: &[Option<VertexAttributeInfo>; MAX_VERTEX_ATTRIBUTES],
-    ) -> Result<Option<(wgpu::RenderPipeline, wgpu::BindGroup)>, naga_agal::Error> {
+    ) -> Result<
+        Option<(
+            crate::gpu_resources::RenderPipeline,
+            crate::gpu_resources::BindGroup,
+        )>,
+        super::PipelineError,
+    > {
         if !self.dirty.get() {
             return Ok(None);
         }
@@ -417,7 +423,7 @@ impl CurrentPipeline {
                     label: pipeline_layout_label.as_deref(),
                     bind_group_layouts: &[Some(&compiled_shaders.bind_group_layout)],
                     immediate_size: 0,
-                });
+                })?;
 
         let bind_group = descriptors
             .device
@@ -425,7 +431,7 @@ impl CurrentPipeline {
                 label: bind_group_label.as_deref(),
                 layout: &compiled_shaders.bind_group_layout,
                 entries: &bind_group_entries,
-            });
+            })?;
 
         struct BufferData {
             buffer: Rc<VertexBufferWrapper>,
@@ -587,7 +593,7 @@ impl CurrentPipeline {
                 },
                 multiview_mask: None,
                 cache: None,
-            });
+            })?;
         Ok(Some((compiled, bind_group)))
     }
 

@@ -95,16 +95,13 @@ impl GuiController {
             .iter()
             .find(|format| supported_formats.contains(format))
             .copied()
-            .unwrap_or_else(|| {
-                supported_formats
-                    .first()
-                    .copied()
-                    .expect("At least one format should be supported")
-            });
+            .or_else(|| supported_formats.first().copied())
+            .ok_or_else(|| anyhow!("surface has no supported format"))?;
         tracing::info!("Using surface format {:?}", surface_format);
         let size = window.inner_size();
-        surface.configure(
-            &device,
+        let descriptors = Descriptors::with_runtime(instance, adapter, device, queue, runtime)?;
+        descriptors.device.configure_surface(
+            &surface,
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: surface_format,
@@ -116,8 +113,7 @@ impl GuiController {
                 alpha_mode: Default::default(),
                 view_formats: Default::default(),
             },
-        );
-        let descriptors = Descriptors::with_runtime(instance, adapter, device, queue, runtime)?;
+        )?;
         let egui_ctx = Context::default();
 
         let theme_controller = futures::executor::block_on(ThemeController::new(
@@ -141,7 +137,7 @@ impl GuiController {
             window.fullscreen().is_none() && !no_gui,
             size.height,
             window.scale_factor(),
-        ));
+        )?);
         let egui_renderer = egui_wgpu::Renderer::new(
             &descriptors.device,
             surface_format,
@@ -169,7 +165,7 @@ impl GuiController {
         egui_extras::install_image_loaders(egui_winit.egui_ctx());
 
         #[cfg(feature = "tracy_images")]
-        let tracy_frame_captures = crate::tracy::FrameCapturesHolder::new(&descriptors.device);
+        let tracy_frame_captures = crate::tracy::FrameCapturesHolder::new(&descriptors.device)?;
 
         Ok(Self {
             descriptors,
@@ -214,8 +210,8 @@ impl GuiController {
     }
 
     pub fn reconfigure_surface(&self) {
-        self.surface.configure(
-            &self.descriptors.device,
+        if let Err(error) = self.descriptors.device.configure_surface(
+            &self.surface,
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: self.surface_format,
@@ -227,13 +223,24 @@ impl GuiController {
                 alpha_mode: Default::default(),
                 view_formats: Default::default(),
             },
-        );
-        self.movie_view_renderer.update_resolution(
+        ) {
+            self.descriptors.runtime.fail(error.clone());
+            tracing::error!("GPU surface stopped: {error}");
+            return;
+        }
+        match self.movie_view_renderer.update_resolution(
             &self.descriptors,
             self.window.fullscreen().is_none() && !self.no_gui,
             self.size.height,
             self.window.scale_factor(),
-        );
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.descriptors.runtime.fail(error.clone());
+                tracing::error!("GPU rendering stopped: {error}");
+                return;
+            }
+        };
     }
 
     #[must_use]
@@ -281,14 +288,21 @@ impl GuiController {
         tracing::info!("Opening {}", content_descriptor.describe());
 
         self.close_movie(player);
-        let movie_view = MovieView::new(
+        let movie_view = match MovieView::new(
             self.movie_view_renderer.clone(),
             &self.descriptors.device,
             self.size.width,
             self.size.height,
             #[cfg(feature = "tracy_images")]
             self.tracy_frame_captures.clone(),
-        );
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.descriptors.runtime.fail(error.clone());
+                tracing::error!("GPU rendering stopped: {error}");
+                return;
+            }
+        };
         player.create(&opt, &content_descriptor, movie_view);
         self.gui.on_player_created(
             opt,
@@ -365,14 +379,25 @@ impl GuiController {
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 // Generic error, not much we can do.
-                panic!("wgpu: Acquiring a texture failed with a validation error");
+                self.descriptors
+                    .runtime
+                    .fail(ruffle_render_wgpu::gpu_runtime::RenderFailure::new(
+                        ruffle_render_wgpu::gpu_runtime::RenderFailureKind::Validation,
+                        "acquiring a desktop surface texture failed",
+                    ));
+                return;
             }
         };
 
         #[cfg(feature = "tracy_images")]
         if player.is_none() {
-            self.tracy_frame_captures
-                .set_target(&self.descriptors.device, None);
+            if let Err(error) = self
+                .tracy_frame_captures
+                .set_target(&self.descriptors.device, None)
+            {
+                self.descriptors.runtime.fail(error);
+                return;
+            }
         }
 
         let raw_input = self.egui_winit.take_egui_input(&self.window);
@@ -422,6 +447,7 @@ impl GuiController {
         let mut encoder =
             self.descriptors
                 .device
+                .raw()
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("egui encoder"),
                 });
@@ -499,8 +525,13 @@ impl GuiController {
             #[cfg(feature = "tracy_images")]
             {
                 drop(render_pass);
-                self.tracy_frame_captures
-                    .capture_frame(&self.descriptors.device, &mut encoder);
+                if let Err(error) = self
+                    .tracy_frame_captures
+                    .capture_frame(&self.descriptors.device, &mut encoder)
+                {
+                    self.descriptors.runtime.fail(error);
+                    return;
+                }
             }
         }
 
@@ -508,7 +539,21 @@ impl GuiController {
         if self.descriptors.runtime.check_health().is_err() {
             return;
         }
-        self.descriptors.queue.submit(command_buffers);
+        #[allow(unused_mut)]
+        let mut leases = movie_view
+            .map(MovieView::resource_leases)
+            .unwrap_or_default();
+        #[cfg(feature = "tracy_images")]
+        leases.extend(self.tracy_frame_captures.resource_leases());
+        if let Err(error) = self
+            .descriptors
+            .queue
+            .submit_external(command_buffers, &leases)
+        {
+            self.descriptors.runtime.fail(error.clone());
+            tracing::error!("GPU rendering stopped: {error}");
+            return;
+        }
         if self.descriptors.runtime.check_health().is_err() {
             return;
         }
@@ -525,7 +570,9 @@ impl GuiController {
         #[cfg(feature = "tracy")]
         tracing_tracy::client::frame_mark();
         #[cfg(feature = "tracy_images")]
-        self.tracy_frame_captures.finish_frame();
+        if let Err(error) = self.tracy_frame_captures.finish_frame() {
+            self.descriptors.runtime.fail(error);
+        }
     }
 
     pub fn show_context_menu(

@@ -1,7 +1,6 @@
 use crate::buffer_pool::BufferDescription;
 use crate::descriptors::Descriptors;
 use std::borrow::Cow;
-use wgpu::util::DeviceExt;
 use wgpu::{CommandEncoder, TextureFormat};
 
 macro_rules! create_debug_label {
@@ -70,16 +69,18 @@ pub fn get_backend_names(backends: wgpu::Backends) -> Vec<&'static str> {
 }
 
 pub fn create_buffer_with_data(
-    device: &wgpu::Device,
+    device: &crate::gpu_resources::Device,
     data: &[u8],
     usage: wgpu::BufferUsages,
     label: Option<String>,
-) -> wgpu::Buffer {
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        usage,
-        label: label.as_deref(),
-        contents: data,
-    })
+) -> Result<crate::gpu_resources::Buffer, crate::gpu_runtime::RenderFailure> {
+    Ok(
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            usage,
+            label: label.as_deref(),
+            contents: data,
+        })?,
+    )
 }
 
 // Based off wgpu example 'capture'
@@ -125,8 +126,8 @@ impl BufferDescription for BufferDimensions {
 }
 
 pub fn capture_image<R, F: FnOnce(&[u8], u32) -> R>(
-    device: &wgpu::Device,
-    buffer: &wgpu::Buffer,
+    device: &crate::gpu_resources::Device,
+    buffer: &crate::gpu_resources::Buffer,
     dimensions: &BufferDimensions,
     index: Option<wgpu::SubmissionIndex>,
     with_rgba: F,
@@ -184,8 +185,8 @@ pub fn poll_failure(error: wgpu::PollError) -> crate::gpu_runtime::RenderFailure
 }
 
 pub fn buffer_to_image(
-    device: &wgpu::Device,
-    buffer: &wgpu::Buffer,
+    device: &crate::gpu_resources::Device,
+    buffer: &crate::gpu_resources::Buffer,
     dimensions: &BufferDimensions,
     index: Option<wgpu::SubmissionIndex>,
     size: wgpu::Extent3d,
@@ -225,11 +226,11 @@ pub fn supported_sample_count(
 pub fn run_copy_pipeline(
     descriptors: &Descriptors,
     format: wgpu::TextureFormat,
-    frame_view: &wgpu::TextureView,
-    input: &wgpu::TextureView,
+    frame_view: &crate::gpu_resources::TextureView,
+    input: &crate::gpu_resources::TextureView,
     sample_count: u32,
     encoder: &mut CommandEncoder,
-) {
+) -> Result<(), crate::gpu_runtime::RenderFailure> {
     let copy_bind_group = descriptors
         .device
         .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -247,9 +248,9 @@ pub fn run_copy_pipeline(
                 },
             ],
             label: create_debug_label!("Copy bind group").as_deref(),
-        });
+        })?;
 
-    let pipeline = descriptors.copy_pipeline(format, sample_count);
+    let pipeline = descriptors.copy_pipeline(format, sample_count)?;
 
     // We overwrite the pixels in the target texture (no blending at all),
     // so this doesn't matter.
@@ -278,10 +279,12 @@ pub fn run_copy_pipeline(
     });
 
     render_pass.set_pipeline(&pipeline);
-    render_pass.set_bind_group(2, &copy_bind_group, &[]);
+    render_pass.set_bind_group(2, (&copy_bind_group).raw(), &[]);
 
     render_pass.draw(0..3, 0..1);
     drop(render_pass);
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -319,17 +322,15 @@ impl<T> SampleCountMap<T> {
 }
 
 impl<T> SampleCountMap<std::sync::OnceLock<T>> {
-    pub fn get_or_init<F>(&self, sample_count: u32, init: F) -> &T
+    pub fn get_or_init<F, E>(&self, sample_count: u32, init: F) -> Result<&T, E>
     where
-        F: FnOnce() -> T,
+        F: FnOnce() -> Result<T, E>,
     {
-        match sample_count {
-            1 => self.one.get_or_init(init),
-            2 => self.two.get_or_init(init),
-            4 => self.four.get_or_init(init),
-            8 => self.eight.get_or_init(init),
-            16 => self.sixteen.get_or_init(init),
-            _ => unreachable!("Sample counts must be powers of two between 1..=16"),
+        let cell = self.get(sample_count);
+        if let Some(value) = cell.get() {
+            return Ok(value);
         }
+        let value = init()?;
+        Ok(cell.get_or_init(|| value))
     }
 }

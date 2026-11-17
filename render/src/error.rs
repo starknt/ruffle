@@ -18,7 +18,7 @@ pub enum RenderFailureKind {
 }
 
 /// Cheaply cloned first-failure information shared with the host and VM.
-#[derive(Clone, Debug, Error)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error("{kind:?}: {message}")]
 pub struct RenderFailure {
     kind: RenderFailureKind,

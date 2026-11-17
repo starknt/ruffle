@@ -18,30 +18,32 @@ impl ResolveBuffer {
         format: wgpu::TextureFormat,
         usage: wgpu::TextureUsages,
         pool: &mut TexturePool,
-    ) -> Self {
-        let texture = pool.get_texture(descriptors, size, usage, format, 1);
-        Self {
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        let texture = pool.get_texture(descriptors, size, usage, format, 1)?;
+        Ok(Self {
             texture: PoolOrArcTexture::Pool(texture),
-        }
+        })
     }
 
-    pub fn new_manual(texture: wgpu::Texture) -> Self {
-        Self {
+    pub fn new_manual(
+        texture: crate::gpu_resources::Texture,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        Ok(Self {
             texture: PoolOrArcTexture::Manual((
                 texture.clone(),
-                texture.create_view(&Default::default()),
+                texture.create_view(&Default::default())?,
             )),
-        }
+        })
     }
 
-    pub fn view(&self) -> &wgpu::TextureView {
+    pub fn view(&self) -> &crate::gpu_resources::TextureView {
         match self.texture {
             PoolOrArcTexture::Pool(ref texture) => &texture.1,
             PoolOrArcTexture::Manual(ref texture) => &texture.1,
         }
     }
 
-    pub fn texture(&self) -> &wgpu::Texture {
+    pub fn texture(&self) -> &crate::gpu_resources::Texture {
         match self.texture {
             PoolOrArcTexture::Pool(ref texture) => &texture.0,
             PoolOrArcTexture::Manual(ref texture) => &texture.0,
@@ -65,18 +67,31 @@ pub struct FrameBuffer {
 /// (when rendering to the main screen), or rendering to a non-pooled `Texture`
 /// (when doing an offscreen render to a BitmapData texture)
 pub enum PoolOrArcTexture {
-    Pool(PoolEntry<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>),
-    Manual((wgpu::Texture, wgpu::TextureView)),
+    Pool(
+        PoolEntry<
+            (
+                crate::gpu_resources::Texture,
+                crate::gpu_resources::TextureView,
+            ),
+            AlwaysCompatible,
+        >,
+    ),
+    Manual(
+        (
+            crate::gpu_resources::Texture,
+            crate::gpu_resources::TextureView,
+        ),
+    ),
 }
 
 impl PoolOrArcTexture {
-    pub fn texture(&self) -> &wgpu::Texture {
+    pub fn texture(&self) -> &crate::gpu_resources::Texture {
         match self {
             PoolOrArcTexture::Pool(texture) => &texture.0,
             PoolOrArcTexture::Manual(texture) => &texture.0,
         }
     }
-    pub fn view(&self) -> &wgpu::TextureView {
+    pub fn view(&self) -> &crate::gpu_resources::TextureView {
         match self {
             PoolOrArcTexture::Pool(texture) => &texture.1,
             PoolOrArcTexture::Manual(texture) => &texture.1,
@@ -92,33 +107,36 @@ impl FrameBuffer {
         format: wgpu::TextureFormat,
         usage: wgpu::TextureUsages,
         pool: &mut TexturePool,
-    ) -> Self {
-        let texture = pool.get_texture(descriptors, size, usage, format, sample_count);
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        let texture = pool.get_texture(descriptors, size, usage, format, sample_count)?;
 
-        Self {
+        Ok(Self {
             texture: PoolOrArcTexture::Pool(texture),
             size,
-        }
+        })
     }
 
-    pub fn new_manual(texture: wgpu::Texture, size: wgpu::Extent3d) -> Self {
-        Self {
+    pub fn new_manual(
+        texture: crate::gpu_resources::Texture,
+        size: wgpu::Extent3d,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        Ok(Self {
             texture: PoolOrArcTexture::Manual((
                 texture.clone(),
-                texture.create_view(&Default::default()),
+                texture.create_view(&Default::default())?,
             )),
             size,
-        }
+        })
     }
 
-    pub fn view(&self) -> &wgpu::TextureView {
+    pub fn view(&self) -> &crate::gpu_resources::TextureView {
         match self.texture {
             PoolOrArcTexture::Pool(ref texture) => &texture.1,
             PoolOrArcTexture::Manual(ref texture) => &texture.1,
         }
     }
 
-    pub fn texture(&self) -> &wgpu::Texture {
+    pub fn texture(&self) -> &crate::gpu_resources::Texture {
         match self.texture {
             PoolOrArcTexture::Pool(ref texture) => &texture.0,
             PoolOrArcTexture::Manual(ref texture) => &texture.0,
@@ -136,7 +154,13 @@ impl FrameBuffer {
 
 #[derive(Debug)]
 pub struct BlendBuffer {
-    texture: PoolEntry<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>,
+    texture: PoolEntry<
+        (
+            crate::gpu_resources::Texture,
+            crate::gpu_resources::TextureView,
+        ),
+        AlwaysCompatible,
+    >,
 }
 
 impl BlendBuffer {
@@ -146,24 +170,30 @@ impl BlendBuffer {
         format: wgpu::TextureFormat,
         usage: wgpu::TextureUsages,
         pool: &mut TexturePool,
-    ) -> Self {
-        let texture = pool.get_texture(descriptors, size, usage, format, 1);
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        let texture = pool.get_texture(descriptors, size, usage, format, 1)?;
 
-        Self { texture }
+        Ok(Self { texture })
     }
 
-    pub fn view(&self) -> &wgpu::TextureView {
+    pub fn view(&self) -> &crate::gpu_resources::TextureView {
         &self.texture.1
     }
 
-    pub fn texture(&self) -> &wgpu::Texture {
+    pub fn texture(&self) -> &crate::gpu_resources::Texture {
         &self.texture.0
     }
 }
 
 #[derive(Debug)]
 pub struct StencilBuffer {
-    texture: PoolEntry<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>,
+    texture: PoolEntry<
+        (
+            crate::gpu_resources::Texture,
+            crate::gpu_resources::TextureView,
+        ),
+        AlwaysCompatible,
+    >,
 }
 
 impl StencilBuffer {
@@ -172,19 +202,19 @@ impl StencilBuffer {
         msaa_sample_count: u32,
         size: wgpu::Extent3d,
         pool: &mut TexturePool,
-    ) -> Self {
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let texture = pool.get_texture(
             descriptors,
             size,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
             wgpu::TextureFormat::Stencil8,
             msaa_sample_count,
-        );
+        )?;
 
-        Self { texture }
+        Ok(Self { texture })
     }
 
-    pub fn view(&self) -> &wgpu::TextureView {
+    pub fn view(&self) -> &crate::gpu_resources::TextureView {
         &self.texture.1
     }
 }
@@ -211,8 +241,8 @@ impl CommandTarget {
         sample_count: u32,
         render_target_mode: RenderTargetMode,
         encoder: &mut wgpu::CommandEncoder,
-    ) -> Self {
-        let globals = pool.get_globals(descriptors, size.width, size.height);
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        let globals = pool.get_globals(descriptors, size.width, size.height)?;
 
         let mut make_pooled_frame_buffer = || {
             FrameBuffer::new(
@@ -236,18 +266,18 @@ impl CommandTarget {
             if let RenderTargetMode::ExistingWithColor(texture, _) = &render_target_mode {
                 if sample_count > 1 {
                     (
-                        make_pooled_frame_buffer(),
-                        Some(ResolveBuffer::new_manual(texture.clone())),
+                        make_pooled_frame_buffer()?,
+                        Some(ResolveBuffer::new_manual(texture.clone())?),
                     )
                 } else {
                     (
-                        FrameBuffer::new_manual(texture.clone(), texture.size()),
+                        FrameBuffer::new_manual(texture.clone(), texture.size())?,
                         None,
                     )
                 }
             } else if sample_count > 1 {
                 (
-                    make_pooled_frame_buffer(),
+                    make_pooled_frame_buffer()?,
                     Some(ResolveBuffer::new(
                         descriptors,
                         size,
@@ -257,10 +287,10 @@ impl CommandTarget {
                             | wgpu::TextureUsages::TEXTURE_BINDING
                             | wgpu::TextureUsages::RENDER_ATTACHMENT,
                         pool,
-                    )),
+                    )?),
                 )
             } else {
-                (make_pooled_frame_buffer(), None)
+                (make_pooled_frame_buffer()?, None)
             };
 
         if let RenderTargetMode::FreshWithTexture(texture) = &render_target_mode {
@@ -284,10 +314,10 @@ impl CommandTarget {
                     descriptors,
                     format,
                     frame_buffer.texture.view(),
-                    &texture.create_view(&Default::default()),
+                    &texture.create_view(&Default::default())?,
                     sample_count,
                     encoder,
-                );
+                )?;
             } else {
                 ruffle_render::profile::work(|w| {
                     w.copy_bytes += u64::from(size.width) * u64::from(size.height) * 4
@@ -300,7 +330,7 @@ impl CommandTarget {
             }
         }
 
-        Self {
+        Ok(Self {
             frame_buffer,
             blend_buffer: OnceCell::new(),
             resolve_buffer,
@@ -311,7 +341,7 @@ impl CommandTarget {
             sample_count,
             color_needs_clear: OnceCell::new(),
             render_target_mode,
-        }
+        })
     }
 
     pub fn width(&self) -> u32 {
@@ -360,7 +390,7 @@ impl CommandTarget {
         }
         Some(wgpu::RenderPassColorAttachment {
             view: self.frame_buffer.view(),
-            resolve_target: self.resolve_buffer.as_ref().map(|b| b.view()),
+            resolve_target: self.resolve_buffer.as_ref().map(|b| b.view().raw()),
             ops: wgpu::Operations {
                 load,
                 store: wgpu::StoreOp::Store,
@@ -377,12 +407,13 @@ impl CommandTarget {
         &self,
         descriptors: &Descriptors,
         pool: &mut TexturePool,
-    ) -> Option<wgpu::RenderPassDepthStencilAttachment<'_>> {
+    ) -> Result<Option<wgpu::RenderPassDepthStencilAttachment<'_>>, crate::gpu_runtime::RenderFailure>
+    {
         let new_buffer = self.depth.get().is_none();
-        let stencil = self
-            .depth
-            .get_or_init(|| StencilBuffer::new(descriptors, self.sample_count, self.size, pool));
-        Some(wgpu::RenderPassDepthStencilAttachment {
+        let stencil = crate::gpu_resources::try_cell(&self.depth, || {
+            StencilBuffer::new(descriptors, self.sample_count, self.size, pool)
+        })?;
+        Ok(Some(wgpu::RenderPassDepthStencilAttachment {
             view: stencil.view(),
             depth_ops: None,
             stencil_ops: Some(wgpu::Operations {
@@ -393,7 +424,7 @@ impl CommandTarget {
                 },
                 store: wgpu::StoreOp::Store,
             }),
-        })
+        }))
     }
 
     pub fn update_blend_buffer(
@@ -401,8 +432,8 @@ impl CommandTarget {
         descriptors: &Descriptors,
         pool: &mut TexturePool,
         encoder: &mut wgpu::CommandEncoder,
-    ) -> &BlendBuffer {
-        let blend_buffer = self.blend_buffer.get_or_init(|| {
+    ) -> Result<&BlendBuffer, crate::gpu_runtime::RenderFailure> {
+        let blend_buffer = crate::gpu_resources::try_cell(&self.blend_buffer, || {
             BlendBuffer::new(
                 descriptors,
                 self.size,
@@ -412,7 +443,7 @@ impl CommandTarget {
                     | wgpu::TextureUsages::COPY_SRC,
                 pool,
             )
-        });
+        })?;
         self.ensure_cleared(encoder);
         ruffle_render::profile::work(|w| {
             w.copy_bytes += u64::from(self.size.width) * u64::from(self.size.height) * 4
@@ -436,7 +467,7 @@ impl CommandTarget {
             },
             self.frame_buffer.size(),
         );
-        blend_buffer
+        Ok(blend_buffer)
     }
 
     pub fn copy_blend_region(
@@ -445,7 +476,7 @@ impl CommandTarget {
         pool: &mut TexturePool,
         encoder: &mut wgpu::CommandEncoder,
         region: ruffle_render::region::RenderRect,
-    ) -> BlendBuffer {
+    ) -> Result<BlendBuffer, crate::gpu_runtime::RenderFailure> {
         let size = wgpu::Extent3d {
             width: region.width,
             height: region.height,
@@ -459,7 +490,7 @@ impl CommandTarget {
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::COPY_SRC,
             pool,
-        );
+        )?;
         self.ensure_cleared(encoder);
         ruffle_render::profile::work(|w| {
             w.copy_bytes += u64::from(region.width) * u64::from(region.height) * 4
@@ -483,17 +514,17 @@ impl CommandTarget {
             },
             size,
         );
-        buffer
+        Ok(buffer)
     }
 
-    pub fn color_view(&self) -> &wgpu::TextureView {
+    pub fn color_view(&self) -> &crate::gpu_resources::TextureView {
         self.resolve_buffer
             .as_ref()
             .map(|b| b.view())
             .unwrap_or_else(|| self.frame_buffer.view())
     }
 
-    pub fn color_texture(&self) -> &wgpu::Texture {
+    pub fn color_texture(&self) -> &crate::gpu_resources::Texture {
         self.resolve_buffer
             .as_ref()
             .map(|b| b.texture())

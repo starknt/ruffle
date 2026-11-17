@@ -29,7 +29,7 @@ impl ShaderFilter {
         draw_encoder: &mut wgpu::CommandEncoder,
         source: &FilterSource<'a>,
         mut filter: ShaderFilterArgs<'a>,
-    ) -> CommandTarget {
+    ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
 
@@ -45,7 +45,7 @@ impl ShaderFilter {
             sample_count,
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
             draw_encoder,
-        );
+        )?;
 
         for arg in &mut filter.shader_args {
             if let PixelBenderShaderArgument::ImageInput { texture, .. } = arg {
@@ -67,6 +67,6 @@ impl ShaderFilter {
             source,
         )
         .expect("Failed to run pixelbender shader");
-        target
+        Ok(target)
     }
 }

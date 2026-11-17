@@ -566,7 +566,8 @@ fn bitmap_gpu_copy_preserves_the_requested_region() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
-fn destroyed_readback_buffer_returns_error_without_publishing_pixels() {
+fn destroyed_readback_buffer_returns_error_without_publishing_pixels()
+-> Result<(), crate::gpu_runtime::RenderFailure> {
     let descriptors = gpu();
     let dimensions = crate::utils::BufferDimensions::new(1, 1, wgpu::TextureFormat::Rgba8Unorm);
     let buffer = descriptors.device.create_buffer(&wgpu::BufferDescriptor {
@@ -574,7 +575,7 @@ fn destroyed_readback_buffer_returns_error_without_publishing_pixels() {
         size: 256,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
-    });
+    })?;
     buffer.destroy();
     let published = std::cell::Cell::new(false);
     let result =
@@ -583,4 +584,6 @@ fn destroyed_readback_buffer_returns_error_without_publishing_pixels() {
         });
     assert!(result.is_err());
     assert!(!published.get());
+
+    Ok(())
 }

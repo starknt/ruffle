@@ -1,16 +1,16 @@
 use crate::gui::MENU_HEIGHT;
 use ruffle_render_wgpu::descriptors::Descriptors;
+use ruffle_render_wgpu::gpu_resources;
 use ruffle_render_wgpu::target::{RenderTarget, RenderTargetFrame};
 use std::borrow::Cow;
 use std::sync::Arc;
-use wgpu::util::DeviceExt;
 
 #[derive(Debug)]
 pub struct MovieViewRenderer {
-    bind_group_layout: wgpu::BindGroupLayout,
-    pipeline: wgpu::RenderPipeline,
-    sampler: wgpu::Sampler,
-    vertices: wgpu::Buffer,
+    bind_group_layout: gpu_resources::BindGroupLayout,
+    pipeline: gpu_resources::RenderPipeline,
+    sampler: gpu_resources::Sampler,
+    vertices: gpu_resources::Buffer,
 }
 
 fn get_vertices(has_menu: bool, height: u32, scale_factor: f64) -> [[f32; 4]; 6] {
@@ -33,47 +33,48 @@ fn get_vertices(has_menu: bool, height: u32, scale_factor: f64) -> [[f32; 4]; 6]
 
 impl MovieViewRenderer {
     pub fn new(
-        device: &wgpu::Device,
+        device: &gpu_resources::Device,
         surface_format: wgpu::TextureFormat,
         has_menu: bool,
         height: u32,
         scale_factor: f64,
-    ) -> Self {
+    ) -> Result<Self, ruffle_render::error::RenderFailure> {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("blit.wgsl"))),
-        });
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+        })?;
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            })?;
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
-        });
+        })?;
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
-        });
+        })?;
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
             layout: Some(&pipeline_layout),
@@ -121,19 +122,19 @@ impl MovieViewRenderer {
             }),
             multiview_mask: None,
             cache: None,
-        });
+        })?;
         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(&get_vertices(has_menu, height, scale_factor)),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
+        })?;
 
-        Self {
+        Ok(Self {
             bind_group_layout,
             pipeline,
             sampler,
             vertices,
-        }
+        })
     }
 
     pub fn update_resolution(
@@ -142,20 +143,22 @@ impl MovieViewRenderer {
         has_menu: bool,
         height: u32,
         scale_factor: f64,
-    ) {
+    ) -> Result<(), ruffle_render::error::RenderFailure> {
         descriptors.queue.write_buffer(
             &self.vertices,
             0,
             bytemuck::cast_slice(&get_vertices(has_menu, height, scale_factor)),
-        );
+        )?;
+
+        Ok(())
     }
 }
 
 #[derive(Debug)]
 pub struct MovieView {
     renderer: Arc<MovieViewRenderer>,
-    texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
+    texture: gpu_resources::Texture,
+    bind_group: gpu_resources::BindGroup,
     #[cfg(feature = "tracy_images")]
     tracy_frame_captures: crate::tracy::FrameCapturesHolder,
 }
@@ -163,11 +166,11 @@ pub struct MovieView {
 impl MovieView {
     pub fn new(
         renderer: Arc<MovieViewRenderer>,
-        device: &wgpu::Device,
+        device: &gpu_resources::Device,
         width: u32,
         height: u32,
         #[cfg(feature = "tracy_images")] tracy_frame_captures: crate::tracy::FrameCapturesHolder,
-    ) -> Self {
+    ) -> Result<Self, ruffle_render::error::RenderFailure> {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
@@ -181,8 +184,8 @@ impl MovieView {
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        });
-        let view = texture.create_view(&Default::default());
+        })?;
+        let view = texture.create_view(&Default::default())?;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &renderer.bind_group_layout,
@@ -196,16 +199,25 @@ impl MovieView {
                     resource: wgpu::BindingResource::Sampler(&renderer.sampler),
                 },
             ],
-        });
+        })?;
         #[cfg(feature = "tracy_images")]
-        tracy_frame_captures.set_target(device, Some(&texture));
-        Self {
+        tracy_frame_captures.set_target(device, Some(&texture))?;
+        Ok(Self {
             renderer,
             texture,
             bind_group,
             #[cfg(feature = "tracy_images")]
             tracy_frame_captures,
-        }
+        })
+    }
+
+    pub fn resource_leases(&self) -> Vec<ruffle_render_wgpu::gpu_runtime::ResourceLease> {
+        vec![
+            self.texture.lease().clone(),
+            self.bind_group.lease().clone(),
+            self.renderer.pipeline.lease().clone(),
+            self.renderer.vertices.lease().clone(),
+        ]
     }
 
     pub fn render(
@@ -214,7 +226,7 @@ impl MovieView {
         render_pass: &mut wgpu::RenderPass<'static>,
     ) {
         render_pass.set_pipeline(&renderer.pipeline);
-        render_pass.set_bind_group(0, &self.bind_group, &[]);
+        render_pass.set_bind_group(0, self.bind_group.raw(), &[]);
         render_pass.set_vertex_buffer(0, renderer.vertices.slice(..));
         render_pass.draw(0..6, 0..1);
     }
@@ -225,7 +237,7 @@ impl RenderTarget for MovieView {
 
     fn resize(
         &mut self,
-        device: &wgpu::Device,
+        device: &gpu_resources::Device,
         width: u32,
         height: u32,
     ) -> Result<(), ruffle_render::error::RenderFailure> {
@@ -236,7 +248,7 @@ impl RenderTarget for MovieView {
             height,
             #[cfg(feature = "tracy_images")]
             self.tracy_frame_captures.clone(),
-        );
+        )?;
 
         Ok(())
     }
@@ -257,34 +269,34 @@ impl RenderTarget for MovieView {
         &mut self,
     ) -> Result<Option<Self::Frame>, ruffle_render::error::RenderFailure> {
         Ok(Some(MovieViewFrame(
-            self.texture.create_view(&Default::default()),
+            self.texture.create_view(&Default::default())?,
         )))
     }
 
-    fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(
+    fn submit<I: IntoIterator<Item = gpu_resources::CommandBuffer>>(
         &self,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _device: &gpu_resources::Device,
+        queue: &gpu_resources::Queue,
         health: &ruffle_render::error::RendererHealth,
         command_buffers: I,
         _frame: Self::Frame,
     ) -> Result<wgpu::SubmissionIndex, ruffle_render::error::RenderFailure> {
         health.check()?;
-        let index = queue.submit(command_buffers);
+        let index = queue.submit(command_buffers)?;
         health.check()?;
         Ok(index)
     }
 }
 
 #[derive(Debug)]
-pub struct MovieViewFrame(wgpu::TextureView);
+pub struct MovieViewFrame(gpu_resources::TextureView);
 
 impl RenderTargetFrame for MovieViewFrame {
-    fn into_view(self) -> wgpu::TextureView {
+    fn into_view(self) -> gpu_resources::TextureView {
         self.0
     }
 
-    fn view(&self) -> &wgpu::TextureView {
+    fn view(&self) -> &gpu_resources::TextureView {
         &self.0
     }
 }

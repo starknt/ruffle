@@ -31,7 +31,7 @@ pub enum DrawCommand {
         // If this is from a texture pool, we need to keep a copy to make sure it isn't freed before we use it.
         // We don't actually _need_ that texture though, thus the _
         _texture: Option<PoolOrArcTexture>,
-        binds: wgpu::BindGroup,
+        binds: crate::gpu_resources::BindGroup,
         blend_mode: TrivialBlend,
         render_stage3d: bool,
         draw_offsets: DrawOffsets,
@@ -39,14 +39,14 @@ pub enum DrawCommand {
     RenderAlphaMask {
         maskee: PoolOrArcTexture,
         mask: PoolOrArcTexture,
-        binds: wgpu::BindGroup,
+        binds: crate::gpu_resources::BindGroup,
         draw_offsets: DrawOffsets,
     },
     DrawColor {
         draw_offsets: DrawOffsets,
     },
     RenderGradient {
-        bind_group: wgpu::BindGroup,
+        bind_group: crate::gpu_resources::BindGroup,
         draw_offsets: DrawOffsets,
     },
     DrawLine {
@@ -150,8 +150,8 @@ pub struct CommandRenderer<'encoder> {
     mask_state: &'encoder mut MaskState,
     needs_stencil: bool,
     chunk_buffers: &'encoder ChunkBuffers,
-    current_pipeline: Option<&'encoder wgpu::RenderPipeline>,
-    current_index_buffer: Option<&'encoder wgpu::Buffer>,
+    current_pipeline: Option<&'encoder crate::gpu_resources::RenderPipeline>,
+    current_index_buffer: Option<&'encoder crate::gpu_resources::Buffer>,
     work: Option<ruffle_render::profile::RenderWork>,
 }
 
@@ -218,7 +218,7 @@ impl<'encoder> CommandRenderer<'encoder> {
     pub fn set_pipeline(
         &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
-        pipeline: &'encoder wgpu::RenderPipeline,
+        pipeline: &'encoder crate::gpu_resources::RenderPipeline,
     ) {
         if self.current_pipeline != Some(pipeline) {
             if let Some(work) = &mut self.work {
@@ -264,7 +264,7 @@ impl<'encoder> CommandRenderer<'encoder> {
     pub fn render_texture(
         &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
-        bind_group: &'encoder wgpu::BindGroup,
+        bind_group: &'encoder crate::gpu_resources::BindGroup,
         blend_mode: TrivialBlend,
         render_stage3d: bool,
         draw_offsets: &'encoder DrawOffsets,
@@ -293,7 +293,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         if let Some(work) = &mut self.work {
             work.material_binds += 1;
         }
-        render_pass.set_bind_group(2, bind_group, &[]);
+        render_pass.set_bind_group(2, (bind_group).raw(), &[]);
 
         self.draw(render_pass, draw_offsets);
     }
@@ -301,7 +301,7 @@ impl<'encoder> CommandRenderer<'encoder> {
     pub fn draw_gradient(
         &mut self,
         render_pass: &mut wgpu::RenderPass<'encoder>,
-        bind_group: &'encoder wgpu::BindGroup,
+        bind_group: &'encoder crate::gpu_resources::BindGroup,
         draw_offsets: &'encoder DrawOffsets,
     ) {
         self.set_pipeline(
@@ -316,7 +316,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         if let Some(work) = &mut self.work {
             work.material_binds += 1;
         }
-        render_pass.set_bind_group(2, bind_group, &[]);
+        render_pass.set_bind_group(2, (bind_group).raw(), &[]);
 
         self.draw(render_pass, draw_offsets);
     }
@@ -326,7 +326,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         render_pass: &mut wgpu::RenderPass<'encoder>,
         _maskee: &PoolOrArcTexture,
         _mask: &PoolOrArcTexture,
-        bind_group: &'encoder wgpu::BindGroup,
+        bind_group: &'encoder crate::gpu_resources::BindGroup,
         draw_offsets: &'encoder DrawOffsets,
     ) {
         if let Some(work) = &mut self.work {
@@ -346,7 +346,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         if let Some(work) = &mut self.work {
             work.material_binds += 1;
         }
-        render_pass.set_bind_group(2, bind_group, &[]);
+        render_pass.set_bind_group(2, (bind_group).raw(), &[]);
 
         self.draw(render_pass, draw_offsets);
     }

@@ -64,7 +64,7 @@ pub fn do_copy<'gc>(
         &bitmap_data.sync(activation.context.renderer)?.borrow(),
         texture.handle(),
         side,
-    );
+    )?;
     Ok(())
 }
 
@@ -130,7 +130,7 @@ pub fn upload_from_bitmap_data<'gc>(
                     &source.sync(activation.context.renderer)?.borrow(),
                     texture.handle(),
                     0,
-                );
+                )?;
             } else {
                 avm2_stub_method!(
                     activation,

@@ -11,6 +11,7 @@ use crate::backend::RenderTargetMode;
 use crate::blend::ComplexBlend;
 use crate::buffer_pool::TexturePool;
 use crate::filters::FilterSource;
+use crate::gpu_profiler::Scope;
 use crate::mesh::Mesh;
 use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
 use crate::surface::buffers::ChunkBuffers;
@@ -27,7 +28,6 @@ use ruffle_render::quality::StageQuality;
 use std::sync::Arc;
 use target::CommandTarget;
 use tracing::instrument;
-use wgpu_profiler::Scope;
 
 use crate::surface::mask::MaskState;
 use chunk::ChunkBlendMode;
@@ -53,7 +53,7 @@ impl Surface {
         width: u32,
         height: u32,
         frame_buffer_format: wgpu::TextureFormat,
-    ) -> Self {
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let size = wgpu::Extent3d {
             width,
             height,
@@ -65,32 +65,32 @@ impl Surface {
             quality.sample_count(),
             frame_buffer_format,
         );
-        let pipelines = descriptors.pipelines(sample_count, frame_buffer_format);
-        Self {
+        let pipelines = descriptors.pipelines(sample_count, frame_buffer_format)?;
+        Ok(Self {
             origin: [0, 0],
             size,
             quality,
             sample_count,
             pipelines,
             format: frame_buffer_format,
-        }
+        })
     }
 
     #[expect(clippy::too_many_arguments)]
     #[instrument(level = "debug", skip_all)]
     pub fn draw_commands_and_copy_to<'encoder, 'global: 'encoder>(
         &self,
-        frame_view: &wgpu::TextureView,
+        frame_view: &crate::gpu_resources::TextureView,
         render_target_mode: RenderTargetMode,
         descriptors: &'global Descriptors,
-        staging_belt: &'global mut wgpu::util::StagingBelt,
+        staging_belt: &'global mut crate::gpu_resources::StagingBelt,
         chunk_buffers: &'global mut ChunkBuffers,
         draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
         meshes: &'global Vec<Mesh>,
         commands: CommandList,
         layer: LayerRef<'encoder>,
         texture_pool: &'global mut TexturePool,
-    ) {
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
         let target = self.draw_commands(
             render_target_mode,
             descriptors,
@@ -101,7 +101,7 @@ impl Surface {
             draw_encoder,
             layer,
             texture_pool,
-        );
+        )?;
 
         run_copy_pipeline(
             descriptors,
@@ -110,7 +110,9 @@ impl Surface {
             target.color_view(),
             1,
             draw_encoder,
-        );
+        )?;
+
+        Ok(())
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -121,12 +123,12 @@ impl Surface {
         descriptors: &'encoder Descriptors,
         meshes: &'encoder Vec<Mesh>,
         commands: CommandList,
-        staging_belt: &'encoder mut wgpu::util::StagingBelt,
+        staging_belt: &'encoder mut crate::gpu_resources::StagingBelt,
         chunk_buffers: &'encoder mut ChunkBuffers,
         draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
-    ) -> CommandTarget {
+    ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
         let target = CommandTarget::new(
             descriptors,
             texture_pool,
@@ -135,7 +137,7 @@ impl Surface {
             self.sample_count,
             render_target_mode,
             draw_encoder,
-        );
+        )?;
 
         let mut mask_state = MaskState::empty();
         for commands in CommandBatches::new(commands, target.width(), target.height()) {
@@ -156,7 +158,7 @@ impl Surface {
                 },
                 texture_pool,
                 mask_state,
-            );
+            )?;
 
             for chunk in chunks {
                 match chunk {
@@ -170,7 +172,7 @@ impl Surface {
                             &descriptors.device,
                             draw_encoder,
                             chunk_buffers,
-                        );
+                        )?;
                         ruffle_render::profile::work(|w| {
                             w.render_passes += 1;
                             w.pass_pixels += u64::from(target.width()) * u64::from(target.height());
@@ -187,15 +189,15 @@ impl Surface {
                             wgpu::RenderPassDescriptor {
                                 color_attachments: &[target.color_attachments()],
                                 depth_stencil_attachment: if needs_stencil {
-                                    target.stencil_attachment(descriptors, texture_pool)
+                                    target.stencil_attachment(descriptors, texture_pool)?
                                 } else {
                                     None
                                 },
                                 ..Default::default()
                             },
                         );
-                        render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
-                        render_pass.set_bind_group(1, &chunk_buffers.bind_group, &[]);
+                        render_pass.set_bind_group(0, (target.globals().bind_group()).raw(), &[]);
+                        render_pass.set_bind_group(1, (&chunk_buffers.bind_group).raw(), &[]);
                         let mut renderer = CommandRenderer::new(
                             &self.pipelines,
                             chunk_buffers,
@@ -215,7 +217,7 @@ impl Surface {
                     } => {
                         assert!(!needs_stencil, "Shader blend mode not implemented in masks");
                         let parent_blend_buffer =
-                            target.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                            target.update_blend_buffer(descriptors, texture_pool, draw_encoder)?;
                         run_pixelbender_shader_impl(
                             descriptors,
                             shader,
@@ -270,14 +272,14 @@ impl Surface {
                             && region.width == parent.width()
                             && region.height == parent.height()
                         {
-                            parent.update_blend_buffer(descriptors, texture_pool, draw_encoder)
+                            parent.update_blend_buffer(descriptors, texture_pool, draw_encoder)?
                         } else {
                             bounded_buffer = parent.copy_blend_region(
                                 descriptors,
                                 texture_pool,
                                 draw_encoder,
                                 region,
-                            );
+                            )?;
                             &bounded_buffer
                         };
 
@@ -318,7 +320,7 @@ impl Surface {
                                             ),
                                         },
                                     ],
-                                });
+                                })?;
 
                         ruffle_render::profile::work(|w| {
                             w.render_passes += 1;
@@ -343,13 +345,13 @@ impl Surface {
                                 .as_deref(),
                                 color_attachments: &[target.color_attachments()],
                                 depth_stencil_attachment: if needs_stencil {
-                                    target.stencil_attachment(descriptors, texture_pool)
+                                    target.stencil_attachment(descriptors, texture_pool)?
                                 } else {
                                     None
                                 },
                                 ..Default::default()
                             });
-                        render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
+                        render_pass.set_bind_group(0, (target.globals().bind_group()).raw(), &[]);
 
                         if needs_stencil {
                             mask_state.apply_stencil_reference(&mut render_pass);
@@ -377,7 +379,7 @@ impl Surface {
                             region.width,
                             region.height,
                         );
-                        render_pass.set_bind_group(2, &blend_bind_group, &[]);
+                        render_pass.set_bind_group(2, (&blend_bind_group).raw(), &[]);
 
                         render_pass.set_vertex_buffer(
                             0,
@@ -399,7 +401,7 @@ impl Surface {
         // If nothing happened, ensure it's cleared so we don't operate on garbage data
         target.ensure_cleared(draw_encoder);
 
-        target
+        Ok(target)
     }
 
     pub fn quality(&self) -> StageQuality {

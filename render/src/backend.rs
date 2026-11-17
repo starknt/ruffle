@@ -345,6 +345,7 @@ impl FromWStr for ProgramType {
 }
 
 pub trait Context3D: Any {
+    fn health(&self) -> &crate::error::RendererHealth;
     fn profile(&self) -> Context3DProfile;
     // The BitmapHandle for the texture we're rendering to
     fn bitmap_handle(&self) -> BitmapHandle;
@@ -371,14 +372,17 @@ pub trait Context3D: Any {
     // objects after dispose() has been called.
     fn disposed_vertex_buffer_handle(&self) -> Rc<dyn VertexBuffer>;
 
-    fn create_index_buffer(&mut self, usage: BufferUsage, num_indices: u32)
-    -> Box<dyn IndexBuffer>;
+    fn create_index_buffer(
+        &mut self,
+        usage: BufferUsage,
+        num_indices: u32,
+    ) -> Result<Box<dyn IndexBuffer>, crate::error::RenderFailure>;
     fn create_vertex_buffer(
         &mut self,
         usage: BufferUsage,
         num_vertices: u32,
         data_32_per_vertex: u8,
-    ) -> Rc<dyn VertexBuffer>;
+    ) -> Result<Rc<dyn VertexBuffer>, crate::error::RenderFailure>;
 
     fn create_texture(
         &mut self,
@@ -403,7 +407,10 @@ pub trait Context3D: Any {
         fragment_shader_agal: Vec<u8>,
     ) -> Result<(), naga_agal::AgalError>;
 
-    fn process_command(&mut self, command: Context3DCommand<'_>);
+    fn process_command(
+        &mut self,
+        command: Context3DCommand<'_>,
+    ) -> Result<(), crate::error::RenderFailure>;
 
     fn present(&mut self);
 }

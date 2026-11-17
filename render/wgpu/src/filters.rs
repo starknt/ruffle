@@ -18,21 +18,21 @@ use crate::filters::displacement_map::DisplacementMapFilter;
 use crate::filters::drop_shadow::DropShadowFilter;
 use crate::filters::glow::GlowFilter;
 use crate::filters::shader::ShaderFilter;
+use crate::gpu_resources::StagingBelt;
 use crate::surface::target::CommandTarget;
 use bytemuck::{Pod, Zeroable};
 use ruffle_render::filters::Filter;
-use wgpu::util::StagingBelt;
 use wgpu::vertex_attr_array;
 
 #[derive(Debug)]
 pub struct FilterSource<'a> {
-    pub texture: &'a wgpu::Texture,
+    pub texture: &'a crate::gpu_resources::Texture,
     pub point: (u32, u32),
     pub size: (u32, u32),
 }
 
 impl<'a> FilterSource<'a> {
-    pub fn for_entire_texture(texture: &'a wgpu::Texture) -> Self {
+    pub fn for_entire_texture(texture: &'a crate::gpu_resources::Texture) -> Self {
         Self {
             texture,
             point: (0, 0),
@@ -195,15 +195,17 @@ pub struct Filters {
 }
 
 impl Filters {
-    pub fn new(device: &wgpu::Device) -> Self {
-        Self {
-            blur: BlurFilter::new(device),
-            color_matrix: ColorMatrixFilter::new(device),
+    pub fn new(
+        device: &crate::gpu_resources::Device,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        Ok(Self {
+            blur: BlurFilter::new(device)?,
+            color_matrix: ColorMatrixFilter::new(device)?,
             shader: ShaderFilter::new(),
-            glow: GlowFilter::new(device),
-            bevel: BevelFilter::new(device),
-            displacement_map: DisplacementMapFilter::new(device),
-        }
+            glow: GlowFilter::new(device)?,
+            bevel: BevelFilter::new(device)?,
+            displacement_map: DisplacementMapFilter::new(device)?,
+        })
     }
 
     pub fn apply(
@@ -214,7 +216,7 @@ impl Filters {
         staging_belt: &mut StagingBelt,
         source: FilterSource,
         filter: Filter,
-    ) -> CommandTarget {
+    ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
         let target = match filter {
             Filter::ColorMatrixFilter(filter) => Some(descriptors.filters.color_matrix.apply(
                 descriptors,
@@ -223,7 +225,7 @@ impl Filters {
                 staging_belt,
                 &source,
                 &filter,
-            )),
+            )?),
             Filter::BlurFilter(filter) => descriptors.filters.blur.apply(
                 descriptors,
                 texture_pool,
@@ -231,14 +233,14 @@ impl Filters {
                 staging_belt,
                 &source,
                 &filter,
-            ),
+            )?,
             Filter::ShaderFilter(shader) => Some(descriptors.filters.shader.apply(
                 descriptors,
                 texture_pool,
                 draw_encoder,
                 &source,
                 shader,
-            )),
+            )?),
             Filter::GlowFilter(filter) => Some(descriptors.filters.glow.apply(
                 descriptors,
                 texture_pool,
@@ -248,7 +250,7 @@ impl Filters {
                 &filter,
                 &self.blur,
                 (0.0, 0.0),
-            )),
+            )?),
             Filter::DropShadowFilter(filter) => Some(DropShadowFilter::apply(
                 descriptors,
                 texture_pool,
@@ -258,7 +260,7 @@ impl Filters {
                 &filter,
                 &self.blur,
                 &self.glow,
-            )),
+            )?),
             Filter::BevelFilter(filter) => Some(descriptors.filters.bevel.apply(
                 descriptors,
                 texture_pool,
@@ -267,7 +269,7 @@ impl Filters {
                 &source,
                 &filter,
                 &self.blur,
-            )),
+            )?),
             Filter::DisplacementMapFilter(filter) => descriptors.filters.displacement_map.apply(
                 descriptors,
                 texture_pool,
@@ -275,7 +277,7 @@ impl Filters {
                 staging_belt,
                 &source,
                 &filter,
-            ),
+            )?,
             filter => {
                 static WARNED_FILTERS: LazyLock<Mutex<HashSet<&'static str>>> =
                     LazyLock::new(Default::default);
@@ -300,24 +302,27 @@ impl Filters {
             }
         };
 
-        let target = target.unwrap_or_else(|| {
-            // Apply a default color matrix - it's essentially a blit
-            // TODO: Not need to do this.
-            descriptors.filters.color_matrix.apply(
-                descriptors,
-                texture_pool,
-                draw_encoder,
-                staging_belt,
-                &source,
-                &Default::default(),
-            )
-        });
+        let target = match target {
+            Some(target) => target,
+            None => {
+                // Apply a default color matrix - it's essentially a blit
+                // TODO: Not need to do this.
+                descriptors.filters.color_matrix.apply(
+                    descriptors,
+                    texture_pool,
+                    draw_encoder,
+                    staging_belt,
+                    &source,
+                    &Default::default(),
+                )?
+            }
+        };
 
         // We're about to perform a copy, so make sure that we've applied
         // a clear (in case no other draw commands were issued, we still need
         // the background clear color applied)
         target.ensure_cleared(draw_encoder);
-        target
+        Ok(target)
     }
 }
 

@@ -3,7 +3,6 @@ use crate::target::RenderTarget;
 use crate::{Descriptors, GradientUniforms, PosColorVertex, PosUvVertex, as_texture};
 use std::any::Any;
 use std::ops::Range;
-use wgpu::util::DeviceExt;
 
 use crate::buffer_builder::BufferBuilder;
 use ruffle_render::backend::{ShapeHandle, ShapeHandleImpl};
@@ -19,8 +18,8 @@ pub struct Mesh {
     pub bounds: Option<[f64; 4]>,
     pub retained_bytes: Option<usize>,
     pub draws: Vec<Draw>,
-    pub vertex_buffer: wgpu::Buffer,
-    pub index_buffer: wgpu::Buffer,
+    pub vertex_buffer: crate::gpu_resources::Buffer,
+    pub index_buffer: crate::gpu_resources::Buffer,
     pub _allocation: ruffle_render::profile::GpuMesh,
 }
 
@@ -84,17 +83,17 @@ impl PendingDraw {
     pub fn finish(
         self,
         descriptors: &Descriptors,
-        uniform_buffer: &wgpu::Buffer,
+        uniform_buffer: &crate::gpu_resources::Buffer,
         gradients: &[CommonGradient],
-    ) -> Draw {
-        Draw {
+    ) -> Result<Draw, crate::gpu_runtime::RenderFailure> {
+        Ok(Draw {
             draw_type: self
                 .draw_type
-                .finish(descriptors, uniform_buffer, gradients),
+                .finish(descriptors, uniform_buffer, gradients)?,
             vertices: self.vertices,
             indices: self.index_offset..(self.index_offset + self.num_indices),
             mask_indices: self.index_offset..(self.index_offset + self.num_mask_indices),
-        }
+        })
     }
 }
 
@@ -117,7 +116,7 @@ impl PendingDraw {
         vertex_buffer: &mut BufferBuilder,
         index_buffer: &mut BufferBuilder,
         indices_so_far: &mut u32,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, crate::gpu_runtime::RenderFailure> {
         let vertices = match &draw.draw_type {
             TessDrawType::Color => {
                 let vertices: Vec<_> = draw
@@ -164,15 +163,19 @@ impl PendingDraw {
                 matrix: _,
                 gradient,
             } => PendingDrawType::gradient(gradient, shape_id, draw_id),
-            TessDrawType::Bitmap(bitmap) => PendingDrawType::bitmap(bitmap, source, backend)?,
+            TessDrawType::Bitmap(bitmap) => match PendingDrawType::bitmap(bitmap, source, backend)?
+            {
+                Some(draw) => draw,
+                None => return Ok(None),
+            },
         };
-        Some(PendingDraw {
+        Ok(Some(PendingDraw {
             draw_type,
             vertices,
             index_offset,
             num_indices: index_count,
             num_mask_indices: draw.mask_index_count,
-        })
+        }))
     }
 }
 
@@ -219,8 +222,10 @@ impl PendingDrawType {
         bitmap: Bitmap,
         source: &dyn BitmapSource,
         backend: &mut WgpuRenderBackend<T>,
-    ) -> Option<Self> {
-        let handle = source.bitmap_handle(bitmap.bitmap_id, backend)?;
+    ) -> Result<Option<Self>, crate::gpu_runtime::RenderFailure> {
+        let Some(handle) = source.bitmap_handle(bitmap.bitmap_id, backend) else {
+            return Ok(None);
+        };
         let texture = as_texture(&handle);
         let binds = texture.bind_group(
             bitmap.is_repeating,
@@ -229,71 +234,80 @@ impl PendingDrawType {
             &backend.descriptors.bind_layouts.bitmap,
             handle.clone(),
             &backend.descriptors.bitmap_samplers,
-        );
+        )?;
 
-        Some(PendingDrawType::Bitmap {
+        Ok(Some(PendingDrawType::Bitmap {
             binds: binds.clone(),
-        })
+        }))
     }
 
     pub fn finish(
         self,
         descriptors: &Descriptors,
-        uniform_buffer: &wgpu::Buffer,
+        uniform_buffer: &crate::gpu_resources::Buffer,
         gradients: &[CommonGradient],
-    ) -> DrawType {
-        match self {
+    ) -> Result<DrawType, crate::gpu_runtime::RenderFailure> {
+        Ok(match self {
             PendingDrawType::Color => DrawType::Color,
             PendingDrawType::Gradient {
                 gradient_index,
                 bind_group_label,
             } => {
                 let common = &gradients[gradient_index];
-                let bind_group = descriptors
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        layout: &descriptors.bind_layouts.gradient,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                    buffer: uniform_buffer,
-                                    offset: common.buffer_offset,
-                                    size: wgpu::BufferSize::new(
-                                        std::mem::size_of::<GradientUniforms>() as u64,
+                let bind_group =
+                    descriptors
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            layout: &descriptors.bind_layouts.gradient,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                        buffer: uniform_buffer,
+                                        offset: common.buffer_offset,
+                                        size: wgpu::BufferSize::new(std::mem::size_of::<
+                                            GradientUniforms,
+                                        >(
+                                        )
+                                            as u64),
+                                    }),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::TextureView(
+                                        &common.texture_view,
                                     ),
-                                }),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::TextureView(&common.texture_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::Sampler(
-                                    descriptors.bitmap_samplers.get_sampler(false, true),
-                                ),
-                            },
-                        ],
-                        label: bind_group_label.as_deref(),
-                    });
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::Sampler(
+                                        descriptors.bitmap_samplers.get_sampler(false, true),
+                                    ),
+                                },
+                            ],
+                            label: bind_group_label.as_deref(),
+                        })?;
                 DrawType::Gradient { bind_group }
             }
             PendingDrawType::Bitmap { binds } => DrawType::Bitmap { binds },
-        }
+        })
     }
 }
 
 #[derive(Debug)]
 pub enum DrawType {
     Color,
-    Gradient { bind_group: wgpu::BindGroup },
-    Bitmap { binds: BitmapBinds },
+    Gradient {
+        bind_group: crate::gpu_resources::BindGroup,
+    },
+    Bitmap {
+        binds: BitmapBinds,
+    },
 }
 
 #[derive(Debug)]
 pub struct CommonGradient {
-    texture_view: wgpu::TextureView,
+    texture_view: crate::gpu_resources::TextureView,
     buffer_offset: wgpu::BufferAddress,
 }
 
@@ -302,7 +316,7 @@ impl CommonGradient {
         descriptors: &Descriptors,
         gradient: Gradient,
         uniform_buffers: &mut BufferBuilder,
-    ) -> Self {
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let colors = if gradient.records.is_empty() {
             [0; GRADIENT_SIZE * 4]
         } else {
@@ -382,34 +396,34 @@ impl CommonGradient {
             },
             wgpu::util::TextureDataOrder::LayerMajor,
             &colors[..],
-        );
-        let view = texture.create_view(&Default::default());
+        )?;
+        let view = texture.create_view(&Default::default())?;
 
         let buffer_offset = uniform_buffers
             .add(&[GradientUniforms::from(gradient)])
             .expect("Mesh uniform buffer was too large!")
             .start;
 
-        Self {
+        Ok(Self {
             texture_view: view,
             buffer_offset,
-        }
+        })
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct BitmapBinds {
-    pub bind_group: wgpu::BindGroup,
+    pub bind_group: crate::gpu_resources::BindGroup,
 }
 
 impl BitmapBinds {
     pub fn new(
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-        texture_view: wgpu::TextureView,
+        device: &crate::gpu_resources::Device,
+        layout: &crate::gpu_resources::BindGroupLayout,
+        sampler: &crate::gpu_resources::Sampler,
+        texture_view: crate::gpu_resources::TextureView,
         label: Option<String>,
-    ) -> Self {
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout,
             entries: &[
@@ -423,7 +437,7 @@ impl BitmapBinds {
                 },
             ],
             label: label.as_deref(),
-        });
-        Self { bind_group }
+        })?;
+        Ok(Self { bind_group })
     }
 }

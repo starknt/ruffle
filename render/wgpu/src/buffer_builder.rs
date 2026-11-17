@@ -1,7 +1,6 @@
 use bytemuck::{AnyBitPattern, NoUninit};
 use std::ops::Range;
 use wgpu::BufferAddress;
-use wgpu::util::DeviceExt;
 
 pub struct BufferBuilder {
     inner: Vec<u8>,
@@ -61,28 +60,32 @@ impl BufferBuilder {
 
     pub fn finish(
         self,
-        device: &wgpu::Device,
+        device: &crate::gpu_resources::Device,
         label: Option<String>,
         usage: wgpu::BufferUsages,
-    ) -> wgpu::Buffer {
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: label.as_deref(),
-            contents: &self.inner,
-            usage,
-        })
+    ) -> Result<crate::gpu_resources::Buffer, crate::gpu_runtime::RenderFailure> {
+        Ok(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: label.as_deref(),
+                contents: &self.inner,
+                usage,
+            })?,
+        )
     }
 
     pub fn copy_to(
         self,
-        staging_belt: &mut wgpu::util::StagingBelt,
+        staging_belt: &mut crate::gpu_resources::StagingBelt,
         encoder: &mut wgpu::CommandEncoder,
-        buffer: &wgpu::Buffer,
-    ) {
+        buffer: &crate::gpu_resources::Buffer,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
         if let Some(length) = wgpu::BufferSize::new(self.inner.len() as u64) {
             let mut view =
-                staging_belt.write_buffer(encoder, buffer, BufferAddress::default(), length);
+                staging_belt.write_buffer(encoder, buffer, BufferAddress::default(), length)?;
             view.copy_from_slice(&self.inner);
         }
+
+        Ok(())
     }
 
     pub fn len(&self) -> usize {

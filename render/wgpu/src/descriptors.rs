@@ -8,21 +8,21 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use wgpu::Backend;
-use wgpu::util::DeviceExt;
 
 pub struct Descriptors {
     pub runtime: crate::gpu_runtime::GpuRuntime,
     pub wgpu_instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
-    pub device: wgpu::Device,
+    pub device: crate::gpu_resources::Device,
     pub limits: wgpu::Limits,
     pub backend: Backend,
-    pub queue: wgpu::Queue,
+    pub queue: crate::gpu_resources::Queue,
     pub submission_lock: Option<Arc<Mutex<()>>>,
     pub bitmap_samplers: BitmapSamplers,
     pub bind_layouts: BindLayouts,
     pub quad: Quad,
-    copy_pipeline: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), wgpu::RenderPipeline>>,
+    copy_pipeline:
+        Mutex<FnvHashMap<(u32, wgpu::TextureFormat), crate::gpu_resources::RenderPipeline>>,
     pub shaders: Shaders,
     pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), Arc<Pipelines>>>,
     pub filters: Filters,
@@ -58,13 +58,27 @@ impl Descriptors {
         queue: wgpu::Queue,
         runtime: crate::gpu_runtime::GpuRuntime,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        let device = crate::gpu_resources::Device::new(device, queue, runtime);
+        Self::with_device(instance, adapter, device)
+    }
+
+    /// Reuse the native factory and weak resource index across shared host targets.
+    pub fn with_device(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        device: crate::gpu_resources::Device,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        let runtime = device.runtime().clone();
         runtime.check_health()?;
+        let device =
+            device.with_owner(runtime.issue_owner(crate::gpu_runtime::OwnerKind::Renderer)?);
+        let queue = device.queue();
         let limits = device.limits();
-        let bind_layouts = BindLayouts::new(&device);
-        let bitmap_samplers = BitmapSamplers::new(&device);
-        let shaders = Shaders::new(&device);
-        let quad = Quad::new(&device);
-        let filters = Filters::new(&device);
+        let bind_layouts = BindLayouts::new(&device)?;
+        let bitmap_samplers = BitmapSamplers::new(&device)?;
+        let shaders = Shaders::new(&device)?;
+        let quad = Quad::new(&device)?;
+        let filters = Filters::new(&device)?;
         let backend = adapter.get_info().backend;
 
         runtime.check_health()?;
@@ -98,14 +112,13 @@ impl Descriptors {
         &self,
         format: wgpu::TextureFormat,
         msaa_sample_count: u32,
-    ) -> wgpu::RenderPipeline {
+    ) -> Result<crate::gpu_resources::RenderPipeline, crate::gpu_runtime::RenderFailure> {
         let mut pipelines = self
             .copy_pipeline
             .lock()
             .expect("Pipelines should not be already locked");
-        pipelines
-            .entry((msaa_sample_count, format))
-            .or_insert_with(|| {
+        Ok(
+            crate::gpu_resources::try_cached(&mut pipelines, (msaa_sample_count, format), || {
                 let copy_texture_pipeline_layout =
                     &self
                         .device
@@ -113,7 +126,7 @@ impl Descriptors {
                             label: create_debug_label!("Copy pipeline layout").as_deref(),
                             bind_group_layouts: &[None, None, Some(&self.bind_layouts.bitmap)],
                             immediate_size: 0,
-                        });
+                        })?;
                 self.device
                     .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                         label: create_debug_label!("Copy pipeline").as_deref(),
@@ -154,37 +167,42 @@ impl Descriptors {
                         multiview_mask: None,
                         cache: None,
                     })
-            })
-            .clone()
+            })?
+            .clone(),
+        )
     }
 
-    pub fn pipelines(&self, msaa_sample_count: u32, format: wgpu::TextureFormat) -> Arc<Pipelines> {
+    pub fn pipelines(
+        &self,
+        msaa_sample_count: u32,
+        format: wgpu::TextureFormat,
+    ) -> Result<Arc<Pipelines>, crate::gpu_runtime::RenderFailure> {
         let mut pipelines = self
             .pipelines
             .lock()
             .expect("Pipelines should not be already locked");
-        pipelines
-            .entry((msaa_sample_count, format))
-            .or_insert_with(|| {
-                Arc::new(Pipelines::new(
+        Ok(
+            crate::gpu_resources::try_cached(&mut pipelines, (msaa_sample_count, format), || {
+                Ok::<_, crate::gpu_runtime::RenderFailure>(Arc::new(Pipelines::new(
                     &self.device,
                     &self.shaders,
                     format,
                     msaa_sample_count,
                     &self.bind_layouts,
-                ))
-            })
-            .clone()
+                )?))
+            })?
+            .clone(),
+        )
     }
 }
 
 pub struct Quad {
-    pub vertex_buffer: wgpu::Buffer,
+    pub vertex_buffer: crate::gpu_resources::Buffer,
     pub vertices_pos: Range<wgpu::BufferAddress>,
     pub vertices_pos_uv: Range<wgpu::BufferAddress>,
     pub vertices_pos_color: Range<wgpu::BufferAddress>,
     pub vertices_filter: Range<wgpu::BufferAddress>,
-    pub index_buffer: wgpu::Buffer,
+    pub index_buffer: crate::gpu_resources::Buffer,
     pub indices_quad: Range<u32>,
     pub indices_line: Range<u32>,
     pub indices_line_rect: Range<u32>,
@@ -192,7 +210,9 @@ pub struct Quad {
 }
 
 impl Quad {
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(
+        device: &crate::gpu_resources::Device,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let mut vertex_buffer = BufferBuilder::new(&device.limits(), 0);
         let vertices_pos = vertex_buffer
             .add(&[
@@ -275,19 +295,19 @@ impl Quad {
             device,
             Some("Quad vertices".to_string()),
             wgpu::BufferUsages::VERTEX,
-        );
+        )?;
 
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Quad indices"),
             contents: bytemuck::cast_slice(&[0, 1, 2, 0, 2, 3, 0, 1, 2, 3, 0]),
             usage: wgpu::BufferUsages::INDEX,
-        });
+        })?;
         let indices_quad = 0..6;
         let indices_line = 0..2;
         let indices_line_rect = 6..11;
         let full_index_range = 0..index_buffer.size();
 
-        Self {
+        Ok(Self {
             vertex_buffer: vbo,
             vertices_pos,
             vertices_pos_uv,
@@ -298,6 +318,6 @@ impl Quad {
             indices_line,
             indices_line_rect,
             full_index_range,
-        }
+        })
     }
 }

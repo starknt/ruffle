@@ -3,9 +3,9 @@ use crate::descriptors::Descriptors;
 use crate::filters::FilterSource;
 use crate::filters::blur::BlurFilter;
 use crate::filters::glow::GlowFilter;
+use crate::gpu_resources::StagingBelt;
 use crate::surface::target::CommandTarget;
 use swf::DropShadowFilter as DropShadowFilterArgs;
-use wgpu::util::StagingBelt;
 
 /// Drop shadow is just Glow with an offset.
 /// None of this strictly needs to be a struct,
@@ -23,12 +23,12 @@ impl DropShadowFilter {
         filter: &DropShadowFilterArgs,
         blur_filter: &BlurFilter,
         glow_filter: &GlowFilter,
-    ) -> CommandTarget {
+    ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
         let distance = filter.distance.to_f32();
         let angle = filter.angle.to_f32();
         let x = angle.cos() * distance;
         let y = angle.sin() * distance;
-        glow_filter.apply(
+        Ok(glow_filter.apply(
             descriptors,
             texture_pool,
             draw_encoder,
@@ -37,6 +37,6 @@ impl DropShadowFilter {
             &filter.inner_glow_filter(),
             blur_filter,
             (-x, -y),
-        )
+        )?)
     }
 }

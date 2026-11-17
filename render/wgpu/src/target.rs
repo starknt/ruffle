@@ -8,15 +8,20 @@ use std::ops::Deref;
 use tracing::instrument;
 
 pub trait RenderTargetFrame: Debug {
-    fn into_view(self) -> wgpu::TextureView;
+    fn into_view(self) -> crate::gpu_resources::TextureView;
 
-    fn view(&self) -> &wgpu::TextureView;
+    fn view(&self) -> &crate::gpu_resources::TextureView;
 }
 
 pub trait RenderTarget: Debug + 'static {
     type Frame: RenderTargetFrame;
 
-    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> Result<(), Error>;
+    fn resize(
+        &mut self,
+        device: &crate::gpu_resources::Device,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error>;
 
     fn format(&self) -> wgpu::TextureFormat;
 
@@ -29,10 +34,10 @@ pub trait RenderTarget: Debug + 'static {
     /// may attempt to recreate the swap chain via [`RenderTarget::resize`].
     fn get_next_texture(&mut self) -> Result<Option<Self::Frame>, Error>;
 
-    fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(
+    fn submit<I: IntoIterator<Item = crate::gpu_resources::CommandBuffer>>(
         &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        device: &crate::gpu_resources::Device,
+        queue: &crate::gpu_resources::Queue,
         health: &RendererHealth,
         command_buffers: I,
         frame: Self::Frame,
@@ -43,20 +48,21 @@ pub trait RenderTarget: Debug + 'static {
 pub struct SwapChainTarget {
     window_surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
+    device: crate::gpu_resources::Device,
 }
 
 #[derive(Debug)]
 pub struct SwapChainTargetFrame {
     texture: wgpu::SurfaceTexture,
-    view: wgpu::TextureView,
+    view: crate::gpu_resources::TextureView,
 }
 
 impl RenderTargetFrame for SwapChainTargetFrame {
-    fn into_view(self) -> wgpu::TextureView {
+    fn into_view(self) -> crate::gpu_resources::TextureView {
         self.view
     }
 
-    fn view(&self) -> &wgpu::TextureView {
+    fn view(&self) -> &crate::gpu_resources::TextureView {
         &self.view
     }
 }
@@ -66,7 +72,7 @@ impl SwapChainTarget {
         surface: wgpu::Surface<'static>,
         adapter: &wgpu::Adapter,
         (width, height): (u32, u32),
-        device: &wgpu::Device,
+        device: &crate::gpu_resources::Device,
     ) -> Result<Self, Error> {
         if width == 0
             || height == 0
@@ -122,10 +128,11 @@ impl SwapChainTarget {
                 vec![format, linear_format]
             },
         };
-        surface.configure(device, &surface_config);
+        device.configure_surface(&surface, &surface_config)?;
         Ok(Self {
             surface_config,
             window_surface: surface,
+            device: device.clone(),
         })
     }
 }
@@ -133,10 +140,15 @@ impl SwapChainTarget {
 impl RenderTarget for SwapChainTarget {
     type Frame = SwapChainTargetFrame;
 
-    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> Result<(), Error> {
+    fn resize(
+        &mut self,
+        device: &crate::gpu_resources::Device,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error> {
         self.surface_config.width = width;
         self.surface_config.height = height;
-        self.window_surface.configure(device, &self.surface_config);
+        device.configure_surface(&self.window_surface, &self.surface_config)?;
 
         Ok(())
     }
@@ -177,19 +189,23 @@ impl RenderTarget for SwapChainTarget {
         };
         let view_format = remove_srgb(self.surface_config.format);
 
-        let view = texture.texture.create_view(&wgpu::TextureViewDescriptor {
+        let tracked = self.device.import_texture(
+            texture.texture.clone(),
+            crate::gpu_runtime::ResourceKind::HostTarget,
+        )?;
+        let view = tracked.create_view(&wgpu::TextureViewDescriptor {
             format: Some(view_format),
             ..Default::default()
-        });
+        })?;
 
         Ok(Some(SwapChainTargetFrame { texture, view }))
     }
 
     #[instrument(level = "debug", skip_all)]
-    fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(
+    fn submit<I: IntoIterator<Item = crate::gpu_resources::CommandBuffer>>(
         &self,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _device: &crate::gpu_resources::Device,
+        queue: &crate::gpu_resources::Queue,
         health: &RendererHealth,
         command_buffers: I,
         frame: Self::Frame,
@@ -199,7 +215,7 @@ impl RenderTarget for SwapChainTarget {
                 ruffle_render::profile::NativePhase::QueueSubmit,
             );
             health.check()?;
-            queue.submit(command_buffers)
+            queue.submit(command_buffers)?
         };
         let _timer =
             ruffle_render::profile::native_time(ruffle_render::profile::NativePhase::Present);
@@ -212,12 +228,15 @@ impl RenderTarget for SwapChainTarget {
 
 #[derive(Debug)]
 pub enum MaybeOwnedBuffer {
-    Borrowed(PoolEntry<wgpu::Buffer, BufferDimensions>, BufferDimensions),
-    Owned(wgpu::Buffer, BufferDimensions),
+    Borrowed(
+        PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
+        BufferDimensions,
+    ),
+    Owned(crate::gpu_resources::Buffer, BufferDimensions),
 }
 
 impl MaybeOwnedBuffer {
-    pub fn inner(&self) -> (&wgpu::Buffer, &BufferDimensions) {
+    pub fn inner(&self) -> (&crate::gpu_resources::Buffer, &BufferDimensions) {
         match &self {
             MaybeOwnedBuffer::Borrowed(entry, dimensions) => ((*entry).deref(), dimensions),
             MaybeOwnedBuffer::Owned(buffer, dimensions) => (buffer, dimensions),
@@ -234,36 +253,39 @@ pub struct TextureBufferInfo {
 #[derive(Debug)]
 pub struct TextureTarget {
     pub size: wgpu::Extent3d,
-    pub texture: wgpu::Texture,
+    pub texture: crate::gpu_resources::Texture,
     pub format: wgpu::TextureFormat,
     pub buffer: Option<TextureBufferInfo>,
 }
 
 #[derive(Debug)]
-pub struct TextureTargetFrame(wgpu::TextureView);
+pub struct TextureTargetFrame(crate::gpu_resources::TextureView);
 
 impl RenderTargetFrame for TextureTargetFrame {
-    fn view(&self) -> &wgpu::TextureView {
+    fn view(&self) -> &crate::gpu_resources::TextureView {
         &self.0
     }
 
-    fn into_view(self) -> wgpu::TextureView {
+    fn into_view(self) -> crate::gpu_resources::TextureView {
         self.0
     }
 }
 
 impl TextureTarget {
-    pub fn new(device: &wgpu::Device, size: (u32, u32)) -> Result<Self, Error> {
+    pub fn new(device: &crate::gpu_resources::Device, size: (u32, u32)) -> Result<Self, Error> {
         Self::with_readback(device, size, true)
     }
 
     /// Render-only target: neither allocates a mapping buffer nor copies into it.
-    pub fn new_without_readback(device: &wgpu::Device, size: (u32, u32)) -> Result<Self, Error> {
+    pub fn new_without_readback(
+        device: &crate::gpu_resources::Device,
+        size: (u32, u32),
+    ) -> Result<Self, Error> {
         Self::with_readback(device, size, false)
     }
 
     fn with_readback(
-        device: &wgpu::Device,
+        device: &crate::gpu_resources::Device,
         size: (u32, u32),
         readback: bool,
     ) -> Result<Self, Error> {
@@ -301,17 +323,19 @@ impl TextureTarget {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::TEXTURE_BINDING,
-        });
+        })?;
         let buffer_label = create_debug_label!("Render target buffer");
-        let buffer = readback.then(|| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: buffer_label.as_deref(),
-                size: (buffer_dimensions.padded_bytes_per_row as u64
-                    * buffer_dimensions.height as u64),
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
+        let buffer = readback
+            .then(|| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: buffer_label.as_deref(),
+                    size: (buffer_dimensions.padded_bytes_per_row as u64
+                        * buffer_dimensions.height as u64),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
             })
-        });
+            .transpose()?;
         Ok(Self {
             size,
             texture,
@@ -323,7 +347,7 @@ impl TextureTarget {
         })
     }
 
-    pub fn get_texture(&self) -> wgpu::Texture {
+    pub fn get_texture(&self) -> crate::gpu_resources::Texture {
         self.texture.clone()
     }
 
@@ -335,7 +359,12 @@ impl TextureTarget {
 impl RenderTarget for TextureTarget {
     type Frame = TextureTargetFrame;
 
-    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> Result<(), Error> {
+    fn resize(
+        &mut self,
+        device: &crate::gpu_resources::Device,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error> {
         *self = Self::with_readback(device, (width, height), self.buffer.is_some())?;
 
         Ok(())
@@ -355,15 +384,15 @@ impl RenderTarget for TextureTarget {
 
     fn get_next_texture(&mut self) -> Result<Option<Self::Frame>, Error> {
         Ok(Some(TextureTargetFrame(
-            self.texture.create_view(&Default::default()),
+            self.texture.create_view(&Default::default())?,
         )))
     }
 
     #[instrument(level = "debug", skip_all)]
-    fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(
+    fn submit<I: IntoIterator<Item = crate::gpu_resources::CommandBuffer>>(
         &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        device: &crate::gpu_resources::Device,
+        queue: &crate::gpu_resources::Queue,
         health: &RendererHealth,
         command_buffers: I,
         _frame: Self::Frame,
@@ -373,7 +402,7 @@ impl RenderTarget for TextureTarget {
             let label = create_debug_label!("Render target transfer encoder");
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: label.as_deref(),
-            });
+            })?;
             let (buffer, dimensions) = buffer.inner();
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
@@ -400,19 +429,19 @@ impl RenderTarget for TextureTarget {
                     depth_or_array_layers: 1,
                 },
             );
-            let buffer = encoder.finish();
+            let buffer = encoder.finish()?;
             ruffle_render::profile::work(|w| {
                 w.copy_bytes += u64::from(copy_area.width()) * u64::from(copy_area.height()) * 4
             });
             let _timer = ruffle_render::profile::native_time(
                 ruffle_render::profile::NativePhase::QueueSubmit,
             );
-            queue.submit(command_buffers.into_iter().chain(Some(buffer)))
+            queue.submit(command_buffers.into_iter().chain(Some(buffer)))?
         } else {
             let _timer = ruffle_render::profile::native_time(
                 ruffle_render::profile::NativePhase::QueueSubmit,
             );
-            queue.submit(command_buffers)
+            queue.submit(command_buffers)?
         };
         health.check()?;
         Ok(index)

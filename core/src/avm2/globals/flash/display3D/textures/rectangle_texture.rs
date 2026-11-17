@@ -36,7 +36,7 @@ pub fn upload_from_bitmap_data<'gc>(
                 &source.sync(activation.context.renderer)?.borrow(),
                 texture.handle(),
                 0,
-            );
+            )?;
         } else {
             unreachable!("Argument is BitmapData-typed");
         }

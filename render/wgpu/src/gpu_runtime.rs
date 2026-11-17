@@ -65,10 +65,11 @@ pub enum ResourceKind {
     Shader,
     HostTarget,
     QuerySet,
+    CommandEncoder,
 }
 
 impl ResourceKind {
-    pub const COUNT: usize = 15;
+    pub const COUNT: usize = 16;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -160,6 +161,7 @@ struct Ledger {
     records: FnvHashMap<ResourceId, ResourceInfo>,
     stats: GpuMemoryStats,
     next_resource: u64,
+    next_owner: u64,
 }
 
 struct Inner {
@@ -286,6 +288,18 @@ impl GpuRuntime {
 
     pub fn check_health(&self) -> Result<(), RenderFailure> {
         self.0.healthy()
+    }
+
+    pub fn issue_owner(&self, kind: OwnerKind) -> Result<ResourceOwner, RenderFailure> {
+        self.check_health()?;
+        let mut ledger = self.0.ledger();
+        ledger.next_owner = ledger.next_owner.checked_add(1).ok_or_else(|| {
+            failure(
+                RenderFailureKind::Internal,
+                "resource owner identity space exhausted",
+            )
+        })?;
+        Ok(ResourceOwner::new(kind, ledger.next_owner))
     }
 
     pub fn reserve(

@@ -4,16 +4,18 @@ use crate::{GradientUniforms, Transforms};
 
 #[derive(Debug)]
 pub struct BindLayouts {
-    pub globals: wgpu::BindGroupLayout,
-    pub transforms: wgpu::BindGroupLayout,
-    pub bitmap: wgpu::BindGroupLayout,
-    pub gradient: wgpu::BindGroupLayout,
-    pub blend: wgpu::BindGroupLayout,
-    pub alpha_mask: wgpu::BindGroupLayout,
+    pub globals: crate::gpu_resources::BindGroupLayout,
+    pub transforms: crate::gpu_resources::BindGroupLayout,
+    pub bitmap: crate::gpu_resources::BindGroupLayout,
+    pub gradient: crate::gpu_resources::BindGroupLayout,
+    pub blend: crate::gpu_resources::BindGroupLayout,
+    pub alpha_mask: crate::gpu_resources::BindGroupLayout,
 }
 
 impl BindLayouts {
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(
+        device: &crate::gpu_resources::Device,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let uniform_buffer_layout_label = create_debug_label!("Uniform buffer bind group layout");
         let transforms = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -29,7 +31,7 @@ impl BindLayouts {
                 count: None,
             }],
             label: uniform_buffer_layout_label.as_deref(),
-        });
+        })?;
 
         let globals_layout_label = create_debug_label!("Globals bind group layout");
         let globals = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -46,7 +48,7 @@ impl BindLayouts {
                 },
                 count: None,
             }],
-        });
+        })?;
 
         let bitmap_bind_layout_label = create_debug_label!("Bitmap shape bind group layout");
         let bitmap = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -69,7 +71,7 @@ impl BindLayouts {
                 },
             ],
             label: bitmap_bind_layout_label.as_deref(),
-        });
+        })?;
 
         let blend_bind_layout_label = create_debug_label!("Blend bind group layout");
         let blend = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -102,7 +104,7 @@ impl BindLayouts {
                 },
             ],
             label: blend_bind_layout_label.as_deref(),
-        });
+        })?;
 
         let gradient_bind_layout_label = create_debug_label!("Gradient shape bind group");
         let gradient = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -137,7 +139,7 @@ impl BindLayouts {
                 },
             ],
             label: gradient_bind_layout_label.as_deref(),
-        });
+        })?;
 
         let alpha_mask_bind_layout_label = create_debug_label!("Alpha mask bind group layout");
         let alpha_mask = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -170,15 +172,15 @@ impl BindLayouts {
                 },
             ],
             label: alpha_mask_bind_layout_label.as_deref(),
-        });
+        })?;
 
-        Self {
+        Ok(Self {
             globals,
             transforms,
             bitmap,
             gradient,
             blend,
             alpha_mask,
-        }
+        })
     }
 }

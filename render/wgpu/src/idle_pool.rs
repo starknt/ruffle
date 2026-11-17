@@ -70,7 +70,7 @@ impl Budget {
         s.next += 1;
         s.next
     }
-    pub fn submitted(&self, queue: &wgpu::Queue) {
+    pub fn submitted(&self, queue: &crate::gpu_resources::Queue) {
         let mut s = self.0.borrow_mut();
         if s.limit.is_none() {
             return;
