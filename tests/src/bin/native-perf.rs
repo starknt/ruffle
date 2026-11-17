@@ -212,9 +212,11 @@ fn main() -> Result<()> {
         _ => bail!("backend must be vulkan, metal, dx12 or gl"),
     };
     let setup = Instant::now();
-    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-    descriptor.backends = backends;
-    let instance = wgpu::Instance::new(descriptor);
+    let instance = ruffle_render_wgpu::backend::create_wgpu_instance(
+        backends,
+        wgpu::BackendOptions::default(),
+        None,
+    );
     let (adapter, device, queue) = futures::executor::block_on(request_adapter_and_device(
         backends,
         &instance,
