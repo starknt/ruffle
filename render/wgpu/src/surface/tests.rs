@@ -1047,6 +1047,82 @@ fn graph_normal_frames_draw_directly_and_resolve_msaa_without_a_copy_pass() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn compositing_uses_copyable_final_targets_without_a_full_surface_copy() {
+    let descriptors = gpu();
+    for quality in [StageQuality::Low, StageQuality::High] {
+        for alpha_mask in [false, true] {
+            for copyable in [false, true] {
+                let mut target = TextureTarget::new(&descriptors.device, (32, 32)).unwrap();
+                if !copyable {
+                    // A presentation surface may support attachment writes only.
+                    target.texture = descriptors
+                        .device
+                        .create_texture(&wgpu::TextureDescriptor {
+                            label: None,
+                            size: target.size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: target.format,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                            view_formats: &[],
+                        })
+                        .unwrap();
+                    target.buffer = None;
+                }
+                let mut renderer =
+                    WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+                renderer.set_quality(quality).unwrap();
+                let metrics = ruffle_render::profile::RenderMetrics::default();
+                let _scope = ruffle_render::profile::enter(Some(&metrics));
+                let mut foreground = CommandList::new();
+                rect(&mut foreground, 8.0, 8.0, 16.0, 16.0, Color::RED);
+                let mut commands = CommandList::new();
+                if alpha_mask {
+                    let mut mask = CommandList::new();
+                    rect(&mut mask, 8.0, 8.0, 16.0, 16.0, Color::WHITE);
+                    commands.render_alpha_mask(foreground, mask);
+                } else {
+                    commands.blend(foreground, RenderBlendMode::Builtin(BlendMode::Multiply));
+                }
+                renderer
+                    .submit_frame(Color::WHITE, commands, vec![])
+                    .unwrap();
+                // Source/mask/composite, or source/clear/blend. An attachment-only
+                // surface additionally needs the final copy; a readable target does not.
+                assert_eq!(
+                    metrics.snapshot().work.render_passes,
+                    if copyable { 3 } else { 4 }
+                );
+                descriptors
+                    .device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: Some(std::time::Duration::from_secs(2)),
+                    })
+                    .unwrap();
+                descriptors.runtime.check_health().unwrap();
+                if copyable {
+                    let image = renderer.capture_frame().unwrap().unwrap();
+                    for (x, y, pixel) in image.enumerate_pixels() {
+                        let expected = if (8..24).contains(&x) && (8..24).contains(&y) {
+                            [255, 0, 0, 255]
+                        } else {
+                            [255, 255, 255, 255]
+                        };
+                        assert_eq!(
+                            pixel.0, expected,
+                            "{quality:?}, alpha={alpha_mask}, ({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn shader_filter_preparation_error_is_returned_without_panicking() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, BitmapHandle, BitmapHandleImpl};
     use ruffle_render::filters::{Filter, ShaderFilter, ShaderObject};

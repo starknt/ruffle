@@ -91,8 +91,15 @@ impl Surface {
         layer: LayerRef<'encoder>,
         texture_pool: &'global mut TexturePool,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
-        let direct = graph.graph.direct_attachment()
-            && matches!(render_target_mode, RenderTargetMode::FreshWithColor(_));
+        let direct = matches!(render_target_mode, RenderTargetMode::FreshWithColor(_))
+            && (graph.graph.direct_attachment() || {
+                // Complex compositing copies the destination before sampling it.
+                // Host texture targets can supply that copy directly; presentation
+                // surfaces with attachment-only usage still need the intermediate.
+                let texture = frame_view.texture_handle()?;
+                texture.usage().contains(wgpu::TextureUsages::COPY_SRC)
+                    && texture.format() == self.format
+            });
         let render_target_mode = match render_target_mode {
             RenderTargetMode::FreshWithColor(color) if direct => {
                 RenderTargetMode::ExistingWithView(frame_view.clone(), color)
