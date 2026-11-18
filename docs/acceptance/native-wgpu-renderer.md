@@ -206,3 +206,9 @@ A fresh paced NVIDIA load/unload diagnostic ran **1800 measured frames / 29.9997
 Validation: core 250 passed / 9 existing ignored, render 65 passed, host 30 passed / 1 existing ignored; the stricter 4 KiB scalar-read regressions pass separately. The desktop release builds successfully. Twelve selected native bitmap regressions pass per GPU. Existing warnings remain; strict Clippy and other platforms were not rerun. The unrelated 21-line parent `render_profile.rs` diff remains untouched and excluded from commits.
 
 Remaining: the official game's repeated-scene ownership baseline and post-fix frame/RSS trace; its long GC and socket-handler pauses; the original Task16 acceptance gaps. No new engine leak or safe GC scheduling repair is claimed by this follow-up.
+
+### 皮肤祈愿 exchange panel pagination
+
+On 2026-11-18 the user confirmed that the page buttons worked in the official game on zone 1 with the Linux desktop release (Aola `df80773`, Ruffle `6d767f5402`).
+
+Before the fix, a click at the center of the right arrow (stage coordinates 865, 262) hit the clipped portrait on the fifth card. AVM2 mouse picking now applies timeline masks in display order. In the offline desktop replay, the arrows advanced from page 1 to page 4 and back, stopped at both boundaries, and the visible portrait remained clickable. The first-page Vulkan capture matched the pre-fix replay pixel for pixel.
