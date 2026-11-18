@@ -962,8 +962,17 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
         let vtable = self.vtable(activation);
+        self.get_property_with_trait(multiname, vtable, vtable.get_trait(multiname), activation)
+    }
 
-        match vtable.get_trait(multiname) {
+    pub(crate) fn get_property_with_trait(
+        &self,
+        multiname: &Multiname<'gc>,
+        vtable: VTable<'gc>,
+        property: Option<Property>,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
+        match property {
             Some(Property::Slot { slot_id } | Property::ConstSlot { slot_id }) => {
                 // Only objects can have slots
                 let object = self.as_object().unwrap();
@@ -1074,8 +1083,24 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<(), Error<'gc>> {
         let vtable = self.vtable(activation);
+        self.set_property_with_trait(
+            multiname,
+            vtable,
+            vtable.get_trait(multiname),
+            value,
+            activation,
+        )
+    }
 
-        match vtable.get_trait(multiname) {
+    pub(crate) fn set_property_with_trait(
+        &self,
+        multiname: &Multiname<'gc>,
+        _vtable: VTable<'gc>,
+        property: Option<Property>,
+        value: Value<'gc>,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Result<(), Error<'gc>> {
+        match property {
             Some(Property::Slot { slot_id }) => {
                 // Only objects can have slots
                 let object = self.as_object().unwrap();
@@ -1216,8 +1241,24 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
         let vtable = self.vtable(activation);
+        self.call_property_with_trait(
+            multiname,
+            vtable,
+            vtable.get_trait(multiname),
+            arguments,
+            activation,
+        )
+    }
 
-        match vtable.get_trait(multiname) {
+    pub(crate) fn call_property_with_trait(
+        &self,
+        multiname: &Multiname<'gc>,
+        _vtable: VTable<'gc>,
+        property: Option<Property>,
+        arguments: FunctionArgs<'_, 'gc>,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
+        match property {
             Some(Property::Slot { slot_id } | Property::ConstSlot { slot_id }) => {
                 // Only objects can have slots
                 let object = self.as_object().unwrap();

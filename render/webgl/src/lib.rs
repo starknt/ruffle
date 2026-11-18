@@ -113,6 +113,7 @@ impl From<TessVertex> for Vertex {
 }
 
 pub struct WebGlRenderBackend {
+    health: ruffle_render::error::RendererHealth,
     /// WebGL1 context
     gl: Gl,
 
@@ -287,6 +288,7 @@ impl WebGlRenderBackend {
         gl.pixel_storei(Gl::UNPACK_ALIGNMENT, 1);
 
         let mut renderer = Self {
+            health: Default::default(),
             gl,
             gl2,
             vao_ext,
@@ -993,14 +995,20 @@ fn same_blend_mode(first: Option<&RenderBlendMode>, second: &RenderBlendMode) ->
 }
 
 impl RenderBackend for WebGlRenderBackend {
+    fn health(&self) -> &ruffle_render::error::RendererHealth {
+        &self.health
+    }
     fn render_offscreen(
         &mut self,
         _handle: BitmapHandle,
         _commands: CommandList,
         _quality: StageQuality,
         _bounds: PixelRegion,
-    ) -> Option<Box<dyn SyncHandle>> {
-        None
+    ) -> Result<Option<Box<dyn SyncHandle>>, ruffle_render::error::Error> {
+        self.health.check()?;
+        let output = (|| None)();
+        self.health.check()?;
+        Ok(output)
     }
 
     fn viewport_dimensions(&self) -> ViewportDimensions {
@@ -1011,37 +1019,48 @@ impl RenderBackend for WebGlRenderBackend {
         }
     }
 
-    fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions) {
-        // Build view matrix based on canvas size.
-        self.view_matrix = [
-            [1.0 / (dimensions.width as f32 / 2.0), 0.0, 0.0, 0.0],
-            [0.0, -1.0 / (dimensions.height as f32 / 2.0), 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [-1.0, 1.0, 0.0, 1.0],
-        ];
+    fn set_viewport_dimensions(
+        &mut self,
+        dimensions: ViewportDimensions,
+    ) -> Result<(), ruffle_render::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| {
+            // Build view matrix based on canvas size.
+            self.view_matrix = [
+                [1.0 / (dimensions.width as f32 / 2.0), 0.0, 0.0, 0.0],
+                [0.0, -1.0 / (dimensions.height as f32 / 2.0), 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0, 1.0],
+            ];
 
-        // Setup GL viewport and renderbuffers clamped to reasonable sizes.
-        // We don't use `.clamp()` here because `self.gl.drawing_buffer_width()` and
-        // `self.gl.drawing_buffer_height()` return zero when the WebGL context is lost,
-        // then an assertion error would be triggered.
-        self.renderbuffer_width =
-            (dimensions.width.max(1) as i32).min(self.gl.drawing_buffer_width());
-        self.renderbuffer_height =
-            (dimensions.height.max(1) as i32).min(self.gl.drawing_buffer_height());
+            // Setup GL viewport and renderbuffers clamped to reasonable sizes.
+            // We don't use `.clamp()` here because `self.gl.drawing_buffer_width()` and
+            // `self.gl.drawing_buffer_height()` return zero when the WebGL context is lost,
+            // then an assertion error would be triggered.
+            self.renderbuffer_width =
+                (dimensions.width.max(1) as i32).min(self.gl.drawing_buffer_width());
+            self.renderbuffer_height =
+                (dimensions.height.max(1) as i32).min(self.gl.drawing_buffer_height());
 
-        // Recreate framebuffers with the new size.
-        let _ = self.build_msaa_buffers();
-        self.gl
-            .viewport(0, 0, self.renderbuffer_width, self.renderbuffer_height);
-        self.viewport_scale_factor = dimensions.scale_factor
+            // Recreate framebuffers with the new size.
+            let _ = self.build_msaa_buffers();
+            self.gl
+                .viewport(0, 0, self.renderbuffer_width, self.renderbuffer_height);
+            self.viewport_scale_factor = dimensions.scale_factor
+        })();
+        self.health.check()?;
+        Ok(output)
     }
 
     fn register_shape(
         &mut self,
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
-    ) -> ShapeHandle {
-        self.register_shape_with_scale(shape, bitmap_source, 1.0)
+    ) -> Result<ShapeHandle, ruffle_render::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| self.register_shape_with_scale(shape, bitmap_source, 1.0))();
+        self.health.check()?;
+        Ok(output)
     }
 
     fn register_shape_with_scale(
@@ -1049,23 +1068,28 @@ impl RenderBackend for WebGlRenderBackend {
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
         scale: f32,
-    ) -> ShapeHandle {
-        let mesh = match self.register_shape_internal(shape, bitmap_source, scale) {
-            Ok(draws) => Mesh {
-                draws,
-                gl2: self.gl2.clone(),
-                vao_ext: self.vao_ext.clone(),
-            },
-            Err(e) => {
-                log::error!("Couldn't register shape: {e:?}");
-                Mesh {
-                    draws: vec![],
+    ) -> Result<ShapeHandle, ruffle_render::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| {
+            let mesh = match self.register_shape_internal(shape, bitmap_source, scale) {
+                Ok(draws) => Mesh {
+                    draws,
                     gl2: self.gl2.clone(),
                     vao_ext: self.vao_ext.clone(),
+                },
+                Err(e) => {
+                    log::error!("Couldn't register shape: {e:?}");
+                    Mesh {
+                        draws: vec![],
+                        gl2: self.gl2.clone(),
+                        vao_ext: self.vao_ext.clone(),
+                    }
                 }
-            }
-        };
-        ShapeHandle(Arc::new(mesh))
+            };
+            ShapeHandle(Arc::new(mesh))
+        })();
+        self.health.check()?;
+        Ok(output)
     }
 
     fn submit_frame(
@@ -1073,13 +1097,18 @@ impl RenderBackend for WebGlRenderBackend {
         clear: Color,
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
-    ) {
-        if !cache_entries.is_empty() {
-            panic!("Bitmap caching is unavailable on the webgl backend");
-        }
-        self.begin_frame(clear);
-        commands.execute(self);
-        self.end_frame();
+    ) -> Result<(), ruffle_render::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| {
+            if !cache_entries.is_empty() {
+                panic!("Bitmap caching is unavailable on the webgl backend");
+            }
+            self.begin_frame(clear);
+            commands.execute(self);
+            self.end_frame();
+        })();
+        self.health.check()?;
+        Ok(output)
     }
 
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, BitmapError> {
@@ -1201,7 +1230,15 @@ impl RenderBackend for WebGlRenderBackend {
         "webgl"
     }
 
-    fn set_quality(&mut self, _quality: StageQuality) {}
+    fn set_quality(
+        &mut self,
+        _quality: StageQuality,
+    ) -> Result<(), ruffle_render::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| {})();
+        self.health.check()?;
+        Ok(output)
+    }
 
     fn compile_pixelbender_shader(
         &mut self,

@@ -1,8 +1,10 @@
 pub mod null;
 
-use crate::bitmap::{Bitmap, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle};
+use crate::bitmap::{
+    Bitmap, BitmapHandle, BitmapInfo, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
+};
 use crate::commands::CommandList;
-use crate::error::Error;
+use crate::error::{Error, RenderFailure, RendererHealth};
 use crate::filters::Filter;
 use crate::pixel_bender::{PixelBenderShader, PixelBenderShaderHandle};
 use crate::pixel_bender_support::PixelBenderShaderArgument;
@@ -25,23 +27,34 @@ pub struct BitmapCacheEntry {
     pub filters: Vec<Filter>,
 }
 
+/// Reclaimable ownership of an optional raster cache. Display-list commands own
+/// their handles independently, so eviction only affects later reuse.
+pub trait BitmapCacheLease: Debug {
+    fn bitmap(&self) -> Option<BitmapInfo>;
+}
+
 pub trait RenderBackend: Any {
+    fn health(&self) -> &RendererHealth;
+
     fn viewport_dimensions(&self) -> ViewportDimensions;
     // Do not call this method directly - use `player.set_viewport_dimensions`,
     // which will ensure that the stage is properly updated as well.
-    fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions);
+    fn set_viewport_dimensions(
+        &mut self,
+        dimensions: ViewportDimensions,
+    ) -> Result<(), RenderFailure>;
     fn register_shape(
         &mut self,
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
-    ) -> ShapeHandle;
+    ) -> Result<ShapeHandle, RenderFailure>;
 
     fn register_shape_with_scale(
         &mut self,
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
         _scale: f32,
-    ) -> ShapeHandle {
+    ) -> Result<ShapeHandle, RenderFailure> {
         // Default implementation ignores scale
         self.register_shape(shape, bitmap_source)
     }
@@ -52,7 +65,7 @@ pub trait RenderBackend: Any {
         commands: CommandList,
         quality: StageQuality,
         bounds: PixelRegion,
-    ) -> Option<Box<dyn SyncHandle>>;
+    ) -> Result<Option<Box<dyn SyncHandle>>, Error>;
 
     /// Applies the given filter with a `BitmapHandle` source onto a destination `BitmapHandle`.
     /// The `destination_rect` must be calculated by the caller and is assumed to be correct.
@@ -68,8 +81,8 @@ pub trait RenderBackend: Any {
         _destination: BitmapHandle,
         _dest_point: (i32, i32),
         _filter: Filter,
-    ) -> Option<Box<dyn SyncHandle>> {
-        None
+    ) -> Result<Option<Box<dyn SyncHandle>>, Error> {
+        Ok(None)
     }
 
     fn is_filter_supported(&self, _filter: &Filter) -> bool {
@@ -85,7 +98,7 @@ pub trait RenderBackend: Any {
         clear: swf::Color,
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
-    );
+    ) -> Result<(), RenderFailure>;
 
     fn create_empty_texture(
         &mut self,
@@ -100,6 +113,21 @@ pub trait RenderBackend: Any {
     /// it after eviction. Never offer mutable BitmapData or GPU-written targets.
     fn cache_immutable_bitmap(&mut self, _bitmap: &BitmapHandle) -> bool {
         false
+    }
+
+    /// Register a lazily allocated raster target with display-cache ownership.
+    fn create_bitmap_cache(
+        &mut self,
+        width: NonZeroU32,
+        height: NonZeroU32,
+    ) -> Result<BitmapHandle, Error> {
+        self.create_empty_texture(width, height)
+    }
+
+    /// None means unmanaged retention. A managed lease may contain no bitmap
+    /// after admission fails or the global cache governor evicts it.
+    fn retain_bitmap_cache(&mut self, _handle: &BitmapHandle) -> Option<Arc<dyn BitmapCacheLease>> {
+        None
     }
 
     fn update_texture(
@@ -127,7 +155,7 @@ pub trait RenderBackend: Any {
     /// An internal name that is used to identify the render-backend.
     fn name(&self) -> &'static str;
 
-    fn set_quality(&mut self, quality: StageQuality);
+    fn set_quality(&mut self, quality: StageQuality) -> Result<(), RenderFailure>;
 
     /// Sample count used to rasterize the stage and its bitmap caches.
     fn stage_sample_count(&self) -> u32 {
@@ -164,6 +192,24 @@ pub trait RenderBackend: Any {
         pending: &mut PixelBenderPending,
     ) -> Result<Option<PixelBenderOutput>, Error> {
         Ok(pending.take_ready())
+    }
+
+    /// Whether arbitrary current bitmap regions can be read without an earlier
+    /// sync token. Chained copies require this capability to cover older writes.
+    fn supports_bitmap_region_readback(&self) -> bool {
+        false
+    }
+
+    /// Read the current GPU pixels in exactly this region, without consuming a
+    /// previously issued sync token. Unsupported backends return Ok(None) and
+    /// do not call the callback; failures must propagate as errors.
+    fn read_bitmap_region(
+        &mut self,
+        _handle: &BitmapHandle,
+        _region: PixelRegion,
+        _with_rgba: RgbaBufRead,
+    ) -> Result<Option<()>, Error> {
+        Ok(None)
     }
 
     fn resolve_sync_handle(
@@ -345,6 +391,7 @@ impl FromWStr for ProgramType {
 }
 
 pub trait Context3D: Any {
+    fn health(&self) -> &crate::error::RendererHealth;
     fn profile(&self) -> Context3DProfile;
     // The BitmapHandle for the texture we're rendering to
     fn bitmap_handle(&self) -> BitmapHandle;
@@ -371,14 +418,17 @@ pub trait Context3D: Any {
     // objects after dispose() has been called.
     fn disposed_vertex_buffer_handle(&self) -> Rc<dyn VertexBuffer>;
 
-    fn create_index_buffer(&mut self, usage: BufferUsage, num_indices: u32)
-    -> Box<dyn IndexBuffer>;
+    fn create_index_buffer(
+        &mut self,
+        usage: BufferUsage,
+        num_indices: u32,
+    ) -> Result<Box<dyn IndexBuffer>, crate::error::RenderFailure>;
     fn create_vertex_buffer(
         &mut self,
         usage: BufferUsage,
         num_vertices: u32,
         data_32_per_vertex: u8,
-    ) -> Rc<dyn VertexBuffer>;
+    ) -> Result<Rc<dyn VertexBuffer>, crate::error::RenderFailure>;
 
     fn create_texture(
         &mut self,
@@ -403,7 +453,10 @@ pub trait Context3D: Any {
         fragment_shader_agal: Vec<u8>,
     ) -> Result<(), naga_agal::AgalError>;
 
-    fn process_command(&mut self, command: Context3DCommand<'_>);
+    fn process_command(
+        &mut self,
+        command: Context3DCommand<'_>,
+    ) -> Result<(), crate::error::RenderFailure>;
 
     fn present(&mut self);
 }
@@ -719,7 +772,17 @@ pub enum Context3DCommand<'a> {
 #[derive(Clone, Debug)]
 pub struct ShapeHandle(pub Arc<dyn ShapeHandleImpl>);
 
-pub trait ShapeHandleImpl: Any + Debug {}
+pub trait ShapeHandleImpl: Any + Debug {
+    /// Conservative bytes pinned by a retained command. None forbids retention
+    /// (e.g. mutable bitmap fills whose external storage is not accounted).
+    fn retained_bytes(&self) -> Option<usize> {
+        None
+    }
+    /// Local pixel bounds of all rasterized geometry, including strokes.
+    fn bounds(&self) -> Option<[f64; 4]> {
+        None
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

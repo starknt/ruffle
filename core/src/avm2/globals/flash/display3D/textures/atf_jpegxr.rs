@@ -169,7 +169,7 @@ pub fn do_compressed_upload<'gc>(
 
     texture
         .context3d()
-        .copy_pixels_to_texture(bitmap, texture.handle(), 0);
+        .copy_pixels_to_texture(bitmap, texture.handle(), 0)?;
 
     Ok(())
 }

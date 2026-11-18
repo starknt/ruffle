@@ -389,7 +389,9 @@ impl MainWindow {
             if dt.as_millis() > 0.0 {
                 self.time = new_time;
                 self.next_frame_time = self.player.get().map(|mut player| {
-                    player.tick(dt);
+                    if let Err(error) = player.tick(dt) {
+                        tracing::error!("Playback stopped: {error}");
+                    }
                     new_time + player.time_til_next_frame()
                 });
             }
@@ -427,7 +429,9 @@ impl MainWindow {
             && !self.occluded
             && let Some(player) = player.as_deref_mut()
         {
-            player.render();
+            if let Err(error) = player.render() {
+                tracing::error!("Rendering stopped: {error}");
+            }
         }
         if player_needs_render || self.gui.needs_render() {
             self.gui.window().request_redraw();

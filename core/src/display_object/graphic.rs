@@ -112,6 +112,7 @@ impl<'gc> Graphic<'gc> {
     }
 
     pub fn drawing_mut(&self) -> RefMut<'_, Drawing> {
+        self.invalidate_cached_bitmap();
         self.0.drawing.get_or_init(Default::default).borrow_mut()
     }
 
@@ -131,7 +132,7 @@ impl<'gc> Graphic<'gc> {
         self,
         context: &mut RenderContext<'_, 'gc>,
         current_scale: f32,
-    ) -> ShapeHandle {
+    ) -> Result<ShapeHandle, ruffle_render::error::RenderFailure> {
         // Since graphics are created from a shared shape, we may be able to reuse a
         // cached tessellation from another instance at a similar scale.
         let shared = self.0.shared.get();
@@ -140,20 +141,20 @@ impl<'gc> Graphic<'gc> {
             let mut cache = shared.scaled_handle.borrow_mut();
             if let Some(handle) = cache.find_near_and_touch(current_scale) {
                 // Found a cached handle at a similar scale; reuse it.
-                return handle;
+                return Ok(handle);
             }
         }
 
         // Tessellate at the current scale
         let library = context
             .library
-            .library_for_movie(shared.movie)
+            .library_for_movie(shared.movie, context.gc_context)
             .expect("Graphic's movie has a library");
         let new_handle = context.renderer.register_shape_with_scale(
             (&shared.shape).into(),
-            &MovieLibrarySource { library },
+            &MovieLibrarySource { library: &library },
             current_scale,
-        );
+        )?;
 
         {
             let mut cache = shared.scaled_handle.borrow_mut();
@@ -166,7 +167,7 @@ impl<'gc> Graphic<'gc> {
             cache.insert(current_scale, new_handle.clone());
         }
 
-        new_handle
+        Ok(new_handle)
     }
 }
 
@@ -226,7 +227,7 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
         // This does not create a new instance, but instead swaps out the underlying static data to point to the new art.
         if let Some(new_graphic) = context
             .library
-            .library_for_movie_mut(self.movie())
+            .library_for_movie_mut(self.movie(), context.gc_context)
             .get_graphic(id)
         {
             self.set_shared(context.gc(), new_graphic.0.shared.get());
@@ -258,7 +259,13 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
             let scale_y = f32::abs(matrix.b + matrix.d);
             let current_scale = ((scale_x * scale_x + scale_y * scale_y) / 2.0).sqrt();
 
-            let handle = self.get_or_retessellate_handle(context, current_scale);
+            let handle = match self.get_or_retessellate_handle(context, current_scale) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    context.renderer.health().fail(error);
+                    return;
+                }
+            };
 
             context.commands.render_shape(handle, transform)
         }

@@ -1,87 +1,60 @@
-use ruffle_render::commands::{Command, CommandList, RenderBlendMode};
-use swf::BlendMode;
+use crate::graph_encoder::{PlannedCommand, PlannedList};
 
-/// Consume intermediate blend/mask textures before building the next batch.
-/// This bounds sibling intermediates, not recursion depth or an individual target.
+// Small regions should not force repeated resolves of the entire destination.
+// Storage is bounded by the byte watermark; this independent cap bounds metadata.
+const MAX_INPUTS: usize = 64;
+
+/// Consume graph scopes before preparing the next sibling set. Region-aware
+/// storage costs include MSAA/resolve; a small object cap also bounds bindings.
+/// Ancestor-layer sampling keeps its established preparation boundary intact.
 pub(super) struct CommandBatches {
-    unbatched: Option<CommandList>,
-    commands: std::iter::Peekable<std::vec::IntoIter<Command>>,
-    max_inputs: usize,
+    unbatched: Option<PlannedList>,
+    commands: std::iter::Peekable<std::vec::IntoIter<PlannedCommand>>,
+    watermark: u64,
 }
-
 impl CommandBatches {
-    pub fn new(commands: CommandList, width: u32, height: u32) -> Self {
-        // Alpha/Erase can read an enclosing Layer while child commands are being
-        // prepared. Keep the original preparation order for that entire list.
-        // Shader blends receive their foreground/background at consumption time.
-        let rgba_bytes = u64::from(width).max(1) * u64::from(height).max(1) * 4;
-        let limit = ((32 * 1024 * 1024 / rgba_bytes) as usize).clamp(1, 8);
-        let mut inputs = 0;
-        let needs_batches = commands.commands.iter().any(|command| {
-            inputs += temporary_inputs(command);
-            inputs > limit
-        });
-        let fallback = needs_batches && samples_ancestor_layer(&commands);
-        let max_inputs = if needs_batches && !fallback {
-            limit
-        } else {
-            usize::MAX
-        };
-        // Move the original vector through unchanged for stock and fallback.
-        let (unbatched, commands) = if max_inputs == usize::MAX {
+    pub fn new(commands: PlannedList, watermark: u64) -> Self {
+        let needs_batches =
+            commands.temporary_inputs() > MAX_INPUTS || commands.temporary_bytes() > watermark;
+        let opaque_layer = needs_batches && commands.samples_ancestor_layer();
+        let (unbatched, commands) = if !needs_batches || opaque_layer {
             (Some(commands), Vec::new())
         } else {
-            (None, commands.commands)
+            (None, commands.into_commands())
         };
-        if fallback {
+        if opaque_layer {
             ruffle_render::profile::blend_batch_fallback();
         }
         Self {
             unbatched,
             commands: commands.into_iter().peekable(),
-            max_inputs,
+            watermark,
         }
     }
 }
-
 impl Iterator for CommandBatches {
-    type Item = CommandList;
-
+    type Item = PlannedList;
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(commands) = self.unbatched.take() {
             return Some(commands);
         }
-        let mut batch = CommandList::new();
-        let mut inputs: usize = 0;
+        let mut batch = PlannedList::default();
         while let Some(command) = self.commands.peek() {
-            let cost = temporary_inputs(command);
-            if cost != 0 && inputs != 0 && inputs.saturating_add(cost) > self.max_inputs {
+            if command.inputs != 0
+                && batch.temporary_inputs() != 0
+                && (batch.temporary_inputs().saturating_add(command.inputs) > MAX_INPUTS
+                    || batch
+                        .temporary_bytes()
+                        .saturating_add(command.transient_bytes)
+                        > self.watermark)
+            {
                 ruffle_render::profile::blend_batch_split();
                 break;
             }
-            inputs += cost;
-            batch.commands.push(self.commands.next().unwrap());
+            if let Some(command) = self.commands.next() {
+                batch.push(command);
+            }
         }
         (!batch.is_empty()).then_some(batch)
     }
-}
-
-fn temporary_inputs(command: &Command) -> usize {
-    match command {
-        Command::Blend(..) => 1,
-        Command::RenderAlphaMask { .. } => 2,
-        _ => 0,
-    }
-}
-
-fn samples_ancestor_layer(commands: &CommandList) -> bool {
-    commands.commands.iter().any(|command| match command {
-        Command::Blend(_, RenderBlendMode::Builtin(BlendMode::Alpha | BlendMode::Erase)) => true,
-        Command::Blend(children, _) => samples_ancestor_layer(children),
-        Command::RenderAlphaMask {
-            maskee_commands,
-            mask_commands,
-        } => samples_ancestor_layer(maskee_commands) || samples_ancestor_layer(mask_commands),
-        _ => false,
-    })
 }

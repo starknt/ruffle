@@ -285,7 +285,9 @@ impl<'gc> Stage<'gc> {
                 | StageQuality::High16x16
                 | StageQuality::High16x16Linear
         ));
-        context.renderer.set_quality(quality);
+        if let Err(error) = context.renderer.set_quality(quality) {
+            context.renderer.health().fail(error);
+        }
 
         // Flash Player redraws right away when the quality is changed.
         *context.needs_render = true;

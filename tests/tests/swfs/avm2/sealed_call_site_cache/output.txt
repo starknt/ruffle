@@ -1,0 +1,52 @@
+9 9 true 9 9 1
+void 10
+constant 1074
+getter boom
+arity 1063
+after 10
+109 109 true 109 9 1
+void 10
+constant 1074
+getter boom
+arity 1063
+after 110
+9 9 true 9 9 1
+void 10
+constant 1074
+getter boom
+arity 1063
+after 10
+109 109 true 109 9 1
+void 10
+constant 1074
+getter boom
+arity 1063
+after 110
+9 9 true 9 9 1
+void 10
+constant 1074
+getter boom
+arity 1063
+after 10
+109 109 true 109 9 1
+void 10
+constant 1074
+getter boom
+arity 1063
+after 110
+9 9 true 9 9 1
+void 10
+constant 1074
+getter boom
+arity 1063
+after 10
+109 109 true 109 9 1
+void 10
+constant 1074
+getter boom
+arity 1063
+after 110
+read 1 1
+dynamic 31
+dynamic 44
+read 1

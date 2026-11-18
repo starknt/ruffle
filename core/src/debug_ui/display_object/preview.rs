@@ -106,7 +106,10 @@ impl RenderedPreview {
         )
         .ok()?;
 
-        let data = target.sync(context.renderer);
+        let data = match target.sync(context.renderer) {
+            Ok(data) => data,
+            Err(_) => return None,
+        };
         let data = data.borrow();
         let width = data.width();
         let height = data.height();

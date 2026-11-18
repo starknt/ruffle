@@ -1,9 +1,13 @@
+use crate::gpu_resources::CommandEncoder;
+use crate::surface::mask::{MaskMode, MaskState};
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::{borrow::Cow, cell::Cell, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
+use crate::gpu_resources::StagingBelt;
+use crate::gpu_resources::{PipelineLayout, RenderPipeline, TextureView};
 use indexmap::IndexMap;
 use ruffle_render::bitmap::BitmapHandle;
 use ruffle_render::error::Error as BitmapError;
@@ -13,12 +17,10 @@ use ruffle_render::pixel_bender::{
 };
 use ruffle_render::pixel_bender_support::{ImageInputTexture, PixelBenderShaderArgument};
 use smallvec::{SmallVec, smallvec_inline};
-use wgpu::util::{DeviceExt, StagingBelt};
 use wgpu::{
     BindGroupEntry, BindingResource, BlendComponent, BufferDescriptor, BufferUsages,
-    ColorTargetState, ColorWrites, CommandEncoder, PipelineLayout, RenderPipeline,
-    RenderPipelineDescriptor, SamplerBindingType, ShaderModuleDescriptor, TexelCopyTextureInfo,
-    TextureDescriptor, TextureFormat, TextureView, VertexState,
+    ColorTargetState, ColorWrites, RenderPipelineDescriptor, SamplerBindingType,
+    ShaderModuleDescriptor, TexelCopyTextureInfo, TextureDescriptor, TextureFormat, VertexState,
 };
 
 use crate::filters::{FilterSource, VERTEX_BUFFERS_DESCRIPTION_FILTERS};
@@ -29,34 +31,42 @@ use crate::{
 
 #[derive(Debug)]
 pub struct PixelBenderWgpuShader {
-    bind_group_layout: wgpu::BindGroupLayout,
+    device: crate::gpu_resources::Device,
+    bind_group_layout: crate::gpu_resources::BindGroupLayout,
     pipeline_layout: PipelineLayout,
-    pipelines: RefCell<HashMap<(u32, wgpu::TextureFormat), RenderPipeline>>,
-    vertex_shader: wgpu::ShaderModule,
-    fragment_shader: wgpu::ShaderModule,
+    pipelines: RefCell<HashMap<(u32, wgpu::TextureFormat, Option<MaskMode>), RenderPipeline>>,
+    vertex_shader: crate::gpu_resources::ShaderModule,
+    fragment_shader: crate::gpu_resources::ShaderModule,
     shader: PixelBenderShader,
-    float_parameters_buffer: wgpu::Buffer,
+    float_parameters_buffer: crate::gpu_resources::Buffer,
     float_parameters_buffer_size: u64,
-    int_parameters_buffer: wgpu::Buffer,
+    int_parameters_buffer: crate::gpu_resources::Buffer,
     int_parameters_buffer_size: u64,
-    zeroed_out_of_range_mode: wgpu::Buffer,
+    zeroed_out_of_range_mode: crate::gpu_resources::Buffer,
     staging_belt: RefCell<StagingBelt>,
 }
 
 impl PixelBenderWgpuShader {
+    pub(crate) fn device(&self) -> &crate::gpu_resources::Device {
+        &self.device
+    }
+
+    pub(crate) fn resource_id(&self) -> crate::gpu_runtime::ResourceId {
+        self.bind_group_layout.lease().id()
+    }
+
     /// Gets a `RenderPipeline` for the specified sample count
     fn get_pipeline(
         &self,
-        descriptors: &Descriptors,
         samples: u32,
         format: TextureFormat,
-    ) -> wgpu::RenderPipeline {
-        self.pipelines
-            .borrow_mut()
-            .entry((samples, format))
-            .or_insert_with(|| {
-                descriptors
-                    .device
+        mask: Option<MaskMode>,
+    ) -> Result<crate::gpu_resources::RenderPipeline, crate::gpu_runtime::RenderFailure> {
+        Ok(crate::gpu_resources::try_cached(
+            &mut self.pipelines.borrow_mut(),
+            (samples, format, mask),
+            || {
+                self.device
                     .create_render_pipeline(&RenderPipelineDescriptor {
                         label: create_debug_label!("PixelBender shader pipeline").as_deref(),
                         layout: Some(&self.pipeline_layout),
@@ -76,12 +86,12 @@ impl PixelBenderWgpuShader {
                                     color: BlendComponent::OVER,
                                     alpha: BlendComponent::OVER,
                                 }),
-                                write_mask: ColorWrites::all(),
+                                write_mask: mask.map_or(ColorWrites::ALL, MaskMode::color_writes),
                             })],
                             compilation_options: Default::default(),
                         }),
                         primitive: Default::default(),
-                        depth_stencil: None,
+                        depth_stencil: mask.map(MaskMode::pipeline_stencil),
                         multisample: wgpu::MultisampleState {
                             count: samples,
                             mask: !0,
@@ -90,8 +100,9 @@ impl PixelBenderWgpuShader {
                         multiview_mask: None,
                         cache: None,
                     })
-            })
-            .clone()
+            },
+        )?
+        .clone())
     }
 }
 
@@ -106,7 +117,15 @@ pub fn as_cache_holder(handle: &PixelBenderShaderHandle) -> &PixelBenderWgpuShad
 }
 
 impl PixelBenderWgpuShader {
-    pub fn new(descriptors: &Descriptors, shader: PixelBenderShader) -> PixelBenderWgpuShader {
+    pub fn new(
+        descriptors: &Descriptors,
+        shader: PixelBenderShader,
+    ) -> Result<PixelBenderWgpuShader, crate::gpu_runtime::RenderFailure> {
+        let device = descriptors.device.with_owner(
+            descriptors
+                .runtime
+                .issue_owner(crate::gpu_runtime::OwnerKind::ShaderJob)?,
+        );
         let mut layout_entries = vec![
             // One sampler per filter/wrapping combination - see BitmapFilters
             // An AGAL shader can use any of these samplers, so
@@ -180,23 +199,18 @@ impl PixelBenderWgpuShader {
         let globals_layout_label =
             create_debug_label!("PixelBender bind group layout for {:?}", shader.name);
         let bind_group_layout =
-            descriptors
-                .device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: globals_layout_label.as_deref(),
-                    entries: &layout_entries,
-                });
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: globals_layout_label.as_deref(),
+                entries: &layout_entries,
+            })?;
 
         let pipeline_layout_label =
             create_debug_label!("PixelBender pipeline layout for {:?}", shader.name);
-        let pipeline_layout =
-            descriptors
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: pipeline_layout_label.as_deref(),
-                    bind_group_layouts: &[Some(&bind_group_layout)],
-                    immediate_size: 0,
-                });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: pipeline_layout_label.as_deref(),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        })?;
 
         let shaders =
             naga_pixelbender::ShaderBuilder::build(&shader).expect("Failed to compile shader");
@@ -204,46 +218,42 @@ impl PixelBenderWgpuShader {
         let float_label =
             create_debug_label!("PixelBender float parameters buffer for {:?}", shader.name);
 
-        let float_parameters_buffer = descriptors.device.create_buffer(&BufferDescriptor {
+        let float_parameters_buffer = device.create_buffer(&BufferDescriptor {
             label: float_label.as_deref(),
             size: shaders.float_parameters_buffer_size,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        })?;
 
         let int_label =
             create_debug_label!("PixelBender int parameters buffer for {:?}", shader.name);
 
-        let int_parameters_buffer = descriptors.device.create_buffer(&BufferDescriptor {
+        let int_parameters_buffer = device.create_buffer(&BufferDescriptor {
             label: int_label.as_deref(),
             size: shaders.int_parameters_buffer_size,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        })?;
 
-        let zeroed_out_of_range_mode = descriptors.device.create_buffer(&BufferDescriptor {
+        let zeroed_out_of_range_mode = device.create_buffer(&BufferDescriptor {
             label: create_debug_label!("PixelBender zeroed_out_of_range_mode parameter buffer")
                 .as_deref(),
             size: shaders.int_parameters_buffer_size,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        })?;
 
-        let vertex_shader = descriptors
-            .device
-            .create_shader_module(ShaderModuleDescriptor {
-                label: None,
-                source: wgpu::ShaderSource::Naga(Cow::Owned(shaders.vertex)),
-            });
+        let vertex_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Naga(Cow::Owned(shaders.vertex)),
+        })?;
 
-        let fragment_shader = descriptors
-            .device
-            .create_shader_module(ShaderModuleDescriptor {
-                label: None,
-                source: wgpu::ShaderSource::Naga(Cow::Owned(shaders.fragment)),
-            });
+        let fragment_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Naga(Cow::Owned(shaders.fragment)),
+        })?;
 
-        PixelBenderWgpuShader {
+        Ok(PixelBenderWgpuShader {
             bind_group_layout,
             pipeline_layout,
             pipelines: Default::default(),
@@ -256,8 +266,9 @@ impl PixelBenderWgpuShader {
             int_parameters_buffer_size: shaders.int_parameters_buffer_size,
             zeroed_out_of_range_mode,
             // FIXME - come up with a good chunk size
-            staging_belt: RefCell::new(StagingBelt::new(descriptors.device.clone(), 8)),
-        }
+            staging_belt: RefCell::new(StagingBelt::new(device.clone(), 8)),
+            device,
+        })
     }
 }
 
@@ -279,11 +290,11 @@ pub(super) fn temporary_texture_format_for_channels(channels: u32) -> wgpu::Text
 }
 
 fn image_input_as_texture<'a>(
-    descriptors: &Descriptors,
+    device: &crate::gpu_resources::Device,
     input: &'a ImageInputTexture<'a>,
-) -> Cow<'a, wgpu::Texture> {
-    match input {
-        ImageInputTexture::Bitmap(handle) => Cow::Borrowed(&as_texture(handle).texture),
+) -> Result<Cow<'a, crate::gpu_resources::Texture>, crate::gpu_runtime::RenderFailure> {
+    Ok(match input {
+        ImageInputTexture::Bitmap(handle) => Cow::Borrowed(&as_texture(handle, device)?.texture),
         ImageInputTexture::TextureRef(raw_texture) => {
             Cow::Borrowed(raw_texture_as_texture(*raw_texture))
         }
@@ -304,7 +315,7 @@ fn image_input_as_texture<'a>(
 
             let padded_bytes = bytemuck::cast_slice::<f32, u8>(padded_data.as_ref());
 
-            let fresh_texture = descriptors.device.create_texture(&TextureDescriptor {
+            let fresh_texture = device.create_texture(&TextureDescriptor {
                 label: Some("Temporary PixelBender output texture"),
                 size: extent,
                 mip_level_count: 1,
@@ -313,8 +324,8 @@ fn image_input_as_texture<'a>(
                 format: texture_format,
                 usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[texture_format],
-            });
-            descriptors.queue.write_texture(
+            })?;
+            device.queue().write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &fresh_texture,
                     mip_level: 0,
@@ -328,10 +339,10 @@ fn image_input_as_texture<'a>(
                     rows_per_image: None,
                 },
                 extent,
-            );
+            )?;
             Cow::Owned(fresh_texture)
         }
-    }
+    })
 }
 
 impl<T: RenderTarget> WgpuRenderBackend<T> {
@@ -339,7 +350,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         &self,
         shader: PixelBenderShader,
     ) -> Result<PixelBenderShaderHandle, BitmapError> {
-        let handle = PixelBenderWgpuShader::new(&self.descriptors, shader);
+        let handle = PixelBenderWgpuShader::new(&self.descriptors, shader)?;
         Ok(PixelBenderShaderHandle(Arc::new(handle)))
     }
 }
@@ -355,14 +366,16 @@ pub(super) fn run_pixelbender_shader_impl(
     shader: PixelBenderShaderHandle,
     mode: ShaderMode,
     arguments: &[PixelBenderShaderArgument],
-    target: &wgpu::Texture,
+    target: &crate::gpu_resources::Texture,
     render_command_encoder: &mut CommandEncoder,
     color_attachment: Option<wgpu::RenderPassColorAttachment>,
+    stencil: Option<(MaskState, wgpu::RenderPassDepthStencilAttachment)>,
     sample_count: u32,
     // FIXME - do we cover the whole source or the whole dest?
     source: &FilterSource,
 ) -> Result<(), BitmapError> {
     let compiled_shader = &as_cache_holder(&shader);
+    let device = compiled_shader.device();
     let mut staging_belt = compiled_shader.staging_belt.borrow_mut();
 
     let mut arguments = arguments.to_vec();
@@ -412,7 +425,7 @@ pub(super) fn run_pixelbender_shader_impl(
         &compiled_shader.zeroed_out_of_range_mode,
         0,
         NonZeroU64::new(std::mem::size_of::<f32>() as u64 * 4).unwrap(),
-    );
+    )?;
 
     // This would ideally be a single f32, but web requires at least 16 bytes
     zeroed_out_of_range_mode_slice.copy_from_slice(bytemuck::cast_slice(&[match mode {
@@ -438,7 +451,7 @@ pub(super) fn run_pixelbender_shader_impl(
     for input in &mut arguments {
         match input {
             PixelBenderShaderArgument::ImageInput { index, texture, .. } => {
-                let input_texture = &image_input_as_texture(descriptors, texture.as_ref().unwrap());
+                let input_texture = &image_input_as_texture(device, texture.as_ref().unwrap())?;
                 let same_source_dest = if let Cow::Borrowed(input_texture) = input_texture {
                     std::ptr::eq(*input_texture, target)
                 } else {
@@ -448,56 +461,61 @@ pub(super) fn run_pixelbender_shader_impl(
                 if same_source_dest {
                     // The input is the same as the output - we need to clone the input.
                     // We will write to the original output, and use a clone of the input as a texture input binding
-                    let cached_fresh_handle = target_clone.get_or_insert_with(|| {
-                        let extent = wgpu::Extent3d {
-                            width: target.width(),
-                            height: target.height(),
-                            depth_or_array_layers: 1,
-                        };
-                        let fresh_texture = descriptors.device.create_texture(&TextureDescriptor {
-                            label: Some("PixelBenderShader target clone"),
-                            size: extent,
-                            mip_level_count: 1,
-                            sample_count: 1,
-                            dimension: wgpu::TextureDimension::D2,
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            usage: wgpu::TextureUsages::COPY_DST
-                                | wgpu::TextureUsages::TEXTURE_BINDING,
-                            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
-                        });
-                        render_command_encoder.copy_texture_to_texture(
-                            TexelCopyTextureInfo {
-                                texture: target,
-                                mip_level: 0,
-                                origin: Default::default(),
-                                aspect: Default::default(),
-                            },
-                            TexelCopyTextureInfo {
-                                texture: &fresh_texture,
-                                mip_level: 0,
-                                origin: Default::default(),
-                                aspect: Default::default(),
-                            },
-                            extent,
-                        );
+                    let cached_fresh_handle =
+                        crate::gpu_resources::try_option(&mut target_clone, || {
+                            let extent = wgpu::Extent3d {
+                                width: target.width(),
+                                height: target.height(),
+                                depth_or_array_layers: 1,
+                            };
+                            let fresh_texture = device.create_texture(&TextureDescriptor {
+                                label: Some("PixelBenderShader target clone"),
+                                size: extent,
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format: wgpu::TextureFormat::Rgba8Unorm,
+                                usage: wgpu::TextureUsages::COPY_DST
+                                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                                view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+                            })?;
+                            render_command_encoder.copy_texture_to_texture(
+                                TexelCopyTextureInfo {
+                                    texture: target,
+                                    mip_level: 0,
+                                    origin: Default::default(),
+                                    aspect: Default::default(),
+                                },
+                                TexelCopyTextureInfo {
+                                    texture: &fresh_texture,
+                                    mip_level: 0,
+                                    origin: Default::default(),
+                                    aspect: Default::default(),
+                                },
+                                extent,
+                            );
 
-                        BitmapHandle(Arc::new(Texture {
-                            _allocation: Default::default(),
-                            view: fresh_texture.create_view(&Default::default()),
-                            texture: fresh_texture,
-                            repeating_linear: Default::default(),
-                            repeating_nearest: Default::default(),
-                            clamped_linear: Default::default(),
-                            clamped_nearest: Default::default(),
-                            copy_count: Cell::new(0),
-                        }))
-                    });
+                            Ok::<_, crate::gpu_runtime::RenderFailure>(BitmapHandle(Arc::new(
+                                Texture {
+                                    _allocation: Default::default(),
+                                    view: fresh_texture.create_view(&Default::default())?,
+                                    texture: fresh_texture,
+                                    batch_source: Default::default(),
+                                    repeating_linear: Default::default(),
+                                    repeating_nearest: Default::default(),
+                                    clamped_linear: Default::default(),
+                                    clamped_nearest: Default::default(),
+                                    copy_count: Default::default(),
+                                    version: Default::default(),
+                                },
+                            )))
+                        })?;
                     *texture = Some(cached_fresh_handle.clone().into());
                 }
-                let wgpu_texture = image_input_as_texture(descriptors, texture.as_ref().unwrap());
+                let wgpu_texture = image_input_as_texture(device, texture.as_ref().unwrap())?;
                 texture_views.insert(
                     *index,
-                    wgpu_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                    wgpu_texture.create_view(&wgpu::TextureViewDescriptor::default())?,
                 );
             }
             PixelBenderShaderArgument::ValueInput { index, value } => {
@@ -594,7 +612,7 @@ pub(super) fn run_pixelbender_shader_impl(
                     buffer,
                     vec4_count as u64 * 4 * component_size_bytes,
                     NonZeroU64::new(num_vec4s as u64 * 4 * component_size_bytes).unwrap(),
-                );
+                )?;
                 match value_vec {
                     FloatOrInt::Float(v) => {
                         buffer_slice.copy_from_slice(bytemuck::cast_slice(&v));
@@ -611,7 +629,7 @@ pub(super) fn run_pixelbender_shader_impl(
     for input in &arguments {
         match input {
             PixelBenderShaderArgument::ImageInput { index, texture, .. } => {
-                let wgpu_texture = image_input_as_texture(descriptors, texture.as_ref().unwrap());
+                let wgpu_texture = image_input_as_texture(device, texture.as_ref().unwrap())?;
 
                 if first_image.is_none() {
                     first_image = Some(wgpu_texture);
@@ -627,34 +645,46 @@ pub(super) fn run_pixelbender_shader_impl(
         }
     }
 
-    let bind_group = descriptors
-        .device
-        .create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &compiled_shader.bind_group_layout,
-            entries: &bind_group_entries,
-        });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &compiled_shader.bind_group_layout,
+        entries: &bind_group_entries,
+    })?;
 
     staging_belt.finish();
 
-    let vertices = descriptors
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: create_debug_label!("Filter vertices").as_deref(),
-            contents: bytemuck::cast_slice(&[source.vertices()]),
-            usage: BufferUsages::VERTEX,
-        });
+    let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: create_debug_label!("Filter vertices").as_deref(),
+        contents: bytemuck::cast_slice(&[source.vertices()]),
+        usage: BufferUsages::VERTEX,
+    })?;
 
-    let pipeline = compiled_shader.get_pipeline(descriptors, sample_count, target.format());
+    let pipeline = compiled_shader.get_pipeline(
+        sample_count,
+        target.format(),
+        stencil.as_ref().map(|(mask, _)| mask.mode),
+    )?;
 
+    ruffle_render::profile::work(|w| {
+        w.render_passes += 1;
+        w.filter_passes += 1;
+        w.draw_calls += 1;
+        w.pipeline_changes += 1;
+        w.material_binds += 1;
+        w.pass_pixels += u64::from(target.width()) * u64::from(target.height());
+    });
+    let mask = stencil.as_ref().map(|(mask, _)| *mask);
     let mut render_pass = render_command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("PixelBender render pass"),
         color_attachments: &[color_attachment],
-        depth_stencil_attachment: None,
+        depth_stencil_attachment: stencil.map(|(_, attachment)| attachment),
         ..Default::default()
     });
-    render_pass.set_bind_group(0, &bind_group, &[]);
+    render_pass.set_bind_group(0, (&bind_group).raw(), &[]);
     render_pass.set_pipeline(&pipeline);
+    if let Some(mask) = mask {
+        mask.apply_stencil_reference(&mut render_pass);
+    }
 
     render_pass.set_vertex_buffer(0, vertices.slice(..));
     render_pass.set_index_buffer(

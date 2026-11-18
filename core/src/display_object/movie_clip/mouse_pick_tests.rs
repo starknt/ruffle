@@ -99,6 +99,114 @@ fn nested_child_and_late_parent_graphics_remain_pickable() {
 }
 
 #[test]
+fn timeline_mask_clips_a_script_added_child_until_a_later_timeline_depth() {
+    with_tree(|root, context| {
+        let button = MovieClip::new(root.movie(), context.gc());
+        rectangle(button);
+        root.replace_at_depth(context, button.into(), 1);
+        let mut card = MovieClip::new(root.movie(), context.gc());
+        root.replace_at_depth(context, card.into(), 2);
+
+        let mask = MovieClip::new(root.movie(), context.gc());
+        rectangle(mask);
+        mask.set_x(Twips::new(100));
+        mask.set_clip_depth(3);
+        card.replace_at_depth(context, mask.into(), 1);
+        let placeholder = MovieClip::new(root.movie(), context.gc());
+        card.replace_at_depth(context, placeholder.into(), 2);
+        let portrait = MovieClip::new(root.movie(), context.gc());
+        rectangle(portrait);
+        card.insert_at_index(context, portrait.into(), card.num_children());
+
+        assert_pick(root, context, 150, portrait);
+        assert_pick(root, context, 50, button);
+
+        // A later timeline placement ends the mask before the next addChild.
+        let boundary = MovieClip::new(root.movie(), context.gc());
+        card.replace_at_depth(context, boundary.into(), 4);
+        let overlay = MovieClip::new(root.movie(), context.gc());
+        rectangle(overlay);
+        card.insert_at_index(context, overlay.into(), card.num_children());
+        assert_pick(root, context, 50, overlay);
+    });
+}
+
+#[test]
+fn nested_timeline_masks_both_apply_at_the_inclusive_end_depth() {
+    with_tree(|root, context| {
+        let button = MovieClip::new(root.movie(), context.gc());
+        rectangle(button);
+        root.replace_at_depth(context, button.into(), 1);
+        let outer = MovieClip::new(root.movie(), context.gc());
+        rectangle(outer);
+        outer.set_x(Twips::new(100));
+        outer.set_clip_depth(5);
+        root.replace_at_depth(context, outer.into(), 2);
+        let inner = MovieClip::new(root.movie(), context.gc());
+        rectangle(inner);
+        inner.set_clip_depth(4);
+        root.replace_at_depth(context, inner.into(), 3);
+        let child = MovieClip::new(root.movie(), context.gc());
+        rectangle(child);
+        root.replace_at_depth(context, child.into(), 4);
+
+        assert_pick(root, context, 150, child);
+        assert_pick(root, context, 50, button);
+
+        let sibling = MovieClip::new(root.movie(), context.gc());
+        rectangle(sibling);
+        sibling.set_x(Twips::new(100));
+        root.replace_at_depth(context, sibling.into(), 5);
+        assert_pick(root, context, 250, sibling);
+    });
+}
+
+#[test]
+fn timeline_mask_still_applies_when_picking_non_interactive_children() {
+    with_tree(|root, context| {
+        let button = MovieClip::new(root.movie(), context.gc());
+        rectangle(button);
+        root.replace_at_depth(context, button.into(), 1);
+        let card = MovieClip::new(root.movie(), context.gc());
+        root.replace_at_depth(context, card.into(), 2);
+
+        // The interactive pass visits this empty sibling before the bitmap.
+        let empty = MovieClip::new(root.movie(), context.gc());
+        card.replace_at_depth(context, empty.into(), 1);
+        let mask = MovieClip::new(root.movie(), context.gc());
+        rectangle(mask);
+        mask.set_x(Twips::new(100));
+        mask.set_clip_depth(3);
+        card.replace_at_depth(context, mask.into(), 2);
+        let pixels = ruffle_render::bitmap::Bitmap::new(
+            10,
+            10,
+            ruffle_render::bitmap::BitmapFormat::Rgb,
+            vec![255; 300],
+        );
+        let bitmap = crate::display_object::Bitmap::new(context.gc(), 0, pixels, root.movie());
+        card.replace_at_depth(context, bitmap.into(), 3);
+
+        assert_pick(root, context, 150, card);
+        assert_pick(root, context, 50, button);
+    });
+}
+
+fn assert_pick<'gc>(
+    root: MovieClip<'gc>,
+    context: &mut UpdateContext<'gc>,
+    x: i32,
+    expected: MovieClip<'gc>,
+) {
+    let point = Point::new(Twips::new(x), Twips::new(100));
+    let result = root.mouse_pick_avm2(context, point, false);
+    assert!(
+        matches!(result, Avm2MousePick::Hit(hit) if hit == expected.into()),
+        "at {point:?}, expected {expected:?}, got {result:?}"
+    );
+}
+
+#[test]
 #[ignore = "diagnostic mouse-pick benchmark; no machine-dependent FPS assertion"]
 fn empty_container_mouse_pick_benchmark() {
     use std::{hint::black_box, time::Instant};

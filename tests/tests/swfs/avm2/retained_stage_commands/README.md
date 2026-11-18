@@ -1,0 +1,1 @@
+Expected pixels are analytic, axis-aligned 16x16 opaque fills; generated from the coordinates and draw order in Test.as. Tests stage reuse, same-frame geometry changes, reordering, stage -> BitmapData.draw -> stage, color transforms, and detach/reparent.

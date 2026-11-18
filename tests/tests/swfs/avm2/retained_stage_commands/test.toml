@@ -1,0 +1,60 @@
+num_frames = 10
+
+[player_options]
+with_renderer = { optional = false, quality = "low" }
+
+[[compilers]]
+type = "Asc"
+class = "Test"
+scripts = ["Test.as"]
+swf_version = 11
+
+[image_comparisons.frame1]
+trigger = 1
+tolerance = 0
+max_outliers = 0
+
+[image_comparisons.frame2]
+trigger = 2
+tolerance = 0
+max_outliers = 0
+
+[image_comparisons.frame3]
+trigger = 3
+tolerance = 0
+max_outliers = 0
+
+[image_comparisons.frame4]
+trigger = 4
+tolerance = 0
+max_outliers = 0
+
+[image_comparisons.frame5]
+trigger = 5
+tolerance = 0
+max_outliers = 0
+
+[image_comparisons.frame6]
+trigger = 6
+tolerance = 0
+max_outliers = 0
+
+[image_comparisons.frame7]
+trigger = 7
+tolerance = 0
+max_outliers = 0
+
+[image_comparisons.frame8]
+trigger = 8
+tolerance = 0
+max_outliers = 0
+
+[image_comparisons.frame9]
+trigger = 9
+tolerance = 0
+max_outliers = 0
+
+[image_comparisons.frame10]
+trigger = 10
+tolerance = 0
+max_outliers = 0

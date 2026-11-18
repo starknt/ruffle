@@ -3,6 +3,117 @@
 use std::{cell::RefCell, rc::Rc};
 use web_time::Instant;
 
+macro_rules! work_counters {
+    ($($name:ident),* $(,)?) => {
+        #[derive(Debug, Default, Clone, Copy)]
+        #[cfg_attr(feature = "serde", derive(serde::Serialize))]
+        pub struct RenderWork { $(pub $name: u64,)* }
+        impl RenderWork {
+            pub fn entries(&self) -> impl Iterator<Item = (&'static str, u64)> {
+                [$( (stringify!($name), self.$name),)*].into_iter()
+            }
+            pub fn delta(self, previous: Self) -> Self {
+                Self { $($name: self.$name.saturating_sub(previous.$name),)* }
+            }
+            pub fn add(&mut self, other: Self) {
+                $(self.$name = self.$name.saturating_add(other.$name);)*
+            }
+        }
+    }
+}
+// `pass_pixels` sums color attachment areas per encoded pass (before scissor),
+// not shaded fragments. `snapshot_bytes` counts cumulative admissions, not
+// current resident bytes. `mask_passes` counts passes using stencil/alpha masks.
+work_counters!(
+    draw_calls,
+    render_passes,
+    blend_passes,
+    mask_passes,
+    filter_passes,
+    offscreen_targets,
+    offscreen_pixels,
+    pass_pixels,
+    copy_bytes,
+    pipeline_changes,
+    material_binds,
+    cache_hits,
+    cache_redraws,
+    tree_visits,
+    snapshot_hits,
+    snapshot_misses,
+    snapshot_evictions,
+    snapshot_bytes,
+    pic_hits,
+    pic_misses,
+    pic_megamorphic,
+    catch_up_frames,
+    discarded_frame_debt_us,
+    native_pipeline_changes,
+    native_bind_groups,
+    native_vertex_buffers,
+    native_index_buffers,
+    native_scissors,
+    native_stencil_references,
+    native_viewports,
+);
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct GpuSample {
+    pub frame: Option<u64>,
+    pub nanos: u64,
+    /// Inclusive named query durations. Nested names must not be summed as total frame time.
+    pub phases: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum NativePhase {
+    EncoderFinish,
+    SubmitLock,
+    QueueSubmit,
+    SurfaceAcquire,
+    Present,
+    QueueThrottle,
+    Preparation,
+}
+impl NativePhase {
+    pub const NAMES: [&'static str; 7] = [
+        "encoderFinish",
+        "submitLock",
+        "queueSubmit",
+        "surfaceAcquire",
+        "present",
+        "queueThrottle",
+        "preparation",
+    ];
+}
+
+/// Aggregate locally in renderer hot loops, then publish once per chunk.
+pub fn work(f: impl FnOnce(&mut RenderWork)) {
+    CURRENT.with_borrow(|current| {
+        if let Some(metrics) = current {
+            f(&mut metrics.0.borrow_mut().work);
+        }
+    });
+}
+
+pub struct NativeTimer(Option<(RenderMetrics, NativePhase, Instant)>);
+pub fn native_time(phase: NativePhase) -> NativeTimer {
+    NativeTimer(CURRENT.with_borrow(|m| m.clone().map(|m| (m, phase, Instant::now()))))
+}
+impl Drop for NativeTimer {
+    fn drop(&mut self) {
+        if let Some((metrics, phase, start)) = &self.0 {
+            let mut counters = metrics.0.borrow_mut();
+            let timing = &mut counters.native_timings[*phase as usize];
+            let nanos = start.elapsed().as_nanos() as u64;
+            timing.samples += 1;
+            timing.nanos += nanos;
+            timing.max_nanos = timing.max_nanos.max(nanos);
+        }
+    }
+}
+
 #[cfg(feature = "lifecycle_counts")]
 pub mod lifecycle;
 
@@ -41,11 +152,58 @@ pub enum Phase {
     RenderBackend,
     RenderSubmit,
 }
+impl Phase {
+    pub const NAMES: [&'static str; 32] = [
+        "logic",
+        "gc",
+        "decode",
+        "upload",
+        "readback",
+        "gpu",
+        "executor",
+        "stageCpu",
+        "hostAction",
+        "preload",
+        "avm2",
+        "avm1",
+        "audio",
+        "postFrame",
+        "connections",
+        "audioSkew",
+        "socket",
+        "netConnection",
+        "wallTimers",
+        "timers",
+        "streams",
+        "audioTick",
+        "socketReceive",
+        "socketConnect",
+        "socketData",
+        "socketClose",
+        "wake",
+        "input",
+        "composite",
+        "renderTree",
+        "renderBackend",
+        "renderSubmit",
+    ];
+}
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Timing {
     pub samples: u64,
     pub nanos: u64,
     pub max_nanos: u64,
+}
+/// Numeric-only evidence for long collector pauses; never roots arena objects.
+#[derive(Debug, Clone, Copy)]
+pub struct GcSample {
+    pub nanos: u64,
+    pub phase_before: &'static str,
+    pub phase_after: &'static str,
+    pub objects_before: usize,
+    pub objects_after: usize,
+    pub debt_before: f64,
+    pub debt_after: f64,
 }
 #[derive(Debug, Clone)]
 pub struct AsyncEvent {
@@ -81,6 +239,13 @@ pub struct PublishedCodeStats {
 
 #[derive(Debug, Default, Clone)]
 pub struct Counters {
+    pub work: RenderWork,
+    pub native_timings: [Timing; 7],
+    pub native_resources: Option<NativeResources>,
+    pub gpu_samples: Vec<GpuSample>,
+    pub dropped_gpu_samples: u64,
+    pub gc_samples: Vec<GcSample>,
+    pub dropped_gc_samples: u64,
     #[cfg(feature = "lifecycle_counts")]
     pub lifecycle: lifecycle::Counters,
     pub timings: [Timing; 32],
@@ -117,6 +282,41 @@ pub struct Counters {
     pub async_events: Vec<AsyncEvent>,
 }
 
+/// Device-wide logical accounting. Driver allocations and process RSS are
+/// different measurements and are deliberately not folded into these bytes.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct NativeResources {
+    pub device_generation: u64,
+    pub logical_bytes: u64,
+    pub active_bytes: u64,
+    pub reserved_bytes: u64,
+    pub idle_bytes: u64,
+    pub retiring_bytes: u64,
+    pub peak_bytes: u64,
+    pub cache_retained_bytes: u64,
+    pub pool_retained_bytes: u64,
+    pub resources: usize,
+    pub classes: Vec<(&'static str, u64, usize)>,
+    pub submitted: u64,
+    pub completed: u64,
+    pub budget_rejections: u64,
+    pub creation_retries: u64,
+    pub terminal_failure: Option<String>,
+    pub worker_active: usize,
+    pub worker_bytes: u64,
+    pub worker_peak_active: usize,
+    pub worker_peak_bytes: u64,
+    pub worker_submitted: u64,
+}
+pub fn record_native_resources(stats: NativeResources) {
+    CURRENT.with_borrow(|current| {
+        if let Some(metrics) = current {
+            metrics.0.borrow_mut().native_resources = Some(stats);
+        }
+    });
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct BitmapResidencyStats {
     pub retained_bytes: u64,
@@ -134,7 +334,10 @@ pub fn record_bitmap_residency(stats: BitmapResidencyStats) {
     });
 }
 #[derive(Clone, Default, Debug)]
-pub struct RenderMetrics(Rc<RefCell<Counters>>);
+pub struct RenderMetrics(
+    Rc<RefCell<Counters>>,
+    std::sync::Arc<std::sync::Mutex<GpuBitmapStats>>,
+);
 thread_local! {
     static CURRENT: RefCell<Option<RenderMetrics>> = const { RefCell::new(None) };
 }
@@ -151,8 +354,26 @@ impl Drop for Scope {
     }
 }
 impl RenderMetrics {
+    pub fn take_gc_samples(&self) -> (Vec<GcSample>, u64) {
+        let mut counters = self.0.borrow_mut();
+        (
+            std::mem::take(&mut counters.gc_samples),
+            std::mem::take(&mut counters.dropped_gc_samples),
+        )
+    }
+    pub fn take_gpu_samples(&self) -> Vec<GpuSample> {
+        std::mem::take(&mut self.0.borrow_mut().gpu_samples)
+    }
     pub fn snapshot(&self) -> Counters {
-        self.0.borrow().clone()
+        let mut snapshot = self.0.borrow().clone();
+        let bitmaps = self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.gpu_bitmaps = bitmaps.count;
+        snapshot.gpu_bitmap_bytes = bitmaps.bytes;
+        snapshot.peak_gpu_bitmap_bytes = bitmaps.peak;
+        snapshot
     }
 
     pub fn take_async_events(&self) -> Vec<AsyncEvent> {
@@ -170,10 +391,24 @@ pub fn next_frame() -> Option<u64> {
     CURRENT.with_borrow(|m| m.as_ref().map(|m| m.0.borrow().stage_submissions + 1))
 }
 pub fn record_gpu(nanos: u64, frame: Option<u64>) {
+    record_gpu_sample(GpuSample {
+        frame,
+        nanos,
+        phases: Vec::new(),
+    });
+}
+pub fn record_gpu_sample(sample: GpuSample) {
+    let (frame, nanos) = (sample.frame, sample.nanos);
     CURRENT.with_borrow(|m| {
         if let Some(m) = m {
             m.record(Phase::Gpu, nanos);
-            m.0.borrow_mut().gpu_frame = frame;
+            let mut counters = m.0.borrow_mut();
+            counters.gpu_frame = frame;
+            if counters.gpu_samples.len() < 256 {
+                counters.gpu_samples.push(sample);
+            } else {
+                counters.dropped_gpu_samples += 1;
+            }
         }
     });
 }
@@ -197,6 +432,22 @@ pub fn record_host_duration(phase: Phase, nanos: u64) {
     CURRENT.with_borrow(|m| {
         if let Some(m) = m {
             m.record(phase, nanos);
+        }
+    });
+}
+
+pub fn record_gc(sample: GcSample) {
+    if sample.nanos < 8_000_000 {
+        return;
+    }
+    CURRENT.with_borrow(|current| {
+        if let Some(metrics) = current {
+            let mut counters = metrics.0.borrow_mut();
+            if counters.gc_samples.len() < 32 {
+                counters.gc_samples.push(sample);
+            } else {
+                counters.dropped_gc_samples += 1;
+            }
         }
     });
 }
@@ -340,28 +591,37 @@ pub fn pool(idle: [u64; 2], peak: [u64; 2], combined: u64) {
 }
 
 #[derive(Debug, Default)]
-pub struct GpuBitmap(Option<(RenderMetrics, u64)>);
+struct GpuBitmapStats {
+    count: u64,
+    bytes: u64,
+    peak: u64,
+}
+#[derive(Debug, Default)]
+pub struct GpuBitmap(Option<(std::sync::Arc<std::sync::Mutex<GpuBitmapStats>>, u64)>);
 impl GpuBitmap {
     pub fn new(bytes: u64) -> Self {
-        Self(CURRENT.with_borrow(|m| {
-            m.clone().map(|m| {
-                {
-                    let mut c = m.0.borrow_mut();
-                    c.gpu_bitmaps += 1;
-                    c.gpu_bitmap_bytes += bytes;
-                    c.peak_gpu_bitmap_bytes = c.peak_gpu_bitmap_bytes.max(c.gpu_bitmap_bytes);
-                }
-                (m, bytes)
+        Self(CURRENT.with_borrow(|current| {
+            current.as_ref().map(|metrics| {
+                let mut counts = metrics
+                    .1
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                counts.count += 1;
+                counts.bytes += bytes;
+                counts.peak = counts.peak.max(counts.bytes);
+                (metrics.1.clone(), bytes)
             })
         }))
     }
 }
 impl Drop for GpuBitmap {
     fn drop(&mut self) {
-        if let Some((m, b)) = &self.0 {
-            let mut c = m.0.borrow_mut();
-            c.gpu_bitmaps -= 1;
-            c.gpu_bitmap_bytes -= b;
+        if let Some((metrics, bytes)) = &self.0 {
+            let mut counts = metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            counts.count -= 1;
+            counts.bytes -= bytes;
         }
     }
 }
@@ -436,6 +696,78 @@ mod tests {
     use super::{
         RenderMetrics, bitmap_gpu_copy, bitmap_readback, enabled, enter, executor_queue_depth,
     };
+
+    #[test]
+    fn slow_gc_diagnostics_are_scoped_bounded_and_drained_once() {
+        let metrics = RenderMetrics::default();
+        let sample = super::GcSample {
+            nanos: 10_000_000,
+            phase_before: "marking",
+            phase_after: "sweeping",
+            objects_before: 100,
+            objects_after: 80,
+            debt_before: 500.0,
+            debt_after: 0.0,
+        };
+        {
+            let _scope = enter(Some(&metrics));
+            super::record_gc(super::GcSample {
+                nanos: 100,
+                ..sample
+            });
+            for i in 0..40 {
+                super::record_gc(super::GcSample {
+                    objects_before: 100 + i,
+                    ..sample
+                });
+            }
+        }
+        super::record_gc(sample);
+        let (samples, dropped) = metrics.take_gc_samples();
+        assert_eq!((samples.len(), dropped), (32, 8));
+        assert_eq!(samples.first().unwrap().objects_before, 100);
+        assert_eq!(samples.last().unwrap().objects_before, 131);
+        assert_eq!(samples[0].phase_after, "sweeping");
+        assert_eq!(samples[0].debt_before, 500.0);
+        assert_eq!(samples[0].objects_after, 80);
+        let (samples, dropped) = metrics.take_gc_samples();
+        assert!(samples.is_empty());
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn completed_gpu_samples_preserve_each_frame_and_drain_once() {
+        let metrics = RenderMetrics::default();
+        let _scope = enter(Some(&metrics));
+        super::record_gpu(11, Some(3));
+        super::record_gpu(17, Some(4));
+        let samples = metrics.take_gpu_samples();
+        assert_eq!(
+            samples
+                .iter()
+                .map(|s| (s.frame, s.nanos))
+                .collect::<Vec<_>>(),
+            [(Some(3), 11), (Some(4), 17)]
+        );
+        assert!(metrics.take_gpu_samples().is_empty());
+    }
+
+    #[test]
+    fn work_counters_belong_to_the_scoped_player() {
+        let a = RenderMetrics::default();
+        let b = RenderMetrics::default();
+        {
+            let _scope = enter(Some(&a));
+            super::work(|w| w.draw_calls += 2);
+            {
+                let _scope = enter(Some(&b));
+                super::work(|w| w.draw_calls += 7);
+            }
+            super::work(|w| w.draw_calls += 3);
+        }
+        assert_eq!(a.snapshot().work.draw_calls, 5);
+        assert_eq!(b.snapshot().work.draw_calls, 7);
+    }
 
     #[test]
     fn executor_queue_depth_is_recorded_in_the_current_metrics() {
@@ -546,5 +878,21 @@ mod tests {
         );
         assert_eq!(first.values.iter().flatten().sum::<u64>(), 11);
         assert_eq!(second.values.iter().flatten().sum::<u64>(), 4);
+    }
+}
+
+#[cfg(test)]
+mod gpu_bitmap_thread_tests {
+    #[test]
+    fn cache_eviction_updates_bitmap_metrics_from_the_device_owner() {
+        let metrics = super::RenderMetrics::default();
+        let _scope = super::enter(Some(&metrics));
+        let allocation = super::GpuBitmap::new(64);
+        assert_eq!(metrics.snapshot().gpu_bitmap_bytes, 64);
+        std::thread::spawn(move || drop(allocation)).join().unwrap();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.gpu_bitmap_bytes, 0);
+        assert_eq!(snapshot.gpu_bitmaps, 0);
+        assert_eq!(snapshot.peak_gpu_bitmap_bytes, 64);
     }
 }

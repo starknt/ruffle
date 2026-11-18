@@ -211,11 +211,11 @@ impl<'gc> Avm2Button<'gc> {
 
         for record in shared.cell.borrow().records.iter() {
             if record.states.contains(swf_state) {
-                match context
+                let child = context
                     .library
-                    .library_for_movie_mut(movie)
-                    .instantiate_by_id(record.id, context.gc_context)
-                {
+                    .library_for_movie_mut(movie, context.gc_context)
+                    .instantiate_by_id(record.id, context.gc_context);
+                match child {
                     Some(child) => {
                         child.set_matrix(record.matrix.into());
                         child.set_depth(record.depth.into());

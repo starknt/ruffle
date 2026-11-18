@@ -284,24 +284,26 @@ impl<'gc> DisplacementMapFilter<'gc> {
     pub fn filter(
         self,
         context: &mut UpdateContext<'gc>,
-    ) -> ruffle_render::filters::DisplacementMapFilter {
+    ) -> Result<ruffle_render::filters::DisplacementMapFilter, ruffle_render::error::RenderFailure>
+    {
         let filter = self.0;
         let map_point = filter.map_point.get();
-        ruffle_render::filters::DisplacementMapFilter {
+        Ok(ruffle_render::filters::DisplacementMapFilter {
             color: filter.color.get(),
             component_x: filter.component_x.get() as u8,
             component_y: filter.component_y.get() as u8,
             map_bitmap: filter
                 .map_bitmap
                 .get()
-                .map(|b| b.bitmap_handle(context.gc(), context.renderer)),
+                .map(|b| b.bitmap_handle(context.gc(), context.renderer))
+                .transpose()?,
             map_point: (map_point.x, map_point.y),
             mode: filter.mode.get(),
             scale_x: filter.scale_x.get(),
             scale_y: filter.scale_y.get(),
             viewscale_x: 1.0,
             viewscale_y: 1.0,
-        }
+        })
     }
 }
 

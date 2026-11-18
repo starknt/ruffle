@@ -2,6 +2,7 @@ use crate::buffer_builder::BufferBuilder;
 use crate::buffer_pool::{BufferPool, TexturePool};
 use crate::context3d::WgpuContext3D;
 use crate::filters::FilterSource;
+use crate::gpu_profiler::{GpuProfiler, GpuProfilerSettings};
 use crate::mesh::{CommonGradient, Mesh, PendingDraw};
 use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
 use crate::surface::buffers::ChunkBuffers;
@@ -13,14 +14,13 @@ use crate::{
     AsyncReadback, Descriptors, Error, QueueSyncHandle, RenderTarget, SwapChainTarget, Texture,
     as_texture, format_list, get_backend_names,
 };
-use image::imageops::FilterType;
 use ruffle_render::backend::{
     BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderPending,
     PixelBenderTarget,
 };
 use ruffle_render::backend::{RenderBackend, ShapeHandle, ViewportDimensions};
 use ruffle_render::bitmap::{
-    Bitmap, BitmapFormat, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
+    Bitmap, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
 };
 use ruffle_render::commands::CommandList;
 use ruffle_render::error::Error as BitmapError;
@@ -29,16 +29,13 @@ use ruffle_render::pixel_bender::{PixelBenderShader, PixelBenderShaderHandle};
 use ruffle_render::pixel_bender_support::PixelBenderShaderArgument;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::shape_utils::DistilledShape;
-use ruffle_render::tessellator::ShapeTessellator;
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use swf::Color;
 use tracing::instrument;
 use wgpu::SubmissionIndex;
-use wgpu_profiler::{GpuProfiler, GpuProfilerSettings};
 
 pub const DEFAULT_IMMUTABLE_BITMAP_CACHE_LIMIT: u64 = 256 * 1024 * 1024;
 
@@ -67,6 +64,10 @@ pub fn create_wgpu_instance(
             .difference(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL)
             .with_env(),
         backend_options,
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds {
+            for_resource_creation: Some(90),
+            for_device_loss: None,
+        },
         ..descriptor
     })
 }
@@ -77,56 +78,33 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     target: T,
     surface: Surface,
     meshes: Vec<Mesh>,
-    shape_tessellator: ShapeTessellator,
+    small_meshes: crate::mesh::SmallMeshCache,
+    pub(crate) preparation_generation: crate::prepare::PreparationGeneration,
     // This is currently unused - we just store it to report in
     // `get_viewport_dimensions`
     viewport_scale_factor: f64,
     texture_pool: TexturePool,
     offscreen_texture_pool: TexturePool,
-    pub(crate) offscreen_buffer_pool: Arc<BufferPool<wgpu::Buffer, BufferDimensions>>,
+    pub(crate) offscreen_buffer_pool:
+        Arc<BufferPool<crate::gpu_resources::Buffer, BufferDimensions>>,
     chunk_buffers: ChunkBuffers,
     active_frame: ActiveFrame,
     profiler: GpuProfiler,
-    bitmap_residency: Option<crate::bitmap_residency::BitmapResidency>,
+    last_submission: Option<SubmissionIndex>,
+    bitmap_residency:
+        Option<Arc<crate::bitmap_residency::BitmapResidency<crate::bitmap_recipe::BitmapRecipe>>>,
+}
+
+impl<T: RenderTarget> Drop for WgpuRenderBackend<T> {
+    fn drop(&mut self) {
+        self.preparation_generation.cancel();
+        // Descriptors may outlive a movie/renderer in a shared-device host.
+        // Cached bindings must not keep that renderer's targets alive there.
+        self.descriptors.materials.clear();
+    }
 }
 
 impl WgpuRenderBackend<SwapChainTarget> {
-    #[cfg(target_family = "wasm")]
-    pub async fn for_canvas(
-        canvas: web_sys::HtmlCanvasElement,
-        webgpu: bool,
-    ) -> Result<Self, Error> {
-        let backends = if webgpu {
-            wgpu::Backends::BROWSER_WEBGPU
-        } else {
-            wgpu::Backends::GL
-        };
-        let instance = create_wgpu_instance(
-            backends,
-            wgpu::BackendOptions {
-                gl: wgpu::GlBackendOptions {
-                    // See <https://github.com/gfx-rs/wgpu/releases/tag/v25.0.0>
-                    fence_behavior: wgpu::GlFenceBehavior::AutoFinish,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            None,
-        );
-        let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas))?;
-        let (adapter, device, queue) = request_adapter_and_device(
-            backends,
-            &instance,
-            Some(&surface),
-            wgpu::PowerPreference::HighPerformance,
-        )
-        .await?;
-        let descriptors = Descriptors::new(instance, adapter, device, queue);
-        let target =
-            SwapChainTarget::new(surface, &descriptors.adapter, (1, 1), &descriptors.device);
-        Self::new(Arc::new(descriptors), target)
-    }
-
     /// # Safety
     ///  See [`wgpu::SurfaceTargetUnsafe`] variants for safety requirements.
     ///
@@ -136,7 +114,6 @@ impl WgpuRenderBackend<SwapChainTarget> {
     /// provide one). Prefer passing `display` - some backends (e.g. GL via
     /// EGL) select their platform when the instance is created, before the
     /// target's display handle is seen.
-    #[cfg(not(target_family = "wasm"))]
     pub unsafe fn for_window_unsafe(
         window: wgpu::SurfaceTargetUnsafe,
         size: (u32, u32),
@@ -158,14 +135,14 @@ impl WgpuRenderBackend<SwapChainTarget> {
             Some(&surface),
             power_preference,
         ))?;
-        let descriptors = Descriptors::new(instance, adapter, device, queue);
-        let target = SwapChainTarget::new(surface, &descriptors.adapter, size, &descriptors.device);
+        let descriptors = Descriptors::new(instance, adapter, device, queue)?;
+        let target =
+            SwapChainTarget::new(surface, &descriptors.adapter, size, &descriptors.device)?;
         Self::new(Arc::new(descriptors), target)
     }
 
     /// # Safety
     ///  See [`wgpu::SurfaceTargetUnsafe`] variants for safety requirements.
-    #[cfg(not(target_family = "wasm"))]
     pub unsafe fn recreate_surface_unsafe(
         &mut self,
         window: wgpu::SurfaceTargetUnsafe,
@@ -174,12 +151,11 @@ impl WgpuRenderBackend<SwapChainTarget> {
         let descriptors = &self.descriptors;
         let surface = unsafe { descriptors.wgpu_instance.create_surface_unsafe(window)? };
         self.target =
-            SwapChainTarget::new(surface, &descriptors.adapter, size, &descriptors.device);
+            SwapChainTarget::new(surface, &descriptors.adapter, size, &descriptors.device)?;
         Ok(())
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl WgpuRenderBackend<crate::target::TextureTarget> {
     pub fn for_offscreen(
         size: (u32, u32),
@@ -199,24 +175,30 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
             None,
             power_preference,
         ))?;
-        let descriptors = Descriptors::new(instance, adapter, device, queue);
+        let descriptors = Descriptors::new(instance, adapter, device, queue)?;
         let target = crate::target::TextureTarget::new(&descriptors.device, size)?;
         Self::new(Arc::new(descriptors), target)
     }
 
-    pub fn capture_frame(&self) -> Option<image::RgbaImage> {
+    pub fn capture_frame(
+        &self,
+    ) -> Result<Option<image::RgbaImage>, crate::gpu_runtime::RenderFailure> {
+        self.descriptors.runtime.check_health()?;
         use crate::utils::buffer_to_image;
         if let Some(buffer) = &self.target.buffer {
             let (buffer, dimensions) = buffer.buffer.inner();
-            Some(buffer_to_image(
-                &self.descriptors.device,
-                buffer,
-                dimensions,
-                None,
-                self.target.size,
+            Ok(Some(
+                buffer_to_image(
+                    &self.descriptors.device,
+                    buffer,
+                    dimensions,
+                    None,
+                    self.target.size,
+                )
+                .map_err(|error| self.descriptors.runtime.health().record(error))?,
             ))
         } else {
-            None
+            Ok(None)
         }
     }
 }
@@ -231,6 +213,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         target: T,
         measure_gpu: bool,
     ) -> Result<Self, Error> {
+        descriptors.runtime.check_health()?;
         if target.width() > descriptors.limits.max_texture_dimension_2d
             || target.height() > descriptors.limits.max_texture_dimension_2d
         {
@@ -249,9 +232,9 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             target.width(),
             target.height(),
             target.format(),
-        );
+        )?;
 
-        let budget = crate::idle_pool::Budget::new(Some(crate::idle_pool::IDLE_LIMIT));
+        let budget = crate::idle_pool::Budget::with_runtime(&descriptors.runtime);
         let offscreen_buffer_pool = BufferPool::new(
             budget.clone(),
             1,
@@ -266,8 +249,8 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             }),
         );
 
-        let chunk_buffers = ChunkBuffers::new(&descriptors);
-        let active_frame = ActiveFrame::new(&descriptors, budget.clone());
+        let chunk_buffers = ChunkBuffers::new(&descriptors)?;
+        let active_frame = ActiveFrame::new(&descriptors, budget.clone())?;
 
         let profiler_settings = GpuProfilerSettings {
             enable_timer_queries: cfg!(feature = "profile-with-tracy")
@@ -289,13 +272,19 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         #[cfg(not(feature = "profile-with-tracy"))]
         let profiler = GpuProfiler::new(&descriptors.device, profiler_settings)?;
 
+        let bitmap_residency = crate::bitmap_residency::BitmapResidency::with_runtime(
+            &descriptors.runtime,
+            descriptors.runtime.config().cache_limit,
+        );
+        descriptors.runtime.check_health()?;
         Ok(Self {
             budget: budget.clone(),
             descriptors,
             target,
             surface,
             meshes: Vec::new(),
-            shape_tessellator: ShapeTessellator::new(),
+            small_meshes: Default::default(),
+            preparation_generation: crate::prepare::PreparationGeneration::default(),
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(budget.clone()),
             offscreen_texture_pool: TexturePool::new(budget),
@@ -303,9 +292,8 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             chunk_buffers,
             active_frame,
             profiler,
-            bitmap_residency: Some(crate::bitmap_residency::BitmapResidency::new(
-                DEFAULT_IMMUTABLE_BITMAP_CACHE_LIMIT,
-            )),
+            last_submission: None,
+            bitmap_residency: Some(Arc::new(bitmap_residency)),
         })
     }
 
@@ -313,23 +301,36 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
     /// writable bitmaps are separate owners and are not constrained by this cache.
     /// A zero or absent limit disables the cache for focused renderer tests.
     pub fn set_immutable_bitmap_cache_limit(&mut self, limit: Option<u64>) {
-        self.bitmap_residency = limit
-            .filter(|limit| *limit > 0)
-            .map(crate::bitmap_residency::BitmapResidency::new);
+        self.bitmap_residency = limit.filter(|limit| *limit > 0).map(|limit| {
+            Arc::new(crate::bitmap_residency::BitmapResidency::with_runtime(
+                &self.descriptors.runtime,
+                limit,
+            ))
+        });
     }
 
-    fn register_shape_internal(
+    pub(crate) fn register_prepared_shape(
         &mut self,
-        shape: DistilledShape,
+        prepared: crate::prepare::mesh::PreparedMesh,
+        shape_id: swf::CharacterId,
         bitmap_source: &dyn BitmapSource,
-        scale: f32,
-    ) -> Mesh {
-        let shape_id = shape.id;
-        let lyon_mesh =
-            self.shape_tessellator
-                .tessellate_shape_with_scale(shape, bitmap_source, scale);
-
-        let mut draws = Vec::with_capacity(lyon_mesh.draws.len());
+        owner: crate::gpu_runtime::ResourceOwner,
+    ) -> Result<Arc<Mesh>, crate::gpu_runtime::RenderFailure> {
+        let key = crate::mesh::SmallMeshCache::key(&prepared);
+        if let Some(key) = &key
+            && let Some(mesh) = self.small_meshes.get(key)
+        {
+            self.descriptors.runtime.check_health()?;
+            return Ok(mesh);
+        }
+        let device = self.descriptors.device.with_owner(owner);
+        let retainable = !prepared
+            .draws
+            .iter()
+            .any(|d| matches!(d.draw_type, ruffle_render::tessellator::DrawType::Bitmap(_)));
+        let gradient_count = prepared.gradients.len();
+        let bounds = prepared.bounds;
+        let mut draws = Vec::with_capacity(prepared.draws.len());
         let mut uniform_buffer = BufferBuilder::new(
             &self.descriptors.limits,
             self.descriptors.limits.min_uniform_buffer_offset_alignment,
@@ -337,17 +338,18 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         let mut vertex_buffer = BufferBuilder::new(&self.descriptors.limits, 0);
         let mut index_buffer = BufferBuilder::new(&self.descriptors.limits, 0);
         let mut indices_so_far = 0;
-        let mut gradients = Vec::with_capacity(lyon_mesh.gradients.len());
+        let mut gradients = Vec::with_capacity(prepared.gradients.len());
 
-        for gradient in lyon_mesh.gradients {
+        for gradient in prepared.gradients {
             gradients.push(CommonGradient::new(
                 &self.descriptors,
+                &device,
                 gradient,
                 &mut uniform_buffer,
-            ));
+            )?);
         }
 
-        for draw in lyon_mesh.draws {
+        for draw in prepared.draws {
             let draw_id = draws.len();
             if let Some(draw) = PendingDraw::new(
                 self,
@@ -358,79 +360,183 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                 &mut vertex_buffer,
                 &mut index_buffer,
                 &mut indices_so_far,
-            ) {
+            )? {
                 draws.push(draw);
             }
         }
 
-        let uniform_buffer = uniform_buffer.finish(
-            &self.descriptors.device,
-            create_debug_label!("Shape {} uniforms", shape_id),
-            wgpu::BufferUsages::UNIFORM,
-        );
-        let vertex_buffer = vertex_buffer.finish(
-            &self.descriptors.device,
-            create_debug_label!("Shape {} vertices", shape_id),
-            wgpu::BufferUsages::VERTEX,
-        );
-        let index_buffer = index_buffer.finish(
-            &self.descriptors.device,
-            create_debug_label!("Shape {} indices", shape_id),
-            wgpu::BufferUsages::INDEX,
-        );
+        // Immutable sections share one allocation and lease. Uniform offsets
+        // keep their original alignment; draw ranges select the vertex/index
+        // sections. Avoid two extra scoped creations for every small shape.
+        let packed_indices = uniform_buffer.len().checked_add(vertex_buffer.len());
+        let packed_size = packed_indices.and_then(|start| start.checked_add(index_buffer.len()));
+        let packed = packed_indices
+            .zip(packed_size)
+            .filter(|(index_start, bytes)| {
+                uniform_buffer.len().is_multiple_of(4)
+                    && index_start.is_multiple_of(4)
+                    && *bytes as u64 <= self.descriptors.limits.max_buffer_size
+                    && u32::try_from(*index_start / 4)
+                        .ok()
+                        .and_then(|base| base.checked_add(indices_so_far))
+                        .is_some()
+            });
+        let (uniform_buffer, vertex_buffer, index_buffer, storage_bytes) =
+            if let Some((index_start, _)) = packed {
+                let vertex_start = uniform_buffer.len() as u64;
+                let index_start = (index_start / 4) as u32;
+                let mut packed = uniform_buffer;
+                let invalid = |_| {
+                    crate::gpu_runtime::RenderFailure::new(
+                        crate::gpu_runtime::RenderFailureKind::Internal,
+                        "checked immutable mesh sections no longer fit",
+                    )
+                };
+                packed.append_section(&vertex_buffer).map_err(invalid)?;
+                packed.append_section(&index_buffer).map_err(invalid)?;
+                for draw in &mut draws {
+                    draw.vertices.start += vertex_start;
+                    draw.vertices.end += vertex_start;
+                    draw.index_offset += index_start;
+                }
+                let buffer = packed.finish(
+                    &device,
+                    create_debug_label!("Shape {} storage", shape_id),
+                    wgpu::BufferUsages::UNIFORM
+                        | wgpu::BufferUsages::VERTEX
+                        | wgpu::BufferUsages::INDEX,
+                )?;
+                let bytes = buffer.size();
+                (buffer.clone(), buffer.clone(), buffer, bytes)
+            } else {
+                // A legal mesh can exceed the device's single-buffer limit in
+                // aggregate. Choose separate storage before any allocation or
+                // writes; allocation failures themselves are never retried here.
+                let uniforms = uniform_buffer.finish(
+                    &device,
+                    create_debug_label!("Shape {} uniforms", shape_id),
+                    wgpu::BufferUsages::UNIFORM,
+                )?;
+                let vertices = vertex_buffer.finish(
+                    &device,
+                    create_debug_label!("Shape {} vertices", shape_id),
+                    wgpu::BufferUsages::VERTEX,
+                )?;
+                let indices = index_buffer.finish(
+                    &device,
+                    create_debug_label!("Shape {} indices", shape_id),
+                    wgpu::BufferUsages::INDEX,
+                )?;
+                let bytes = uniforms.size() + vertices.size() + indices.size();
+                (uniforms, vertices, indices, bytes)
+            };
 
-        let draws = draws
+        let draws: Vec<_> = draws
             .into_iter()
             .map(|d| d.finish(&self.descriptors, &uniform_buffer, &gradients))
-            .collect();
+            .collect::<Result<_, _>>()?;
 
-        let allocation = ruffle_render::profile::GpuMesh::new(
-            uniform_buffer.size() + vertex_buffer.size() + index_buffer.size(),
-        );
+        let allocation = ruffle_render::profile::GpuMesh::new(storage_bytes);
 
-        Mesh {
+        let retained_bytes = retainable.then_some(()).and_then(|()| {
+            crate::mesh::retained_mesh_bytes(storage_bytes, gradient_count, draws.capacity())
+        });
+        let mesh = Arc::new(Mesh {
+            retained_bytes,
+            bounds,
             draws,
             vertex_buffer,
             index_buffer,
             _allocation: allocation,
+        });
+        if let Some(key) = key {
+            self.small_meshes.insert(key, &mesh);
         }
+        Ok(mesh)
     }
 
-    fn clamp_bitmap(&self, bitmap: &mut Bitmap) -> bool {
+    fn prepare_commands(
+        &mut self,
+        commands: &CommandList,
+        width: u32,
+        height: u32,
+        quality: StageQuality,
+        format: wgpu::TextureFormat,
+        load: crate::pass_graph::Load,
+    ) -> Result<crate::graph_encoder::GraphEncoder, crate::gpu_runtime::RenderFailure> {
+        let samples = crate::utils::supported_sample_count(
+            &self.descriptors.adapter,
+            quality.sample_count(),
+            format,
+        );
+        crate::graph_encoder::GraphEncoder::prepare(
+            self,
+            commands,
+            ruffle_render::region::RenderRect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            samples,
+            load,
+        )
+    }
+
+    fn validate_bitmap_size(
+        &self,
+        bitmap: &Bitmap<'_>,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
         let max_size = self.descriptors.limits.max_texture_dimension_2d;
-        if bitmap.width() > max_size || bitmap.height() > max_size {
-            let image =
-                image::RgbaImage::from_raw(bitmap.width(), bitmap.height(), bitmap.data().to_vec())
-                    .expect("Width and height of bitmap must match bitmap data");
-
-            let ratio = bitmap.width() as f32 / bitmap.height() as f32;
-            let mut width = bitmap.width();
-            let mut height = bitmap.height();
-            if width > max_size {
-                width = max_size;
-                height = (max_size as f32 / ratio) as u32;
-            }
-            if height > max_size {
-                height = max_size;
-                width = (max_size as f32 * ratio) as u32;
-            }
-            let resized = image::imageops::resize(&image, width, height, FilterType::CatmullRom);
-            *bitmap = Bitmap::new(width, height, BitmapFormat::Rgba, resized.into_raw());
-            true
-        } else {
-            false
+        if bitmap.width() == 0
+            || bitmap.height() == 0
+            || bitmap.width() > max_size
+            || bitmap.height() > max_size
+        {
+            return Err(self.descriptors.runtime.health().record(
+                crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Validation,
+                    "bitmap dimensions exceed device limits",
+                ),
+            ));
         }
+        Ok(())
     }
 
+    /// Collect completed timestamp queries without blocking or inventing missing samples.
+    pub fn collect_gpu_samples(&mut self) {
+        if ruffle_render::profile::enabled() {
+            ruffle_render::profile::record_native_resources(
+                self.descriptors.runtime.diagnostic_snapshot(),
+            );
+        }
+        let timestamp_period = self.descriptors.queue.get_timestamp_period();
+        while let Some(queries) = self.profiler.process_finished_frame(timestamp_period) {
+            if let Some(sample) = crate::gpu_metrics::sample_queries(&queries) {
+                ruffle_render::profile::record_gpu_sample(sample);
+            }
+        }
+    }
     pub fn descriptors(&self) -> &Arc<Descriptors> {
         &self.descriptors
+    }
+
+    pub fn sample_count(&self) -> u32 {
+        self.surface.sample_count()
+    }
+    pub fn quality(&self) -> StageQuality {
+        self.surface.quality()
+    }
+
+    pub fn last_submission(&self) -> Option<SubmissionIndex> {
+        self.last_submission.clone()
     }
 
     pub fn target(&self) -> &T {
         &self.target
     }
 
-    pub fn device(&self) -> &wgpu::Device {
+    pub fn device(&self) -> &crate::gpu_resources::Device {
         &self.descriptors.device
     }
 
@@ -477,24 +583,30 @@ enum WgpuPixelBenderPending {
 }
 
 impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
-    fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions) {
-        // Avoid panics from creating 0-sized framebuffers.
-        // TODO: find a way to bubble an error when the size is too large
-        let width = std::cmp::max(
-            std::cmp::min(
-                dimensions.width,
-                self.descriptors.limits.max_texture_dimension_2d,
-            ),
-            1,
-        );
-        let height = std::cmp::max(
-            std::cmp::min(
-                dimensions.height,
-                self.descriptors.limits.max_texture_dimension_2d,
-            ),
-            1,
-        );
-        self.target.resize(&self.descriptors.device, width, height);
+    fn health(&self) -> &ruffle_render::error::RendererHealth {
+        self.descriptors.runtime.health()
+    }
+
+    fn set_viewport_dimensions(
+        &mut self,
+        dimensions: ViewportDimensions,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.preparation_generation.invalidate();
+        self.descriptors.runtime.check_health()?;
+        if dimensions.width > self.descriptors.limits.max_texture_dimension_2d
+            || dimensions.height > self.descriptors.limits.max_texture_dimension_2d
+        {
+            return Err(self.descriptors.runtime.health().record(
+                crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Validation,
+                    "viewport exceeds device texture limits",
+                ),
+            ));
+        }
+        let width = dimensions.width.max(1);
+        let height = dimensions.height.max(1);
+        self.target
+            .resize(&self.descriptors.device, width, height)?;
 
         self.surface = Surface::new(
             &self.descriptors,
@@ -502,20 +614,25 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             width,
             height,
             self.target.format(),
-        );
+        )?;
 
         self.viewport_scale_factor = dimensions.scale_factor;
         self.texture_pool = TexturePool::new(self.budget.clone());
+
+        self.descriptors.runtime.check_health()?;
+        Ok(())
     }
 
     fn create_context3d(
         &mut self,
         profile: Context3DProfile,
     ) -> Result<Box<dyn Context3D>, BitmapError> {
+        self.descriptors.runtime.check_health()?;
+        self.descriptors.runtime.check_health()?;
         Ok(Box::new(WgpuContext3D::new(
             self.descriptors.clone(),
             profile,
-        )))
+        )?))
     }
 
     fn debug_info(&self) -> Cow<'static, str> {
@@ -544,30 +661,29 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     }
 
     fn name(&self) -> &'static str {
-        if cfg!(target_family = "wasm") {
-            let info = self.descriptors.adapter.get_info();
-            if info.backend == wgpu::Backend::BrowserWebGpu {
-                "webgpu"
-            } else {
-                "wgpu-webgl"
-            }
-        } else {
-            "wgpu"
-        }
+        "wgpu"
     }
 
     fn stage_sample_count(&self) -> u32 {
         self.surface.sample_count()
     }
 
-    fn set_quality(&mut self, quality: StageQuality) {
+    fn set_quality(
+        &mut self,
+        quality: StageQuality,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.preparation_generation.invalidate();
+        self.descriptors.runtime.check_health()?;
         self.surface = Surface::new(
             &self.descriptors,
             quality,
             self.surface.size().width,
             self.surface.size().height,
             self.target.format(),
-        );
+        )?;
+
+        self.descriptors.runtime.check_health()?;
+        Ok(())
     }
 
     fn viewport_dimensions(&self) -> ViewportDimensions {
@@ -583,9 +699,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         &mut self,
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
-    ) -> ShapeHandle {
-        let mesh = self.register_shape_internal(shape, bitmap_source, 1.0);
-        ShapeHandle(Arc::new(mesh))
+    ) -> Result<ShapeHandle, crate::gpu_runtime::RenderFailure> {
+        self.register_shape_with_scale(shape, bitmap_source, 1.0)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -594,9 +709,29 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
         scale: f32,
-    ) -> ShapeHandle {
-        let mesh = self.register_shape_internal(shape, bitmap_source, scale);
-        ShapeHandle(Arc::new(mesh))
+    ) -> Result<ShapeHandle, crate::gpu_runtime::RenderFailure> {
+        self.descriptors.runtime.check_health()?;
+        let geometry = Arc::new(ruffle_render::shape_utils::OwnedDistilledShape::from(shape));
+        let mut bitmaps = crate::shape_recipe::FrozenBitmapSource::default();
+        for id in geometry.bitmap_ids() {
+            if let std::collections::hash_map::Entry::Vacant(entry) = bitmaps.0.entry(id) {
+                if let Some(size) = bitmap_source.bitmap_size(id) {
+                    entry.insert((size, bitmap_source.bitmap_handle(id, self)));
+                }
+            }
+        }
+        self.descriptors.runtime.check_health()?;
+        Ok(ShapeHandle(Arc::new(crate::shape_recipe::ShapeRecipe {
+            owner: self
+                .descriptors
+                .runtime
+                .issue_owner(crate::gpu_runtime::OwnerKind::Graphic)?,
+            device_generation: self.descriptors.runtime.generation(),
+            mesh: Default::default(),
+            geometry: std::cell::RefCell::new(Some(geometry)),
+            bitmaps,
+            scale,
+        })))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -605,103 +740,167 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         clear: Color,
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
-    ) {
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.descriptors.runtime.check_health()?;
         let _render_backend =
             ruffle_render::profile::time(ruffle_render::profile::Phase::RenderBackend);
-        let Some(frame_output) = self.target.get_next_texture() else {
+        let frame_output = {
+            let _timer = ruffle_render::profile::native_time(
+                ruffle_render::profile::NativePhase::SurfaceAcquire,
+            );
+            self.target.get_next_texture()?
+        };
+        let Some(frame_output) = frame_output else {
             // Attempt to recreate the swap chain in this case.
             self.target.resize(
                 &self.descriptors.device,
                 self.target.width(),
                 self.target.height(),
-            );
-            return;
+            )?;
+            return Ok(());
         };
 
         for entry in cache_entries {
-            let texture = as_texture(&entry.handle);
+            let prepared = crate::render_snapshot::PreparedSnapshot::capture(&entry.commands)?;
+            let cache =
+                (&*entry.handle.0 as &dyn Any).downcast_ref::<crate::bitmap_cache::CacheImage>();
+            let texture = as_texture(&entry.handle, &self.descriptors.device)?;
+            let valid = ruffle_render::region::RenderRect {
+                x: 0,
+                y: 0,
+                width: texture.texture.width(),
+                height: texture.texture.height(),
+            };
+            let (dirty, history) = if let Some(cache) = cache {
+                cache.prepare_redraw(
+                    &prepared.snapshot,
+                    entry.clear,
+                    self.surface.quality(),
+                    &entry.filters,
+                    self.descriptors.runtime.scheduler(),
+                )
+            } else {
+                (ruffle_render::region::RenderRegion::Full, None)
+            };
+            let Some(dirty) = dirty.clip(valid) else {
+                if let Some(cache) = cache {
+                    cache.finish_redraw(history);
+                }
+                continue;
+            };
+            let (input, output) = crate::bitmap_cache::filter_regions(dirty, valid, &entry.filters);
+            let partial = input != valid;
             let surface = Surface::new(
                 &self.descriptors,
                 self.surface.quality(),
-                texture.texture.width(),
-                texture.texture.height(),
+                input.width,
+                input.height,
                 wgpu::TextureFormat::Rgba8Unorm,
-            );
-            if entry.filters.is_empty() {
-                surface.draw_commands(
-                    RenderTargetMode::ExistingWithColor(
-                        texture.texture.clone(),
-                        wgpu::Color {
-                            r: f64::from(entry.clear.r) / 255.0,
-                            g: f64::from(entry.clear.g) / 255.0,
-                            b: f64::from(entry.clear.b) / 255.0,
-                            a: f64::from(entry.clear.a) / 255.0,
-                        },
-                    ),
-                    &self.descriptors,
-                    &self.meshes,
-                    entry.commands,
-                    &mut self.active_frame.staging_belt,
-                    &mut self.chunk_buffers,
-                    &mut self
-                        .profiler
-                        .scope("Draw to CAB", self.active_frame.command_encoder.record()),
-                    LayerRef::None,
-                    &mut self.offscreen_texture_pool,
-                );
+            )?
+            .with_origin([input.x, input.y]);
+            let graph = crate::graph_encoder::GraphEncoder::from_prepared(
+                self,
+                prepared,
+                input,
+                surface.sample_count(),
+                crate::pass_graph::Load::Clear(entry.clear),
+            )?;
+            let commands = graph.into_commands()?;
+            ruffle_render::profile::work(|w| {
+                w.offscreen_targets += 1;
+                w.offscreen_pixels += u64::from(input.width) * u64::from(input.height);
+            });
+            let color = wgpu::Color {
+                r: f64::from(entry.clear.r) / 255.0,
+                g: f64::from(entry.clear.g) / 255.0,
+                b: f64::from(entry.clear.b) / 255.0,
+                a: f64::from(entry.clear.a) / 255.0,
+            };
+            let mode = if partial {
+                RenderTargetMode::FreshWithColor(color)
             } else {
-                let mut scope = self
-                    .profiler
-                    .scope("Filters", self.active_frame.command_encoder.record());
-                // We're relying on there being no impotent filters here,
-                // so that we can safely start by using the actual CAB texture.
-                // It's guaranteed that at least one filter would have used it and moved the target to something else,
-                // letting us safely copy back to it later.
-                let mut target = surface.draw_commands(
-                    RenderTargetMode::ExistingWithColor(
-                        texture.texture.clone(),
-                        wgpu::Color {
-                            r: f64::from(entry.clear.r) / 255.0,
-                            g: f64::from(entry.clear.g) / 255.0,
-                            b: f64::from(entry.clear.b) / 255.0,
-                            a: f64::from(entry.clear.a) / 255.0,
-                        },
-                    ),
+                RenderTargetMode::ExistingWithColor(texture.texture.clone(), color)
+            };
+            let mut scope = self
+                .profiler
+                .scope("Draw to CAB", self.active_frame.command_encoder.record());
+            let mut target = surface.draw_commands(
+                mode,
+                &self.descriptors,
+                &self.meshes,
+                commands,
+                &mut self.active_frame.staging_belt,
+                &mut self.chunk_buffers,
+                &mut scope,
+                LayerRef::None,
+                &mut self.offscreen_texture_pool,
+            )?;
+            let filtered = !entry.filters.is_empty();
+            if filtered {
+                target = self.descriptors.filters.apply_chain(
                     &self.descriptors,
-                    &self.meshes,
-                    entry.commands,
-                    &mut self.active_frame.staging_belt,
-                    &mut self.chunk_buffers,
-                    &mut scope.scope("Draw to CAB"),
-                    LayerRef::None,
+                    &mut scope.scope("Filter chain"),
                     &mut self.offscreen_texture_pool,
+                    &mut self.active_frame.staging_belt,
+                    FilterSource::for_entire_texture(target.color_texture()),
+                    entry.filters,
+                )?;
+            }
+            if partial {
+                scope.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: target.color_texture(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: output.x - input.x,
+                            y: output.y - input.y,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: output.x,
+                            y: output.y,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: output.width,
+                        height: output.height,
+                        depth_or_array_layers: 1,
+                    },
                 );
-                for filter in entry.filters {
-                    target = self.descriptors.filters.apply(
-                        &self.descriptors,
-                        &mut scope.scope(filter.name()),
-                        &mut self.offscreen_texture_pool,
-                        &mut self.active_frame.staging_belt,
-                        FilterSource::for_entire_texture(target.color_texture()),
-                        filter,
-                    );
-                }
+            } else if filtered {
                 run_copy_pipeline(
                     &self.descriptors,
                     texture.texture.format(),
-                    &texture.texture.create_view(&Default::default()),
+                    &texture.texture.create_view(&Default::default())?,
                     target.color_view(),
                     target.color_texture().sample_count(),
                     &mut scope.scope("Copy filtered to CAB"),
-                );
+                )?;
             }
-            // Periodically flush GPU work to prevent OOM when many cache entries
-            // accumulate (e.g. when a large container's cacheAsBitmap is skipped
-            // but its hundreds of children each have their own bitmap caches).
-            self.active_frame.maybe_flush(&self.descriptors);
+            drop(scope);
+            crate::record_bitmap_write(&entry.handle)?;
+            if let Some(cache) = cache {
+                cache.finish_redraw(history);
+            }
+            self.active_frame.maybe_flush(&self.descriptors)?;
         }
 
-        self.surface.draw_commands_and_copy_to(
+        let graph = self.prepare_commands(
+            &commands,
+            self.target.width(),
+            self.target.height(),
+            self.surface.quality(),
+            self.target.format(),
+            crate::pass_graph::Load::Clear(clear),
+        )?;
+        self.surface.draw_graph_and_copy_to(
             frame_output.view(),
             RenderTargetMode::FreshWithColor(wgpu::Color {
                 r: f64::from(clear.r) / 255.0,
@@ -719,115 +918,54 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 self.active_frame.command_encoder.record(),
             ),
             &self.meshes,
-            commands,
+            graph,
             LayerRef::None,
             &mut self.texture_pool,
-        );
+        )?;
         self.profiler
             .resolve_queries(self.active_frame.command_encoder.record());
         self.active_frame.staging_belt.finish();
 
-        self.active_frame
-            .submit_for_target(&self.descriptors, &self.target, frame_output);
+        self.last_submission = Some(self.active_frame.submit_for_target(
+            &self.descriptors,
+            &self.target,
+            frame_output,
+        )?);
         let (idle, peak, combined) = self.budget.stats();
         ruffle_render::profile::pool(idle, peak, combined);
         self.texture_pool.end_frame();
         self.offscreen_texture_pool.end_frame();
         self.profiler
             .end_frame()
-            .expect("Frame should end successfully");
-        let timestamp_period = self.descriptors.queue.get_timestamp_period();
+            .map_err(|error| self.descriptors.runtime.health().record(error.into()))?;
         ruffle_render::profile::submitted();
-        if let Some(queries) = self.profiler.process_finished_frame(timestamp_period) {
-            let mut ranges = queries.iter().filter_map(|q| q.time.as_ref());
-            if let Some(first) = ranges.next() {
-                let (lo, hi) = ranges.fold((first.start, first.end), |(a, b), t| {
-                    (a.min(t.start), b.max(t.end))
-                });
-                let frame = queries
-                    .iter()
-                    .find_map(|q| q.label.strip_prefix("Stage ")?.parse().ok());
-                ruffle_render::profile::record_gpu(((hi - lo) * 1e9) as u64, frame);
-            }
-        }
+        self.collect_gpu_samples();
+
+        self.descriptors.runtime.check_health()?;
+        Ok(())
     }
 
     #[instrument(level = "debug", skip_all)]
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, BitmapError> {
-        let _upload = ruffle_render::profile::time(ruffle_render::profile::Phase::Upload);
-        let mut bitmap = bitmap.to_rgba();
-
-        self.clamp_bitmap(&mut bitmap);
-
-        let extent = wgpu::Extent3d {
-            width: bitmap.width(),
-            height: bitmap.height(),
-            depth_or_array_layers: 1,
-        };
-
-        let texture_label = create_debug_label!("Bitmap");
-        let texture = self
-            .descriptors
-            .device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: texture_label.as_deref(),
-                size: extent,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::COPY_SRC,
-            });
-
-        ruffle_render::profile::uploaded(u64::from(extent.width) * u64::from(extent.height) * 4);
-        self.descriptors.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: Default::default(),
-                aspect: wgpu::TextureAspect::All,
-            },
-            bitmap.data(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * extent.width),
-                rows_per_image: None,
-            },
-            extent,
-        );
-
-        let handle = BitmapHandle(Arc::new(Texture {
-            _allocation: ruffle_render::profile::GpuBitmap::new(
-                u64::from(texture.width())
-                    * u64::from(texture.height())
-                    * u64::from(texture.format().block_copy_size(None).unwrap_or(4)),
-            ),
-            view: texture.create_view(&Default::default()),
-            texture,
-            repeating_linear: Default::default(),
-            repeating_nearest: Default::default(),
-            clamped_linear: Default::default(),
-            clamped_nearest: Default::default(),
-            copy_count: Cell::new(0),
-        }));
-
-        Ok(handle)
+        self.descriptors.runtime.check_health()?;
+        let bitmap = bitmap.to_rgba();
+        self.validate_bitmap_size(&bitmap)?;
+        Ok(BitmapHandle(crate::bitmap_recipe::BitmapRecipe::new(
+            bitmap,
+            &self.descriptors.device,
+        )?))
     }
 
     fn cache_immutable_bitmap(&mut self, bitmap: &BitmapHandle) -> bool {
-        let Some(cache) = &mut self.bitmap_residency else {
+        let Some(cache) = &self.bitmap_residency else {
             return false;
         };
-        let texture = as_texture(bitmap);
-        let bytes = u64::from(texture.texture.width())
-            * u64::from(texture.texture.height())
-            * u64::from(texture.texture.format().block_copy_size(None).unwrap_or(4));
-        cache.retain(bitmap, bytes);
-        ruffle_render::profile::record_bitmap_residency(cache.stats());
+        let Some(recipe) =
+            (&*bitmap.0 as &dyn Any).downcast_ref::<crate::bitmap_recipe::BitmapRecipe>()
+        else {
+            return false;
+        };
+        recipe.retain_in(cache);
         true
     }
 
@@ -836,23 +974,28 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         &mut self,
         handle: &BitmapHandle,
         bitmap: Bitmap<'_>,
-        mut region: PixelRegion,
+        region: PixelRegion,
     ) -> Result<(), BitmapError> {
+        self.descriptors.runtime.check_health()?;
         if region.width() == 0 || region.height() == 0 {
             // Nothing to do. It's important to bail out now, as the
             // write_texture call panics when the source buffer is of zero size.
             return Ok(());
         }
 
-        let texture = as_texture(handle);
+        if let Some(recipe) =
+            (&*handle.0 as &dyn Any).downcast_ref::<crate::bitmap_recipe::BitmapRecipe>()
+        {
+            if recipe.is_resident() && self.active_frame.command_encoder.dirty {
+                self.active_frame.submit_direct(&self.descriptors)?;
+            }
+            return Ok(recipe.update(bitmap.to_rgba(), region)?);
+        }
+        let texture = as_texture(handle, &self.descriptors.device)?;
 
         let _upload = ruffle_render::profile::time(ruffle_render::profile::Phase::Upload);
-        let mut bitmap = bitmap.to_rgba();
-        if self.clamp_bitmap(&mut bitmap) {
-            // If we're updating a resized texture, just redo the whole thing.
-            // We can't trivially map pixel regions as we use a filter to resize.
-            region = PixelRegion::for_whole_size(bitmap.width(), bitmap.height());
-        }
+        let bitmap = bitmap.to_rgba();
+        self.validate_bitmap_size(&bitmap)?;
 
         let extent = wgpu::Extent3d {
             width: region.width(),
@@ -861,7 +1004,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         };
 
         if self.active_frame.command_encoder.dirty {
-            self.active_frame.submit_direct(&self.descriptors);
+            self.active_frame.submit_direct(&self.descriptors)?;
         }
         ruffle_render::profile::uploaded(u64::from(extent.width) * u64::from(extent.height) * 4);
         self.descriptors.queue.write_texture(
@@ -883,8 +1026,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 rows_per_image: None,
             },
             extent,
-        );
+        )?;
 
+        crate::record_bitmap_write(handle)?;
+        self.descriptors.runtime.check_health()?;
         Ok(())
     }
 
@@ -895,16 +1040,16 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         destination: BitmapHandle,
         destination_region: PixelRegion,
     ) -> Result<Option<Box<dyn SyncHandle>>, BitmapError> {
-        if source == destination
-            || source_region.is_empty()
+        self.descriptors.runtime.check_health()?;
+        if source_region.is_empty()
             || source_region.width() != destination_region.width()
             || source_region.height() != destination_region.height()
         {
             return Ok(None);
         }
 
-        let source_texture = as_texture(&source);
-        let destination_texture = as_texture(&destination);
+        let source_texture = as_texture(&source, &self.descriptors.device)?;
+        let destination_texture = as_texture(&destination, &self.descriptors.device)?;
         if source_region.x_max > source_texture.texture.width()
             || source_region.y_max > source_texture.texture.height()
             || destination_region.x_max > destination_texture.texture.width()
@@ -913,7 +1058,14 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             return Ok(None);
         }
 
+        if source_texture.texture.format() != wgpu::TextureFormat::Rgba8Unorm
+            || destination_texture.texture.format() != wgpu::TextureFormat::Rgba8Unorm
+        {
+            return Ok(None);
+        }
+
         let target = TextureTarget {
+            cached_view: None,
             size: wgpu::Extent3d {
                 width: destination_texture.texture.width(),
                 height: destination_texture.texture.height(),
@@ -924,38 +1076,19 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             buffer: None,
         };
 
-        self.active_frame
-            .command_encoder
-            .record()
-            .copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &source_texture.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: source_region.x_min,
-                        y: source_region.y_min,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &destination_texture.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: destination_region.x_min,
-                        y: destination_region.y_min,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: source_region.width(),
-                    height: source_region.height(),
-                    depth_or_array_layers: 1,
-                },
-            );
+        crate::transfers::copy(
+            &self.descriptors,
+            &mut self.offscreen_texture_pool,
+            self.active_frame.command_encoder.record(),
+            &source,
+            source_region,
+            &destination,
+            destination_region,
+        )?;
 
-        self.active_frame.maybe_flush(&self.descriptors);
+        crate::record_bitmap_write(&destination)?;
+        self.active_frame.maybe_flush(&self.descriptors)?;
+        self.descriptors.runtime.check_health()?;
         Ok(Some(self.make_queue_sync_handle(
             target,
             None,
@@ -971,8 +1104,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         commands: CommandList,
         quality: StageQuality,
         bounds: PixelRegion,
-    ) -> Option<Box<dyn SyncHandle>> {
-        let texture = as_texture(&handle);
+    ) -> Result<Option<Box<dyn SyncHandle>>, BitmapError> {
+        self.descriptors.runtime.check_health()?;
+        let texture = as_texture(&handle, &self.descriptors.device)?;
 
         let extent = wgpu::Extent3d {
             width: texture.texture.width(),
@@ -981,15 +1115,22 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         };
 
         let mut target = TextureTarget {
+            cached_view: None,
             size: extent,
             texture: texture.texture.clone(),
             format: wgpu::TextureFormat::Rgba8Unorm,
             buffer: None,
         };
 
-        let frame_output = target
-            .get_next_texture()
-            .expect("TextureTargetFrame.get_next_texture is infallible");
+        let frame_output = target.get_next_texture()?.ok_or_else(|| {
+            self.descriptors
+                .runtime
+                .health()
+                .record(crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Internal,
+                    "texture target returned no attachment",
+                ))
+        })?;
 
         let surface = Surface::new(
             &self.descriptors,
@@ -997,8 +1138,16 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             texture.texture.width(),
             texture.texture.height(),
             wgpu::TextureFormat::Rgba8Unorm,
-        );
-        surface.draw_commands_and_copy_to(
+        )?;
+        let graph = self.prepare_commands(
+            &commands,
+            extent.width,
+            extent.height,
+            quality,
+            wgpu::TextureFormat::Rgba8Unorm,
+            crate::pass_graph::Load::Load,
+        )?;
+        surface.draw_graph_and_copy_to(
             frame_output.view(),
             RenderTargetMode::FreshWithTexture(target.get_texture()),
             &self.descriptors,
@@ -1009,13 +1158,17 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 self.active_frame.command_encoder.record(),
             ),
             &self.meshes,
-            commands,
+            graph,
             LayerRef::Current,
             &mut self.offscreen_texture_pool,
-        );
+        )?;
 
-        self.active_frame.maybe_flush(&self.descriptors);
-        Some(self.make_queue_sync_handle(target, None, handle, bounds))
+        crate::record_bitmap_write(&handle)?;
+        self.active_frame.maybe_flush(&self.descriptors)?;
+        self.descriptors.runtime.check_health()?;
+        Ok(Some(
+            self.make_queue_sync_handle(target, None, handle, bounds),
+        ))
     }
 
     fn is_filter_supported(&self, filter: &Filter) -> bool {
@@ -1043,9 +1196,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         destination: BitmapHandle,
         dest_point: (i32, i32),
         filter: Filter,
-    ) -> Option<Box<dyn SyncHandle>> {
-        let source_texture = as_texture(&source);
-        let dest_texture = as_texture(&destination);
+    ) -> Result<Option<Box<dyn SyncHandle>>, BitmapError> {
+        self.descriptors.runtime.check_health()?;
+        let source_texture = as_texture(&source, &self.descriptors.device)?;
+        let dest_texture = as_texture(&destination, &self.descriptors.device)?;
 
         let copy_area = PixelRegion::for_whole_size(
             dest_texture.texture.width(),
@@ -1053,6 +1207,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         );
 
         let target = TextureTarget {
+            cached_view: None,
             size: wgpu::Extent3d {
                 width: dest_texture.texture.width(),
                 height: dest_texture.texture.height(),
@@ -1074,7 +1229,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 size: source_size,
             },
             filter,
-        );
+        )?;
 
         let (dest_x, dest_y) = dest_point;
 
@@ -1093,7 +1248,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         let copy_height = available_height.min(dest_available_height);
 
         if copy_width == 0 || copy_height == 0 {
-            return None;
+            return Ok(None);
         }
 
         self.active_frame
@@ -1127,14 +1282,22 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 },
             );
 
-        self.active_frame.maybe_flush(&self.descriptors);
-        Some(self.make_queue_sync_handle(target, None, destination, copy_area))
+        crate::record_bitmap_write(&destination)?;
+        self.active_frame.maybe_flush(&self.descriptors)?;
+        self.descriptors.runtime.check_health()?;
+        Ok(Some(self.make_queue_sync_handle(
+            target,
+            None,
+            destination,
+            copy_area,
+        )))
     }
 
     fn compile_pixelbender_shader(
         &mut self,
         shader: PixelBenderShader,
     ) -> Result<PixelBenderShaderHandle, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         self.compile_pixelbender_shader_impl(shader)
     }
 
@@ -1144,6 +1307,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         arguments: &[PixelBenderShaderArgument],
         target: &PixelBenderTarget,
     ) -> Result<PixelBenderOutput, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         let mut pending = self.submit_pixelbender_shader(shader, arguments, target)?;
         loop {
             if let Some(output) = self.poll_pixelbender_shader(&mut pending)? {
@@ -1153,10 +1317,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 .device
                 .poll(wgpu::PollType::Wait {
                     submission_index: None,
-                    timeout: None,
+                    timeout: Some(std::time::Duration::from_secs(2)),
                 })
-                .map_err(|_| {
-                    BitmapError::Unimplemented(Cow::Borrowed("Pixel Bender poll failed"))
+                .map_err(|error| {
+                    self.descriptors
+                        .runtime
+                        .health()
+                        .record(crate::utils::poll_failure(error))
                 })?;
         }
     }
@@ -1165,6 +1332,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         &mut self,
         pending: &mut PixelBenderPending,
     ) -> Result<Option<PixelBenderOutput>, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         let state =
             pending
                 .backend_mut::<WgpuPixelBenderPending>()
@@ -1186,16 +1354,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     let handle = sync_handle
                         .take()
                         .expect("Pixel Bender readback handle missing");
-                    *readback = Some(handle.prepare_async(&mut self.active_frame));
+                    *readback = Some(handle.prepare_async(&mut self.active_frame)?);
                     return Ok(None);
                 }
-                let Some((raw_pixels, buffer_width)) =
-                    readback.as_mut().unwrap().poll().map_err(|error| {
-                        BitmapError::Unimplemented(Cow::Owned(
-                            format!("Pixel Bender readback poll failed: {error}").into(),
-                        ))
-                    })?
-                else {
+                let Some((raw_pixels, buffer_width)) = readback.as_mut().unwrap().poll()? else {
                     return Ok(None);
                 };
                 let pixels = if buffer_width as usize
@@ -1231,6 +1393,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         arguments: &[PixelBenderShaderArgument],
         target: &PixelBenderTarget,
     ) -> Result<PixelBenderPending, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         let output_channels = shader
             .0
             .parsed_shader()
@@ -1252,9 +1415,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 // FIXME - cache this texture somehow. We might also want to consider using
                 // a compute shader
                 let texture_label = create_debug_label!("Temporary pixelbender output texture");
-                let texture = self
-                    .descriptors
-                    .device
+                let texture = crate::pixel_bender::as_cache_holder(&shader)
+                    .device()
                     .create_texture(&wgpu::TextureDescriptor {
                         label: texture_label.as_deref(),
                         size: extent,
@@ -1267,25 +1429,27 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             | wgpu::TextureUsages::COPY_DST
                             | wgpu::TextureUsages::RENDER_ATTACHMENT
                             | wgpu::TextureUsages::COPY_SRC,
-                    });
+                    })?;
                 BitmapHandle(Arc::new(Texture {
                     _allocation: ruffle_render::profile::GpuBitmap::new(
                         u64::from(texture.width())
                             * u64::from(texture.height())
                             * u64::from(texture.format().block_copy_size(None).unwrap_or(4)),
                     ),
-                    view: texture.create_view(&Default::default()),
+                    view: texture.create_view(&Default::default())?,
                     texture,
+                    batch_source: Default::default(),
                     repeating_linear: Default::default(),
                     repeating_nearest: Default::default(),
                     clamped_linear: Default::default(),
                     clamped_nearest: Default::default(),
-                    copy_count: Cell::new(0),
+                    copy_count: Default::default(),
+                    version: Default::default(),
                 }))
             }
         };
 
-        let target_texture = as_texture(&target_handle);
+        let target_texture = as_texture(&target_handle, &self.descriptors.device)?;
 
         let extent = wgpu::Extent3d {
             width: target_texture.texture.width(),
@@ -1301,7 +1465,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         let buffer_info = Some(TextureBufferInfo {
             buffer: MaybeOwnedBuffer::Borrowed(
                 self.offscreen_buffer_pool
-                    .take(&self.descriptors, copy_dimensions.clone()),
+                    .take(&self.descriptors, copy_dimensions.clone())?,
                 copy_dimensions,
             ),
             copy_area: PixelRegion::for_whole_size(
@@ -1311,15 +1475,22 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         });
 
         let mut texture_target = TextureTarget {
+            cached_view: None,
             size: extent,
             texture: target_texture.texture.clone(),
             format: target_texture.texture.format(),
             buffer: buffer_info,
         };
 
-        let frame_output = texture_target
-            .get_next_texture()
-            .expect("TextureTargetFrame.get_next_texture is infallible");
+        let frame_output = texture_target.get_next_texture()?.ok_or_else(|| {
+            self.descriptors
+                .runtime
+                .health()
+                .record(crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Internal,
+                    "texture target returned no attachment",
+                ))
+        })?;
 
         run_pixelbender_shader_impl(
             &self.descriptors,
@@ -1337,16 +1508,18 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 },
                 depth_slice: None,
             }),
+            None,
             1,
             // When running a standalone shader, we always process the entire image
             &FilterSource::for_entire_texture(&target_texture.texture),
         )?;
 
+        crate::record_bitmap_write(&target_handle)?;
         let index = Some(self.active_frame.submit_for_target(
             &self.descriptors,
             &texture_target,
             frame_output,
-        ));
+        )?);
 
         let sync_handle = self.make_queue_sync_handle(
             texture_target,
@@ -1371,18 +1544,46 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         }
     }
 
+    fn create_bitmap_cache(
+        &mut self,
+        width: NonZeroU32,
+        height: NonZeroU32,
+    ) -> Result<BitmapHandle, BitmapError> {
+        Ok(BitmapHandle(crate::bitmap_cache::CacheImage::new(
+            width.get(),
+            height.get(),
+            &self.descriptors.device,
+        )?))
+    }
+    fn retain_bitmap_cache(
+        &mut self,
+        handle: &BitmapHandle,
+    ) -> Option<Arc<dyn ruffle_render::backend::BitmapCacheLease>> {
+        let cache = (&*handle.0 as &dyn Any).downcast_ref::<crate::bitmap_cache::CacheImage>()?;
+        Some(cache.retain(self.descriptors.runtime.scheduler()))
+    }
+
     fn create_empty_texture(
         &mut self,
         width: NonZeroU32,
         height: NonZeroU32,
     ) -> Result<BitmapHandle, BitmapError> {
+        self.descriptors.runtime.check_health()?;
         let width = width.get();
         let height = height.get();
 
         if width > self.descriptors.limits.max_texture_dimension_2d
             || height > self.descriptors.limits.max_texture_dimension_2d
         {
-            return Err(BitmapError::TooLarge);
+            return Err(self
+                .descriptors
+                .runtime
+                .health()
+                .record(crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Validation,
+                    "bitmap exceeds device texture limits",
+                ))
+                .into());
         }
 
         let extent = wgpu::Extent3d {
@@ -1407,21 +1608,58 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     | wgpu::TextureUsages::COPY_DST
                     | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC,
-            });
+            })?;
+        self.descriptors.runtime.check_health()?;
         Ok(BitmapHandle(Arc::new(Texture {
             _allocation: ruffle_render::profile::GpuBitmap::new(
                 u64::from(texture.width())
                     * u64::from(texture.height())
                     * u64::from(texture.format().block_copy_size(None).unwrap_or(4)),
             ),
-            view: texture.create_view(&Default::default()),
+            view: texture.create_view(&Default::default())?,
             texture,
+            batch_source: Default::default(),
             repeating_linear: Default::default(),
             repeating_nearest: Default::default(),
             clamped_linear: Default::default(),
             clamped_nearest: Default::default(),
-            copy_count: Cell::new(0),
+            copy_count: Default::default(),
+            version: Default::default(),
         })))
+    }
+
+    fn supports_bitmap_region_readback(&self) -> bool {
+        true
+    }
+
+    fn read_bitmap_region(
+        &mut self,
+        handle: &BitmapHandle,
+        region: PixelRegion,
+        with_rgba: RgbaBufRead,
+    ) -> Result<Option<()>, BitmapError> {
+        self.descriptors.runtime.check_health()?;
+        let texture = as_texture(handle, &self.descriptors.device)?;
+        if region.is_empty()
+            || region.x_max > texture.texture.width()
+            || region.y_max > texture.texture.height()
+        {
+            return Err(crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::Validation,
+                "invalid bitmap readback region",
+            )
+            .into());
+        }
+        QueueSyncHandle::NotCopied {
+            handle: handle.clone(),
+            copy_area: region,
+            descriptors: self.descriptors.clone(),
+            pool: self.offscreen_buffer_pool.clone(),
+        }
+        .capture(with_rgba, &mut self.active_frame)
+        .map_err(|error| self.descriptors.runtime.health().record(error))?;
+        self.descriptors.runtime.check_health()?;
+        Ok(Some(()))
     }
 
     fn resolve_sync_handle(
@@ -1429,8 +1667,20 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         handle: Box<dyn SyncHandle>,
         with_rgba: RgbaBufRead,
     ) -> Result<(), ruffle_render::error::Error> {
-        let handle = Box::<dyn Any>::downcast::<QueueSyncHandle>(handle).unwrap();
-        handle.capture(with_rgba, &mut self.active_frame);
+        self.descriptors.runtime.check_health()?;
+        let handle = Box::<dyn Any>::downcast::<QueueSyncHandle>(handle).map_err(|_| {
+            self.descriptors
+                .runtime
+                .health()
+                .record(crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Internal,
+                    "foreign readback handle",
+                ))
+        })?;
+        handle
+            .capture(with_rgba, &mut self.active_frame)
+            .map_err(|error| self.descriptors.runtime.health().record(error))?;
+        self.descriptors.runtime.check_health()?;
         Ok(())
     }
 }
@@ -1475,7 +1725,7 @@ async fn request_device(
     limits.max_uniform_buffer_binding_size = adapter.limits().max_uniform_buffer_binding_size;
     limits.max_inter_stage_shader_variables = adapter.limits().max_inter_stage_shader_variables;
     // This will be a default limit in a future wgpu version (down from 8).
-    // It's required for some WebGL devices to be supported.
+    // Keep the GLES-compatible baseline for native GL adapters.
     limits.max_color_attachments = 4;
 
     let mut features = Default::default();
@@ -1507,19 +1757,22 @@ pub enum RenderTargetMode {
     // or when applying a filter. In both cases, we have a fixed background color,
     // and don't need to blend with anything else
     FreshWithColor(wgpu::Color),
+    /// Final attachment selected by the pass graph (including explicit view format).
+    ExistingWithView(crate::gpu_resources::TextureView, wgpu::Color),
     // Construct a new frame buffer, cleared with an existing texture.
     // we will blend with the previous contents of the texture.
     // This is used in `render_offscreen`, as we need to blend with the previous
     // contents of our `BitmapData` texture
-    FreshWithTexture(wgpu::Texture),
+    FreshWithTexture(crate::gpu_resources::Texture),
     // Use the provided texture as our frame buffer, and clear it with the given color.
-    ExistingWithColor(wgpu::Texture, wgpu::Color),
+    ExistingWithColor(crate::gpu_resources::Texture, wgpu::Color),
 }
 
 impl RenderTargetMode {
     pub fn color(&self) -> Option<wgpu::Color> {
         match self {
-            RenderTargetMode::FreshWithColor(color) => Some(*color),
+            RenderTargetMode::FreshWithColor(color)
+            | RenderTargetMode::ExistingWithView(_, color) => Some(*color),
             RenderTargetMode::FreshWithTexture(_) => None,
             RenderTargetMode::ExistingWithColor(_, color) => Some(*color),
         }
@@ -1527,41 +1780,39 @@ impl RenderTargetMode {
 }
 
 struct TrackedEncoder {
-    raw: wgpu::CommandEncoder,
+    raw: crate::gpu_resources::CommandEncoder,
     dirty: bool,
 }
 impl TrackedEncoder {
-    fn record(&mut self) -> &mut wgpu::CommandEncoder {
+    fn record(&mut self) -> &mut crate::gpu_resources::CommandEncoder {
         self.dirty = true;
         &mut self.raw
     }
 }
 pub struct ActiveFrame {
-    pub staging_belt: wgpu::util::StagingBelt,
+    pub staging_belt: crate::gpu_resources::StagingBelt,
     command_encoder: TrackedEncoder,
     budget: crate::idle_pool::Budget,
-
-    draws_since_flush: u32,
 }
 
 impl ActiveFrame {
-    const MAX_DRAWS_PER_FLUSH: u32 = 100;
-
-    pub fn new(descriptors: &Descriptors, budget: crate::idle_pool::Budget) -> Self {
-        Self {
+    pub fn new(
+        descriptors: &Descriptors,
+        budget: crate::idle_pool::Budget,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        Ok(Self {
             budget,
             command_encoder: TrackedEncoder {
                 dirty: false,
                 raw: descriptors
                     .device
-                    .create_command_encoder(&Default::default()),
+                    .create_command_encoder(&Default::default())?,
             },
-            staging_belt: wgpu::util::StagingBelt::new(descriptors.device.clone(), 65536),
-            draws_since_flush: 0,
-        }
+            staging_belt: crate::gpu_resources::StagingBelt::new(descriptors.device.clone(), 65536),
+        })
     }
 
-    pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
+    pub(crate) fn encoder(&mut self) -> &mut crate::gpu_resources::CommandEncoder {
         self.command_encoder.record()
     }
     pub fn submit_for_target<T: RenderTarget>(
@@ -1569,60 +1820,86 @@ impl ActiveFrame {
         descriptors: &Descriptors,
         target: &T,
         frame: T::Frame,
-    ) -> SubmissionIndex {
-        self.draws_since_flush = 0;
+    ) -> Result<SubmissionIndex, crate::gpu_runtime::RenderFailure> {
+        descriptors.runtime.check_health()?;
         self.staging_belt.finish();
         let draw_encoder = std::mem::replace(
             &mut self.command_encoder.raw,
             descriptors
                 .device
-                .create_command_encoder(&Default::default()),
+                .create_command_encoder(&Default::default())?,
         );
         let index = {
             let _submit = ruffle_render::profile::time(ruffle_render::profile::Phase::RenderSubmit);
-            let _submission = descriptors.lock_submission();
+            let command_buffer = {
+                let _timer = ruffle_render::profile::native_time(
+                    ruffle_render::profile::NativePhase::EncoderFinish,
+                );
+                draw_encoder.finish()?
+            };
             target.submit(
                 &descriptors.device,
                 &descriptors.queue,
-                Some(draw_encoder.finish()),
+                descriptors.runtime.health(),
+                Some(command_buffer),
                 frame,
-            )
+            )?
         };
         self.staging_belt.recall();
         self.command_encoder.dirty = false;
         self.budget.submitted(&descriptors.queue);
-        index
+        descriptors.runtime.check_health()?;
+        Ok(index)
     }
 
-    pub fn submit_direct(&mut self, descriptors: &Descriptors) -> SubmissionIndex {
-        self.draws_since_flush = 0;
+    pub fn submit_direct(
+        &mut self,
+        descriptors: &Descriptors,
+    ) -> Result<SubmissionIndex, crate::gpu_runtime::RenderFailure> {
+        descriptors.runtime.check_health()?;
         self.staging_belt.finish();
         let draw_encoder = std::mem::replace(
             &mut self.command_encoder.raw,
             descriptors
                 .device
-                .create_command_encoder(&Default::default()),
+                .create_command_encoder(&Default::default())?,
         );
         let index = {
             let _submit = ruffle_render::profile::time(ruffle_render::profile::Phase::RenderSubmit);
-            let _submission = descriptors.lock_submission();
-            descriptors.queue.submit(Some(draw_encoder.finish()))
+            let command_buffer = {
+                let _timer = ruffle_render::profile::native_time(
+                    ruffle_render::profile::NativePhase::EncoderFinish,
+                );
+                draw_encoder.finish()?
+            };
+            let _timer = ruffle_render::profile::native_time(
+                ruffle_render::profile::NativePhase::QueueSubmit,
+            );
+            descriptors.queue.submit(Some(command_buffer))?
         };
         self.staging_belt.recall();
         self.command_encoder.dirty = false;
         self.budget.submitted(&descriptors.queue);
-        index
+        descriptors.runtime.check_health()?;
+        Ok(index)
     }
 
-    pub fn maybe_flush(&mut self, descriptors: &Descriptors) {
-        // [NA] This is kind of a hack.
-        // If we do "too much" during one frame, the submission ends up being way too large and goes OutOfMemory.
-        // What it is that we're OOMing on is likely buffers and temporary textures and such from render_offscreen
-        // Hard to track that though... so let's just flush it out if we do more than X draws per frame
-        self.draws_since_flush += 1;
-
-        if self.draws_since_flush > Self::MAX_DRAWS_PER_FLUSH {
-            self.submit_direct(descriptors);
+    pub fn maybe_flush(
+        &mut self,
+        descriptors: &Descriptors,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        descriptors.runtime.check_health()?;
+        let pending = self
+            .command_encoder
+            .raw
+            .transient_bytes()
+            .saturating_add(descriptors.queue.pending_upload_bytes());
+        if self.command_encoder.dirty && pending >= descriptors.runtime.config().transient_watermark
+        {
+            self.submit_direct(descriptors)?;
         }
+
+        descriptors.runtime.check_health()?;
+        Ok(())
     }
 }

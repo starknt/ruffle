@@ -58,6 +58,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, Ref, RefCell, RefMut};
 use std::cmp::max;
 use std::collections::HashMap;
+use std::ops::Range;
 use swf::extensions::ReadSwfExt;
 use swf::{ClipEventFlag, DefineBitsLossless, FrameLabelData, TagCode, UTF_8};
 
@@ -515,11 +516,11 @@ impl<'gc> MovieClip<'gc> {
 
         let mut sub_preload_done = true;
         if let Some(symbol) = progress.cur_preload_symbol.take() {
-            match context
+            let character = context
                 .library
-                .library_for_movie_mut(self.movie())
-                .character_by_id(symbol)
-            {
+                .library_for_movie_mut(self.movie(), context.gc_context)
+                .character_by_id(symbol);
+            match character {
                 Some(Character::MovieClip(mc)) => {
                     sub_preload_done = mc.preload(context, chunk_limit);
                     if !sub_preload_done {
@@ -695,7 +696,10 @@ impl<'gc> MovieClip<'gc> {
         let data = reader.read_slice_to_end();
         if !data.is_empty() {
             let movie = self.movie();
-            let domain = context.library.library_for_movie_mut(movie).avm2_domain();
+            let domain = context
+                .library
+                .library_for_movie_mut(movie, context.gc_context)
+                .avm2_domain();
 
             // DoAbc tag seems to be equivalent to a DoAbc2 with no flags (eager)
             match Avm2::do_abc(
@@ -737,7 +741,10 @@ impl<'gc> MovieClip<'gc> {
         let do_abc = reader.read_do_abc_2()?;
         if !do_abc.data.is_empty() {
             let movie = self.movie();
-            let domain = context.library.library_for_movie_mut(movie).avm2_domain();
+            let domain = context
+                .library
+                .library_for_movie_mut(movie, context.gc_context)
+                .avm2_domain();
             let name = AvmString::new(context.gc(), do_abc.name.decode(reader.encoding()));
 
             match Avm2::do_abc(
@@ -788,7 +795,9 @@ impl<'gc> MovieClip<'gc> {
         }
 
         let mc = context.gc();
-        let library = context.library.library_for_movie_mut(self.movie());
+        let mut library = context
+            .library
+            .library_for_movie_mut(self.movie(), context.gc_context);
 
         for asset in exported_assets {
             let name = asset.name.decode(reader.encoding());
@@ -1547,8 +1556,11 @@ impl<'gc> MovieClip<'gc> {
         }
 
         let movie = self.movie();
-        let library = context.library.library_for_movie_mut(movie);
-        match library.instantiate_by_id(id, context.gc_context) {
+        let child = context
+            .library
+            .library_for_movie_mut(movie, context.gc_context)
+            .instantiate_by_id(id, context.gc_context);
+        match child {
             Some(child) => {
                 // Remove previous child from children list,
                 // and add new child onto front of the list.
@@ -2295,6 +2307,40 @@ impl<'gc> MovieClip<'gc> {
         unlock!(Gc::write(mc, self.0), MovieClipData, hit_area).set(hit_area);
     }
 
+    /// Render-list indices hidden from this point by timeline masks.
+    fn clipped_mouse_pick_ranges(
+        self,
+        context: &mut UpdateContext<'gc>,
+        point: Point<Twips>,
+        options: HitTestOptions,
+    ) -> SmallVec<[Range<usize>; 1]> {
+        let mut clipped = SmallVec::<[Range<usize>; 1]>::new();
+        let mut masks = SmallVec::<[(Depth, bool); 2]>::new();
+        for (index, child) in self.iter_render_list().enumerate() {
+            // As in render_children, a mask starts at its display-list position
+            // and ends at the first later placement beyond its clip depth.
+            // Children added by AS3 can have depth zero anywhere in the list.
+            while masks.last().is_some_and(|&(end, _)| child.depth() > end) {
+                masks.pop();
+            }
+            let inside = masks.last().is_none_or(|&(_, inside)| inside);
+            if !inside {
+                if let Some(range) = clipped.last_mut()
+                    && range.end == index
+                {
+                    range.end += 1;
+                } else {
+                    clipped.push(index..index + 1);
+                }
+            }
+            if child.clip_depth() > 0 && child.allow_as_mask() {
+                let inside = inside && child.hit_test_shape(context, point, options);
+                masks.push((child.clip_depth(), inside));
+            }
+        }
+        clipped
+    }
+
     /// Resolve the AVM1 `hitArea` property for mouse picking, if set.
     ///
     /// Unlike AVM2's `Sprite.hitArea`, AVM1 keeps no dedicated storage for the
@@ -2510,7 +2556,7 @@ impl<'gc> MovieClip<'gc> {
                     let movie = self.movie();
                     let domain = context
                         .library
-                        .library_for_movie(movie)
+                        .library_for_movie(movie, context.gc_context)
                         .unwrap()
                         .avm2_domain();
 
@@ -3396,40 +3442,36 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
 
             let mut found_propagate = None;
 
-            let mut clip_layers = self
-                .iter_render_list()
-                .flat_map(|child| {
-                    if child.clip_depth() > 0 {
-                        // Note - we intentionally use 'child.depth()' here insteado
-                        // of the position in the render list - this matches Flash's
-                        // behavior. The 'depth' value comes from the PlaceObject tag
-                        Some((child, (child.depth() + 1)..=(child.clip_depth())))
-                    } else {
-                        None
-                    }
-                })
-                .rev()
-                .peekable();
+            let clipped = self.clipped_mouse_pick_ranges(context, point, options);
 
             // Interactive children run first, followed by non-interactive children.
             // Depth is considered within each group.
 
             let interactive = self
                 .iter_render_list()
+                .enumerate()
                 .rev()
-                .filter(|child| child.as_interactive().is_some());
+                .filter(|(_, child)| child.as_interactive().is_some());
             let non_interactive = self
                 .iter_render_list()
+                .enumerate()
                 .rev()
-                .filter(|child| child.as_interactive().is_none());
+                .filter(|(_, child)| child.as_interactive().is_none());
 
-            for child in interactive.into_iter().chain(non_interactive) {
+            for (index, child) in interactive.chain(non_interactive) {
                 // Mask children are not clickable
                 if child.clip_depth() > 0 || child.maskee().is_some() {
                     continue;
                 }
+                let next_range = clipped.partition_point(|range| range.end <= index);
+                if clipped
+                    .get(next_range)
+                    .is_some_and(|range| range.contains(&index))
+                {
+                    continue;
+                }
 
-                let mut res = if let Some(child) = child.as_interactive() {
+                let res = if let Some(child) = child.as_interactive() {
                     if child.as_displayobject().movie().is_action_script_3() {
                         child.mouse_pick_avm2(context, point, require_button_mode)
                     } else {
@@ -3455,26 +3497,6 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                 } else {
                     Avm2MousePick::Miss
                 };
-
-                while let Some((clip, clip_range)) = clip_layers.peek() {
-                    // This clip layer no longer applies to the remaining children (which all have lower depth values).
-                    // This is a rare case where we actually use 'child.depth()' in AVM2 - child.depth()
-                    // gets set from a PlaceObject tag, and may be *greater* than position in the render list.
-                    if *clip_range.start() > child.depth() {
-                        clip_layers.next();
-                        continue;
-                    }
-
-                    if clip_range.contains(&child.depth()) {
-                        // If the clip layer applies to the current child, check if the child is masked by the clip.
-                        // If the position isn't within the mask region, then treat this as a miss unconditionally.
-                        // We'll continue the outer loop over the children, as another child may be hit.
-                        if !clip.hit_test_shape(context, point, options) {
-                            res = Avm2MousePick::Miss;
-                        }
-                    }
-                    break;
-                }
 
                 match res {
                     Avm2MousePick::Hit(_) => {
@@ -3855,7 +3877,7 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         reader: &mut SwfStream<'a>,
     ) -> Result<(), Error> {
         let mc = context.gc();
-        let library = self.library_mut(context);
+        let mut library = self.library_mut(context);
         let (id, jpeg_data) = reader.read_define_bits()?;
         let jpeg_tables = library.jpeg_tables();
         let jpeg_data =
@@ -4257,10 +4279,11 @@ impl<'gc, 'a> MovieClipShared<'gc> {
 
     #[inline]
     fn import_exports_of_importer(&self, context: &mut UpdateContext<'gc>) {
-        let Some(importer_library) = self
-            .importer_movie
-            .and_then(|mc| context.library.library_for_movie(mc.movie()))
-        else {
+        let Some(importer_library) = self.importer_movie.and_then(|mc| {
+            context
+                .library
+                .library_for_movie(mc.movie(), context.gc_context)
+        }) else {
             return;
         };
 
@@ -4273,7 +4296,8 @@ impl<'gc, 'a> MovieClipShared<'gc> {
             })
             .collect::<HashMap<AvmString<'gc>, (CharacterId, Character<'gc>)>>();
 
-        let self_library = self.library_mut(context);
+        drop(importer_library);
+        let mut self_library = self.library_mut(context);
         for (name, (id, character)) in exported_from_importer {
             if self_library.character_by_id(id).is_none() {
                 self_library.register_character(id, character);
@@ -4299,7 +4323,9 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         movie: SwfMovie<'gc>,
     ) {
         let mc = context.gc();
-        let library = context.library.library_for_movie_mut(movie);
+        let mut library = context
+            .library
+            .library_for_movie_mut(movie, context.gc_context);
         library.register_export(id, name);
 
         // TODO: do other types of Character need to know their exported name?
@@ -4339,10 +4365,13 @@ impl<'gc, 'a> MovieClipShared<'gc> {
                 tracing::debug!("register_export asset: {} (ID: {})", name, export.id);
 
                 if let Some(parent) = importer_movie {
-                    let parent_library = context.library.library_for_movie_mut(parent);
+                    let mut parent_library = context
+                        .library
+                        .library_for_movie_mut(parent, context.gc_context);
 
                     if let Some(id) = parent_library.character_id_by_import_name(&name) {
                         parent_library.register_character(id, character);
+                        drop(parent_library);
 
                         Self::register_export(context, id, name, parent);
                         tracing::debug!(
@@ -4595,8 +4624,11 @@ impl<'gc, 'a> MovieClip<'gc> {
 
             let movie = self.movie();
 
-            let library = activation.context.library.library_for_movie_mut(movie);
-            let domain = library.avm2_domain();
+            let domain = activation
+                .context
+                .library
+                .library_for_movie_mut(movie, activation.context.gc_context)
+                .avm2_domain();
 
             for (class_name, id) in eager_tags.symbolclass_names {
                 let name = AvmString::new(activation.gc(), class_name);
@@ -4606,11 +4638,20 @@ impl<'gc, 'a> MovieClip<'gc> {
                             .context
                             .library
                             .avm2_class_registry_mut()
-                            .set_class_symbol(class_object.inner_class_definition(), movie, id);
+                            .set_class_symbol(
+                                class_object.inner_class_definition(),
+                                movie,
+                                id,
+                                activation.context.gc_context,
+                            );
 
-                        let library = activation.context.library.library_for_movie_mut(movie);
+                        let character = activation
+                            .context
+                            .library
+                            .library_for_movie_mut(movie, activation.context.gc_context)
+                            .character_by_id(id);
 
-                        match library.character_by_id(id) {
+                        match character {
                             Some(Character::EditText(edit_text)) => {
                                 edit_text.set_avm2_class(activation.gc(), class_object)
                             }
@@ -4656,8 +4697,10 @@ impl<'gc, 'a> MovieClip<'gc> {
 
                                 let instantiated = self.instantiate(activation.gc());
 
-                                let library =
-                                    activation.context.library.library_for_movie_mut(movie);
+                                let mut library = activation
+                                    .context
+                                    .library
+                                    .library_for_movie_mut(movie, activation.context.gc_context);
 
                                 library.register_character(id, Character::MovieClip(instantiated));
                             }
@@ -5033,12 +5076,22 @@ impl<'gc> MovieClipShared<'gc> {
         self.movie
     }
 
-    fn library<'a>(&self, context: &'a UpdateContext<'gc>) -> Option<&'a MovieLibrary<'gc>> {
-        context.library.library_for_movie(self.movie())
+    fn library(
+        &self,
+        context: &UpdateContext<'gc>,
+    ) -> Option<std::cell::Ref<'gc, MovieLibrary<'gc>>> {
+        context
+            .library
+            .library_for_movie(self.movie(), context.gc_context)
     }
 
-    fn library_mut<'a>(&self, context: &'a mut UpdateContext<'gc>) -> &'a mut MovieLibrary<'gc> {
-        context.library.library_for_movie_mut(self.movie())
+    fn library_mut(
+        &self,
+        context: &mut UpdateContext<'gc>,
+    ) -> std::cell::RefMut<'gc, MovieLibrary<'gc>> {
+        context
+            .library
+            .library_for_movie_mut(self.movie(), context.gc_context)
     }
 
     fn take_eager_tags(&self, frame: FrameNumber) -> Option<EagerTags> {

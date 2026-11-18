@@ -33,10 +33,10 @@ pub fn upload_from_bitmap_data<'gc>(
 
         if let Some(source) = source_obj.as_bitmap_data() {
             texture.context3d().copy_bitmapdata_to_texture(
-                &source.sync(activation.context.renderer).borrow(),
+                &source.sync(activation.context.renderer)?.borrow(),
                 texture.handle(),
                 0,
-            );
+            )?;
         } else {
             unreachable!("Argument is BitmapData-typed");
         }

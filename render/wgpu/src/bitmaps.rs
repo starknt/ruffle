@@ -2,15 +2,15 @@ use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct BitmapSamplers {
-    pub repeat_linear: wgpu::Sampler,
-    pub repeat_nearest: wgpu::Sampler,
-    pub clamp_linear: wgpu::Sampler,
-    pub clamp_nearest: wgpu::Sampler,
-    pub clamp_u_repeat_v_linear: wgpu::Sampler,
-    pub clamp_u_repeat_v_nearest: wgpu::Sampler,
-    pub repeat_u_clamp_v_linear: wgpu::Sampler,
-    pub repeat_u_clamp_v_nearest: wgpu::Sampler,
-    pub anisotropic: HashMap<WgpuSamplerConfig, wgpu::Sampler>,
+    pub repeat_linear: crate::gpu_resources::Sampler,
+    pub repeat_nearest: crate::gpu_resources::Sampler,
+    pub clamp_linear: crate::gpu_resources::Sampler,
+    pub clamp_nearest: crate::gpu_resources::Sampler,
+    pub clamp_u_repeat_v_linear: crate::gpu_resources::Sampler,
+    pub clamp_u_repeat_v_nearest: crate::gpu_resources::Sampler,
+    pub repeat_u_clamp_v_linear: crate::gpu_resources::Sampler,
+    pub repeat_u_clamp_v_nearest: crate::gpu_resources::Sampler,
+    pub anisotropic: HashMap<WgpuSamplerConfig, crate::gpu_resources::Sampler>,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq)]
@@ -21,13 +21,13 @@ pub struct WgpuSamplerConfig {
 }
 
 fn create_sampler(
-    device: &wgpu::Device,
+    device: &crate::gpu_resources::Device,
     address_mode_u: wgpu::AddressMode,
     address_mode_v: wgpu::AddressMode,
     filter: wgpu::FilterMode,
     sampler_label: Option<String>,
-) -> wgpu::Sampler {
-    device.create_sampler(&wgpu::SamplerDescriptor {
+) -> Result<crate::gpu_resources::Sampler, crate::gpu_runtime::RenderFailure> {
+    Ok(device.create_sampler(&wgpu::SamplerDescriptor {
         label: sampler_label.as_deref(),
         address_mode_u,
         address_mode_v,
@@ -44,39 +44,41 @@ fn create_sampler(
         compare: None,
         anisotropy_clamp: 1,
         border_color: None,
-    })
+    })?)
 }
 
 impl BitmapSamplers {
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(
+        device: &crate::gpu_resources::Device,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let repeat_linear = create_sampler(
             device,
             wgpu::AddressMode::Repeat,
             wgpu::AddressMode::Repeat,
             wgpu::FilterMode::Linear,
             create_debug_label!("Repeat & Linear sampler"),
-        );
+        )?;
         let repeat_nearest = create_sampler(
             device,
             wgpu::AddressMode::Repeat,
             wgpu::AddressMode::Repeat,
             wgpu::FilterMode::Nearest,
             create_debug_label!("Repeat & Nearest sampler"),
-        );
+        )?;
         let clamp_linear = create_sampler(
             device,
             wgpu::AddressMode::ClampToEdge,
             wgpu::AddressMode::ClampToEdge,
             wgpu::FilterMode::Linear,
             create_debug_label!("Clamp & Linear sampler"),
-        );
+        )?;
         let clamp_nearest = create_sampler(
             device,
             wgpu::AddressMode::ClampToEdge,
             wgpu::AddressMode::ClampToEdge,
             wgpu::FilterMode::Nearest,
             create_debug_label!("Clamp & Nearest sampler"),
-        );
+        )?;
 
         let clamp_u_repeat_v_linear = create_sampler(
             device,
@@ -84,7 +86,7 @@ impl BitmapSamplers {
             wgpu::AddressMode::Repeat,
             wgpu::FilterMode::Linear,
             create_debug_label!("Clamp U, Repeat V & Linear sampler"),
-        );
+        )?;
 
         let clamp_u_repeat_v_nearest = create_sampler(
             device,
@@ -92,7 +94,7 @@ impl BitmapSamplers {
             wgpu::AddressMode::Repeat,
             wgpu::FilterMode::Nearest,
             create_debug_label!("Clamp U, Repeat V & Nearest sampler"),
-        );
+        )?;
 
         let repeat_u_clamp_v_linear = create_sampler(
             device,
@@ -100,7 +102,7 @@ impl BitmapSamplers {
             wgpu::AddressMode::ClampToEdge,
             wgpu::FilterMode::Linear,
             create_debug_label!("Repeat U, Clamp V & Linear sampler"),
-        );
+        )?;
 
         let repeat_u_clamp_v_nearest = create_sampler(
             device,
@@ -108,7 +110,7 @@ impl BitmapSamplers {
             wgpu::AddressMode::ClampToEdge,
             wgpu::FilterMode::Nearest,
             create_debug_label!("Repeat U, Clamp V & Nearest sampler"),
-        );
+        )?;
 
         let mut anisotropic = HashMap::new();
         for anisotropy in [2, 4, 8, 16] {
@@ -125,7 +127,7 @@ impl BitmapSamplers {
                             u_mode,
                             v_mode
                         ),
-                    );
+                    )?;
                     anisotropic.insert(
                         WgpuSamplerConfig {
                             anisotropy_clamp: anisotropy,
@@ -138,7 +140,7 @@ impl BitmapSamplers {
             }
         }
 
-        Self {
+        Ok(Self {
             repeat_linear,
             repeat_nearest,
             clamp_linear,
@@ -148,10 +150,14 @@ impl BitmapSamplers {
             repeat_u_clamp_v_linear,
             repeat_u_clamp_v_nearest,
             anisotropic,
-        }
+        })
     }
 
-    pub fn get_sampler(&self, is_repeating: bool, is_smoothed: bool) -> &wgpu::Sampler {
+    pub fn get_sampler(
+        &self,
+        is_repeating: bool,
+        is_smoothed: bool,
+    ) -> &crate::gpu_resources::Sampler {
         match (is_repeating, is_smoothed) {
             (true, true) => &self.repeat_linear,
             (true, false) => &self.repeat_nearest,

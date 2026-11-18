@@ -578,7 +578,7 @@ fn begin_bitmap_fill<'gc>(
     let fill_style = if let [Value::Object(bitmap_data), ..] = args {
         if let NativeObject::BitmapData(bitmap_data) = bitmap_data.native() {
             // Register the bitmap data with the drawing.
-            let handle = bitmap_data.bitmap_handle(activation.gc(), activation.context.renderer);
+            let handle = bitmap_data.bitmap_handle(activation.gc(), activation.context.renderer)?;
             let bitmap = ruffle_render::bitmap::BitmapInfo {
                 handle,
                 width: bitmap_data.width(),
@@ -793,7 +793,7 @@ fn attach_movie<'gc>(
     if let Some(new_clip) = activation
         .context
         .library
-        .library_for_movie(movie_clip.movie())
+        .library_for_movie(movie_clip.movie(), activation.context.gc_context)
         .and_then(|l| l.instantiate_by_export_name(&export_name, activation.gc()))
     {
         new_clip.set_placed_by_avm1_script(true);
@@ -977,7 +977,10 @@ pub fn clone_sprite<'gc>(
     #[allow(clippy::question_mark)]
     let cloned_sprite = if sprite.id() != 0 {
         // Clip from SWF; instantiate a new copy.
-        let library = context.library.library_for_movie(movie).unwrap();
+        let library = context
+            .library
+            .library_for_movie(movie, context.gc_context)
+            .unwrap();
         library
             .instantiate_by_id(sprite.id(), context.gc())
             .unwrap()
@@ -1797,7 +1800,8 @@ fn set_filters<'gc>(
             let filter_object = value
                 .get(index, activation)?
                 .coerce_to_object_or_bare(activation)?;
-            if let Some(filter) = bitmap_filter::avm1_to_filter(filter_object, activation.context) {
+            if let Some(filter) = bitmap_filter::avm1_to_filter(filter_object, activation.context)?
+            {
                 filters.push(filter);
             }
         }

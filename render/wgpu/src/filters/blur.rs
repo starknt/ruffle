@@ -2,13 +2,15 @@ use crate::backend::RenderTargetMode;
 use crate::buffer_pool::TexturePool;
 use crate::descriptors::Descriptors;
 use crate::filters::{FilterSource, FilterVertex, VERTEX_BUFFERS_DESCRIPTION_FILTERS};
+use crate::gpu_resources::CommandEncoder;
+use crate::gpu_resources::StagingBelt;
+use crate::gpu_resources::{RenderPipeline, TextureView};
 use crate::surface::target::CommandTarget;
 use crate::utils::SampleCountMap;
 use bytemuck::{Pod, Zeroable};
 use std::sync::OnceLock;
 use swf::BlurFilter as BlurFilterArgs;
-use wgpu::util::StagingBelt;
-use wgpu::{BufferSlice, CommandEncoder, RenderPipeline, TextureView};
+use wgpu::BufferSlice;
 
 /// This is a 1:1 match of `struct Filter` in `blur.wgsl`. See that, and the usage below, for more info.
 /// Since WebGL requires 16 byte struct size (alignment), some of these fields (namely m2 and last_weight)
@@ -27,17 +29,19 @@ struct BlurUniform {
 }
 
 pub struct BlurFilter {
-    bind_group_layout: wgpu::BindGroupLayout,
-    pipeline_layout: wgpu::PipelineLayout,
-    vertex_buffer: wgpu::Buffer,
-    uniform_buffer: wgpu::Buffer,
+    bind_group_layout: crate::gpu_resources::BindGroupLayout,
+    pipeline_layout: crate::gpu_resources::PipelineLayout,
+    vertex_buffer: crate::gpu_resources::Buffer,
+    uniform_buffer: crate::gpu_resources::Buffer,
     vertices_size: wgpu::BufferSize,
     uniform_size: wgpu::BufferSize,
-    pipelines: SampleCountMap<OnceLock<wgpu::RenderPipeline>>,
+    pipelines: SampleCountMap<OnceLock<crate::gpu_resources::RenderPipeline>>,
 }
 
 impl BlurFilter {
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(
+        device: &crate::gpu_resources::Device,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let texture = wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -55,23 +59,24 @@ impl BlurFilter {
             count: None,
         };
         let uniform_size = std::mem::size_of::<BlurUniform>() as u64;
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                texture,
-                sampling,
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(uniform_size),
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    texture,
+                    sampling,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(uniform_size),
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-            label: create_debug_label!("Blur filter binds (with buffer)").as_deref(),
-        });
+                ],
+                label: create_debug_label!("Blur filter binds (with buffer)").as_deref(),
+            })?;
 
         let vertices_size = std::mem::size_of::<[FilterVertex; 4]>() as u64;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -79,22 +84,22 @@ impl BlurFilter {
             size: vertices_size,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        })?;
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: uniform_size,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        })?;
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
-        });
+        })?;
 
-        Self {
+        Ok(Self {
             pipelines: Default::default(),
             pipeline_layout,
             vertex_buffer,
@@ -102,14 +107,18 @@ impl BlurFilter {
             bind_group_layout,
             vertices_size: wgpu::BufferSize::new(vertices_size).expect("Definitely not zero."),
             uniform_size: wgpu::BufferSize::new(uniform_size).expect("Definitely not zero."),
-        }
+        })
     }
 
-    fn pipeline(&self, descriptors: &Descriptors, msaa_sample_count: u32) -> &wgpu::RenderPipeline {
+    fn pipeline(
+        &self,
+        descriptors: &Descriptors,
+        msaa_sample_count: u32,
+    ) -> Result<&crate::gpu_resources::RenderPipeline, crate::gpu_runtime::RenderFailure> {
         self.pipelines.get_or_init(msaa_sample_count, || {
             let label = create_debug_label!("Blur Filter ({} msaa)", msaa_sample_count);
             descriptors
-                .device
+                .persistent_device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: label.as_deref(),
                     layout: Some(&self.pipeline_layout),
@@ -150,14 +159,19 @@ impl BlurFilter {
         &self,
         descriptors: &Descriptors,
         texture_pool: &mut TexturePool,
-        draw_encoder: &mut wgpu::CommandEncoder,
+        draw_encoder: &mut crate::gpu_resources::CommandEncoder,
         staging_belt: &mut StagingBelt,
         source: &FilterSource,
         filter: &BlurFilterArgs,
-    ) -> Option<CommandTarget> {
+    ) -> Result<Option<CommandTarget>, crate::gpu_runtime::RenderFailure> {
+        if filter.num_passes() == 0
+            || (filter.blur_x.to_f32() <= 1.0 && filter.blur_y.to_f32() <= 1.0)
+        {
+            return Ok(None);
+        }
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
-        let pipeline = self.pipeline(descriptors, sample_count);
+        let pipeline = self.pipeline(descriptors, sample_count)?;
 
         let mut flip = CommandTarget::new(
             descriptors,
@@ -171,7 +185,7 @@ impl BlurFilter {
             sample_count,
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
             draw_encoder,
-        );
+        )?;
         let mut flop = CommandTarget::new(
             descriptors,
             texture_pool,
@@ -184,13 +198,13 @@ impl BlurFilter {
             sample_count,
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
             draw_encoder,
-        );
+        )?;
 
         staging_belt
-            .write_buffer(draw_encoder, &self.vertex_buffer, 0, self.vertices_size)
+            .write_buffer(draw_encoder, &self.vertex_buffer, 0, self.vertices_size)?
             .copy_from_slice(bytemuck::cast_slice(&[source.vertices()]));
 
-        let source_view = source.texture.create_view(&Default::default());
+        let source_view = source.texture.create_view(&Default::default())?;
         let mut first = true;
         for _ in 0..(filter.num_passes() as usize) {
             for i in 0..2 {
@@ -267,7 +281,7 @@ impl BlurFilter {
                     last_weight,
                 };
                 staging_belt
-                    .write_buffer(draw_encoder, &self.uniform_buffer, 0, self.uniform_size)
+                    .write_buffer(draw_encoder, &self.uniform_buffer, 0, self.uniform_size)?
                     .copy_from_slice(bytemuck::cast_slice(&[uniform]));
 
                 self.render_with_uniform_buffers(
@@ -277,18 +291,18 @@ impl BlurFilter {
                     &flop,
                     previous_view,
                     previous_vertices,
-                );
+                )?;
 
                 std::mem::swap(&mut flip, &mut flop);
             }
         }
 
-        if first {
+        Ok(if first {
             // Nothing happened, don't return an empty unused texture
             None
         } else {
             Some(flip)
-        }
+        })
     }
 
     fn render_with_uniform_buffers(
@@ -299,30 +313,36 @@ impl BlurFilter {
         destination: &CommandTarget,
         source: &TextureView,
         vertices: BufferSlice,
-    ) {
-        let filter_group = descriptors
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: create_debug_label!("Filter group").as_deref(),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(source),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(
-                            descriptors.bitmap_samplers.get_sampler(false, true),
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.uniform_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        let filter_group = descriptors.cached_bind_group(&wgpu::BindGroupDescriptor {
+            label: create_debug_label!("Filter group").as_deref(),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(source),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(
+                        descriptors.bitmap_samplers.get_sampler(false, true),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+            ],
+        })?;
 
+        ruffle_render::profile::work(|w| {
+            w.render_passes += 1;
+            w.filter_passes += 1;
+            w.draw_calls += 1;
+            w.pipeline_changes += 1;
+            w.material_binds += 1;
+            w.pass_pixels += u64::from(destination.width()) * u64::from(destination.height());
+        });
         let mut render_pass = draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: create_debug_label!("Blur filter").as_deref(),
             color_attachments: &[destination.color_attachments()],
@@ -330,7 +350,7 @@ impl BlurFilter {
         });
         render_pass.set_pipeline(pipeline);
 
-        render_pass.set_bind_group(0, &filter_group, &[]);
+        render_pass.set_bind_group(0, (&filter_group).raw(), &[]);
 
         render_pass.set_vertex_buffer(0, vertices);
         render_pass.set_index_buffer(
@@ -338,5 +358,7 @@ impl BlurFilter {
             wgpu::IndexFormat::Uint32,
         );
         render_pass.draw_indexed(descriptors.quad.indices_quad.clone(), 0, 0..1);
+
+        Ok(())
     }
 }

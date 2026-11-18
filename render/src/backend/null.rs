@@ -31,12 +31,16 @@ impl BitmapSource for NullBitmapSource {
 }
 
 pub struct NullRenderer {
+    health: crate::error::RendererHealth,
     dimensions: ViewportDimensions,
 }
 
 impl NullRenderer {
     pub fn new(dimensions: ViewportDimensions) -> Self {
-        Self { dimensions }
+        Self {
+            dimensions,
+            health: Default::default(),
+        }
     }
 }
 
@@ -49,18 +53,32 @@ struct NullShapeHandle;
 impl ShapeHandleImpl for NullShapeHandle {}
 
 impl RenderBackend for NullRenderer {
+    fn health(&self) -> &crate::error::RendererHealth {
+        &self.health
+    }
     fn viewport_dimensions(&self) -> ViewportDimensions {
         self.dimensions
     }
-    fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions) {
-        self.dimensions = dimensions;
+    fn set_viewport_dimensions(
+        &mut self,
+        dimensions: ViewportDimensions,
+    ) -> Result<(), crate::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| {
+            self.dimensions = dimensions;
+        })();
+        self.health.check()?;
+        Ok(output)
     }
     fn register_shape(
         &mut self,
         _shape: DistilledShape,
         _bitmap_source: &dyn BitmapSource,
-    ) -> ShapeHandle {
-        ShapeHandle(Arc::new(NullShapeHandle))
+    ) -> Result<ShapeHandle, crate::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| ShapeHandle(Arc::new(NullShapeHandle)))();
+        self.health.check()?;
+        Ok(output)
     }
 
     fn render_offscreen(
@@ -69,8 +87,11 @@ impl RenderBackend for NullRenderer {
         _commands: CommandList,
         _quality: StageQuality,
         _bounds: PixelRegion,
-    ) -> Option<Box<dyn SyncHandle>> {
-        None
+    ) -> Result<Option<Box<dyn SyncHandle>>, crate::error::Error> {
+        self.health.check()?;
+        let output = (|| None)();
+        self.health.check()?;
+        Ok(output)
     }
 
     fn submit_frame(
@@ -78,7 +99,11 @@ impl RenderBackend for NullRenderer {
         _clear: Color,
         _commands: CommandList,
         _cache_entries: Vec<BitmapCacheEntry>,
-    ) {
+    ) -> Result<(), crate::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| {})();
+        self.health.check()?;
+        Ok(output)
     }
     fn register_bitmap(&mut self, _bitmap: Bitmap<'_>) -> Result<BitmapHandle, Error> {
         Ok(BitmapHandle(Arc::new(NullBitmapHandle)))
@@ -108,7 +133,12 @@ impl RenderBackend for NullRenderer {
         ""
     }
 
-    fn set_quality(&mut self, _quality: StageQuality) {}
+    fn set_quality(&mut self, _quality: StageQuality) -> Result<(), crate::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| {})();
+        self.health.check()?;
+        Ok(output)
+    }
 
     fn run_pixelbender_shader(
         &mut self,
@@ -142,5 +172,47 @@ impl RenderBackend for NullRenderer {
         _height: NonZeroU32,
     ) -> Result<BitmapHandle, Error> {
         Ok(BitmapHandle(Arc::new(NullBitmapHandle)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{RenderFailure, RenderFailureKind};
+
+    #[test]
+    fn unsupported_offscreen_is_distinct_from_a_fatal_renderer() {
+        let mut renderer = NullRenderer::new(ViewportDimensions {
+            width: 1,
+            height: 1,
+            scale_factor: 1.0,
+        });
+        let bitmap = renderer
+            .create_empty_texture(NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap())
+            .unwrap();
+        assert!(
+            renderer
+                .render_offscreen(
+                    bitmap.clone(),
+                    CommandList::new(),
+                    StageQuality::Low,
+                    PixelRegion::for_whole_size(1, 1)
+                )
+                .unwrap()
+                .is_none()
+        );
+        renderer.health().fail(RenderFailure::new(
+            RenderFailureKind::OutOfMemory,
+            "injected failure",
+        ));
+        assert!(matches!(
+            renderer.render_offscreen(
+                bitmap,
+                CommandList::new(),
+                StageQuality::Low,
+                PixelRegion::for_whole_size(1, 1)
+            ),
+            Err(Error::Render(_))
+        ));
     }
 }

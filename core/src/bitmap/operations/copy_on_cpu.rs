@@ -2,6 +2,7 @@ use crate::bitmap::bitmap_data::{BitmapData, BitmapRawData};
 use gc_arena::Mutation;
 use ruffle_render::backend::RenderBackend;
 use ruffle_render::bitmap::PixelRegion;
+use ruffle_render::error::RenderFailure;
 
 pub fn copy_on_cpu<'gc>(
     context: &Mutation<'gc>,
@@ -11,23 +12,23 @@ pub fn copy_on_cpu<'gc>(
     source_region: PixelRegion,
     dest_region: PixelRegion,
     mut blend: bool,
-) {
+) -> Result<(), RenderFailure> {
     if !source.transparency() {
         // We don't need to blend if we're copying an opaque texture, the alpha would be 255 anyway
         blend = false;
     }
     if !blend && source.ptr_eq(dest) && source_region == dest_region {
         // Copying the same area of self to self, noop
-        return;
+        return Ok(());
     }
 
     let dest_is_source = source.ptr_eq(dest);
-    let mut dest = dest.sync(renderer).borrow_mut(context);
+    let mut dest = dest.sync(renderer)?.borrow_mut(context);
 
     if dest_is_source {
         copy_on_cpu_self(&mut dest, source_region, dest_region, blend);
     } else {
-        let source = source.read_area(source_region, renderer);
+        let source = source.read_area(source_region, renderer)?;
 
         if !blend && (dest.transparency() || !source.transparency()) {
             // Copying (not blending) anything to a transparent texture,
@@ -90,6 +91,8 @@ pub fn copy_on_cpu<'gc>(
     }
 
     dest.set_cpu_dirty(context, dest_region);
+
+    Ok(())
 }
 
 /// Copies `source_region` to `dest_region` within the same bitmap.

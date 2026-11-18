@@ -23,7 +23,7 @@ pub fn capture_and_compare_image(
 
     let actual_image = {
         let mut player_lock = player.lock().unwrap();
-        player_lock.render();
+        player_lock.render()?;
         render_interface.capture(player_lock.renderer_mut())
     };
 

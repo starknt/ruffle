@@ -22,6 +22,9 @@ use ruffle_render::perspective_projection::PerspectiveProjection;
 use ruffle_render::pixel_bender::PixelBenderShaderHandle;
 use ruffle_render::transform::{Transform, TransformStack};
 use std::cell::{Cell, Ref, RefCell, RefMut};
+pub(crate) mod snapshot;
+#[cfg(test)]
+mod snapshot_tests;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::num::NonZero;
@@ -108,7 +111,7 @@ use self::loader_display::LoaderDisplayWeak;
 /// Flash isn't very good at always recognising when it should be invalidated,
 /// and there's cases such as changing the blend mode which don't always trigger it.
 ///
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct BitmapCache {
     /// The `Matrix.a` value that was last used with this cache
     matrix_a: f32,
@@ -133,25 +136,63 @@ pub struct BitmapCache {
     /// The current contents of the cache, if any. Values are post-filters.
     bitmap: Option<BitmapInfo>,
 
-    /// Whether we warned that this bitmap was too large to be cached
-    warned_for_oversize: bool,
+    retained: Option<std::sync::Arc<dyn ruffle_render::backend::BitmapCacheLease>>,
+    transient: Option<(
+        u64,
+        u32,
+        u32,
+        std::sync::Weak<dyn ruffle_render::bitmap::BitmapHandleImpl>,
+    )>,
+    retention: AdaptiveBitmapCache,
+    quality: Option<ruffle_render::quality::StageQuality>,
 }
 
-// cacheAsBitmap is an optimization. Keep the optimized path bounded so a
-// long-lived SWF cannot retain an unbounded set of large offscreen textures.
-const OPTIMIZED_MAX_CACHE_PIXELS_AVM1: u64 = 2_000_000;
-const OPTIMIZED_MAX_CACHE_PIXELS_AVM2: u64 = 4_000_000;
+// Instantiation clones display state, never another object's writable raster.
+impl Clone for BitmapCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
 
-fn cache_size_is_acceptable(swf_version: u8, width: u32, height: u32) -> bool {
-    let max_dimension = if swf_version > 9 { 8191 } else { 2880 };
-    let max_pixels = if swf_version > 9 {
-        OPTIMIZED_MAX_CACHE_PIXELS_AVM2
-    } else {
-        OPTIMIZED_MAX_CACHE_PIXELS_AVM1
-    };
-    width < max_dimension
-        && height < max_dimension
-        && u64::from(width) * u64::from(height) < max_pixels
+/// Retention changes storage lifetime only. Every visible frame still uses the
+/// same cache rasterization, filters, color transform and pixel snapping.
+#[derive(Clone, Debug)]
+struct AdaptiveBitmapCache {
+    frame: Option<u64>,
+    dirty_frames: u8,
+    stable_frames: u8,
+    retain: bool,
+}
+impl Default for AdaptiveBitmapCache {
+    fn default() -> Self {
+        Self {
+            frame: None,
+            dirty_frames: 0,
+            stable_frames: 0,
+            retain: true,
+        }
+    }
+}
+impl AdaptiveBitmapCache {
+    fn observe(&mut self, frame: u64, changed: bool) {
+        if self.frame == Some(frame) {
+            return;
+        }
+        self.frame = Some(frame);
+        if changed {
+            self.stable_frames = 0;
+            self.dirty_frames = self.dirty_frames.saturating_add(1);
+            if self.dirty_frames >= 8 {
+                self.retain = false;
+            }
+        } else {
+            self.dirty_frames = 0;
+            self.stable_frames = self.stable_frames.saturating_add(1);
+            if self.stable_frames >= 30 {
+                self.retain = true;
+            }
+        }
+    }
 }
 
 impl BitmapCache {
@@ -163,14 +204,13 @@ impl BitmapCache {
         self.matrix_a = f32::NAN;
     }
 
-    fn is_dirty(&self, other: &Matrix, source_width: u32, source_height: u32) -> bool {
+    fn content_changed(&self, other: &Matrix, source_width: u32, source_height: u32) -> bool {
         self.matrix_a != other.a
             || self.matrix_b != other.b
             || self.matrix_c != other.c
             || self.matrix_d != other.d
             || self.source_width != source_width
             || self.source_height != source_height
-            || self.bitmap.is_none()
     }
 
     /// Clears any dirtiness and ensure there's an appropriately sized texture allocated
@@ -184,7 +224,7 @@ impl BitmapCache {
         actual_width: u32,
         actual_height: u32,
         draw_offset: Point<i32>,
-        swf_version: u8,
+        _swf_version: u8,
     ) {
         self.sample_count = renderer.stage_sample_count();
         self.matrix_a = matrix.a;
@@ -194,25 +234,31 @@ impl BitmapCache {
         self.source_width = source_width;
         self.source_height = source_height;
         self.draw_offset = draw_offset;
-        if let Some(current) = &mut self.bitmap
-            && current.width == actual_width
-            && current.height == actual_height
+        self.bitmap = self.bitmap();
+        self.retained = None;
+        if self
+            .bitmap
+            .as_ref()
+            .is_some_and(|current| current.width == actual_width && current.height == actual_height)
         {
-            return; // No need to resize it
+            return;
         }
-        let acceptable_size = cache_size_is_acceptable(swf_version, actual_width, actual_height);
-
         if renderer.is_offscreen_supported()
             && let Some(actual_width) = NonZero::new(actual_width)
             && let Some(actual_height) = NonZero::new(actual_height)
-            && acceptable_size
         {
-            let handle = renderer.create_empty_texture(actual_width, actual_height);
-            self.bitmap = handle.ok().map(|handle| BitmapInfo {
-                width: actual_width.get(),
-                height: actual_height.get(),
-                handle,
-            });
+            let handle = renderer.create_bitmap_cache(actual_width, actual_height);
+            self.bitmap = match handle {
+                Ok(handle) => Some(BitmapInfo {
+                    width: actual_width.get(),
+                    height: actual_height.get(),
+                    handle,
+                }),
+                Err(error) => {
+                    renderer.health().record(error.into_render_failure());
+                    None
+                }
+            };
         } else {
             self.bitmap = None;
         }
@@ -223,23 +269,258 @@ impl BitmapCache {
     /// temporarily disabled.
     fn clear(&mut self) {
         self.bitmap = None;
+        self.retained = None;
+        self.transient = None;
     }
 
     fn bitmap(&self) -> Option<BitmapInfo> {
-        self.bitmap.clone()
+        self.bitmap
+            .clone()
+            .or_else(|| self.retained.as_ref()?.bitmap())
+            .or_else(|| {
+                let (frame, width, height, handle) = self.transient.as_ref()?;
+                (self.retention.frame == Some(*frame)).then_some(())?;
+                Some(BitmapInfo {
+                    width: *width,
+                    height: *height,
+                    handle: ruffle_render::bitmap::BitmapHandle(handle.upgrade()?),
+                })
+            })
+    }
+
+    fn finish_frame(&mut self, renderer: &mut dyn RenderBackend) {
+        if !self.retention.retain {
+            let transient = self.bitmap().map(|bitmap| {
+                (
+                    self.retention.frame.unwrap_or(0),
+                    bitmap.width,
+                    bitmap.height,
+                    std::sync::Arc::downgrade(&bitmap.handle.0),
+                )
+            });
+            self.clear();
+            self.transient = transient;
+            return;
+        }
+        if let Some(bitmap) = self.bitmap.take() {
+            if let Some(lease) = renderer.retain_bitmap_cache(&bitmap.handle) {
+                self.retained = Some(lease);
+            } else {
+                self.bitmap = Some(bitmap);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod bitmap_cache_tests {
-    use super::cache_size_is_acceptable;
+    use super::*;
+    use crate::bitmap::symbol_pixels::tests::renderer;
 
     #[test]
-    fn optimized_cache_budget_rejects_large_gpu_surfaces() {
-        assert!(cache_size_is_acceptable(10, 1999, 1999));
-        assert!(!cache_size_is_acceptable(10, 2000, 2000));
-        assert!(cache_size_is_acceptable(9, 1400, 1400));
-        assert!(!cache_size_is_acceptable(9, 1500, 1500));
+    fn bitmap_cache_large_required_surface_is_admitted_by_renderer_not_silently_skipped() {
+        let mut renderer = renderer(false);
+        let mut cache = BitmapCache::default();
+        cache.update(
+            &mut renderer,
+            Matrix::IDENTITY,
+            2000,
+            2000,
+            2000,
+            2000,
+            Point::new(0, 0),
+            10,
+        );
+        assert!(
+            cache.bitmap().is_some(),
+            "cacheAsBitmap/filter rasterization must not disappear at an arbitrary pixel budget"
+        );
+    }
+
+    #[test]
+    fn bitmap_cache_adaptive_retention_releases_changing_results_and_retains_stable_results() {
+        let mut renderer = renderer(false);
+        let mut cache = BitmapCache::default();
+        for frame in 1..=38 {
+            if frame <= 8 {
+                cache.make_dirty();
+            }
+            let changed = cache.content_changed(&Matrix::IDENTITY, 8, 8);
+            cache.retention.observe(frame, changed);
+            cache.update(
+                &mut renderer,
+                Matrix::IDENTITY,
+                8,
+                8,
+                8,
+                8,
+                Point::new(0, 0),
+                10,
+            );
+            let result = cache.bitmap().unwrap();
+            let visible_command = result.handle.clone();
+            let weak = std::sync::Arc::downgrade(&result.handle.0);
+            drop(result);
+            cache.finish_frame(&mut renderer);
+            assert!(
+                weak.upgrade().is_some(),
+                "visible command lost its transient result"
+            );
+            drop(visible_command);
+            assert_eq!(
+                cache.bitmap().is_some(),
+                frame < 8 || frame == 38,
+                "frame {frame}"
+            );
+            if (8..38).contains(&frame) {
+                assert!(weak.upgrade().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn bitmap_cache_cloned_display_objects_have_independent_raster_targets() {
+        let mut renderer = renderer(false);
+        let mut original = BitmapCache::default();
+        original.update(
+            &mut renderer,
+            Matrix::IDENTITY,
+            8,
+            8,
+            8,
+            8,
+            Point::new(0, 0),
+            10,
+        );
+        let first = original.bitmap().unwrap();
+        let mut cloned = original.clone();
+        cloned.make_dirty();
+        cloned.update(
+            &mut renderer,
+            Matrix::IDENTITY,
+            8,
+            8,
+            8,
+            8,
+            Point::new(0, 0),
+            10,
+        );
+        assert_ne!(
+            first.handle,
+            cloned.bitmap().unwrap().handle,
+            "a clone would overwrite the original instance's cached pixels"
+        );
+    }
+
+    #[test]
+    fn bitmap_cache_transient_result_reuses_within_the_same_frame_only() {
+        let mut renderer = renderer(false);
+        let mut cache = BitmapCache::default();
+        for frame in 1..=8 {
+            cache.retention.observe(frame, true);
+        }
+        cache.update(
+            &mut renderer,
+            Matrix::IDENTITY,
+            8,
+            8,
+            8,
+            8,
+            Point::new(0, 0),
+            10,
+        );
+        let visible = cache.bitmap().unwrap();
+        cache.finish_frame(&mut renderer);
+        assert_eq!(cache.bitmap().unwrap().handle, visible.handle);
+        cache.retention.observe(9, false);
+        assert!(
+            cache.bitmap().is_none(),
+            "transient storage survived into another frame"
+        );
+    }
+
+    #[test]
+    fn bitmap_cache_shader_replacement_invalidates_parent_even_when_mode_is_unchanged() {
+        use ruffle_render::pixel_bender::{PixelBenderShader, PixelBenderShaderImpl};
+        #[derive(Debug)]
+        struct Shader(PixelBenderShader);
+        impl PixelBenderShaderImpl for Shader {
+            fn parsed_shader(&self) -> &PixelBenderShader {
+                &self.0
+            }
+        }
+        let shader = |name: &str| {
+            PixelBenderShaderHandle(std::sync::Arc::new(Shader(PixelBenderShader {
+                name: name.into(),
+                version: 1,
+                params: vec![],
+                metadata: vec![],
+                operations: vec![],
+            })))
+        };
+        let player = crate::player::PlayerBuilder::new().build();
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                let parent = MovieClip::new(context.stage.movie(), context.gc());
+                let child = Graphic::empty(context);
+                parent.replace_at_depth(context, child.into(), 1);
+                parent.set_bitmap_cached_preference(true);
+                child.set_blend_shader(Some(shader("first")));
+                parent.base().clear_invalidate_flag();
+                child.base().clear_invalidate_flag();
+                let mut renderer = renderer(false);
+                parent.base().bitmap_cache_mut().as_mut().unwrap().update(
+                    &mut renderer,
+                    Matrix::IDENTITY,
+                    8,
+                    8,
+                    8,
+                    8,
+                    Point::new(0, 0),
+                    10,
+                );
+                child.set_blend_shader(Some(shader("replacement")));
+                assert!(
+                    parent
+                        .base()
+                        .bitmap_cache_mut()
+                        .as_ref()
+                        .unwrap()
+                        .content_changed(&Matrix::IDENTITY, 8, 8)
+                );
+            });
+    }
+
+    #[test]
+    fn bitmap_cache_retention_counts_frames_and_translation_reuses_rasterization() {
+        let mut cache = BitmapCache::default();
+        let mut renderer = renderer(false);
+        for frame in 1..=7 {
+            cache.make_dirty();
+            for _ in 0..3 {
+                cache.retention.observe(frame, true);
+            }
+            cache.update(
+                &mut renderer,
+                Matrix::IDENTITY,
+                8,
+                8,
+                8,
+                8,
+                Point::new(0, 0),
+                10,
+            );
+            cache.finish_frame(&mut renderer);
+            assert!(cache.bitmap().is_some());
+        }
+        assert!(!cache.content_changed(
+            &Matrix::translate(Twips::from_pixels(4.5), Twips::ZERO),
+            8,
+            8
+        ));
+        assert!(cache.content_changed(&Matrix::scale(2.0, 1.0), 8, 8));
     }
 }
 
@@ -307,6 +588,8 @@ pub enum RenderMask<'gc> {
 // Ensure this always has the same alignment as its subclasses (needed for `Gc` casts).
 #[repr(align(8))]
 pub struct DisplayObjectBase<'gc> {
+    #[collect(require_static)]
+    snapshots: snapshot::State,
     cell: RefCell<DisplayObjectBaseMut>,
     parent: Lock<Option<DisplayObject<'gc>>>,
     place_frame: Cell<u16>,
@@ -383,6 +666,7 @@ struct DisplayObjectBaseMut {
 impl Default for DisplayObjectBase<'_> {
     fn default() -> Self {
         Self {
+            snapshots: Default::default(),
             cell: RefCell::new(DisplayObjectBaseMut {
                 filters: Default::default(),
                 blend_shader: None,
@@ -417,6 +701,19 @@ impl Default for DisplayObjectBase<'_> {
 }
 
 impl<'gc> DisplayObjectBase<'gc> {
+    fn invalidate_render(&self) {
+        if !self.snapshots.invalidate() {
+            return;
+        }
+        let mut parent = self.parent();
+        while let Some(object) = parent {
+            if !object.base().snapshots.invalidate() {
+                break;
+            }
+            parent = object.parent();
+        }
+    }
+
     fn contains_flag(&self, flag: DisplayObjectFlags) -> bool {
         self.flags.get().contains(flag)
     }
@@ -424,11 +721,20 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn set_flag(&self, flag: DisplayObjectFlags, value: bool) {
         let mut flags = self.flags.get();
         flags.set(flag, value);
+        if (self.flags.get() ^ flags).intersects(
+            DisplayObjectFlags::VISIBLE
+                | DisplayObjectFlags::HAS_SCROLL_RECT
+                | DisplayObjectFlags::CACHE_AS_BITMAP
+                | DisplayObjectFlags::AVM1_REMOVED,
+        ) {
+            self.invalidate_render();
+        }
         self.flags.set(flags);
     }
 
     /// Reset all properties that would be adjusted by a movie load.
     fn reset_for_movie_load(&self) {
+        self.invalidate_render();
         let retained = DisplayObjectFlags::LOCK_ROOT;
         // Other buttons may still reference this object as an inactive state.
         // Movie replacement resets its contents, not those foreign references.
@@ -472,6 +778,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     pub fn set_matrix(&self, matrix: Matrix) {
+        if self.matrix.get() != matrix {
+            self.invalidate_render();
+        }
         self.matrix.set(matrix);
         self.set_scale_rotation_cached(false);
     }
@@ -481,6 +790,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     pub fn set_color_transform(&self, color_transform: ColorTransform) {
+        if self.color_transform.get() != color_transform {
+            self.invalidate_render();
+        }
         self.color_transform.set(color_transform);
     }
 
@@ -492,6 +804,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         &self,
         perspective_projection: Option<PerspectiveProjection>,
     ) -> bool {
+        if self.perspective_projection.get() != perspective_projection {
+            self.invalidate_render();
+        }
         let old = self.perspective_projection.replace(perspective_projection);
         perspective_projection != old
     }
@@ -504,6 +819,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         let changed = matrix.tx != x;
         matrix.tx = x;
+        if self.matrix.get() != matrix {
+            self.invalidate_render();
+        }
         self.matrix.set(matrix);
         self.set_transformed_by_script(true);
         changed
@@ -517,6 +835,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         let changed = matrix.ty != y;
         matrix.ty = y;
+        if self.matrix.get() != matrix {
+            self.invalidate_render();
+        }
         self.matrix.set(matrix);
         self.set_transformed_by_script(true);
         changed
@@ -529,6 +850,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     fn set_z(&self, tz: f64) -> bool {
         let changed = self.tz.get() != tz;
         self.set_transformed_by_script(true);
+        if changed {
+            self.invalidate_render();
+        }
         self.tz.set(tz);
         changed
     }
@@ -605,6 +929,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         matrix.b = (scale_x * sin_x) as f32;
         matrix.c = (scale_y * -sin_y) as f32;
         matrix.d = (scale_y * cos_y) as f32;
+        if self.matrix.get() != matrix {
+            self.invalidate_render();
+        }
         self.matrix.set(matrix);
 
         changed
@@ -640,6 +967,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         matrix.a = (cos * value.unit()) as f32;
         matrix.b = (sin * value.unit()) as f32;
+        if self.matrix.get() != matrix {
+            self.invalidate_render();
+        }
         self.matrix.set(matrix);
 
         changed
@@ -676,6 +1006,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         matrix.c = (-sin * value.unit()) as f32;
         matrix.d = (cos * value.unit()) as f32;
+        if self.matrix.get() != matrix {
+            self.invalidate_render();
+        }
         self.matrix.set(matrix);
 
         changed
@@ -714,6 +1047,9 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut tf = self.color_transform.get();
         let changed = tf.a_multiply != value;
         tf.a_multiply = value;
+        if changed {
+            self.invalidate_render();
+        }
         self.color_transform.set(tf);
         changed
     }
@@ -723,6 +1059,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_clip_depth(&self, depth: Depth) {
+        if self.clip_depth.get() != depth {
+            self.invalidate_render();
+        }
         self.clip_depth.set(depth);
     }
 
@@ -733,6 +1072,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     /// You should almost always use `DisplayObject.set_parent` instead, which
     /// properly handles 'orphan' movie clips
     fn set_parent_ignoring_orphan_list(this: &Write<Self>, parent: Option<DisplayObject<'gc>>) {
+        this.invalidate_render();
         this.wake_orphan_worklists();
         unlock!(this, Self, parent).set(parent)
     }
@@ -814,8 +1154,11 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.cell.borrow().blend_shader.clone()
     }
 
-    fn set_blend_shader(&self, value: Option<PixelBenderShaderHandle>) {
-        self.cell.borrow_mut().blend_shader = value;
+    fn set_blend_shader(&self, value: Option<PixelBenderShaderHandle>) -> bool {
+        let mut cell = self.cell.borrow_mut();
+        let changed = cell.blend_shader != value;
+        cell.blend_shader = value;
+        changed
     }
 
     /// The opaque background color of this display object.
@@ -1027,6 +1370,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_masker(this: &Write<Self>, node: Option<DisplayObject<'gc>>) {
+        this.invalidate_render();
         unlock!(this, Self, masker).set(node);
     }
 
@@ -1035,6 +1379,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_maskee(this: &Write<Self>, node: Option<DisplayObject<'gc>>) {
+        this.invalidate_render();
         unlock!(this, Self, maskee).set(node);
     }
 
@@ -1096,6 +1441,157 @@ pub fn render_base<'gc>(
     context: &mut RenderContext<'_, 'gc>,
     options: RenderOptions,
 ) {
+    // Most continuously changing trees never record a block. Keep leaf draws
+    // on the original small path in that case. Containers still check their
+    // eligibility so unsupported ancestors cannot admit descendant snapshots.
+    if !context.snapshot_allowed
+        || (!context.snapshot_recording
+            && this.as_container().is_none_or(|c| c.num_children() == 0))
+    {
+        render_base_inner(this, context, options);
+    } else {
+        render_snapshot(this, context, options);
+    }
+}
+
+fn render_snapshot<'gc>(
+    this: DisplayObject<'gc>,
+    context: &mut RenderContext<'_, 'gc>,
+    options: RenderOptions,
+) {
+    let base = this.base();
+    let eligible = matches!(
+        this,
+        DisplayObject::MovieClip(_) | DisplayObject::Graphic(_) | DisplayObject::Stage(_)
+    ) && options.apply_transform
+        && options.apply_matrix
+        && options.skip_masks
+        && !context.is_offscreen
+        && !context.commands.drawing_mask()
+        && this.blend_mode() == ExtendedBlendMode::Normal
+        && !this.is_bitmap_cached()
+        && this.masker().is_none()
+        && this.maskee().is_none()
+        && this.clip_depth() == 0
+        && !base.has_scroll_rect()
+        && base.scroll_rect.get().is_none()
+        && base.scaling_grid.get() == Rectangle::default()
+        && (base.perspective_projection.get().is_none()
+            || (matches!(this, DisplayObject::Stage(_))
+                && base.perspective_projection.get() == Some(Default::default()))
+            || (this.is_root()
+                && base.perspective_projection.get()
+                    == Some(PerspectiveProjection {
+                        field_of_view: 55.0,
+                        center: (
+                            this.movie().width().to_pixels() / 2.0,
+                            this.movie().height().to_pixels() / 2.0,
+                        ),
+                    })))
+        && base.tz.get() == 0.0
+        && !base.has_matrix3d_stub();
+    let allowed = context.snapshot_allowed;
+    context.snapshot_allowed &= eligible;
+    if !eligible {
+        context.snapshot_barriers += 1;
+    }
+    let candidate = context.snapshots.is_some()
+        && context.snapshot_allowed
+        && matches!(this, DisplayObject::MovieClip(_))
+        && this.as_container().is_some_and(|c| c.num_children() >= 8);
+    let prepared = if candidate {
+        let dimensions = context.renderer.viewport_dimensions();
+        let key = snapshot::Key {
+            generation: base.snapshots.generation.get(),
+            inherited: context.transform_stack.transform(),
+            own: base.transform(true),
+            viewport: (
+                dimensions.width,
+                dimensions.height,
+                dimensions.scale_factor.to_bits(),
+            ),
+            view: context.stage.view_bounds(),
+            quality: context.stage.quality(),
+        };
+        let Some(node) = base
+            .snapshots
+            .node(context.snapshots.as_deref_mut().unwrap())
+        else {
+            render_base_inner(this, context, options);
+            context.snapshot_allowed = allowed;
+            return;
+        };
+        let hit = node
+            .entry
+            .borrow()
+            .as_ref()
+            .filter(|e| e.key == key)
+            .map(|e| e.commands.clone());
+        if let Some(commands) = hit {
+            context.snapshots.as_deref_mut().unwrap().touch(&node);
+            context
+                .commands
+                .push(ruffle_render::commands::Command::Shared(commands));
+            ruffle_render::profile::work(|w| w.snapshot_hits += 1);
+            context.snapshot_allowed = allowed;
+            return;
+        }
+        node.entry.borrow_mut().take();
+        let stable = node
+            .observed
+            .borrow()
+            .as_ref()
+            .is_none_or(|old| *old == key);
+        *node.observed.borrow_mut() = Some(key.clone());
+        if !stable {
+            render_base_inner(this, context, options);
+            context.snapshot_allowed = allowed;
+            return;
+        }
+        ruffle_render::profile::work(|w| w.snapshot_misses += 1);
+        Some((
+            node,
+            key,
+            std::mem::take(&mut context.commands),
+            context.snapshot_barriers,
+        ))
+    } else {
+        None
+    };
+    let recording = context.snapshot_recording;
+    context.snapshot_recording |= prepared.is_some();
+    render_base_inner(this, context, options);
+    context.snapshot_recording = recording;
+    if let Some((node, key, original, barriers)) = prepared {
+        let commands = std::rc::Rc::new(std::mem::replace(&mut context.commands, original));
+        let stored = context.snapshot_barriers == barriers
+            && context.snapshots.as_deref_mut().unwrap().insert(
+                &node,
+                snapshot::Entry {
+                    key,
+                    commands: commands.clone(),
+                },
+            );
+        if stored {
+            context
+                .commands
+                .push(ruffle_render::commands::Command::Shared(commands));
+        } else {
+            context.commands.append(
+                std::rc::Rc::try_unwrap(commands).expect("uncached block has no other owner"),
+            );
+        }
+    }
+    context.snapshot_allowed = allowed;
+}
+
+fn render_base_inner<'gc>(
+    this: DisplayObject<'gc>,
+    context: &mut RenderContext<'_, 'gc>,
+    options: RenderOptions,
+) {
+    this.base().snapshots.visited();
+    ruffle_render::profile::work(|w| w.tree_visits += 1);
     if options.skip_masks && this.maskee().is_some() {
         // Skip rendering masks (unless we are rendering one explicitly).
         return;
@@ -1121,7 +1617,6 @@ pub fn render_base<'gc>(
             false, // we want to do the filter growth for this object ourselves, to know the offsets
             &context.stage.view_matrix(),
         );
-        let name = this.name();
         let mut filters: Vec<Filter> = this.filters().to_owned();
         let swf_version = this.swf_version();
         filters.retain(|f| !f.impotent());
@@ -1151,9 +1646,14 @@ pub fn render_base<'gc>(
                     y_max: filter_rect.y_max.to_pixels().ceil() as i32,
                 };
                 let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
-                if cache.sample_count != context.renderer.stage_sample_count()
-                    || cache.is_dirty(&base_transform.matrix, width, height)
-                {
+                if cache.quality != Some(context.stage.quality()) {
+                    cache.make_dirty();
+                    cache.quality = Some(context.stage.quality());
+                }
+                let changed = cache.sample_count != context.renderer.stage_sample_count()
+                    || cache.content_changed(&base_transform.matrix, width, height);
+                cache.retention.observe(context.render_epoch, changed);
+                if changed || cache.bitmap().is_none() {
                     cache.update(
                         context.renderer,
                         base_transform.matrix,
@@ -1183,13 +1683,13 @@ pub fn render_base<'gc>(
                     });
                 }
             } else {
-                if !cache.warned_for_oversize {
-                    tracing::warn!(
-                        "Skipping cacheAsBitmap for large object {:?} ({width} x {height})",
-                        name
-                    );
-                    cache.warned_for_oversize = true;
-                }
+                context
+                    .renderer
+                    .health()
+                    .record(ruffle_render::error::RenderFailure::new(
+                        ruffle_render::error::RenderFailureKind::Validation,
+                        "cacheAsBitmap/filter bounds exceed native texture limits",
+                    ));
                 cache.clear();
                 cache_info = None;
             }
@@ -1210,6 +1710,7 @@ pub fn render_base<'gc>(
             + Twips::from_pixels_i32(cache_info.draw_offset.y);
 
         if cache_info.dirty {
+            ruffle_render::profile::work(|w| w.cache_redraws += 1);
             let mut transform_stack = TransformStack::new();
             transform_stack.push(&Transform {
                 color_transform: Default::default(),
@@ -1222,6 +1723,11 @@ pub fn render_base<'gc>(
                 tz: Default::default(),
             });
             let mut offscreen_context = RenderContext {
+                render_epoch: context.render_epoch,
+                snapshots: None,
+                snapshot_allowed: false,
+                snapshot_barriers: 0,
+                snapshot_recording: false,
                 renderer: context.renderer,
                 commands: CommandList::new(),
                 cache_draws: context.cache_draws,
@@ -1240,6 +1746,12 @@ pub fn render_base<'gc>(
                 clear: this.opaque_background().unwrap_or_default(),
                 filters: cache_info.filters,
             });
+        } else {
+            ruffle_render::profile::work(|w| w.cache_hits += 1);
+        }
+
+        if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
+            cache.finish_frame(context.renderer);
         }
 
         // When rendering it back, ensure we're only keeping the translation - scale/rotation is within the image already
@@ -2081,6 +2593,9 @@ pub trait TDisplayObject<'gc>:
     /// Set the parent of this display object.
     #[no_dynamic]
     fn set_parent(self, context: &mut UpdateContext<'gc>, parent: Option<DisplayObject<'gc>>) {
+        if parent.is_none() {
+            self.clear_render_snapshots();
+        }
         let had_parent = self.parent().is_some();
         if let Some(old_parent) = self.parent() {
             old_parent.invalidate_construction();
@@ -2210,6 +2725,7 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn set_next_scroll_rect(self, rectangle: Rectangle<Twips>) {
+        self.base().invalidate_render();
         self.base().next_scroll_rect.set(rectangle);
 
         // Scroll rect is natively handled by cacheAsBitmap - don't invalidate self, only parents
@@ -2225,6 +2741,7 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn set_scaling_grid(self, rect: Rectangle<Twips>) {
+        self.base().invalidate_render();
         self.base().scaling_grid.set(rect);
     }
 
@@ -2316,8 +2833,14 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn set_blend_shader(self, value: Option<PixelBenderShaderHandle>) {
-        self.base().set_blend_shader(value);
+        let changed = self.base().set_blend_shader(value);
         self.set_blend_mode(ExtendedBlendMode::Shader);
+        if changed {
+            self.base().invalidate_render();
+            if let Some(parent) = self.parent() {
+                parent.invalidate_cached_bitmap();
+            }
+        }
     }
 
     #[no_dynamic]
@@ -2698,7 +3221,7 @@ pub trait TDisplayObject<'gc>:
             {
                 let domain = context
                     .library
-                    .library_for_movie(self.movie())
+                    .library_for_movie(self.movie(), context.gc_context)
                     .unwrap()
                     .avm2_domain();
 
@@ -2733,6 +3256,8 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn pre_render(self, _context: &mut RenderContext<'_, 'gc>) {
         let this = self.base();
+        // Invisible children also participate in a parent's recorded block.
+        this.snapshots.visited();
         this.clear_invalidate_flag();
         this.scroll_rect
             .set(this.has_scroll_rect().then(|| this.next_scroll_rect.get()));
@@ -2788,6 +3313,7 @@ pub trait TDisplayObject<'gc>:
     }
 
     fn avm1_unload(self, context: &mut UpdateContext<'gc>) {
+        self.base().snapshots.clear();
         // Unload children.
         if let Some(ctr) = self.as_container() {
             for child in ctr.iter_render_list() {
@@ -3106,15 +3632,27 @@ pub trait TDisplayObject<'gc>:
         }
     }
 
+    #[no_dynamic]
+    fn clear_render_snapshots(self) {
+        self.base().snapshots.clear();
+        if let Some(container) = self.as_container() {
+            for child in container.iter_render_list() {
+                child.clear_render_snapshots();
+            }
+        }
+    }
+
     /// Inform this object and its ancestors that it has visually changed and must be redrawn.
     /// If this object or any ancestor is marked as cacheAsBitmap, it will invalidate that cache.
     #[no_dynamic]
     fn invalidate_cached_bitmap(self) {
-        if self.base().invalidate_cached_bitmap() {
-            // Don't inform ancestors if we've already done so this frame
-            if let Some(parent) = self.parent() {
-                parent.invalidate_cached_bitmap();
+        self.base().invalidate_render();
+        let mut object: Option<DisplayObject<'gc>> = Some(self.into());
+        while let Some(current) = object {
+            if !current.base().invalidate_cached_bitmap() {
+                break;
             }
+            object = current.parent();
         }
     }
 

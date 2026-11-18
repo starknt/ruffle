@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 pub mod cli;
 mod exporter;
 mod player_ext;

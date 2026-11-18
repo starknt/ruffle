@@ -18,6 +18,7 @@ use crate::avm2::value::Value;
 use crate::avm2::vtable::{VTable, VTableInitError};
 use crate::context::UpdateContext;
 use crate::string::{AvmString, WString};
+use crate::tag_utils::SwfMovie;
 use bitflags::bitflags;
 use fnv::FnvHashMap;
 use gc_arena::barrier::unlock;
@@ -105,6 +106,9 @@ pub struct Class<'gc>(Gc<'gc, ClassData<'gc>>);
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct ClassData<'gc> {
+    /// SymbolClass belongs to the class, rather than a global strong registry.
+    /// A script retaining the class must retain the defining movie's symbols.
+    symbol: Lock<Option<(SwfMovie<'gc>, swf::CharacterId)>>,
     /// The name of the class.
     name: Lock<QName<'gc>>,
 
@@ -218,6 +222,7 @@ impl<'gc> ClassData<'gc> {
     /// Create an unlinked & unloaded class.
     fn empty(name: QName<'gc>) -> Self {
         Self {
+            symbol: Lock::new(None),
             name: Lock::new(name),
             param: Lock::new(None),
             super_class: None,
@@ -242,6 +247,14 @@ impl<'gc> ClassData<'gc> {
 }
 
 impl<'gc> Class<'gc> {
+    pub(crate) fn symbol(self) -> Option<(SwfMovie<'gc>, swf::CharacterId)> {
+        self.0.symbol.get()
+    }
+
+    pub(crate) fn set_symbol(self, mc: &Mutation<'gc>, movie: SwfMovie<'gc>, id: swf::CharacterId) {
+        unlock!(Gc::write(mc, self.0), ClassData, symbol).set(Some((movie, id)));
+    }
+
     pub fn as_ptr(self) -> *const () {
         Gc::as_ptr(self.0).cast()
     }

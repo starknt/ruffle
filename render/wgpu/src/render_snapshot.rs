@@ -1,0 +1,656 @@
+//! Immutable preparation input. Only numeric identities and owned CPU data are
+//! Send; the side table with renderer handles stays on the player thread.
+use crate::{
+    bitmap_recipe::BitmapRecipe,
+    gpu_runtime::{RenderFailure, RenderFailureKind, ResourceId, ResourceOwner},
+    shape_recipe::ShapeRecipe,
+};
+use fnv::FnvHashMap as HashMap;
+use ruffle_render::{
+    backend::ShapeHandle,
+    bitmap::{Bitmap, BitmapHandle, PixelRegion, PixelSnapping},
+    commands::{Command, CommandList, RenderBlendMode},
+    matrix::Matrix,
+    pixel_bender::PixelBenderShaderHandle,
+    region::RenderRegion,
+    shape_utils::OwnedDistilledShape,
+    transform::Transform,
+};
+use std::{any::Any, sync::Arc};
+use swf::{BlendMode, Color};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ResourceKey {
+    Recipe { device: u64, owner: ResourceOwner },
+    Native(ResourceId),
+}
+impl ResourceKey {
+    fn device(self) -> u64 {
+        match self {
+            Self::Recipe { device, .. } => device,
+            Self::Native(id) => id.device_generation(),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ResourceVersion {
+    pub key: ResourceKey,
+    pub version: u64,
+}
+#[derive(Clone, Debug)]
+pub enum ResourceRecipe {
+    Bitmap {
+        resource: ResourceVersion,
+        pixels: Arc<Bitmap<'static>>,
+        coverage: ruffle_render::bitmap::coverage::Coverage,
+    },
+    Shape {
+        resource: ResourceVersion,
+        geometry: Option<Arc<OwnedDistilledShape>>,
+        scale: f32,
+        bitmap_sizes: Vec<(u16, ruffle_render::bitmap::BitmapSize)>,
+        bitmaps: Vec<(u16, ResourceVersion)>,
+    },
+    Resident(ResourceVersion),
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum SnapshotBlend {
+    Builtin(BlendMode),
+    Shader(ResourceVersion),
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MaskCommand {
+    Push,
+    Activate,
+    Deactivate,
+    Pop,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum SnapshotCommand {
+    Bitmap {
+        resource: ResourceVersion,
+        transform: Transform,
+        smoothing: bool,
+        pixel_snapping: PixelSnapping,
+        region: PixelRegion,
+    },
+    Shape {
+        resource: ResourceVersion,
+        transform: Transform,
+    },
+    Stage3D {
+        resource: ResourceVersion,
+        transform: Transform,
+    },
+    Rect {
+        color: Color,
+        matrix: Matrix,
+    },
+    Line {
+        color: Color,
+        matrix: Matrix,
+        rectangle: bool,
+    },
+    Mask(MaskCommand),
+    Shared(Arc<[SnapshotNode]>),
+    Blend {
+        children: Arc<[SnapshotNode]>,
+        mode: SnapshotBlend,
+    },
+    AlphaMask {
+        maskee: Arc<[SnapshotNode]>,
+        mask: Arc<[SnapshotNode]>,
+    },
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotNode {
+    pub command: SnapshotCommand,
+    pub region: RenderRegion,
+}
+#[derive(Clone, Debug)]
+pub struct RenderSnapshot {
+    pub commands: Arc<[SnapshotNode]>,
+    pub recipes: Vec<ResourceRecipe>,
+}
+#[derive(Clone)]
+enum Handle {
+    Bitmap(BitmapHandle),
+    Shape(ShapeHandle),
+    Shader(PixelBenderShaderHandle),
+}
+pub(crate) fn bitmap_version(handle: &BitmapHandle) -> Result<ResourceVersion, RenderFailure> {
+    Handle::Bitmap(handle.clone()).version()
+}
+impl Handle {
+    fn version(&self) -> Result<ResourceVersion, RenderFailure> {
+        match self {
+            Self::Bitmap(handle) => {
+                let value = &*handle.0 as &dyn Any;
+                if let Some(recipe) = value.downcast_ref::<BitmapRecipe>() {
+                    Ok(ResourceVersion {
+                        key: ResourceKey::Recipe {
+                            device: recipe.device_generation,
+                            owner: recipe.owner,
+                        },
+                        version: recipe.version(),
+                    })
+                } else if let Some(cache) = value.downcast_ref::<crate::bitmap_cache::CacheImage>()
+                {
+                    Ok(ResourceVersion {
+                        key: ResourceKey::Recipe {
+                            device: cache.device_generation,
+                            owner: cache.owner,
+                        },
+                        version: cache.version(),
+                    })
+                } else if let Some(texture) = value.downcast_ref::<crate::Texture>() {
+                    Ok(ResourceVersion {
+                        key: ResourceKey::Native(texture.texture.lease().id()),
+                        version: texture.version.load(std::sync::atomic::Ordering::Relaxed),
+                    })
+                } else {
+                    Err(foreign())
+                }
+            }
+            Self::Shape(handle) => {
+                let value = &*handle.0 as &dyn Any;
+                if let Some(recipe) = value.downcast_ref::<ShapeRecipe>() {
+                    Ok(ResourceVersion {
+                        key: ResourceKey::Recipe {
+                            device: recipe.device_generation,
+                            owner: recipe.owner,
+                        },
+                        version: 1,
+                    })
+                } else if let Some(mesh) = value.downcast_ref::<crate::mesh::Mesh>() {
+                    Ok(ResourceVersion {
+                        key: ResourceKey::Native(mesh.vertex_buffer.lease().id()),
+                        version: 0,
+                    })
+                } else {
+                    Err(foreign())
+                }
+            }
+            Self::Shader(handle) => Ok(ResourceVersion {
+                key: ResourceKey::Native(
+                    crate::pixel_bender::as_cache_holder(handle).resource_id(),
+                ),
+                version: 0,
+            }),
+        }
+    }
+}
+fn foreign() -> RenderFailure {
+    RenderFailure::new(
+        RenderFailureKind::Validation,
+        "snapshot resource belongs to another renderer",
+    )
+}
+
+pub struct PreparedSnapshot {
+    pub snapshot: RenderSnapshot,
+    resources: Vec<(ResourceVersion, Handle)>,
+    resource_indices: HashMap<ResourceVersion, usize>,
+}
+#[derive(Default)]
+struct Capture {
+    known: HashMap<ResourceVersion, usize>,
+    resources: Vec<(ResourceVersion, Handle)>,
+    recipes: Vec<ResourceRecipe>,
+}
+impl Capture {
+    fn resource(&mut self, handle: Handle) -> Result<ResourceVersion, RenderFailure> {
+        let resource = handle.version()?;
+        // Register before dependencies to make cyclic references bounded.
+        match self.known.entry(resource) {
+            std::collections::hash_map::Entry::Occupied(_) => return Ok(resource),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(usize::MAX);
+            }
+        }
+        let recipe = match &handle {
+            Handle::Bitmap(handle) => (&*handle.0 as &dyn Any)
+                .downcast_ref::<BitmapRecipe>()
+                .and_then(BitmapRecipe::pending_upload)
+                .map(|(pixels, coverage)| ResourceRecipe::Bitmap {
+                    resource,
+                    pixels,
+                    coverage,
+                })
+                .unwrap_or(ResourceRecipe::Resident(resource)),
+            Handle::Shape(handle) => {
+                if let Some(shape) = (&*handle.0 as &dyn Any).downcast_ref::<ShapeRecipe>() {
+                    let mut bitmaps = Vec::new();
+                    let mut sources: Vec<_> = shape.bitmaps.0.iter().collect();
+                    sources.sort_by_key(|(id, _)| **id);
+                    for (&id, (_, bitmap)) in sources {
+                        if let Some(bitmap) = bitmap {
+                            bitmaps.push((id, self.resource(Handle::Bitmap(bitmap.clone()))?));
+                        }
+                    }
+                    ResourceRecipe::Shape {
+                        resource,
+                        geometry: shape.geometry.borrow().clone(),
+                        scale: shape.scale,
+                        bitmap_sizes: shape
+                            .bitmaps
+                            .0
+                            .iter()
+                            .map(|(id, (size, _))| (*id, *size))
+                            .collect(),
+                        bitmaps,
+                    }
+                } else {
+                    ResourceRecipe::Resident(resource)
+                }
+            }
+            Handle::Shader(_) => ResourceRecipe::Resident(resource),
+        };
+        self.recipes.push(recipe);
+        *self.known.get_mut(&resource).unwrap() = self.resources.len();
+        self.resources.push((resource, handle));
+        Ok(resource)
+    }
+    fn commands(&mut self, commands: &CommandList) -> Result<Arc<[SnapshotNode]>, RenderFailure> {
+        let mut nodes = Vec::with_capacity(commands.iter().len());
+        for command in commands.iter() {
+            let region = command.region();
+            let command = match command {
+                Command::RenderBitmap {
+                    bitmap,
+                    transform,
+                    smoothing,
+                    pixel_snapping,
+                    region,
+                } => SnapshotCommand::Bitmap {
+                    resource: self.resource(Handle::Bitmap(bitmap.clone()))?,
+                    transform: transform.clone(),
+                    smoothing: *smoothing,
+                    pixel_snapping: *pixel_snapping,
+                    region: *region,
+                },
+                Command::RenderShape { shape, transform } => SnapshotCommand::Shape {
+                    resource: self.resource(Handle::Shape(shape.clone()))?,
+                    transform: transform.clone(),
+                },
+                Command::RenderStage3D { bitmap, transform } => SnapshotCommand::Stage3D {
+                    resource: self.resource(Handle::Bitmap(bitmap.clone()))?,
+                    transform: transform.clone(),
+                },
+                Command::DrawRect { color, matrix } => SnapshotCommand::Rect {
+                    color: *color,
+                    matrix: *matrix,
+                },
+                Command::DrawLine { color, matrix } | Command::DrawLineRect { color, matrix } => {
+                    SnapshotCommand::Line {
+                        color: *color,
+                        matrix: *matrix,
+                        rectangle: matches!(command, Command::DrawLineRect { .. }),
+                    }
+                }
+                Command::Shared(children) => SnapshotCommand::Shared(self.commands(children)?),
+                Command::Blend(children, mode) => SnapshotCommand::Blend {
+                    children: self.commands(children)?,
+                    mode: match mode {
+                        RenderBlendMode::Builtin(mode) => SnapshotBlend::Builtin(*mode),
+                        RenderBlendMode::Shader(shader) => {
+                            SnapshotBlend::Shader(self.resource(Handle::Shader(shader.clone()))?)
+                        }
+                    },
+                },
+                Command::RenderAlphaMask {
+                    maskee_commands,
+                    mask_commands,
+                } => SnapshotCommand::AlphaMask {
+                    maskee: self.commands(maskee_commands)?,
+                    mask: self.commands(mask_commands)?,
+                },
+                Command::PushMask => SnapshotCommand::Mask(MaskCommand::Push),
+                Command::ActivateMask => SnapshotCommand::Mask(MaskCommand::Activate),
+                Command::DeactivateMask => SnapshotCommand::Mask(MaskCommand::Deactivate),
+                Command::PopMask => SnapshotCommand::Mask(MaskCommand::Pop),
+            };
+            nodes.push(SnapshotNode { command, region });
+        }
+        Ok(nodes.into())
+    }
+}
+impl PreparedSnapshot {
+    fn handle(&self, resource: ResourceVersion) -> Result<&Handle, RenderFailure> {
+        self.resource_indices
+            .get(&resource)
+            .map(|index| &self.resources[*index].1)
+            .ok_or_else(|| {
+                RenderFailure::new(
+                    RenderFailureKind::Validation,
+                    "graph refers to an absent snapshot resource",
+                )
+            })
+    }
+    pub fn blend_mode(&self, mode: &SnapshotBlend) -> Result<RenderBlendMode, RenderFailure> {
+        Ok(match mode {
+            SnapshotBlend::Builtin(mode) => RenderBlendMode::Builtin(*mode),
+            SnapshotBlend::Shader(resource) => match self.handle(*resource)? {
+                Handle::Shader(shader) => RenderBlendMode::Shader(shader.clone()),
+                _ => return Err(foreign()),
+            },
+        })
+    }
+    pub fn leaf(&self, node: &SnapshotNode) -> Result<Command, RenderFailure> {
+        Ok(match &node.command {
+            SnapshotCommand::Bitmap {
+                resource,
+                transform,
+                smoothing,
+                pixel_snapping,
+                region,
+            } => match self.handle(*resource)? {
+                Handle::Bitmap(bitmap) => Command::RenderBitmap {
+                    bitmap: bitmap.clone(),
+                    transform: transform.clone(),
+                    smoothing: *smoothing,
+                    pixel_snapping: *pixel_snapping,
+                    region: *region,
+                },
+                _ => return Err(foreign()),
+            },
+            SnapshotCommand::Stage3D {
+                resource,
+                transform,
+            } => match self.handle(*resource)? {
+                Handle::Bitmap(bitmap) => Command::RenderStage3D {
+                    bitmap: bitmap.clone(),
+                    transform: transform.clone(),
+                },
+                _ => return Err(foreign()),
+            },
+            SnapshotCommand::Shape {
+                resource,
+                transform,
+            } => match self.handle(*resource)? {
+                Handle::Shape(shape) => Command::RenderShape {
+                    shape: shape.clone(),
+                    transform: transform.clone(),
+                },
+                _ => return Err(foreign()),
+            },
+            SnapshotCommand::Rect { color, matrix } => Command::DrawRect {
+                color: *color,
+                matrix: *matrix,
+            },
+            SnapshotCommand::Line {
+                color,
+                matrix,
+                rectangle,
+            } => {
+                if *rectangle {
+                    Command::DrawLineRect {
+                        color: *color,
+                        matrix: *matrix,
+                    }
+                } else {
+                    Command::DrawLine {
+                        color: *color,
+                        matrix: *matrix,
+                    }
+                }
+            }
+            _ => {
+                return Err(RenderFailure::new(
+                    RenderFailureKind::Validation,
+                    "composite used as a graph leaf",
+                ));
+            }
+        })
+    }
+
+    pub fn capture(commands: &CommandList) -> Result<Self, RenderFailure> {
+        let capacity = commands.iter().len().min(64);
+        let mut capture = Capture {
+            known: HashMap::with_capacity_and_hasher(capacity, Default::default()),
+            resources: Vec::with_capacity(capacity),
+            recipes: Vec::with_capacity(capacity),
+        };
+        let commands = capture.commands(commands)?;
+        Ok(Self {
+            snapshot: RenderSnapshot {
+                commands,
+                recipes: capture.recipes,
+            },
+            resource_indices: capture.known,
+            resources: capture.resources,
+        })
+    }
+    fn validate<T: crate::target::RenderTarget>(
+        &self,
+        backend: &crate::backend::WgpuRenderBackend<T>,
+    ) -> Result<(), RenderFailure> {
+        // Reject the whole snapshot before any candidate uploads or allocations.
+        backend.descriptors.runtime.check_health()?;
+        for (version, handle) in &self.resources {
+            if version.key.device() != backend.descriptors.runtime.generation()
+                || handle.version()? != *version
+            {
+                return Err(RenderFailure::new(
+                    RenderFailureKind::Validation,
+                    "snapshot resource version changed before preparation",
+                ));
+            }
+        }
+        Ok(())
+    }
+    pub fn prepare<T: crate::target::RenderTarget>(
+        &self,
+        backend: &mut crate::backend::WgpuRenderBackend<T>,
+        bounds: ruffle_render::region::RenderRect,
+        samples: u32,
+        load: crate::pass_graph::Load,
+    ) -> Result<crate::pass_graph::PassGraph, RenderFailure> {
+        use crate::pass_graph::PassGraph;
+        use crate::prepare::{
+            Work,
+            mesh::{ShapeInput, input_vertices},
+        };
+        self.validate(backend)?;
+        enum Input<'a> {
+            Graph(&'a RenderSnapshot),
+            Shapes(Vec<(ResourceVersion, ShapeInput)>, u64),
+        }
+        enum Output {
+            Graph(PassGraph),
+            Shapes(
+                Vec<(ResourceVersion, crate::prepare::mesh::PreparedMesh)>,
+                Vec<(ResourceVersion, ShapeInput)>,
+            ),
+        }
+        fn command_count(nodes: &[SnapshotNode]) -> usize {
+            nodes
+                .iter()
+                .map(|node| {
+                    1usize.saturating_add(match &node.command {
+                        SnapshotCommand::Shared(children)
+                        | SnapshotCommand::Blend { children, .. } => command_count(children),
+                        SnapshotCommand::AlphaMask { maskee, mask } => {
+                            command_count(maskee).saturating_add(command_count(mask))
+                        }
+                        _ => 0,
+                    })
+                })
+                .fold(0usize, usize::saturating_add)
+        }
+        let commands = command_count(&self.snapshot.commands);
+        let vertices = self
+            .snapshot
+            .recipes
+            .iter()
+            .filter_map(|r| match r {
+                ResourceRecipe::Shape {
+                    geometry: Some(geometry),
+                    ..
+                } => Some(input_vertices(geometry)),
+                _ => None,
+            })
+            .fold(0usize, usize::saturating_add);
+        let parallel = crate::prepare::parallel_workload(commands, vertices);
+        let output_budget =
+            (backend.descriptors.runtime.config().staging_limit / 4).clamp(4096, 16 * 1024 * 1024);
+        let mut shapes = self.snapshot.recipes.iter().filter_map(|r| match r {
+            ResourceRecipe::Shape {
+                resource,
+                geometry: Some(geometry),
+                scale,
+                bitmap_sizes,
+                ..
+            } => Some((
+                *resource,
+                ShapeInput {
+                    geometry: geometry.clone(),
+                    scale: *scale,
+                    bitmap_sizes: bitmap_sizes.clone(),
+                },
+            )),
+            _ => None,
+        });
+        let jobs = std::iter::once(Work {
+            bytes: (commands as u64).saturating_mul(4096).saturating_add(4096),
+            value: Input::Graph(&self.snapshot),
+        })
+        .chain(std::iter::from_fn(|| {
+            let partition: Vec<_> = shapes
+                .by_ref()
+                .take(if parallel { 32 } else { 1 })
+                .collect();
+            if partition.is_empty() {
+                return None;
+            }
+            let input = partition.iter().fold(0u64, |bytes, (_, input)| {
+                bytes.saturating_add((input_vertices(&input.geometry) as u64).saturating_mul(1024))
+            });
+            // Reserve proportionally for small partitions so four tasks can
+            // share the device allowance. An underestimated tessellation still
+            // takes the existing exclusive, bounded path after the wave joins.
+            let budget = output_budget.min(input.saturating_add(4096));
+            Some(Work {
+                bytes: input.saturating_add(budget),
+                value: Input::Shapes(partition, budget),
+            })
+        }));
+        let preparation = backend.descriptors.runtime.preparation().clone();
+        let generation = backend.preparation_generation.capture();
+        let mut graph = None;
+        let mut oversized = Vec::new();
+        let current = preparation.for_each_batch(
+            &generation,
+            parallel,
+            jobs,
+            |input| match input {
+                Input::Graph(snapshot) => {
+                    PassGraph::compile(snapshot, bounds, samples, load).map(Output::Graph)
+                }
+                Input::Shapes(inputs, mut budget) => {
+                    let mut prepared = Vec::with_capacity(inputs.len());
+                    let mut remaining = inputs.into_iter();
+                    // The partition's scratch permit bounds this tessellator.
+                    // Reuse Lyon's internal work storage within the partition;
+                    // drop it before publishing/releasing that permit.
+                    let mut tessellator = ruffle_render::tessellator::ShapeTessellator::new();
+                    while let Some((resource, input)) = remaining.next() {
+                        match input.clone().prepare_with(&mut tessellator, budget) {
+                            Ok(mesh) if mesh.retained_bytes() <= budget => {
+                                budget -= mesh.retained_bytes();
+                                prepared.push((resource, mesh));
+                            }
+                            Ok(_) => {
+                                return Ok(Output::Shapes(
+                                    prepared,
+                                    std::iter::once((resource, input))
+                                        .chain(remaining)
+                                        .collect(),
+                                ));
+                            }
+                            Err(error) if error.kind() == RenderFailureKind::BudgetExceeded => {
+                                // The partition estimate was too small. Publish
+                                // completed meshes, then prepare the remainder
+                                // after every wave has released its outputs.
+                                return Ok(Output::Shapes(
+                                    prepared,
+                                    std::iter::once((resource, input))
+                                        .chain(remaining)
+                                        .collect(),
+                                ));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Ok(Output::Shapes(prepared, Vec::new()))
+                }
+            },
+            |batch| {
+                // Recheck after join before GPU publication; only this closure
+                // can access backend handles, bindings, or the device.
+                self.validate(backend)?;
+                for result in batch {
+                    match result {
+                        Output::Graph(value) => graph = Some(value),
+                        Output::Shapes(meshes, deferred) => {
+                            let mut publish = |resource, mesh| {
+                                let Handle::Shape(handle) = self.handle(resource)? else {
+                                    return Err(foreign());
+                                };
+                                let recipe = (&*handle.0 as &dyn Any)
+                                    .downcast_ref::<ShapeRecipe>()
+                                    .ok_or_else(foreign)?;
+                                recipe.publish(backend, mesh)
+                            };
+                            for (resource, mesh) in meshes {
+                                publish(resource, mesh)?;
+                            }
+                            oversized.extend(deferred);
+                        }
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if !current {
+            return Err(RenderFailure::new(
+                RenderFailureKind::Validation,
+                "stale native preparation generation",
+            ));
+        }
+        for (resource, input) in oversized {
+            let current = preparation.run_exclusive(
+                &generation,
+                |budget| input.prepare_bounded(budget),
+                |mesh| {
+                    self.validate(backend)?;
+                    let Handle::Shape(handle) = self.handle(resource)? else {
+                        return Err(foreign());
+                    };
+                    let recipe = (&*handle.0 as &dyn Any)
+                        .downcast_ref::<ShapeRecipe>()
+                        .ok_or_else(foreign)?;
+                    recipe.publish(backend, mesh)
+                },
+            )?;
+            if !current {
+                return Err(RenderFailure::new(
+                    RenderFailureKind::Validation,
+                    "stale native preparation generation",
+                ));
+            }
+        }
+        for (_, handle) in &self.resources {
+            if let Handle::Bitmap(handle) = handle {
+                crate::as_texture(handle, &backend.descriptors.device)?;
+            }
+        }
+        backend.descriptors.runtime.check_health()?;
+        graph.ok_or_else(|| {
+            RenderFailure::new(
+                RenderFailureKind::Internal,
+                "native preparation produced no graph",
+            )
+        })
+    }
+}

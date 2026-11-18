@@ -478,7 +478,8 @@ impl<'gc> LoadManager<'gc> {
                             tracing::debug!("Preloading swf to run exports {:?}", url);
 
                             // Create library for exports before preloading
-                            uc.library.library_for_movie_mut(clip.movie());
+                            uc.library
+                                .library_for_movie_mut(clip.movie(), uc.gc_context);
                             let res = clip.preload(uc, &mut execution_limit);
                             tracing::debug!(
                                 "Preloaded swf to run exports result {:?} {}",
@@ -2331,9 +2332,9 @@ impl<'gc> MovieLoader<'gc> {
 
         match sniffed_type {
             ContentType::Swf => {
-                let library = uc.library.library_for_movie_mut(movie);
-
-                library.set_avm2_domain(domain);
+                uc.library
+                    .library_for_movie_mut(movie, uc.gc_context)
+                    .set_avm2_domain(domain);
 
                 if let Some(mc) = clip.as_movie_clip() {
                     let loader_info = if let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data {
@@ -2419,9 +2420,11 @@ impl<'gc> MovieLoader<'gc> {
             ContentType::Gif | ContentType::Jpeg | ContentType::JpegXr | ContentType::Png => {
                 let mut activation = Avm2Activation::from_nothing(uc);
 
-                let library = activation.context.library.library_for_movie_mut(movie);
-
-                library.set_avm2_domain(domain);
+                activation
+                    .context
+                    .library
+                    .library_for_movie_mut(movie, activation.context.gc_context)
+                    .set_avm2_domain(domain);
 
                 // This will construct AVM2-side objects even under AVM1, but it doesn't matter,
                 // since Bitmap and BitmapData never have AVM1-side objects.

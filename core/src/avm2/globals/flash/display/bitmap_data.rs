@@ -98,7 +98,7 @@ pub fn init<'gc>(
             activation
                 .context
                 .library
-                .library_for_movie_mut(movie)
+                .library_for_movie_mut(movie, activation.context.gc_context)
                 .character_by_id(chara_id)
         });
 
@@ -206,7 +206,7 @@ pub fn scroll<'gc>(
             bitmap_data,
             x,
             y,
-        );
+        )?;
     }
 
     Ok(Value::Undefined)
@@ -273,7 +273,7 @@ pub fn copy_pixels<'gc>(
                     alpha_bitmap,
                     alpha_point,
                     merge_alpha,
-                );
+                )?;
             } else {
                 operations::copy_pixels(
                     activation.context,
@@ -282,7 +282,7 @@ pub fn copy_pixels<'gc>(
                     (src_min_x, src_min_y, src_width, src_height),
                     (dest_x, dest_y),
                     merge_alpha,
-                );
+                )?;
             }
         }
     }
@@ -368,7 +368,7 @@ pub fn get_vector<'gc>(
             y,
             width,
             height,
-        );
+        )?;
 
         let value_type = activation.avm2().class_defs().uint;
         let new_storage = VectorStorage::from_values(pixels, false, Some(value_type));
@@ -391,7 +391,7 @@ pub fn get_pixel<'gc>(
         bitmap_data.check_valid(activation)?;
         let x = args.get_u32(0);
         let y = args.get_u32(1);
-        let col = operations::get_pixel(bitmap_data, activation.context.renderer, x, y);
+        let col = operations::get_pixel(bitmap_data, activation.context.renderer, x, y)?;
         return Ok(col.into());
     }
 
@@ -410,7 +410,7 @@ pub fn get_pixel32<'gc>(
         bitmap_data.check_valid(activation)?;
         let x = args.get_u32(0);
         let y = args.get_u32(1);
-        let pixel = operations::get_pixel32(bitmap_data, activation.context.renderer, x, y);
+        let pixel = operations::get_pixel32(bitmap_data, activation.context.renderer, x, y)?;
         return Ok(pixel.into());
     }
 
@@ -436,7 +436,7 @@ pub fn set_pixel<'gc>(
             x,
             y,
             color.into(),
-        );
+        )?;
     }
 
     Ok(Value::Undefined)
@@ -464,7 +464,7 @@ pub fn set_pixel32<'gc>(
             x,
             y,
             color,
-        );
+        )?;
     }
 
     Ok(Value::Undefined)
@@ -601,7 +601,7 @@ pub fn copy_channel<'gc>(
                 source_bitmap,
                 source_channel,
                 dest_channel,
-            );
+            )?;
         }
     }
     Ok(Value::Undefined)
@@ -628,7 +628,7 @@ pub fn flood_fill<'gc>(
             x,
             y,
             color,
-        );
+        )?;
     }
 
     Ok(Value::Undefined)
@@ -696,7 +696,7 @@ pub fn color_transform<'gc>(
             x_max,
             y_max,
             &color_transform,
-        );
+        )?;
     }
 
     Ok(Value::Undefined)
@@ -724,7 +724,7 @@ pub fn get_color_bounds_rect<'gc>(
         find_color,
         mask,
         color,
-    );
+    )?;
 
     let rect = activation
         .avm2()
@@ -814,7 +814,7 @@ pub fn hit_test<'gc>(
             bitmap_data,
             source_threshold,
             test_point,
-        )))
+        )?))
     } else if compare_object.is_of_type(rectangle_class) {
         let test_point = (
             compare_object
@@ -841,7 +841,7 @@ pub fn hit_test<'gc>(
             source_threshold,
             test_point,
             size,
-        )))
+        )?))
     } else if let Some(other_bmd) = compare_object.as_bitmap_data() {
         other_bmd.check_valid(activation)?;
         let second_point = args.get_object(activation, 3, "secondBitmapDataPoint")?;
@@ -863,7 +863,7 @@ pub fn hit_test<'gc>(
             other_bmd,
             second_point,
             second_threshold,
-        );
+        )?;
 
         Ok(Value::Bool(result))
     } else if let Some(bitmap) = compare_object
@@ -891,7 +891,7 @@ pub fn hit_test<'gc>(
             other_bmd,
             second_point,
             second_threshold,
-        )))
+        )?))
     } else {
         // This is the error message Flash Player produces. Even though it's misleading.
         Err(make_error_2005(activation, 0, "BitmapData"))
@@ -963,6 +963,7 @@ pub fn draw<'gc>(
             quality,
         ) {
             Ok(()) => {}
+            Err(BitmapDataDrawError::Render(error)) => return Err(error.into()),
             Err(BitmapDataDrawError::Unimplemented) => {
                 return Err("Render backend does not support BitmapData.draw".into());
             }
@@ -1039,6 +1040,7 @@ pub fn draw_with_quality<'gc>(
             quality,
         ) {
             Ok(()) => {}
+            Err(BitmapDataDrawError::Render(error)) => return Err(error.into()),
             Err(BitmapDataDrawError::Unimplemented) => {
                 return Err("Render backend does not support BitmapData.draw".into());
             }
@@ -1072,7 +1074,7 @@ pub fn fill_rect<'gc>(
             width,
             height,
             color,
-        );
+        )?;
     }
     Ok(Value::Undefined)
 }
@@ -1189,7 +1191,7 @@ pub fn apply_filter<'gc>(
             source_size,
             dest_point,
             filter,
-        );
+        )?;
     }
     Ok(Value::Undefined)
 }
@@ -1206,7 +1208,7 @@ pub fn clone<'gc>(
         && !bitmap_data.disposed()
     {
         let new_bitmap_data =
-            bitmap_data.clone_data(activation.context.gc_context, activation.context.renderer);
+            bitmap_data.clone_data(activation.context.gc_context, activation.context.renderer)?;
 
         let new_bitmap_data_object =
             BitmapDataObject::from_bitmap_data(activation.context, new_bitmap_data);
@@ -1280,7 +1282,7 @@ pub fn palette_map<'gc>(
             (source_point.0, source_point.1, source_size.0, source_size.1),
             dest_point,
             (red_array, green_array, blue_array, alpha_array),
-        );
+        )?;
     }
 
     Ok(Value::Undefined)
@@ -1400,7 +1402,7 @@ pub fn threshold<'gc>(
                 color,
                 mask,
                 copy_source,
-            )
+            )?
             .into());
         }
     }
@@ -1467,7 +1469,7 @@ pub fn compare<'gc>(
         activation.context.renderer,
         this_bitmap_data,
         other_bitmap_data,
-    ) {
+    )? {
         Some(bitmap_data) => {
             Ok(BitmapDataObject::from_bitmap_data(activation.context, bitmap_data).into())
         }
@@ -1525,7 +1527,7 @@ pub fn pixel_dissolve<'gc>(
                 random_seed,
                 num_pixels,
                 fill_color,
-            )
+            )?
             .into());
         }
     }
@@ -1581,7 +1583,7 @@ pub fn merge<'gc>(
                 (src_min_x, src_min_y, src_width, src_height),
                 dest_point,
                 (red_mult, green_mult, blue_mult, alpha_mult),
-            );
+            )?;
         }
     }
 

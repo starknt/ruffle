@@ -31,6 +31,7 @@ use web_sys::{
 const GRADIENT_TRANSFORM_THRESHOLD: f32 = 0.0001;
 
 pub struct WebCanvasRenderBackend {
+    health: ruffle_render::error::RendererHealth,
     canvas: HtmlCanvasElement,
     context: CanvasRenderingContext2d,
     color_matrix: Element,
@@ -306,6 +307,7 @@ impl WebCanvasRenderBackend {
         line_rect.close_path();
 
         let renderer = Self {
+            health: Default::default(),
             canvas: canvas.clone(),
             color_matrix,
             context,
@@ -481,10 +483,21 @@ impl WebCanvasRenderBackend {
 }
 
 impl RenderBackend for WebCanvasRenderBackend {
-    fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions) {
-        self.viewport_width = dimensions.width;
-        self.viewport_height = dimensions.height;
-        self.viewport_scale_factor = dimensions.scale_factor;
+    fn health(&self) -> &ruffle_render::error::RendererHealth {
+        &self.health
+    }
+    fn set_viewport_dimensions(
+        &mut self,
+        dimensions: ViewportDimensions,
+    ) -> Result<(), ruffle_render::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| {
+            self.viewport_width = dimensions.width;
+            self.viewport_height = dimensions.height;
+            self.viewport_scale_factor = dimensions.scale_factor;
+        })();
+        self.health.check()?;
+        Ok(output)
     }
 
     fn viewport_dimensions(&self) -> ViewportDimensions {
@@ -499,9 +512,14 @@ impl RenderBackend for WebCanvasRenderBackend {
         &mut self,
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
-    ) -> ShapeHandle {
-        let data = swf_shape_to_canvas_commands(&shape, bitmap_source, self);
-        ShapeHandle(Arc::new(ShapeData(data)))
+    ) -> Result<ShapeHandle, ruffle_render::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| {
+            let data = swf_shape_to_canvas_commands(&shape, bitmap_source, self);
+            ShapeHandle(Arc::new(ShapeData(data)))
+        })();
+        self.health.check()?;
+        Ok(output)
     }
 
     fn render_offscreen(
@@ -510,8 +528,11 @@ impl RenderBackend for WebCanvasRenderBackend {
         _commands: CommandList,
         _quality: StageQuality,
         _bounds: PixelRegion,
-    ) -> Option<Box<dyn SyncHandle>> {
-        None
+    ) -> Result<Option<Box<dyn SyncHandle>>, ruffle_render::error::Error> {
+        self.health.check()?;
+        let output = (|| None)();
+        self.health.check()?;
+        Ok(output)
     }
 
     fn submit_frame(
@@ -519,12 +540,17 @@ impl RenderBackend for WebCanvasRenderBackend {
         clear: Color,
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
-    ) {
-        if !cache_entries.is_empty() {
-            panic!("Bitmap caching is unavailable on the canvas backend");
-        }
-        self.begin_frame(clear);
-        commands.execute(self);
+    ) -> Result<(), ruffle_render::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| {
+            if !cache_entries.is_empty() {
+                panic!("Bitmap caching is unavailable on the canvas backend");
+            }
+            self.begin_frame(clear);
+            commands.execute(self);
+        })();
+        self.health.check()?;
+        Ok(output)
     }
 
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, Error> {
@@ -558,7 +584,15 @@ impl RenderBackend for WebCanvasRenderBackend {
         "canvas"
     }
 
-    fn set_quality(&mut self, _quality: StageQuality) {}
+    fn set_quality(
+        &mut self,
+        _quality: StageQuality,
+    ) -> Result<(), ruffle_render::error::RenderFailure> {
+        self.health.check()?;
+        let output = (|| {})();
+        self.health.check()?;
+        Ok(output)
+    }
 
     fn compile_pixelbender_shader(
         &mut self,

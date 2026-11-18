@@ -2766,7 +2766,7 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
         context.commands.pop_mask();
 
         if let Some(draw_caret_command) = render_state.draw_caret_command {
-            context.commands.commands.push(draw_caret_command);
+            context.commands.push(draw_caret_command);
         }
     }
 

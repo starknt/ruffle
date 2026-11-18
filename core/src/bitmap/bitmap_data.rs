@@ -5,9 +5,11 @@ use bitflags::bitflags;
 use gc_arena::lock::GcRefLock;
 use gc_arena::{Collect, Gc, Mutation};
 use ruffle_render::backend::RenderBackend;
+use ruffle_render::bitmap::coverage::Coverage;
 use ruffle_render::bitmap::{
     Bitmap, BitmapFormat, BitmapHandle, PixelRegion, PixelSnapping, SyncHandle,
 };
+use ruffle_render::error::{RenderFailure, RenderFailureKind};
 use ruffle_wstr::WStr;
 use std::cell::Ref;
 use std::fmt::Debug;
@@ -60,6 +62,39 @@ pub struct Color {
 #[derive(Debug, Clone)]
 pub enum BitmapDataDrawError {
     Unimplemented,
+    Render(RenderFailure),
+}
+
+impl From<RenderFailure> for BitmapDataDrawError {
+    fn from(error: RenderFailure) -> Self {
+        Self::Render(error)
+    }
+}
+
+pub enum BitmapDataWriteError {
+    ByteArray(crate::avm2::bytearray::ByteArrayError),
+    Render(RenderFailure),
+}
+impl From<crate::avm2::bytearray::ByteArrayError> for BitmapDataWriteError {
+    fn from(error: crate::avm2::bytearray::ByteArrayError) -> Self {
+        Self::ByteArray(error)
+    }
+}
+impl From<RenderFailure> for BitmapDataWriteError {
+    fn from(error: RenderFailure) -> Self {
+        Self::Render(error)
+    }
+}
+impl BitmapDataWriteError {
+    pub fn to_avm<'gc>(
+        self,
+        activation: &mut crate::avm2::Activation<'_, 'gc>,
+    ) -> crate::avm2::Error<'gc> {
+        match self {
+            Self::ByteArray(error) => error.to_avm(activation),
+            Self::Render(error) => error.into(),
+        }
+    }
 }
 
 impl Color {
@@ -270,13 +305,16 @@ impl<'gc> BitmapData<'gc> {
         &self,
         mc: &Mutation<'gc>,
         renderer: &mut dyn RenderBackend,
-    ) -> BitmapData<'gc> {
-        let data = self.0.clone_data(renderer);
+    ) -> Result<BitmapData<'gc>, RenderFailure> {
+        let data = self.0.clone_data(renderer)?;
         let data = BitmapRawDataWrapper::new(Gc::new(mc, data.into()));
-        Self(data)
+        Ok(Self(data))
     }
 
-    pub fn sync(&self, renderer: &mut dyn RenderBackend) -> GcRefLock<'gc, BitmapRawData<'gc>> {
+    pub fn sync(
+        &self,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<GcRefLock<'gc, BitmapRawData<'gc>>, RenderFailure> {
         self.0.sync(renderer)
     }
 
@@ -284,7 +322,7 @@ impl<'gc> BitmapData<'gc> {
         &self,
         gc_context: &Mutation<'gc>,
         renderer: &mut dyn RenderBackend,
-    ) -> BitmapHandle {
+    ) -> Result<BitmapHandle, RenderFailure> {
         self.0.bitmap_handle(gc_context, renderer)
     }
 
@@ -308,8 +346,26 @@ impl<'gc> BitmapData<'gc> {
         &self,
         read_area: PixelRegion,
         renderer: &mut dyn RenderBackend,
-    ) -> Ref<'_, BitmapRawData<'gc>> {
+    ) -> Result<Ref<'_, BitmapRawData<'gc>>, RenderFailure> {
         self.0.read_area(read_area, renderer)
+    }
+
+    pub(crate) fn read_pixel(
+        &self,
+        x: u32,
+        y: u32,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<Ref<'_, BitmapRawData<'gc>>, RenderFailure> {
+        self.0.read_pixel(x, y, renderer)
+    }
+
+    pub fn write_area(
+        &self,
+        area: PixelRegion,
+        read: bool,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<GcRefLock<'gc, BitmapRawData<'gc>>, RenderFailure> {
+        self.0.write_area(area, read, renderer)
     }
 
     pub fn height(&self) -> u32 {
@@ -415,7 +471,7 @@ pub struct BitmapRawData<'gc> {
     display_objects: Vec<DisplayObjectWeak<'gc>>,
 
     #[collect(require_static)]
-    dirty_state: DirtyState,
+    validity: BitmapValidity,
 
     /// Holds an egui texture handle, used for rendering this Bitmap in the debug ui.
     /// This is automatically set to `None` when the texture is updated (either from
@@ -424,16 +480,80 @@ pub struct BitmapRawData<'gc> {
     pub egui_texture: std::cell::RefCell<Option<egui::TextureHandle>>,
 }
 
+/// Exact, disjoint authority regions. Unmarked pixels are valid on both sides.
+/// Sync tokens belong to the last GPU operation; their readback origin is kept
+/// separately from the union of dirty pixels. Native reads use the live texture.
+#[derive(Debug)]
+pub struct BitmapValidity {
+    cpu: Coverage,
+    gpu: Coverage,
+    pending: Option<(Box<dyn SyncHandle>, PixelRegion)>,
+    failure: Option<RenderFailure>,
+    /// Locality hint only: authoritative coverage still decides what is readable.
+    last_pixel_read_tile: Option<(u32, u32)>,
+    coherent_pixel_reads: bool,
+}
+impl BitmapValidity {
+    fn new(width: u32, height: u32) -> Self {
+        Self {
+            cpu: Coverage::empty(width, height),
+            gpu: Coverage::empty(width, height),
+            pending: None,
+            failure: None,
+            last_pixel_read_tile: None,
+            coherent_pixel_reads: false,
+        }
+    }
+    fn check(&self) -> Result<(), RenderFailure> {
+        self.failure.clone().map_or(Ok(()), Err)
+    }
+    fn is_clean(&self) -> bool {
+        self.cpu.is_empty() && self.gpu.is_empty() && self.failure.is_none()
+    }
+}
+
+/// A diagnostic view, never an owner of a one-shot GPU synchronization token.
 #[derive(Clone, Debug)]
 pub enum DirtyState {
-    // Both the CPU and GPU pixels are up to date. We do not need to wait for any syncs to complete
     Clean,
-
-    // The CPU pixels have been modified, and need to be synced to the GPU via `update_dirty_texture`
     CpuModified(PixelRegion),
+    GpuModified(PixelRegion),
+    Mixed { cpu: PixelRegion, gpu: PixelRegion },
+    Failed(RenderFailure),
+}
 
-    // The GPU pixels have been modified, and need to be synced to the CPU via `BitmapRawDataWrapper::sync`
-    GpuModified(Box<dyn SyncHandle>, PixelRegion),
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use ruffle_render::backend::{ViewportDimensions, null::NullRenderer};
+
+    #[derive(Debug)]
+    struct FailedSync;
+    impl SyncHandle for FailedSync {}
+
+    #[test]
+    fn failed_bitmap_readback_never_exposes_stale_pixels() {
+        let arena = gc_arena::Arena::<gc_arena::Rootable![BitmapData<'_>]>::new(|mc| {
+            BitmapData::new(mc, 1, 1, true, 0xff123456)
+        });
+        arena.mutate(|mc, bitmap| {
+            let mut renderer = NullRenderer::new(ViewportDimensions {
+                width: 1,
+                height: 1,
+                scale_factor: 1.0,
+            });
+            bitmap.mark_gpu_dirty(mc, Box::new(FailedSync), PixelRegion::for_whole_size(1, 1));
+            assert!(bitmap.sync(&mut renderer).is_err());
+            assert!(bitmap.sync(&mut renderer).is_err());
+            assert!(
+                bitmap
+                    .read_area(PixelRegion::for_pixel(0, 0), &mut renderer)
+                    .is_err()
+            );
+            assert!(!bitmap.can_read(PixelRegion::for_pixel(0, 0)));
+            assert!(renderer.health().check().is_err());
+        });
+    }
 }
 
 mod wrapper {
@@ -446,39 +566,18 @@ mod wrapper {
     use ruffle_render::backend::RenderBackend;
     use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping, SyncHandle};
     use ruffle_render::commands::CommandHandler;
+    use ruffle_render::error::RenderFailure;
     use std::cell::Ref;
     use web_time::Instant;
 
-    use super::{BitmapRawData, DirtyState, copy_pixels_to_bitmapdata};
+    #[cfg(feature = "egui")]
+    use super::DirtyState;
+    use super::{BitmapRawData, BitmapValidity, copy_pixels_to_bitmapdata};
+    use ruffle_render::bitmap::coverage::Coverage;
+    use ruffle_render::error::RenderFailureKind;
 
-    /// A wrapper type that ensures that we always wait for a pending
-    /// GPU -> CPU sync to complete (using `sync_handle`) before accessing
-    /// the CPU-side pixels.
-    ///
-    /// This is overly conservative - we perform a sync before allowing any access
-    /// to the underlying `BitmapData`, even if we wouldn't be accessing the pixels.
-    /// Implementing more fine-grained tracking turned out to be extremely invasive,
-    /// and made the code much less readable. This should be enough for the simple
-    /// case where ActionScript calls `BitmapData.draw`, and then doesn't interact
-    /// with the Bitmap/BitmapData object at all for some time.
-    ///
-    /// There are three ways that this type gets used:
-    /// 1. Blocking on the current GPU->CPU sync via the `sync` method,
-    ///    and obtainng a `GcRefLock<'gc, BitmapData<'gc>>` (or implicily through `as_bitmap_data`).
-    ///    This is done for the vast majority of BitmapData AS2/AS3 methods, as they need to access CPU-side pixels.
-    /// 2. Ignoring the current GPU->CPU sync state. This is done by the `render` method defined on this type,
-    ///    since rendering only uses GPU-side data, and ignores CPU-side pixels entirely.
-    /// 3. Explicitly cancelling any in-progress GPU->CPU sync via `overwrite_cpu_pixels_from_gpu`. This is
-    ///    used by `BitmapData.draw` and `BitmapData.apply_filter`, since the new rendering result will completely
-    ///    replace the current CPU-side pixels. This performs a CPU -> GPU sync, to ensure that the GPU side
-    ///    is up to date before we overwrite the CPU-side pixels.
-    ///    In the future, we could explore using this in additional
-    ///    cases where we know that the entire CPU-side pixel array will be overwritten without being read
-    ///    (e.g. `BitmapData.fillRect` with a rectangle covering the entire bitmap). However, `overwrite_cpu_pixels`
-    ///    is always a performance optimization, and can always be safely replaced with `sync` (at the cost of worse performance)
-    ///
-    /// Note that we also perform CPU-GPU syncs from `BitmapData.update_dirty_texture` when `dirty` is set.
-    /// `sync_handle` and `dirty` can never be set at the same time - we can only have one of them set, or none of them set.
+    /// Guards CPU pixel access with exact GPU validity. Metadata and GPU handle
+    /// access do not wait; nearby scalar reads can prefetch bounded dirty coverage.
     #[derive(Copy, Clone, Collect, Debug)]
     #[collect(no_drop)]
     pub struct BitmapRawDataWrapper<'gc>(GcRefLock<'gc, BitmapRawData<'gc>>);
@@ -504,7 +603,7 @@ mod wrapper {
                     bitmap_handle: None,
                     avm2_object: None,
                     display_objects: vec![],
-                    dirty_state: DirtyState::Clean,
+                    validity: BitmapValidity::new(0, 0),
                     #[cfg(feature = "egui")]
                     egui_texture: Default::default(),
                 }
@@ -514,11 +613,14 @@ mod wrapper {
 
         /// Clones the underlying data, producing a new `BitmapData`
         /// that has no GPU texture or associated display objects
-        pub fn clone_data(&self, renderer: &mut dyn RenderBackend) -> BitmapRawData<'gc> {
+        pub fn clone_data(
+            &self,
+            renderer: &mut dyn RenderBackend,
+        ) -> Result<BitmapRawData<'gc>, RenderFailure> {
             // Sync from the GPU to CPU, since our new BitmapData starts out
             // with no GPU texture
-            let data = self.sync(renderer).borrow();
-            BitmapRawData {
+            let data = self.sync(renderer)?.borrow();
+            Ok(BitmapRawData {
                 pixels: data.pixels.clone(),
                 width: data.width,
                 height: data.height,
@@ -528,46 +630,160 @@ mod wrapper {
                 avm2_object: None,
                 display_objects: vec![],
                 // We have no GPU texture, so there's no need to mark as dirty
-                dirty_state: DirtyState::Clean,
+                validity: BitmapValidity::new(data.width, data.height),
                 #[cfg(feature = "egui")]
                 egui_texture: Default::default(),
-            }
+            })
         }
 
         // Provides access to the underlying `BitmapData`. If a GPU -> CPU sync
         // is in progress, waits for it to complete
-        pub fn sync(&self, renderer: &mut dyn RenderBackend) -> GcRefLock<'gc, BitmapRawData<'gc>> {
-            // SAFETY: The only fields that can store gc pointers are `avm2_object` and `dirty_callbacks`,
-            // which we don't update here. Ideally, we would refactor this so that
-            // `BitmapData` doesn't contain any gc pointers, allowing us to use a normal
-            // `RefCell` instead of a `RefLock`.
+        pub fn sync(
+            &self,
+            renderer: &mut dyn RenderBackend,
+        ) -> Result<GcRefLock<'gc, BitmapRawData<'gc>>, RenderFailure> {
+            self.sync_area(
+                PixelRegion::for_whole_size(self.width(), self.height()),
+                false,
+                renderer,
+            )?;
+            Ok(self.0)
+        }
+
+        fn sync_area(
+            &self,
+            mut area: PixelRegion,
+            prefetch: bool,
+            renderer: &mut dyn RenderBackend,
+        ) -> Result<(), RenderFailure> {
+            renderer.health().check()?;
+            let mut pixel_read_tile = None;
+            let mut coherent_pixel_reads = false;
+            {
+                let read = self.0.borrow();
+                read.validity.check()?;
+                // Aliased input operands may already hold a shared pixel view.
+                // A clean region needs no exclusive access to those pixels.
+                if !read.validity.gpu.intersects(area) {
+                    return Ok(());
+                }
+                if prefetch
+                    && area.width() == 1
+                    && area.height() == 1
+                    && renderer.supports_bitmap_region_readback()
+                {
+                    // Keep isolated reads exact. Repeated nearby reads amortize the
+                    // queue/map wait over at most 4 KiB, not the whole bitmap.
+                    let tile = (area.x_min / 32 * 32, area.y_min / 32 * 32);
+                    pixel_read_tile = Some(tile);
+                    coherent_pixel_reads = read.validity.coherent_pixel_reads
+                        || read.validity.last_pixel_read_tile == Some(tile);
+                    if coherent_pixel_reads {
+                        area = PixelRegion::for_region(
+                            tile.0,
+                            tile.1,
+                            read.width.saturating_sub(tile.0).min(32),
+                            read.height.saturating_sub(tile.1).min(32),
+                        );
+                    }
+                }
+            }
+            // SAFETY: Only owned pixel/validity data changes; no GC references are written.
             let mut write = unsafe { Write::assume(Gc::as_ref(self.0)) }
                 .unlock()
                 .borrow_mut();
-            match std::mem::replace(&mut write.dirty_state, DirtyState::Clean) {
-                DirtyState::GpuModified(sync_handle, bounds) => {
-                    let readback_started = Instant::now();
+            let empty = Coverage::empty(write.width, write.height);
+            let mut gpu = std::mem::replace(&mut write.validity.gpu, empty);
+            let mut fallback_done = false;
+            let result = gpu.for_each_in(area, |region| -> Result<(), RenderFailure> {
+                if fallback_done {
+                    return Ok(());
+                }
+                let started = Instant::now();
+                let mut copied = Err(RenderFailure::new(
+                    RenderFailureKind::MapFailed,
+                    "bitmap readback returned no pixels",
+                ));
+                let result = if let Some(handle) = write.bitmap_handle.clone() {
                     renderer
-                        .resolve_sync_handle(
-                            sync_handle,
-                            Box::new(|buffer, buffer_width| {
-                                copy_pixels_to_bitmapdata(&mut write, buffer, buffer_width, bounds)
+                        .read_bitmap_region(
+                            &handle,
+                            region,
+                            Box::new(|buffer, stride| {
+                                copied = copy_pixels_to_bitmapdata(
+                                    &mut write, buffer, stride, region, region,
+                                );
                             }),
                         )
-                        .expect("Failed to sync BitmapData");
-                    ruffle_render::profile::bitmap_readback(
-                        u64::from(bounds.width())
-                            .saturating_mul(u64::from(bounds.height()))
-                            .saturating_mul(4),
-                        readback_started.elapsed().as_nanos() as u64,
-                    );
-                    write.dirty_state = DirtyState::Clean;
-                    #[cfg(feature = "egui")]
-                    write.egui_texture.borrow_mut().take();
-                }
-                old_state => write.dirty_state = old_state,
+                        .map_err(|error| error.into_render_failure())?
+                } else {
+                    None
+                };
+                let bytes = if result.is_some() {
+                    copied?;
+                    u64::from(region.width()) * u64::from(region.height()) * 4
+                } else {
+                    let (pending, origin) = write.validity.pending.take().ok_or_else(|| {
+                        RenderFailure::new(
+                            RenderFailureKind::MapFailed,
+                            "bitmap has no pending readback",
+                        )
+                    })?;
+                    renderer
+                        .resolve_sync_handle(
+                            pending,
+                            Box::new(|buffer, stride| {
+                                copied = gpu.for_each(|part| {
+                                    copy_pixels_to_bitmapdata(
+                                        &mut write, buffer, stride, origin, part,
+                                    )
+                                });
+                            }),
+                        )
+                        .map_err(|error| error.into_render_failure())?;
+                    copied?;
+                    fallback_done = true;
+                    u64::from(origin.width()) * u64::from(origin.height()) * 4
+                };
+                renderer.health().check()?;
+                ruffle_render::profile::bitmap_readback(bytes, started.elapsed().as_nanos() as u64);
+                Ok(())
+            });
+            if let Err(error) = result {
+                write.validity.gpu = gpu;
+                let error = renderer.health().record(error);
+                write.validity.failure = Some(error.clone());
+                return Err(error);
             }
-            self.0
+            if !fallback_done {
+                gpu.remove(area);
+            }
+            if fallback_done || gpu.is_empty() {
+                gpu = Coverage::empty(write.width, write.height);
+                write.validity.pending = None;
+            }
+            write.validity.gpu = gpu;
+            write.validity.last_pixel_read_tile = pixel_read_tile;
+            write.validity.coherent_pixel_reads = coherent_pixel_reads;
+            #[cfg(feature = "egui")]
+            write.egui_texture.borrow_mut().take();
+            Ok(())
+        }
+
+        /// Access for a CPU write that preserves other regions. `read` is true
+        /// only when this operation needs the previous pixels (e.g. setPixel alpha).
+        pub fn write_area(
+            &self,
+            area: PixelRegion,
+            read: bool,
+            renderer: &mut dyn RenderBackend,
+        ) -> Result<GcRefLock<'gc, BitmapRawData<'gc>>, RenderFailure> {
+            renderer.health().check()?;
+            self.0.borrow().validity.check()?;
+            if read {
+                self.sync_area(area, false, renderer)?;
+            }
+            Ok(self.0)
         }
 
         /// Provides access to the underlying `BitmapHandle`.
@@ -580,9 +796,9 @@ mod wrapper {
             &self,
             gc_context: &Mutation<'gc>,
             renderer: &mut dyn RenderBackend,
-        ) -> BitmapHandle {
+        ) -> Result<BitmapHandle, RenderFailure> {
             let mut bitmap_data = self.0.borrow_mut(gc_context);
-            bitmap_data.update_dirty_texture(renderer);
+            bitmap_data.update_dirty_texture(renderer)?;
             bitmap_data.bitmap_handle(renderer)
         }
 
@@ -592,14 +808,9 @@ mod wrapper {
             sync_handle: Box<dyn SyncHandle>,
             region: PixelRegion,
         ) {
-            let mut bitmap_data = self.0.borrow_mut(gc_context);
-            let mut readback_region = region;
-            if let DirtyState::GpuModified(_, old_region) =
-                std::mem::replace(&mut bitmap_data.dirty_state, DirtyState::Clean)
-            {
-                readback_region.union(old_region);
-            }
-            bitmap_data.set_gpu_dirty(gc_context, sync_handle, readback_region);
+            self.0
+                .borrow_mut(gc_context)
+                .set_gpu_dirty(gc_context, sync_handle, region);
         }
 
         /// Provides access to the underlying `BitmapData`.
@@ -611,13 +822,9 @@ mod wrapper {
             mc: &Mutation<'gc>,
         ) -> (GcRefLock<'gc, BitmapRawData<'gc>>, Option<PixelRegion>) {
             let mut write = self.0.borrow_mut(mc);
-            let dirty_rect = match write.dirty_state {
-                DirtyState::GpuModified(_, rect) => {
-                    write.dirty_state = DirtyState::Clean;
-                    Some(rect)
-                }
-                DirtyState::CpuModified(_) | DirtyState::Clean => None,
-            };
+            let dirty_rect = (!write.validity.gpu.is_empty()).then(|| write.validity.gpu.bounds());
+            write.validity.gpu = Coverage::empty(write.width, write.height);
+            write.validity.pending = None;
             #[cfg(feature = "egui")]
             write.egui_texture.borrow_mut().take();
             (self.0, dirty_rect)
@@ -630,17 +837,19 @@ mod wrapper {
             &self,
             read_area: PixelRegion,
             renderer: &mut dyn RenderBackend,
-        ) -> Ref<'_, BitmapRawData<'gc>> {
-            let needs_update = if let DirtyState::GpuModified(_, area) = self.0.borrow().dirty_state
-            {
-                area.intersects(read_area)
-            } else {
-                false
-            };
-            if needs_update {
-                self.sync(renderer);
-            }
-            self.0.borrow()
+        ) -> Result<Ref<'_, BitmapRawData<'gc>>, RenderFailure> {
+            self.sync_area(read_area, false, renderer)?;
+            Ok(self.0.borrow())
+        }
+
+        pub fn read_pixel(
+            &self,
+            x: u32,
+            y: u32,
+            renderer: &mut dyn RenderBackend,
+        ) -> Result<Ref<'_, BitmapRawData<'gc>>, RenderFailure> {
+            self.sync_area(PixelRegion::for_pixel(x, y), true, renderer)?;
+            Ok(self.0.borrow())
         }
 
         // These methods do not require a sync to complete, as they do not depend on the
@@ -713,16 +922,36 @@ mod wrapper {
             // Note - we do a CPU -> GPU sync, but we do *not* do a GPU -> CPU sync
             // (rendering is done on the GPU, so the CPU pixels don't need to be up-to-date).
             let view = if inner_bitmap_data.bitmap_handle.is_none()
-                && matches!(inner_bitmap_data.dirty_state, DirtyState::Clean)
+                && inner_bitmap_data.validity.is_clean()
             {
-                inner_bitmap_data.pixels.view(context.renderer)
+                match inner_bitmap_data.pixels.view(context.renderer) {
+                    Ok(view) => view,
+                    Err(error) => {
+                        context
+                            .renderer
+                            .health()
+                            .record(error.into_render_failure());
+                        return;
+                    }
+                }
             } else {
                 None
             };
-            let handle = view.unwrap_or_else(|| {
-                inner_bitmap_data.update_dirty_texture(context.renderer);
-                inner_bitmap_data.bitmap_handle(context.renderer)
-            });
+            let handle = match view {
+                Some(handle) => handle,
+                None => {
+                    if inner_bitmap_data
+                        .update_dirty_texture(context.renderer)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    match inner_bitmap_data.bitmap_handle(context.renderer) {
+                        Ok(handle) => handle,
+                        Err(_) => return,
+                    }
+                }
+            };
 
             context.commands.render_bitmap(
                 handle,
@@ -734,22 +963,23 @@ mod wrapper {
         }
 
         pub fn can_read(&self, read_area: PixelRegion) -> bool {
-            if let DirtyState::GpuModified(_, area) = self.0.borrow().dirty_state {
-                !area.intersects(read_area)
-            } else {
-                true
-            }
+            let data = self.0.borrow();
+            data.validity.failure.is_none() && !data.validity.gpu.intersects(read_area)
         }
 
         #[cfg(feature = "egui")]
         pub fn debug_sync_status(&self) -> std::borrow::Cow<'static, str> {
-            match self.0.borrow().dirty_state {
+            match self.0.borrow().dirty_state() {
+                DirtyState::Failed(ref error) => std::borrow::Cow::Owned(error.to_string()),
                 DirtyState::Clean => std::borrow::Cow::Borrowed("Clean"),
+                DirtyState::Mixed { cpu, gpu } => {
+                    std::borrow::Cow::Owned(format!("CPU modified {cpu:?}; GPU modified {gpu:?}"))
+                }
                 DirtyState::CpuModified(area) => std::borrow::Cow::Owned(format!(
                     "CPU modified from {}, {} to {}, {}",
                     area.x_min, area.y_min, area.x_max, area.y_max
                 )),
-                DirtyState::GpuModified(_, area) => std::borrow::Cow::Owned(format!(
+                DirtyState::GpuModified(area) => std::borrow::Cow::Owned(format!(
                     "GPU modified from {}, {} to {}, {}",
                     area.x_min, area.y_min, area.x_max, area.y_max
                 )),
@@ -771,7 +1001,7 @@ pub use wrapper::BitmapRawDataWrapper;
 impl std::fmt::Debug for BitmapRawData<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BitmapRawData")
-            .field("dirty_state", &self.dirty_state)
+            .field("validity", &self.validity)
             .field("width", &self.width)
             .field("height", &self.height)
             .field("transparency", &self.transparency)
@@ -799,7 +1029,7 @@ impl<'gc> BitmapRawData<'gc> {
             bitmap_handle: None,
             avm2_object: None,
             display_objects: vec![],
-            dirty_state: DirtyState::Clean,
+            validity: BitmapValidity::new(width, height),
             #[cfg(feature = "egui")]
             egui_texture: Default::default(),
         }
@@ -819,7 +1049,7 @@ impl<'gc> BitmapRawData<'gc> {
             bitmap_handle: None,
             avm2_object: None,
             disposed: false,
-            dirty_state: DirtyState::Clean,
+            validity: BitmapValidity::new(width, height),
             display_objects: vec![],
             #[cfg(feature = "egui")]
             egui_texture: Default::default(),
@@ -836,7 +1066,7 @@ impl<'gc> BitmapRawData<'gc> {
         self.pixels = crate::bitmap::symbol_pixels::Pixels::owned(Vec::new()); // free the CPU pixel buffer
         self.bitmap_handle = None;
         // There's no longer a handle to update
-        self.dirty_state = DirtyState::Clean;
+        self.validity = BitmapValidity::new(self.width, self.height);
         self.disposed = true;
     }
 
@@ -844,6 +1074,7 @@ impl<'gc> BitmapRawData<'gc> {
         &mut self,
         renderer: &mut dyn RenderBackend,
     ) -> Result<BitmapHandle, ruffle_render::error::Error> {
+        renderer.health().check()?;
         if let Some(ref handle) = self.bitmap_handle {
             return Ok(handle.clone());
         }
@@ -856,23 +1087,37 @@ impl<'gc> BitmapRawData<'gc> {
         );
         let bitmap_handle = renderer.register_bitmap(bitmap);
         if let Ok(ref handle) = bitmap_handle {
-            self.dirty_state = DirtyState::Clean;
+            self.validity = BitmapValidity::new(self.width, self.height);
             self.bitmap_handle = Some(handle.clone());
         }
         bitmap_handle
     }
 
-    pub fn bitmap_handle(&mut self, renderer: &mut dyn RenderBackend) -> BitmapHandle {
+    pub fn bitmap_handle(
+        &mut self,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<BitmapHandle, RenderFailure> {
         self.try_bitmap_handle(renderer)
-            .expect("Failed to register bitmap")
+            .map_err(|error| renderer.health().record(error.into_render_failure()))
     }
 
     pub fn transparency(&self) -> bool {
         self.transparency
     }
 
-    pub fn dirty_state(&self) -> &DirtyState {
-        &self.dirty_state
+    pub fn dirty_state(&self) -> DirtyState {
+        if let Some(error) = &self.validity.failure {
+            return DirtyState::Failed(error.clone());
+        }
+        match (self.validity.cpu.is_empty(), self.validity.gpu.is_empty()) {
+            (true, true) => DirtyState::Clean,
+            (false, true) => DirtyState::CpuModified(self.validity.cpu.bounds()),
+            (true, false) => DirtyState::GpuModified(self.validity.gpu.bounds()),
+            (false, false) => DirtyState::Mixed {
+                cpu: self.validity.cpu.bounds(),
+                gpu: self.validity.gpu.bounds(),
+            },
+        }
     }
 
     pub fn set_gpu_dirty(
@@ -881,33 +1126,30 @@ impl<'gc> BitmapRawData<'gc> {
         sync_handle: Box<dyn SyncHandle>,
         region: PixelRegion,
     ) {
-        self.dirty_state = DirtyState::GpuModified(sync_handle, region);
+        if self.validity.failure.is_some() {
+            return;
+        }
+        self.validity.cpu.remove(region);
+        self.validity.gpu.add(region);
+        self.validity.pending = Some((sync_handle, region));
+        self.validity.last_pixel_read_tile = None;
+        self.validity.coherent_pixel_reads = false;
         self.inform_display_objects(gc_context);
     }
 
     pub fn set_cpu_dirty(&mut self, gc_context: &Mutation<'gc>, region: PixelRegion) {
-        debug_assert!(region.x_max <= self.width);
-        debug_assert!(region.y_max <= self.height);
-
+        debug_assert!(region.x_max <= self.width && region.y_max <= self.height);
+        if self.validity.failure.is_some() || region.is_empty() {
+            return;
+        }
         #[cfg(feature = "egui")]
         self.egui_texture.borrow_mut().take();
-
-        let inform_changes = match &mut self.dirty_state {
-            DirtyState::CpuModified(old_region) => {
-                old_region.union(region);
-                false
-            }
-            DirtyState::Clean => {
-                self.dirty_state = DirtyState::CpuModified(region);
-                true
-            }
-            DirtyState::GpuModified(_, _) => {
-                panic!("Attempted to modify CPU dirty state while GPU sync is in progress!")
-            }
-        };
-        if inform_changes {
-            self.inform_display_objects(gc_context);
+        self.validity.gpu.remove(region);
+        if self.validity.gpu.is_empty() {
+            self.validity.pending = None;
         }
+        self.validity.cpu.add(region);
+        self.inform_display_objects(gc_context);
     }
 
     pub fn pixels(&self) -> &[Color] {
@@ -966,11 +1208,16 @@ impl<'gc> BitmapRawData<'gc> {
 
     // Updates the data stored with our `BitmapHandle` if this `BitmapRawData`
     // is dirty
-    pub fn update_dirty_texture(&mut self, renderer: &mut dyn RenderBackend) {
-        let handle = self.bitmap_handle(renderer);
-        match &self.dirty_state {
-            DirtyState::CpuModified(region) => {
-                if let Err(e) = renderer.update_texture(
+    pub fn update_dirty_texture(
+        &mut self,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<(), RenderFailure> {
+        renderer.health().check()?;
+        let handle = self.bitmap_handle(renderer)?;
+        self.validity.check()?;
+        self.validity.cpu.for_each(|region| {
+            renderer
+                .update_texture(
                     &handle,
                     Bitmap::new(
                         self.width(),
@@ -978,14 +1225,12 @@ impl<'gc> BitmapRawData<'gc> {
                         BitmapFormat::Rgba,
                         self.pixels_rgba(),
                     ),
-                    *region,
-                ) {
-                    tracing::error!("Failed to update dirty bitmap {:?}: {:?}", handle, e);
-                }
-                self.dirty_state = DirtyState::Clean
-            }
-            DirtyState::Clean | DirtyState::GpuModified(_, _) => {}
-        }
+                    region,
+                )
+                .map_err(|error| renderer.health().record(error.into_render_failure()))
+        })?;
+        self.validity.cpu = Coverage::empty(self.width, self.height);
+        Ok(())
     }
 
     fn inform_display_objects(&self, gc_context: &Mutation<'gc>) {
@@ -1028,33 +1273,49 @@ impl IBitmapDrawable<'_> {
 fn copy_pixels_to_bitmapdata(
     write: &mut BitmapRawData,
     buffer: &[u8],
-    buffer_width: u32,
+    stride: u32,
+    origin: PixelRegion,
     area: PixelRegion,
-) {
-    let buffer_width_pixels = buffer_width / 4;
-
+) -> Result<(), RenderFailure> {
+    let row_bytes = u64::from(origin.width()) * 4;
+    let required = u64::from(stride) * u64::from(origin.height().saturating_sub(1)) + row_bytes;
+    if stride % 4 != 0
+        || u64::from(stride) < row_bytes
+        || required > buffer.len() as u64
+        || area.x_min < origin.x_min
+        || area.y_min < origin.y_min
+        || area.x_max > origin.x_max
+        || area.y_max > origin.y_max
+        || area.x_max > write.width
+        || area.y_max > write.height
+    {
+        return Err(RenderFailure::new(
+            RenderFailureKind::MapFailed,
+            "bitmap readback does not cover authoritative pixels",
+        ));
+    }
     for y in area.y_min..area.y_max {
         for x in area.x_min..area.x_max {
-            // note: this order of conversions helps llvm realize the index is 4-byte-aligned
-            let ind = (((x - area.x_min) + (y - area.y_min) * buffer_width_pixels) as usize) * 4;
-
-            // TODO(mid): optimize this A LOT
-            let r = buffer[ind];
-            let g = buffer[ind + 1usize];
-            let b = buffer[ind + 2usize];
-            let a = if write.transparency() {
-                buffer[ind + 3usize]
+            let offset = ((u64::from(y - origin.y_min) * u64::from(stride))
+                + u64::from(x - origin.x_min) * 4) as usize;
+            let alpha = if write.transparency() {
+                buffer[offset + 3]
             } else {
                 255
             };
-
-            let nc = Color::rgba(r, g, b, a);
-
-            // Ignore the original color entirely - the blending (including alpha)
-            // was done by the renderer when it wrote over the previous texture contents.
-            write.set_pixel32_raw(x, y, nc);
+            write.set_pixel32_raw(
+                x,
+                y,
+                Color::rgba(
+                    buffer[offset],
+                    buffer[offset + 1],
+                    buffer[offset + 2],
+                    alpha,
+                ),
+            );
         }
     }
+    Ok(())
 }
 
 #[derive(Copy, Clone, Debug)]

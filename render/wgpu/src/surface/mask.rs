@@ -1,6 +1,6 @@
 use enum_map::Enum;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Enum)]
 pub enum MaskMode {
     NoMask,
     DrawMaskStencil,
@@ -22,7 +22,7 @@ impl MaskState {
         }
     }
 
-    pub fn apply_stencil_reference(self, render_pass: &mut wgpu::RenderPass) {
+    pub fn apply_stencil_reference(self, render_pass: &mut crate::gpu_resources::RenderPass) {
         match self.mode {
             MaskMode::NoMask => {}
             MaskMode::DrawMaskStencil => {
@@ -61,5 +61,42 @@ impl MaskState {
         } else {
             self.mode = MaskMode::DrawMaskedContent;
         };
+    }
+}
+
+impl MaskMode {
+    pub fn pipeline_stencil(self) -> wgpu::DepthStencilState {
+        let face = wgpu::StencilFaceState {
+            compare: if self == Self::NoMask {
+                wgpu::CompareFunction::Always
+            } else {
+                wgpu::CompareFunction::Equal
+            },
+            fail_op: wgpu::StencilOperation::Keep,
+            depth_fail_op: wgpu::StencilOperation::Keep,
+            pass_op: match self {
+                Self::DrawMaskStencil => wgpu::StencilOperation::IncrementClamp,
+                Self::ClearMaskStencil => wgpu::StencilOperation::DecrementClamp,
+                _ => wgpu::StencilOperation::Keep,
+            },
+        };
+        wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Stencil8,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState {
+                front: face,
+                back: face,
+                read_mask: !0,
+                write_mask: !0,
+            },
+            bias: Default::default(),
+        }
+    }
+    pub fn color_writes(self) -> wgpu::ColorWrites {
+        match self {
+            Self::DrawMaskStencil | Self::ClearMaskStencil => wgpu::ColorWrites::empty(),
+            _ => wgpu::ColorWrites::ALL,
+        }
     }
 }

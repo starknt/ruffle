@@ -4994,14 +4994,16 @@ dependencies = [
  "naga",
  "naga-agal",
  "naga-pixelbender",
+ "parking_lot",
  "profiling",
+ "rayon",
  "ruffle_render",
  "smallvec",
  "swf 0.4.0",
+ "thiserror 2.0.18",
  "tracing",
- "web-sys",
+ "tracy-client",
  "wgpu",
- "wgpu-profiler",
 ]
 
 [[package]]
@@ -5133,7 +5135,6 @@ dependencies = [
  "ruffle_render",
  "ruffle_render_canvas",
  "ruffle_render_webgl",
- "ruffle_render_wgpu",
  "ruffle_video_external",
  "ruffle_web_common",
  "serde",
@@ -5951,9 +5952,12 @@ dependencies = [
  "libtest-mimic",
  "ruffle_core",
  "ruffle_fs_tests_runner",
+ "ruffle_render",
  "ruffle_render_wgpu",
  "ruffle_test_framework",
  "serde",
+ "serde_json",
+ "sha2",
  "temp-dir",
  "toml",
  "tracing",
@@ -7027,8 +7031,6 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "30.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6b7fb58561a792bc237628ba0792e332de418fefe145f13b5ed8201e6d52f58"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -7088,18 +7090,6 @@ checksum = "d2f62e73117bb7a62bfd9c5a5841438a823f6566c6442a808ee269d2d055c081"
 dependencies = [
  "naga",
  "wgpu-types",
-]
-
-[[package]]
-name = "wgpu-profiler"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a15a635a2a2ec0b9787589f17dbbffaa7960e779bcf0348a67f73c3e7665f9eb"
-dependencies = [
- "parking_lot",
- "thiserror 2.0.18",
- "tracy-client",
- "wgpu",
 ]
 
 [[package]]

@@ -1,8 +1,8 @@
 use crate::buffer_pool::BufferDescription;
 use crate::descriptors::Descriptors;
+use crate::gpu_resources::CommandEncoder;
 use std::borrow::Cow;
-use wgpu::util::DeviceExt;
-use wgpu::{CommandEncoder, TextureFormat};
+use wgpu::TextureFormat;
 
 macro_rules! create_debug_label {
     ($($arg:tt)*) => (
@@ -65,24 +65,23 @@ pub fn get_backend_names(backends: wgpu::Backends) -> Vec<&'static str> {
     if backends.contains(wgpu::Backends::GL) {
         names.push("Open GL");
     }
-    if backends.contains(wgpu::Backends::BROWSER_WEBGPU) {
-        names.push("Web GPU");
-    }
 
     names
 }
 
 pub fn create_buffer_with_data(
-    device: &wgpu::Device,
+    device: &crate::gpu_resources::Device,
     data: &[u8],
     usage: wgpu::BufferUsages,
     label: Option<String>,
-) -> wgpu::Buffer {
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        usage,
-        label: label.as_deref(),
-        contents: data,
-    })
+) -> Result<crate::gpu_resources::Buffer, crate::gpu_runtime::RenderFailure> {
+    Ok(
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            usage,
+            label: label.as_deref(),
+            contents: data,
+        })?,
+    )
 }
 
 // Based off wgpu example 'capture'
@@ -128,41 +127,71 @@ impl BufferDescription for BufferDimensions {
 }
 
 pub fn capture_image<R, F: FnOnce(&[u8], u32) -> R>(
-    device: &wgpu::Device,
-    buffer: &wgpu::Buffer,
+    device: &crate::gpu_resources::Device,
+    buffer: &crate::gpu_resources::Buffer,
     dimensions: &BufferDimensions,
     index: Option<wgpu::SubmissionIndex>,
     with_rgba: F,
-) -> R {
+) -> Result<R, crate::gpu_runtime::RenderFailure> {
+    use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
+    let started = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(2);
     let (sender, receiver) = std::sync::mpsc::channel();
     let buffer_slice = buffer.slice(..);
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-        sender.send(result).unwrap();
+        let _ = sender.send(result);
     });
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: index,
-            timeout: None,
-        })
-        .expect("Device must not fail to poll");
-    let _ = receiver.recv().expect("MPSC channel must not fail");
-    let map = buffer_slice
-        .get_mapped_range()
-        .expect("Buffer slice must be mappable");
-    let result = with_rgba(&map, dimensions.padded_bytes_per_row);
-    drop(map);
+    let result = (|| {
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: index,
+                timeout: Some(deadline),
+            })
+            .map_err(poll_failure)?;
+        receiver
+            .recv_timeout(deadline.saturating_sub(started.elapsed()))
+            .map_err(|error| {
+                RenderFailure::new(
+                    RenderFailureKind::Timeout,
+                    format!("readback callback: {error}"),
+                )
+            })?
+            .map_err(|error| {
+                RenderFailure::new(
+                    RenderFailureKind::MapFailed,
+                    format!("readback map: {error}"),
+                )
+            })?;
+        let map = buffer_slice.get_mapped_range().map_err(|error| {
+            RenderFailure::new(
+                RenderFailureKind::MapFailed,
+                format!("readback range: {error}"),
+            )
+        })?;
+        let result = with_rgba(&map, dimensions.padded_bytes_per_row);
+        drop(map);
+        Ok(result)
+    })();
     buffer.unmap();
     result
 }
 
-#[cfg(not(target_family = "wasm"))]
+pub fn poll_failure(error: wgpu::PollError) -> crate::gpu_runtime::RenderFailure {
+    use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
+    let kind = match error {
+        wgpu::PollError::Timeout => RenderFailureKind::Timeout,
+        wgpu::PollError::WrongSubmissionIndex(..) => RenderFailureKind::Internal,
+    };
+    RenderFailure::new(kind, error.to_string())
+}
+
 pub fn buffer_to_image(
-    device: &wgpu::Device,
-    buffer: &wgpu::Buffer,
+    device: &crate::gpu_resources::Device,
+    buffer: &crate::gpu_resources::Buffer,
     dimensions: &BufferDimensions,
     index: Option<wgpu::SubmissionIndex>,
     size: wgpu::Extent3d,
-) -> image::RgbaImage {
+) -> Result<image::RgbaImage, crate::gpu_runtime::RenderFailure> {
     capture_image(device, buffer, dimensions, index, |rgba, _buffer_width| {
         let mut bytes = Vec::with_capacity(dimensions.height * dimensions.unpadded_bytes_per_row);
 
@@ -212,36 +241,66 @@ pub fn supported_sample_count(
 pub fn run_copy_pipeline(
     descriptors: &Descriptors,
     format: wgpu::TextureFormat,
-    frame_view: &wgpu::TextureView,
-    input: &wgpu::TextureView,
+    frame_view: &crate::gpu_resources::TextureView,
+    input: &crate::gpu_resources::TextureView,
     sample_count: u32,
     encoder: &mut CommandEncoder,
-) {
-    let copy_bind_group = descriptors
-        .device
-        .create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &descriptors.bind_layouts.bitmap,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(input),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(
-                        descriptors.bitmap_samplers.get_sampler(false, false),
-                    ),
-                },
-            ],
-            label: create_debug_label!("Copy bind group").as_deref(),
-        });
+) -> Result<(), crate::gpu_runtime::RenderFailure> {
+    run_copy_regions_pipeline(
+        descriptors,
+        format,
+        frame_view,
+        input,
+        sample_count,
+        encoder,
+        None,
+    )
+}
 
-    let pipeline = descriptors.copy_pipeline(format, sample_count);
+pub fn run_copy_regions_pipeline(
+    descriptors: &Descriptors,
+    format: wgpu::TextureFormat,
+    frame_view: &crate::gpu_resources::TextureView,
+    input: &crate::gpu_resources::TextureView,
+    sample_count: u32,
+    encoder: &mut CommandEncoder,
+    regions: Option<&[ruffle_render::region::RenderRect]>,
+) -> Result<(), crate::gpu_runtime::RenderFailure> {
+    let copy_bind_group = descriptors.cached_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &descriptors.bind_layouts.bitmap,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(input),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(
+                    descriptors.bitmap_samplers.get_sampler(false, false),
+                ),
+            },
+        ],
+        label: create_debug_label!("Copy bind group").as_deref(),
+    })?;
+
+    let pipeline = descriptors.copy_pipeline(format, sample_count)?;
 
     // We overwrite the pixels in the target texture (no blending at all),
     // so this doesn't matter.
-    let load = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+    let load = if regions.is_some() {
+        wgpu::LoadOp::Load
+    } else {
+        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+    };
 
+    ruffle_render::profile::work(|w| {
+        w.render_passes += 1;
+        w.draw_calls += regions.map_or(1, |regions| regions.len() as u64);
+        w.pipeline_changes += 1;
+        w.material_binds += 1;
+        w.pass_pixels +=
+            u64::from(frame_view.texture().width()) * u64::from(frame_view.texture().height());
+    });
     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: create_debug_label!("Copy back to render target").as_deref(),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -257,10 +316,19 @@ pub fn run_copy_pipeline(
     });
 
     render_pass.set_pipeline(&pipeline);
-    render_pass.set_bind_group(2, &copy_bind_group, &[]);
+    render_pass.set_bind_group(2, (&copy_bind_group).raw(), &[]);
 
-    render_pass.draw(0..3, 0..1);
+    if let Some(regions) = regions {
+        for region in regions {
+            render_pass.set_scissor_rect(region.x, region.y, region.width, region.height);
+            render_pass.draw(0..3, 0..1);
+        }
+    } else {
+        render_pass.draw(0..3, 0..1);
+    }
     drop(render_pass);
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -298,17 +366,15 @@ impl<T> SampleCountMap<T> {
 }
 
 impl<T> SampleCountMap<std::sync::OnceLock<T>> {
-    pub fn get_or_init<F>(&self, sample_count: u32, init: F) -> &T
+    pub fn get_or_init<F, E>(&self, sample_count: u32, init: F) -> Result<&T, E>
     where
-        F: FnOnce() -> T,
+        F: FnOnce() -> Result<T, E>,
     {
-        match sample_count {
-            1 => self.one.get_or_init(init),
-            2 => self.two.get_or_init(init),
-            4 => self.four.get_or_init(init),
-            8 => self.eight.get_or_init(init),
-            16 => self.sixteen.get_or_init(init),
-            _ => unreachable!("Sample counts must be powers of two between 1..=16"),
+        let cell = self.get(sample_count);
+        if let Some(value) = cell.get() {
+            return Ok(value);
         }
+        let value = init()?;
+        Ok(cell.get_or_init(|| value))
     }
 }

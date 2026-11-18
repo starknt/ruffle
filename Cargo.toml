@@ -39,6 +39,7 @@ members = [
     "tools/fuzzer",
     "tools/stub-report",
 ]
+exclude = ["render/wgpu/vendor/wgpu-hal"]
 default-members = ["desktop"]
 resolver = "2"
 
@@ -59,8 +60,7 @@ quote = "1.0.45"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 naga = { version = "30.0.1", features = ["wgsl-out"] }
-wgpu = "30.0.1"
-wgpu-profiler = "0.28.0"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "dx12", "metal", "gles", "wgsl"] }
 egui = "0.36.1"
 egui_extras = { version = "0.36.1", default-features = false }
 egui-wgpu = "0.36.1"
@@ -206,3 +206,7 @@ lto = "off"
 incremental = true
 # Right between the defaults of 16 and 256, for crate fragment caching.
 codegen-units = 64
+
+# Native GL 3.3 binding negotiation; see the vendored patch note.
+[patch.crates-io]
+wgpu-hal = { path = "render/wgpu/vendor/wgpu-hal" }

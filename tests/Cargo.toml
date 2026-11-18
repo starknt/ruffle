@@ -34,13 +34,17 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+futures = { workspace = true }
+ruffle_render = { path = "../render", features = ["serde"] }
+image = { workspace = true, features = ["png"] }
 temp-dir = "0.2.0"
 ruffle_core = { path = "../core" }
 
 [dev-dependencies]
 ruffle_core = { path = "../core", features = ["timeline_debug", "audio", "mp3", "aac", "default_font"] }
 libtest-mimic = { workspace = true }
-image = { workspace = true, features = ["png"] }
 futures = { workspace = true }
 env_logger = "0.11.10"
 tracing = { workspace = true }
@@ -50,3 +54,8 @@ tracing-subscriber = { workspace = true }
 name = "tests"
 harness = false
 path = "tests/regression_tests.rs"
+
+[[bin]]
+name = "native-perf"
+path = "src/bin/native-perf.rs"
+required-features = ["imgtests"]

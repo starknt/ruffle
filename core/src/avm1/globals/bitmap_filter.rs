@@ -72,9 +72,9 @@ pub fn clone<'gc>(
 pub fn avm1_to_filter<'gc>(
     object: Object<'gc>,
     context: &mut UpdateContext<'gc>,
-) -> Option<Filter> {
+) -> Result<Option<Filter>, ruffle_render::error::RenderFailure> {
     let native = object.native();
-    match native {
+    Ok(match native {
         NativeObject::BevelFilter(filter) => Some(Filter::BevelFilter(filter.filter())),
         NativeObject::BlurFilter(filter) => Some(Filter::BlurFilter(filter.filter())),
         NativeObject::ColorMatrixFilter(filter) => Some(Filter::ColorMatrixFilter(filter.filter())),
@@ -82,7 +82,7 @@ pub fn avm1_to_filter<'gc>(
         NativeObject::GlowFilter(filter) => Some(Filter::GlowFilter(filter.filter())),
         NativeObject::DropShadowFilter(filter) => Some(Filter::DropShadowFilter(filter.filter())),
         NativeObject::DisplacementMapFilter(filter) => {
-            Some(Filter::DisplacementMapFilter(filter.filter(context)))
+            Some(Filter::DisplacementMapFilter(filter.filter(context)?))
         }
         NativeObject::GradientBevelFilter(filter) => {
             Some(Filter::GradientBevelFilter(filter.filter()))
@@ -93,7 +93,7 @@ pub fn avm1_to_filter<'gc>(
 
         // Invalid filters are silently dropped/ignored, no errors are thrown.
         _ => None,
-    }
+    })
 }
 
 pub fn filter_to_avm1<'gc>(activation: &mut Activation<'_, 'gc>, filter: Filter) -> Value<'gc> {

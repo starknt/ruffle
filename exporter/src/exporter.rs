@@ -44,7 +44,7 @@ impl Exporter {
         ))
         .map_err(|e| anyhow!(e.to_string()))?;
 
-        let descriptors = Arc::new(Descriptors::new(instance, adapter, device, queue));
+        let descriptors = Arc::new(Descriptors::new(instance, adapter, device, queue)?);
 
         Ok(Self {
             descriptors,
@@ -120,12 +120,13 @@ impl MovieExport {
 
     pub fn capture_frame(&self) -> Result<RgbaImage> {
         let image = || {
-            self.player.lock().unwrap().render();
+            self.player.lock().unwrap().render()?;
             self.player.capture_frame()
         };
         match catch_unwind(image) {
-            Ok(Some(image)) => Ok(image),
-            Ok(None) => Err(anyhow!("No frame captured")),
+            Ok(Ok(Some(image))) => Ok(image),
+            Ok(Ok(None)) => Err(anyhow!("No frame captured")),
+            Ok(Err(error)) => Err(error.into()),
             Err(e) => Err(anyhow!("{e:?}")),
         }
     }

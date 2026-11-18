@@ -34,7 +34,7 @@ pub fn create_index_buffer<'gc>(
             return Err(make_error_3671(activation));
         }
 
-        return Ok(context.create_index_buffer(num_indices, activation));
+        return Ok(context.create_index_buffer(num_indices, activation)?);
     }
     Ok(Value::Undefined)
 }
@@ -62,7 +62,7 @@ pub fn create_vertex_buffer<'gc>(
             data_32_per_vertex as u8,
             BufferUsage::DynamicDraw,
             activation,
-        ));
+        )?);
     }
     Ok(Value::Undefined)
 }
@@ -129,7 +129,7 @@ pub fn configure_back_buffer<'gc>(
             enable_depth_and_stencil,
             wants_best_resolution,
             wants_best_resolution_on_browser_zoom,
-        );
+        )?;
     }
     Ok(Value::Undefined)
 }
@@ -159,7 +159,7 @@ pub fn set_vertex_buffer_at<'gc>(
 
         let buffer_offset = args.get_u32(2);
 
-        context.set_vertex_buffer_at(index, buffer, buffer_offset);
+        context.set_vertex_buffer_at(index, buffer, buffer_offset)?;
     }
     Ok(Value::Undefined)
 }
@@ -186,7 +186,7 @@ pub fn set_program<'gc>(
 
     if let Some(context) = this.as_context_3d() {
         let program = args.try_get_object(0).map(|p| p.as_program_3d().unwrap());
-        context.set_program(program);
+        context.set_program(program)?;
     }
     Ok(Value::Undefined)
 }
@@ -207,7 +207,7 @@ pub fn draw_triangles<'gc>(
         let first_index = args.get_u32(1);
         let num_triangles = args.get_u32(2) as i32;
 
-        context.draw_triangles(index_buffer, first_index, num_triangles);
+        context.draw_triangles(index_buffer, first_index, num_triangles)?;
     }
     Ok(Value::Undefined)
 }
@@ -267,7 +267,7 @@ pub fn draw_to_bitmap_data<'gc>(
             PixelRegion::for_whole_size(source_width, source_height),
         );
 
-        let handle = destination.bitmap_handle(activation.gc(), activation.context.renderer);
+        let handle = destination.bitmap_handle(activation.gc(), activation.context.renderer)?;
 
         let (destination, _) = destination.overwrite_cpu_pixels_from_gpu(activation.gc());
         let mut write = destination.borrow_mut(activation.gc());
@@ -279,7 +279,7 @@ pub fn draw_to_bitmap_data<'gc>(
             commands,
             StageQuality::High,
             dirty_region,
-        );
+        )?;
 
         if let Some(sync_handle) = image {
             write.set_gpu_dirty(activation.gc(), sync_handle, dirty_region);
@@ -325,7 +325,7 @@ pub fn set_culling<'gc>(
             .parse()
             .map_err(|_| make_error_2008(activation, "triangleFaceToCull"))?;
 
-        context.set_culling(culling);
+        context.set_culling(culling)?;
     }
     Ok(Value::Undefined)
 }
@@ -370,7 +370,7 @@ pub fn set_program_constants_from_matrix<'gc>(
             .map(|&val| val.to_le_bytes())
             .collect::<Vec<[u8; 4]>>();
 
-        context.set_program_constants(program_type, first_register, &matrix_raw_data);
+        context.set_program_constants(program_type, first_register, &matrix_raw_data)?;
     }
     Ok(Value::Undefined)
 }
@@ -413,7 +413,7 @@ pub fn set_program_constants_from_vector<'gc>(
             .take(to_take)
             .collect::<Vec<[u8; 4]>>();
 
-        context.set_program_constants(program_type, first_register, &raw_data);
+        context.set_program_constants(program_type, first_register, &raw_data)?;
     }
     Ok(Value::Undefined)
 }
@@ -458,7 +458,7 @@ pub fn set_program_constants_from_byte_array<'gc>(
             .get(..num_floats)
             .ok_or_else(|| make_error_3669(activation))?;
 
-        context.set_program_constants(program_type, first_register, raw_data);
+        context.set_program_constants(program_type, first_register, raw_data)?;
     }
 
     Ok(Value::Undefined)
@@ -481,7 +481,7 @@ pub fn clear<'gc>(
         let stencil = args.get_u32(5);
         let mask = args.get_u32(6);
 
-        context.set_clear(red, green, blue, alpha, depth, stencil, mask);
+        context.set_clear(red, green, blue, alpha, depth, stencil, mask)?;
     }
     Ok(Value::Undefined)
 }
@@ -605,7 +605,7 @@ pub fn set_texture_at<'gc>(
             None
         };
 
-        context.set_texture_at(sampler, texture, cube);
+        context.set_texture_at(sampler, texture, cube)?;
     }
     Ok(Value::Undefined)
 }
@@ -624,7 +624,7 @@ pub fn set_color_mask<'gc>(
         let blue = args.get_bool(2);
         let alpha = args.get_bool(3);
 
-        context.set_color_mask(red, green, blue, alpha);
+        context.set_color_mask(red, green, blue, alpha)?;
     }
     Ok(Value::Undefined)
 }
@@ -644,7 +644,7 @@ pub fn set_depth_test<'gc>(
             .parse()
             .map_err(|_| make_error_2008(activation, "passCompareMode"))?;
 
-        context.set_depth_test(depth_mask, pass_compare_mode);
+        context.set_depth_test(depth_mask, pass_compare_mode)?;
     }
     Ok(Value::Undefined)
 }
@@ -668,7 +668,7 @@ pub fn set_blend_factors<'gc>(
             .parse()
             .map_err(|_| make_error_2008(activation, "destinationFactor"))?;
 
-        context.set_blend_factors(source_factor, destination_factor);
+        context.set_blend_factors(source_factor, destination_factor)?;
     }
     Ok(Value::Undefined)
 }
@@ -728,7 +728,7 @@ pub fn set_render_to_texture<'gc>(
         enable_depth_and_stencil,
         anti_alias,
         surface_selector,
-    );
+    )?;
     Ok(Value::Undefined)
 }
 
@@ -771,7 +771,7 @@ pub fn set_stencil_actions<'gc>(
             on_both_pass,
             on_depth_fail,
             on_depth_pass_stencil_fail,
-        );
+        )?;
     }
 
     Ok(Value::Undefined)
@@ -785,7 +785,7 @@ pub fn set_render_to_back_buffer<'gc>(
     let this = this.as_object().unwrap();
 
     let context = this.as_context_3d().unwrap();
-    context.set_render_to_back_buffer();
+    context.set_render_to_back_buffer()?;
     Ok(Value::Undefined)
 }
 
@@ -803,7 +803,7 @@ pub fn set_stencil_reference_value<'gc>(
         let read_mask = args.get_u32(1);
         let write_mask = args.get_u32(2);
 
-        context.set_stencil_reference_value(reference_value, read_mask, write_mask);
+        context.set_stencil_reference_value(reference_value, read_mask, write_mask)?;
     }
 
     Ok(Value::Undefined)
@@ -856,7 +856,7 @@ pub fn set_sampler_state_at<'gc>(
             );
         }
 
-        context.set_sampler_state_at(sampler, wrap, filter);
+        context.set_sampler_state_at(sampler, wrap, filter)?;
     }
     Ok(Value::Undefined)
 }
@@ -886,7 +886,7 @@ pub fn set_scissor_rectangle<'gc>(
         None
     };
 
-    context3d.set_scissor_rectangle(rectangle);
+    context3d.set_scissor_rectangle(rectangle)?;
     Ok(Value::Undefined)
 }
 

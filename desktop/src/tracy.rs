@@ -1,3 +1,7 @@
+use ruffle_render_wgpu::gpu_resources::{
+    BindGroup, BindGroupLayout, Buffer, Device, RenderPipeline, Sampler, Texture, TextureView,
+};
+use ruffle_render_wgpu::gpu_runtime::{RenderFailure, RenderFailureKind};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,54 +34,85 @@ impl Config for RuffleTracyConfig {
 pub struct FrameCapturesHolder(Arc<Mutex<FrameCaptures>>);
 
 impl FrameCapturesHolder {
-    pub fn new(device: &wgpu::Device) -> Self {
-        Self(Arc::new(Mutex::new(FrameCaptures::new(device))))
+    pub fn resource_leases(&self) -> Vec<ruffle_render_wgpu::gpu_runtime::ResourceLease> {
+        let captures = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut leases = vec![captures.blit_pipeline.lease().clone()];
+        if let Some(target) = &captures.target {
+            leases.push(target.bind_group.lease().clone());
+        }
+        for capture in &captures.submitted_captures {
+            leases.push(capture.buffer.view.lease().clone());
+            leases.push(capture.buffer.buffer.lease().clone());
+        }
+        leases
     }
 
-    pub fn set_target(&self, device: &wgpu::Device, texture: Option<&wgpu::Texture>) {
+    pub fn new(device: &Device) -> Result<Self, RenderFailure> {
+        Ok(Self(Arc::new(Mutex::new(FrameCaptures::new(device)?))))
+    }
+
+    pub fn set_target(
+        &self,
+        device: &Device,
+        texture: Option<&Texture>,
+    ) -> Result<(), RenderFailure> {
         self.0
             .lock()
             .expect("FramesCaptures must not be poisoned")
-            .set_target(device, texture);
+            .set_target(device, texture)?;
+
+        Ok(())
     }
 
-    pub fn capture_frame(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
+    pub fn capture_frame(
+        &self,
+        device: &Device,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(), RenderFailure> {
         self.0
             .lock()
             .expect("FramesCaptures must not be poisoned")
-            .capture_frame(device, encoder);
+            .capture_frame(device, encoder)?;
+
+        Ok(())
     }
 
-    pub fn finish_frame(&self) {
+    pub fn finish_frame(&self) -> Result<(), RenderFailure> {
         self.0
             .lock()
             .expect("FramesCaptures must not be poisoned")
-            .finish_frame();
+            .finish_frame()?;
+
+        Ok(())
     }
 }
 
 #[derive(Debug)]
 pub struct FrameCaptures {
+    device: Device,
     available_buffers: Vec<PooledBuffer>,
     submitted_captures: Vec<PendingCapture>,
     mapped_captures: Vec<PendingCapture>,
     current_frame: u64,
-    blit_pipeline: wgpu::RenderPipeline,
-    blit_bind_group_layout: wgpu::BindGroupLayout,
+    blit_pipeline: RenderPipeline,
+    blit_bind_group_layout: BindGroupLayout,
     target: Option<CaptureTarget>,
-    sampler: wgpu::Sampler,
+    sampler: Sampler,
 }
 
 #[derive(Debug)]
 struct PooledBuffer {
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    buffer: wgpu::Buffer,
+    texture: Texture,
+    view: TextureView,
+    buffer: Buffer,
 }
 
 #[derive(Debug)]
 struct CaptureTarget {
-    bind_group: wgpu::BindGroup,
+    bind_group: BindGroup,
     width: u32,
     height: u32,
     padded_bytes_per_row: u32,
@@ -90,16 +125,17 @@ struct PendingCapture {
     height: u32,
     frame_num: u64,
     ready: Arc<AtomicBool>,
+    started: std::time::Instant,
 }
 
 impl PendingCapture {
-    pub fn upload(&self, current_frame: u64) {
+    pub fn upload(&self, current_frame: u64) -> Result<(), RenderFailure> {
         // If we're so far behind we couldn't even fit into a u8, just drop it.
         let Some(offset) = current_frame
             .checked_sub(self.frame_num)
             .and_then(|o| u8::try_from(o).ok())
         else {
-            return;
+            return Ok(());
         };
 
         // Tracy needs a raw rgba image with no padding, so we have to remove it
@@ -110,7 +146,7 @@ impl PendingCapture {
             .buffer
             .slice(..)
             .get_mapped_range()
-            .expect("Buffer must be mappable");
+            .map_err(|error| RenderFailure::new(RenderFailureKind::MapFailed, error.to_string()))?;
         for row in 0..self.height {
             let start = row as usize * padded_width as usize;
             let end = start + (self.width as usize * 4);
@@ -123,11 +159,13 @@ impl PendingCapture {
             offset,
             false,
         );
+
+        Ok(())
     }
 }
 
 impl PooledBuffer {
-    pub fn new(device: &wgpu::Device, target: &CaptureTarget) -> Self {
+    pub fn new(device: &Device, target: &CaptureTarget) -> Result<Self, RenderFailure> {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
@@ -141,19 +179,19 @@ impl PooledBuffer {
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        })?;
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default())?;
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: (target.padded_bytes_per_row * target.height * 4) as wgpu::BufferAddress,
+            size: (target.padded_bytes_per_row * target.height) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
-        });
-        PooledBuffer {
+        })?;
+        Ok(PooledBuffer {
             texture,
             view,
             buffer,
-        }
+        })
     }
 }
 
@@ -166,7 +204,7 @@ impl FrameCaptures {
     /// This MUST be a multiple of 4.
     const MAX_HEIGHT: u32 = 180;
 
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(device: &Device) -> Result<Self, RenderFailure> {
         let blit_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: None,
@@ -188,12 +226,13 @@ impl FrameCaptures {
                         count: None,
                     },
                 ],
-            });
-        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&blit_bind_group_layout)],
-            immediate_size: 0,
-        });
+            })?;
+        let blit_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&blit_bind_group_layout)],
+                immediate_size: 0,
+            })?;
         let shader_source = r"
 @group(0) @binding(0) var frame_sampler: sampler;
 @group(0) @binding(1) var frame_texture: texture_2d<f32>;
@@ -224,7 +263,7 @@ struct VertexOutput {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(shader_source)),
-        });
+        })?;
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
             layout: Some(&blit_pipeline_layout),
@@ -245,15 +284,16 @@ struct VertexOutput {
             }),
             multiview_mask: None,
             cache: None,
-        });
+        })?;
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
-        });
-        Self {
+        })?;
+        Ok(Self {
+            device: device.clone(),
             current_frame: 0,
             blit_pipeline,
             available_buffers: Default::default(),
@@ -262,11 +302,15 @@ struct VertexOutput {
             blit_bind_group_layout,
             target: None,
             sampler,
-        }
+        })
     }
 
     /// Sets the target texture that will be captured and uploaded to Tracy.
-    pub fn set_target(&mut self, device: &wgpu::Device, texture: Option<&wgpu::Texture>) {
+    pub fn set_target(
+        &mut self,
+        device: &Device,
+        texture: Option<&Texture>,
+    ) -> Result<(), RenderFailure> {
         if let Some(texture) = texture {
             // The ideal size of a captured texture should be 320x180
             // Preserve the texture aspect ratio (if possible) whilst maintaining that limit
@@ -276,7 +320,7 @@ struct VertexOutput {
             let scale = scale_x.max(scale_y).max(1.0);
             let width = (texture.width() as f32 / scale).floor() as u32 / 4 * 4;
             let height = (texture.height() as f32 / scale).floor() as u32 / 4 * 4;
-            let view = texture.create_view(&Default::default());
+            let view = texture.create_view(&Default::default())?;
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &self.blit_bind_group_layout,
@@ -290,7 +334,7 @@ struct VertexOutput {
                         resource: wgpu::BindingResource::TextureView(&view),
                     },
                 ],
-            });
+            })?;
 
             // 4 bytes per pixel (Tracy wants RGBA)
             let bytes_per_row = width * 4;
@@ -314,21 +358,34 @@ struct VertexOutput {
         } else {
             self.target = None;
         }
+
+        Ok(())
     }
 
     /// Performs a capture and records it for later upload.
     /// This should be called once you've finished rendering to the texture,
     /// but before you submit the frame.
-    pub fn capture_frame(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
+    pub fn capture_frame(
+        &mut self,
+        device: &Device,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(), RenderFailure> {
         let Some(target) = &self.target else {
-            return;
+            return Ok(());
         };
 
+        device.runtime().check_health()?;
+        if self.mapped_captures.len() + self.submitted_captures.len() >= 3 {
+            return Err(RenderFailure::new(
+                RenderFailureKind::BudgetExceeded,
+                "Tracy capture queue is full",
+            ));
+        }
         // Take an existing buffer, or make one if we've run out
-        let buffer = self
-            .available_buffers
-            .pop()
-            .unwrap_or_else(|| PooledBuffer::new(device, target));
+        let buffer = match self.available_buffers.pop() {
+            Some(buffer) => buffer,
+            None => PooledBuffer::new(device, target)?,
+        };
 
         // Copy the frame to the texture
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -345,7 +402,7 @@ struct VertexOutput {
             multiview_mask: None,
         });
         render_pass.set_pipeline(&self.blit_pipeline);
-        render_pass.set_bind_group(0, &target.bind_group, &[]);
+        render_pass.set_bind_group(0, target.bind_group.raw(), &[]);
         render_pass.draw(0..6, 0..1);
         drop(render_pass);
 
@@ -377,36 +434,58 @@ struct VertexOutput {
             height: target.height,
             frame_num: self.current_frame,
             ready: Arc::new(AtomicBool::new(false)),
+            started: std::time::Instant::now(),
         };
         self.submitted_captures.push(capture);
+
+        Ok(())
     }
 
     /// Uploads any finished captures to Tracy.
     /// This should be called _after_ `wgpu::Queue::submit`, but before you present to the surface.
-    pub fn finish_frame(&mut self) {
+    pub fn finish_frame(&mut self) -> Result<(), RenderFailure> {
         self.current_frame += 1;
         let current_size = self.target.as_ref().map(|t| (t.width, t.height));
         for capture in self.submitted_captures.drain(..) {
             let ready = capture.ready.clone();
+            let health = self.device.runtime().health().clone();
             capture
                 .buffer
                 .buffer
                 .slice(..)
-                .map_async(wgpu::MapMode::Read, move |_| {
-                    ready.store(true, Ordering::Relaxed);
+                .map_async(wgpu::MapMode::Read, move |result| match result {
+                    Ok(()) => ready.store(true, Ordering::Release),
+                    Err(error) => {
+                        health.fail(RenderFailure::new(
+                            RenderFailureKind::MapFailed,
+                            error.to_string(),
+                        ));
+                    }
                 });
             self.mapped_captures.push(capture);
         }
+        self.device.runtime().check_health()?;
+        if self.mapped_captures.iter().any(|c| {
+            !c.ready.load(Ordering::Acquire)
+                && c.started.elapsed() >= std::time::Duration::from_secs(2)
+        }) {
+            return Err(RenderFailure::new(
+                RenderFailureKind::Timeout,
+                "Tracy capture timed out",
+            ));
+        }
         let ready_captures = self
             .mapped_captures
-            .extract_if(.., |c| c.ready.load(Ordering::Relaxed));
+            .extract_if(.., |c| c.ready.load(Ordering::Acquire));
         for capture in ready_captures {
-            capture.upload(self.current_frame);
+            capture.upload(self.current_frame)?;
             capture.buffer.buffer.unmap();
 
             if current_size == Some((capture.width, capture.height)) {
                 self.available_buffers.push(capture.buffer);
             }
         }
+
+        Ok(())
     }
 }

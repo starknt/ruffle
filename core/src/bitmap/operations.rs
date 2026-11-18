@@ -1,10 +1,10 @@
-use crate::avm2::bytearray::{ByteArrayError, ByteArrayStorage};
+use crate::avm2::bytearray::ByteArrayStorage;
 use crate::avm2::error::{Error2006Type, make_error_2006};
 use crate::avm2::vector::VectorStorage;
 use crate::avm2::{Activation, Error, Value as Avm2Value};
 use crate::bitmap::bitmap_data::{
-    BitmapData, BitmapDataDrawError, BitmapRawData, ChannelOptions, Color, IBitmapDrawable,
-    LehmerRng, ThresholdOperation,
+    BitmapData, BitmapDataDrawError, BitmapDataWriteError, BitmapRawData, ChannelOptions, Color,
+    IBitmapDrawable, LehmerRng, ThresholdOperation,
 };
 use crate::bitmap::turbulence::Turbulence;
 use crate::context::{RenderContext, UpdateContext};
@@ -13,6 +13,7 @@ use gc_arena::Mutation;
 use ruffle_render::backend::RenderBackend;
 use ruffle_render::bitmap::{PixelRegion, PixelSnapping};
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
+use ruffle_render::error::RenderFailure;
 use ruffle_render::filters::Filter;
 use ruffle_render::matrix::Matrix;
 use ruffle_render::quality::StageQuality;
@@ -38,23 +39,17 @@ pub fn fill_rect<'gc>(
     width: i32,
     height: i32,
     color: u32,
-) {
+) -> Result<(), RenderFailure> {
     let mut rect = PixelRegion::for_region_i32(x, y, width, height);
     rect.clamp(target.width(), target.height());
 
     if rect.width() == 0 || rect.height() == 0 {
-        return;
+        return Ok(());
     }
 
     let is_full = rect.width() == target.width() && rect.height() == target.height();
 
-    let target = if is_full {
-        // If we're filling the whole region, we can discard the gpu data
-        target.overwrite_cpu_pixels_from_gpu(mc).0
-    } else {
-        // If we're filling a partial region, finish any gpu->cpu sync
-        target.sync(renderer)
-    };
+    let target = target.write_area(rect, false, renderer)?;
     let mut write = target.borrow_mut(mc);
     let color = Color::from(color).to_premultiplied_alpha(write.transparency());
 
@@ -66,6 +61,8 @@ pub fn fill_rect<'gc>(
         }
     }
     write.set_cpu_dirty(mc, rect);
+
+    Ok(())
 }
 
 pub fn set_pixel32<'gc>(
@@ -75,11 +72,11 @@ pub fn set_pixel32<'gc>(
     x: u32,
     y: u32,
     color: u32,
-) {
+) -> Result<(), RenderFailure> {
     if x >= target.width() || y >= target.height() {
-        return;
+        return Ok(());
     }
-    let target = target.sync(renderer);
+    let target = target.write_area(PixelRegion::for_pixel(x, y), false, renderer)?;
     let mut write = target.borrow_mut(mc);
     let transparency = write.transparency();
     write.set_pixel32_raw(
@@ -88,18 +85,25 @@ pub fn set_pixel32<'gc>(
         Color::from(color).to_premultiplied_alpha(transparency),
     );
     write.set_cpu_dirty(mc, PixelRegion::for_pixel(x, y));
+
+    Ok(())
 }
 
-pub fn get_pixel32(target: BitmapData, renderer: &mut dyn RenderBackend, x: u32, y: u32) -> u32 {
+pub fn get_pixel32(
+    target: BitmapData,
+    renderer: &mut dyn RenderBackend,
+    x: u32,
+    y: u32,
+) -> Result<u32, RenderFailure> {
     if x >= target.width() || y >= target.height() {
-        return 0;
+        return Ok(0);
     }
-    let read = target.read_area(PixelRegion::for_pixel(x, y), renderer);
-    if read.transparency() {
+    let read = target.read_pixel(x, y, renderer)?;
+    Ok(if read.transparency() {
         read.get_pixel32_raw(x, y).to_un_multiplied_alpha().into()
     } else {
         read.get_pixel32_raw(x, y).into()
-    }
+    })
 }
 
 pub fn set_pixel<'gc>(
@@ -109,11 +113,15 @@ pub fn set_pixel<'gc>(
     x: u32,
     y: u32,
     color: Color,
-) {
+) -> Result<(), RenderFailure> {
     if x >= target.width() || y >= target.height() {
-        return;
+        return Ok(());
     }
-    let target = target.sync(renderer);
+    let target = target.write_area(
+        PixelRegion::for_pixel(x, y),
+        target.transparency(),
+        renderer,
+    )?;
     let mut write = target.borrow_mut(mc);
 
     if write.transparency() {
@@ -124,17 +132,25 @@ pub fn set_pixel<'gc>(
         write.set_pixel32_raw(x, y, color.with_alpha(0xFF));
     }
     write.set_cpu_dirty(mc, PixelRegion::for_pixel(x, y));
+
+    Ok(())
 }
 
-pub fn get_pixel(target: BitmapData, renderer: &mut dyn RenderBackend, x: u32, y: u32) -> u32 {
+pub fn get_pixel(
+    target: BitmapData,
+    renderer: &mut dyn RenderBackend,
+    x: u32,
+    y: u32,
+) -> Result<u32, RenderFailure> {
     if x >= target.width() || y >= target.height() {
-        return 0;
+        return Ok(0);
     }
-    let read = target.read_area(PixelRegion::for_pixel(x, y), renderer);
-    read.get_pixel32_raw(x, y)
+    let read = target.read_pixel(x, y, renderer)?;
+    Ok(read
+        .get_pixel32_raw(x, y)
         .to_un_multiplied_alpha()
         .with_alpha(0x0)
-        .into()
+        .into())
 }
 pub fn flood_fill<'gc>(
     mc: &Mutation<'gc>,
@@ -143,18 +159,18 @@ pub fn flood_fill<'gc>(
     x: u32,
     y: u32,
     color: u32,
-) -> bool {
+) -> Result<bool, RenderFailure> {
     if x >= target.width() || y >= target.height() {
-        return false;
+        return Ok(false);
     }
-    let target = target.sync(renderer);
+    let target = target.sync(renderer)?;
     let mut write = target.borrow_mut(mc);
     let expected_color = write.get_pixel32_raw(x, y);
     let replace_color = Color::from(color).to_premultiplied_alpha(write.transparency());
 
     if expected_color == replace_color {
         // If we try to replace X with X, we'll infinite loop
-        return false;
+        return Ok(false);
     }
 
     let mut pending = vec![(x, y)];
@@ -182,7 +198,7 @@ pub fn flood_fill<'gc>(
         }
     }
     write.set_cpu_dirty(mc, dirty_region);
-    true
+    Ok(true)
 }
 
 pub fn noise<'gc>(
@@ -249,7 +265,7 @@ pub fn noise<'gc>(
         }
     }
     let region = PixelRegion::for_whole_size(write.width(), write.height());
-    write.set_cpu_dirty(mc, region)
+    write.set_cpu_dirty(mc, region);
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -366,7 +382,7 @@ pub fn perlin_noise<'gc>(
         }
     }
     let region = PixelRegion::for_whole_size(write.width(), write.height());
-    write.set_cpu_dirty(mc, region)
+    write.set_cpu_dirty(mc, region);
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -379,7 +395,7 @@ pub fn copy_channel<'gc>(
     source_bitmap: BitmapData<'gc>,
     source_channel: i32,
     dest_channel: i32,
-) {
+) -> Result<(), RenderFailure> {
     let (min_x, min_y) = dest_point;
     let (src_min_x, src_min_y, src_width, src_height) = src_rect;
 
@@ -407,16 +423,16 @@ pub fn copy_channel<'gc>(
     );
 
     if dest_region.width() == 0 || dest_region.height() == 0 {
-        return;
+        return Ok(());
     }
 
     let source = if source_bitmap.ptr_eq(target) {
         None
     } else {
-        Some(source_bitmap.read_area(source_region, renderer))
+        Some(source_bitmap.read_area(source_region, renderer)?)
     };
 
-    let target = target.sync(renderer);
+    let target = target.sync(renderer)?;
     let mut write = target.borrow_mut(mc);
 
     for y in 0..dest_region.height().min(source_region.height()) {
@@ -470,6 +486,8 @@ pub fn copy_channel<'gc>(
     }
 
     write.set_cpu_dirty(mc, dest_region);
+
+    Ok(())
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -482,7 +500,7 @@ pub fn color_transform<'gc>(
     x_max: u32,
     y_max: u32,
     color_transform: &ColorTransform,
-) {
+) -> Result<(), RenderFailure> {
     // Flash bug: applying a color transform with only an alpha multiplier > 1 has no effect.
     if color_transform.r_multiply == Fixed8::ONE
         && color_transform.g_multiply == Fixed8::ONE
@@ -493,7 +511,7 @@ pub fn color_transform<'gc>(
         && color_transform.b_add == 0
         && color_transform.a_add == 0
     {
-        return;
+        return Ok(());
     }
 
     // Clamp both min and max coordinates to target size to enforce invariants
@@ -503,10 +521,10 @@ pub fn color_transform<'gc>(
     let y_max = y_max.min(target.height());
 
     if x_max == 0 || y_max == 0 || x_min == x_max || y_min == y_max {
-        return;
+        return Ok(());
     }
 
-    let target = target.sync(renderer);
+    let target = target.sync(renderer)?;
     let mut write = target.borrow_mut(mc);
     let transparency = write.transparency();
 
@@ -527,6 +545,8 @@ pub fn color_transform<'gc>(
         mc,
         PixelRegion::encompassing_pixels((x_min, y_min), (x_max - 1, y_max - 1)),
     );
+
+    Ok(())
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -542,7 +562,7 @@ pub fn threshold<'gc>(
     colour: u32,
     mask: u32,
     copy_source: bool,
-) -> u32 {
+) -> Result<u32, RenderFailure> {
     // Pre-compute the masked threshold
     let masked_threshold = threshold & mask;
 
@@ -566,16 +586,16 @@ pub fn threshold<'gc>(
     );
 
     if dest_region.width() == 0 || dest_region.height() == 0 {
-        return 0;
+        return Ok(0);
     }
 
     let source = if source_bitmap.ptr_eq(target) {
         None
     } else {
-        Some(source_bitmap.read_area(source_region, renderer))
+        Some(source_bitmap.read_area(source_region, renderer)?)
     };
 
-    let target = target.sync(renderer);
+    let target = target.sync(renderer)?;
     let mut write = target.borrow_mut(mc);
 
     // Check each pixel
@@ -621,7 +641,7 @@ pub fn threshold<'gc>(
         write.set_cpu_dirty(mc, dirty_area);
     }
 
-    modified_count
+    Ok(modified_count)
 }
 
 pub fn scroll<'gc>(
@@ -630,12 +650,12 @@ pub fn scroll<'gc>(
     target: BitmapData<'gc>,
     x: i32,
     y: i32,
-) {
+) -> Result<(), RenderFailure> {
     let width = target.width() as i32;
     let height = target.height() as i32;
 
     if (x == 0 && y == 0) || x.abs() >= width || y.abs() >= height {
-        return; // no-op
+        return Ok(()); // no-op
     }
 
     // since this is an "in-place copy", we have to iterate from bottom to top
@@ -660,7 +680,7 @@ pub fn scroll<'gc>(
     let x_to = if reverse_x { -1 } else { width.min(width - x) };
     let dx = if reverse_x { -1 } else { 1 };
 
-    let target = target.sync(renderer);
+    let target = target.sync(renderer)?;
     let mut write = target.borrow_mut(mc);
 
     let mut src_y = y_from;
@@ -675,7 +695,9 @@ pub fn scroll<'gc>(
     }
 
     let region = PixelRegion::for_whole_size(write.width(), write.height());
-    write.set_cpu_dirty(mc, region)
+    write.set_cpu_dirty(mc, region);
+
+    Ok(())
 }
 
 pub fn palette_map<'gc>(
@@ -686,7 +708,7 @@ pub fn palette_map<'gc>(
     src_rect: (i32, i32, i32, i32),
     dest_point: (i32, i32),
     channel_arrays: ([u32; 256], [u32; 256], [u32; 256], [u32; 256]),
-) {
+) -> Result<(), RenderFailure> {
     let (src_min_x, src_min_y, src_width, src_height) = src_rect;
     let (dest_min_x, dest_min_y) = dest_point;
 
@@ -701,16 +723,16 @@ pub fn palette_map<'gc>(
     );
 
     if dest_region.width() == 0 || dest_region.height() == 0 {
-        return;
+        return Ok(());
     }
 
     let source = if source_bitmap.ptr_eq(target) {
         None
     } else {
-        Some(source_bitmap.read_area(source_region, renderer))
+        Some(source_bitmap.read_area(source_region, renderer)?)
     };
 
-    let target = target.sync(renderer);
+    let target = target.sync(renderer)?;
     let mut write = target.borrow_mut(mc);
 
     for y in 0..dest_region.height() {
@@ -741,6 +763,8 @@ pub fn palette_map<'gc>(
     }
 
     write.set_cpu_dirty(mc, dest_region);
+
+    Ok(())
 }
 
 /// Compare two BitmapData objects.
@@ -750,14 +774,14 @@ pub fn compare<'gc>(
     renderer: &mut dyn RenderBackend,
     left: BitmapData<'gc>,
     right: BitmapData<'gc>,
-) -> Option<BitmapData<'gc>> {
+) -> Result<Option<BitmapData<'gc>>, RenderFailure> {
     // This function expects that the two bitmaps have the same dimensions.
     // TODO: Relax this assumption and return a special value instead?
     debug_assert_eq!(left.width(), right.width());
     debug_assert_eq!(left.height(), right.height());
 
-    let left = left.sync(renderer).borrow();
-    let right = right.sync(renderer).borrow();
+    let left = left.sync(renderer)?.borrow();
+    let right = right.sync(renderer)?.borrow();
 
     let mut different = false;
     let pixels = left
@@ -785,7 +809,7 @@ pub fn compare<'gc>(
         })
         .collect();
 
-    if different {
+    Ok(if different {
         Some(BitmapData::new_with_pixels(
             mc,
             left.width(),
@@ -795,7 +819,7 @@ pub fn compare<'gc>(
         ))
     } else {
         None
-    }
+    })
 }
 
 #[cfg(test)]
@@ -817,19 +841,19 @@ pub fn hit_test_point(
     target: BitmapData,
     alpha_threshold: u8,
     test_point: (i32, i32),
-) -> bool {
-    if target.is_point_in_bounds(test_point.0, test_point.1) {
+) -> Result<bool, RenderFailure> {
+    Ok(if target.is_point_in_bounds(test_point.0, test_point.1) {
         let x = test_point.0 as u32;
         let y = test_point.1 as u32;
         target
-            .read_area(PixelRegion::for_pixel(x, y), renderer)
+            .read_area(PixelRegion::for_pixel(x, y), renderer)?
             .get_pixel32_raw(x, y)
             .alpha()
             // If `alpha_threshold` is 0, consider it to be 1.
             >= alpha_threshold.max(1)
     } else {
         false
-    }
+    })
 }
 
 pub fn hit_test_rectangle(
@@ -838,19 +862,19 @@ pub fn hit_test_rectangle(
     alpha_threshold: u8,
     top_left: (i32, i32),
     size: (i32, i32),
-) -> bool {
+) -> Result<bool, RenderFailure> {
     let mut region = PixelRegion::for_region_i32(top_left.0, top_left.1, size.0, size.1);
     region.clamp(target.width(), target.height());
-    let read = target.read_area(region, renderer);
+    let read = target.read_area(region, renderer)?;
 
     for y in region.y_min..region.y_max {
         for x in region.x_min..region.x_max {
             if read.get_pixel32_raw(x, y).alpha() >= alpha_threshold {
-                return true;
+                return Ok(true);
             }
         }
     }
-    false
+    Ok(false)
 }
 
 pub fn hit_test_bitmapdata<'gc>(
@@ -861,7 +885,7 @@ pub fn hit_test_bitmapdata<'gc>(
     test: BitmapData<'gc>,
     test_point: (i32, i32),
     test_threshold: u8,
-) -> bool {
+) -> Result<bool, RenderFailure> {
     let xd = test_point.0 - self_point.0;
     let yd = test_point.1 - self_point.1;
     let self_width = target.width() as i32;
@@ -891,14 +915,14 @@ pub fn hit_test_bitmapdata<'gc>(
         )
     };
 
-    let target = target.read_area(
-        PixelRegion::for_region(self_x0, self_y0, width, height),
-        renderer,
-    );
-    let test = test.read_area(
-        PixelRegion::for_region(test_x0, test_y0, width, height),
-        renderer,
-    );
+    let self_region = PixelRegion::for_region(self_x0, self_y0, width, height);
+    let test_region = PixelRegion::for_region(test_x0, test_y0, width, height);
+    if target.ptr_eq(test) {
+        // Complete both regional reads before retaining either shared borrow.
+        drop(test.read_area(test_region, renderer)?);
+    }
+    let target = target.read_area(self_region, renderer)?;
+    let test = test.read_area(test_region, renderer)?;
 
     for x in 0..width {
         for y in 0..height {
@@ -907,11 +931,11 @@ pub fn hit_test_bitmapdata<'gc>(
             let test_is_opaque =
                 test.get_pixel32_raw(test_x0 + x, test_y0 + y).alpha() >= test_threshold;
             if self_is_opaque && test_is_opaque {
-                return true;
+                return Ok(true);
             }
         }
     }
-    false
+    Ok(false)
 }
 
 pub fn color_bounds_rect(
@@ -920,13 +944,13 @@ pub fn color_bounds_rect(
     find_color: bool,
     mut mask: u32,
     mut color: u32,
-) -> (u32, u32, u32, u32) {
+) -> Result<(u32, u32, u32, u32), RenderFailure> {
     let mut min_x = target.width();
     let mut max_x = 0;
     let mut min_y = target.height();
     let mut max_y = 0;
 
-    let target = target.sync(renderer).borrow();
+    let target = target.sync(renderer)?.borrow();
 
     // We need to work in the same colorspace (premult) - but that means the color won't always match for opaque BMD
     // Let's just cheat it by pretending the alpha is part of the mask, that way it'll essentially ignore it (as it's always 0xFF)
@@ -958,7 +982,7 @@ pub fn color_bounds_rect(
     }
 
     // Flash treats a match of (0, 0) alone as none.
-    if max_x > 0 || max_y > 0 {
+    Ok(if max_x > 0 || max_y > 0 {
         let x = min_x;
         let y = min_y;
         let w = max_x - min_x + 1;
@@ -966,7 +990,7 @@ pub fn color_bounds_rect(
         (x, y, w, h)
     } else {
         (0, 0, 0, 0)
-    }
+    })
 }
 
 pub fn merge<'gc>(
@@ -977,7 +1001,7 @@ pub fn merge<'gc>(
     src_rect: (i32, i32, i32, i32),
     dest_point: (i32, i32),
     rgba_mult: (i32, i32, i32, i32),
-) {
+) -> Result<(), RenderFailure> {
     let (src_min_x, src_min_y, src_width, src_height) = src_rect;
     let (dest_min_x, dest_min_y) = dest_point;
     let transparency = target.transparency();
@@ -993,16 +1017,16 @@ pub fn merge<'gc>(
     );
 
     if dest_region.width() == 0 || dest_region.height() == 0 {
-        return;
+        return Ok(());
     }
 
     let source = if source_bitmap.ptr_eq(target) {
         None
     } else {
-        Some(source_bitmap.read_area(source_region, renderer))
+        Some(source_bitmap.read_area(source_region, renderer)?)
     };
 
-    let target = target.sync(renderer);
+    let target = target.sync(renderer)?;
     let mut write = target.borrow_mut(mc);
 
     for y in 0..dest_region.height() {
@@ -1053,6 +1077,8 @@ pub fn merge<'gc>(
     }
 
     write.set_cpu_dirty(mc, dest_region);
+
+    Ok(())
 }
 
 pub fn copy_pixels<'gc>(
@@ -1062,7 +1088,28 @@ pub fn copy_pixels<'gc>(
     src_rect: (i32, i32, i32, i32),
     dest_point: (i32, i32),
     merge_alpha: bool,
-) {
+) -> Result<(), RenderFailure> {
+    copy_pixels_inner(
+        context.gc(),
+        context.renderer,
+        target,
+        source_bitmap,
+        src_rect,
+        dest_point,
+        merge_alpha,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn copy_pixels_inner<'gc>(
+    mc: &Mutation<'gc>,
+    renderer: &mut dyn RenderBackend,
+    target: BitmapData<'gc>,
+    source_bitmap: BitmapData<'gc>,
+    src_rect: (i32, i32, i32, i32),
+    dest_point: (i32, i32),
+    merge_alpha: bool,
+) -> Result<(), RenderFailure> {
     let (src_min_x, src_min_y, src_width, src_height) = src_rect;
     let (dest_min_x, dest_min_y) = dest_point;
     let transparency = target.transparency();
@@ -1079,7 +1126,7 @@ pub fn copy_pixels<'gc>(
     );
 
     if dest_region.width() == 0 || dest_region.height() == 0 {
-        return;
+        return Ok(());
     }
 
     let target_has_pending_gpu_write =
@@ -1089,34 +1136,40 @@ pub fn copy_pixels<'gc>(
         transparency,
         merge_alpha,
         false,
-        target_has_pending_gpu_write,
-    ) && !source_bitmap.ptr_eq(target);
+        target_has_pending_gpu_write && !renderer.supports_bitmap_region_readback(),
+    ) && (!source_bitmap.ptr_eq(target)
+        || (renderer.supports_bitmap_region_readback()
+            && !(source_region.intersects(dest_region)
+                && dest_region.x_min < source_region.x_min
+                && dest_region.y_min > source_region.y_min)));
+    // Flash's down-left overlapping self-copy reads rows already overwritten
+    // by preceding rows. Preserve that CPU behavior instead of memmove here.
     if gpu_copy_candidate {
-        let source_handle = source_bitmap.bitmap_handle(context.gc(), context.renderer);
-        let target_handle = target.bitmap_handle(context.gc(), context.renderer);
-        if let Ok(Some(sync_handle)) = context.renderer.copy_bitmap_region(
-            source_handle,
-            source_region,
-            target_handle,
-            dest_region,
-        ) {
-            target.mark_gpu_dirty(context.gc(), sync_handle, dest_region);
+        let source_handle = source_bitmap.bitmap_handle(mc, renderer)?;
+        let target_handle = target.bitmap_handle(mc, renderer)?;
+        if let Some(sync_handle) = renderer
+            .copy_bitmap_region(source_handle, source_region, target_handle, dest_region)
+            .map_err(|error| renderer.health().record(error.into_render_failure()))?
+        {
+            target.mark_gpu_dirty(mc, sync_handle, dest_region);
             ruffle_render::profile::bitmap_gpu_copy(true);
-            return;
+            return Ok(());
         }
     }
 
     ruffle_render::profile::bitmap_gpu_copy(false);
 
     copy_on_cpu(
-        context.gc(),
-        context.renderer,
+        mc,
+        renderer,
         source_bitmap,
         target,
         source_region,
         dest_region,
         (source_transparency && !transparency) || merge_alpha,
-    );
+    )?;
+
+    Ok(())
 }
 
 fn can_copy_pixels_on_gpu(
@@ -1142,7 +1195,7 @@ pub fn copy_pixels_with_alpha_source<'gc>(
     alpha_bitmap: BitmapData<'gc>,
     alpha_point: (i32, i32),
     merge_alpha: bool,
-) {
+) -> Result<(), RenderFailure> {
     if source_bitmap.ptr_eq(alpha_bitmap)
         && alpha_point.0 == src_rect.0
         && alpha_point.1 == src_rect.1
@@ -1154,8 +1207,8 @@ pub fn copy_pixels_with_alpha_source<'gc>(
             src_rect,
             dest_point,
             merge_alpha,
-        );
-        return;
+        )?;
+        return Ok(());
     }
 
     let (src_min_x, src_min_y, src_width, src_height) = src_rect;
@@ -1170,7 +1223,7 @@ pub fn copy_pixels_with_alpha_source<'gc>(
     if dest_region.width() == 0 || dest_region.height() == 0 {
         // Either the destination rectangle was entirely out of bounds,
         // or the source rectangle's width or height was zero.
-        return;
+        return Ok(());
     }
 
     let transparency = target.transparency();
@@ -1180,22 +1233,25 @@ pub fn copy_pixels_with_alpha_source<'gc>(
     let mut source_region =
         PixelRegion::for_region_i32(src_min_x, src_min_y, src_width, src_height);
     source_region.clamp(source_bitmap.width(), source_bitmap.height());
-    let source_bitmap = if source_bitmap.ptr_eq(target) {
-        None
-    } else {
-        Some(source_bitmap.read_area(source_region, context.renderer))
-    };
-
     let mut alpha_region =
         PixelRegion::for_region_i32(alpha_point.0, alpha_point.1, src_width, src_height);
     alpha_region.clamp(alpha_bitmap.width(), alpha_bitmap.height());
+    if source_bitmap.ptr_eq(alpha_bitmap) && !source_bitmap.ptr_eq(target) {
+        drop(alpha_bitmap.read_area(alpha_region, context.renderer)?);
+    }
+    let source_bitmap = if source_bitmap.ptr_eq(target) {
+        None
+    } else {
+        Some(source_bitmap.read_area(source_region, context.renderer)?)
+    };
+
     let alpha_bitmap = if alpha_bitmap.ptr_eq(target) {
         None
     } else {
-        Some(alpha_bitmap.read_area(alpha_region, context.renderer))
+        Some(alpha_bitmap.read_area(alpha_region, context.renderer)?)
     };
 
-    let target = target.sync(context.renderer);
+    let target = target.sync(context.renderer)?;
     let mut write = target.borrow_mut(context.gc());
 
     for src_y in src_min_y..(src_min_y + src_height) {
@@ -1282,6 +1338,8 @@ pub fn copy_pixels_with_alpha_source<'gc>(
         }
     }
     write.set_cpu_dirty(context.gc(), dest_region);
+
+    Ok(())
 }
 
 pub fn apply_filter<'gc>(
@@ -1292,7 +1350,7 @@ pub fn apply_filter<'gc>(
     source_size: (u32, u32),
     dest_point: (i32, i32),
     filter: Filter,
-) {
+) -> Result<(), RenderFailure> {
     // Prevent creating 0x0 textures.
     // FIXME: this is not correct.
     // Currently at minimum, applyFilter(blur) is bugged in that
@@ -1301,7 +1359,7 @@ pub fn apply_filter<'gc>(
     // Once it is fixed, this check should be removed or replaced by
     // "if after including size adjustment the size is still 0, return".
     if source_size.0 == 0 || source_size.1 == 0 {
-        return;
+        return Ok(());
     }
 
     if !context.renderer.is_filter_supported(&filter) {
@@ -1315,7 +1373,7 @@ pub fn apply_filter<'gc>(
         );
 
         if dest_region.width() == 0 || dest_region.height() == 0 {
-            return;
+            return Ok(());
         }
 
         // Until we support these filters, treat this like a copy
@@ -1327,23 +1385,31 @@ pub fn apply_filter<'gc>(
             source_region,
             dest_region,
             false,
-        );
-        return;
+        )?;
+        return Ok(());
     }
 
-    let source_handle = source.bitmap_handle(context.gc(), context.renderer);
+    let source_handle = source.bitmap_handle(context.gc(), context.renderer)?;
+    let dest = target.bitmap_handle(context.gc(), context.renderer)?;
     let (target, _) = target.overwrite_cpu_pixels_from_gpu(context.gc());
     let mut write = target.borrow_mut(context.gc());
-    let dest = write.bitmap_handle(context.renderer);
 
-    let sync_handle = context.renderer.apply_filter(
-        source_handle,
-        source_point,
-        source_size,
-        dest,
-        dest_point,
-        filter,
-    );
+    let sync_handle = context
+        .renderer
+        .apply_filter(
+            source_handle,
+            source_point,
+            source_size,
+            dest,
+            dest_point,
+            filter,
+        )
+        .map_err(|error| {
+            context
+                .renderer
+                .health()
+                .record(error.into_render_failure())
+        })?;
     let region = PixelRegion::for_whole_size(write.width(), write.height());
     match sync_handle {
         Some(sync_handle) => write.set_gpu_dirty(context.gc(), sync_handle, region),
@@ -1351,6 +1417,8 @@ pub fn apply_filter<'gc>(
             tracing::warn!("BitmapData.apply_filter: Renderer not yet implemented")
         }
     }
+
+    Ok(())
 }
 
 fn copy_on_cpu<'gc>(
@@ -1361,7 +1429,7 @@ fn copy_on_cpu<'gc>(
     source_region: PixelRegion,
     dest_region: PixelRegion,
     blend: bool,
-) {
+) -> Result<(), RenderFailure> {
     copy_on_cpu::copy_on_cpu(
         context,
         renderer,
@@ -1370,7 +1438,9 @@ fn copy_on_cpu<'gc>(
         source_region,
         dest_region,
         blend,
-    );
+    )?;
+
+    Ok(())
 }
 
 fn blend_and_transform<'gc>(
@@ -1380,9 +1450,9 @@ fn blend_and_transform<'gc>(
     source_region: PixelRegion,
     dest_region: PixelRegion,
     transform: &ColorTransform,
-) {
+) -> Result<(), RenderFailure> {
     let dest_is_source = source.ptr_eq(dest);
-    let mut dest = dest.sync(context.renderer).borrow_mut(context.gc());
+    let mut dest = dest.sync(context.renderer)?.borrow_mut(context.gc());
 
     if dest_is_source {
         for y in 0..dest_region.height() {
@@ -1401,7 +1471,7 @@ fn blend_and_transform<'gc>(
             }
         }
     } else {
-        let source = source.read_area(source_region, context.renderer);
+        let source = source.read_area(source_region, context.renderer)?;
         let opaque = !dest.transparency();
 
         for y in 0..dest_region.height() {
@@ -1422,6 +1492,8 @@ fn blend_and_transform<'gc>(
     }
 
     dest.set_cpu_dirty(context.gc(), dest_region);
+
+    Ok(())
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1501,7 +1573,7 @@ pub fn draw<'gc>(
                         source_region,
                         dest_region,
                         &transform.color_transform,
-                    );
+                    )?;
                 } else {
                     copy_on_cpu(
                         context.gc(),
@@ -1511,7 +1583,7 @@ pub fn draw<'gc>(
                         source_region,
                         dest_region,
                         source.transparency(), // If transparent source, blend the pixels. Otherwise they'll be 0xFF alpha and nothing to blend.
-                    );
+                    )?;
                 }
                 return Ok(());
             }
@@ -1523,6 +1595,11 @@ pub fn draw<'gc>(
 
     let mut cache_draws = vec![];
     let mut render_context = RenderContext {
+        render_epoch: 0,
+        snapshots: None,
+        snapshot_allowed: false,
+        snapshot_barriers: 0,
+        snapshot_recording: false,
         renderer: context.renderer,
         commands: CommandList::new(),
         cache_draws: &mut cache_draws,
@@ -1582,7 +1659,7 @@ pub fn draw<'gc>(
         render_context.commands.pop_mask();
     }
 
-    let handle = target.bitmap_handle(render_context.gc(), render_context.renderer);
+    let handle = target.bitmap_handle(render_context.gc(), render_context.renderer)?;
 
     let commands = if blend_mode == BlendMode::Normal {
         render_context.commands
@@ -1608,7 +1685,13 @@ pub fn draw<'gc>(
     );
     let image = context
         .renderer
-        .render_offscreen(handle, commands, quality, dirty_region);
+        .render_offscreen(handle, commands, quality, dirty_region)
+        .map_err(|error| {
+            context
+                .renderer
+                .health()
+                .record(error.into_render_failure())
+        })?;
 
     match image {
         Some(sync_handle) => {
@@ -1626,13 +1709,13 @@ pub fn get_vector<'gc>(
     y: i32,
     width: i32,
     height: i32,
-) -> Vec<Avm2Value<'gc>> {
+) -> Result<Vec<Avm2Value<'gc>>, RenderFailure> {
     let mut region = PixelRegion::for_region_i32(x, y, width, height);
     region.clamp(target.width(), target.height());
 
     let mut result = Vec::with_capacity((region.width() * region.height()) as usize);
 
-    let read = target.read_area(region, renderer);
+    let read = target.read_area(region, renderer)?;
 
     for y in region.y_min..region.y_max {
         for x in region.x_min..region.x_max {
@@ -1642,7 +1725,7 @@ pub fn get_vector<'gc>(
         }
     }
 
-    result
+    Ok(result)
 }
 
 pub fn set_vector<'gc>(
@@ -1663,7 +1746,7 @@ pub fn set_vector<'gc>(
 
     let region = PixelRegion::for_region(x_min, y_min, width as u32, height as u32);
 
-    let bitmap_data = target.sync(activation.context.renderer);
+    let bitmap_data = target.sync(activation.context.renderer)?;
     let mut bitmap_data = bitmap_data.borrow_mut(activation.gc());
     let transparency = bitmap_data.transparency();
     let mut iter = vector.iter();
@@ -1697,7 +1780,7 @@ pub fn get_pixels_as_byte_array<'gc>(
     let mut region = PixelRegion::for_region_i32(x, y, width, height);
     region.clamp(target.width(), target.height());
 
-    let read = target.read_area(region, activation.context.renderer);
+    let read = target.read_area(region, activation.context.renderer)?;
     for y in region.y_min..region.y_max {
         for x in region.x_min..region.x_max {
             let color = read.get_pixel32_raw(x, y);
@@ -1720,7 +1803,7 @@ pub fn set_pixels_from_byte_array<'gc>(
     width: i32,
     height: i32,
     bytearray: &mut ByteArrayStorage,
-) -> Result<(), ByteArrayError> {
+) -> Result<(), BitmapDataWriteError> {
     let mut region = PixelRegion::for_region_i32(x, y, width, height);
     region.clamp(target.width(), target.height());
     let transparency = target.transparency();
@@ -1730,7 +1813,7 @@ pub fn set_pixels_from_byte_array<'gc>(
         target.overwrite_cpu_pixels_from_gpu(mc).0
     } else {
         // If we're filling a partial region, finish any gpu->cpu sync
-        target.sync(renderer)
+        target.sync(renderer)?
     };
     let mut write = target.borrow_mut(mc);
 
@@ -1747,7 +1830,7 @@ pub fn set_pixels_from_byte_array<'gc>(
             }
         }
 
-        write.set_cpu_dirty(mc, region)
+        write.set_cpu_dirty(mc, region);
     }
 
     Ok(())
@@ -1764,7 +1847,7 @@ pub fn pixel_dissolve<'gc>(
     random_seed: i32,
     num_pixels: i32,
     fill_color: u32,
-) -> i32 {
+) -> Result<i32, RenderFailure> {
     /// Returns at least 2. Always returns an even number.
     fn get_feistel_block_size(sequence_length: u32) -> u32 {
         let sequence_length = sequence_length.max(2);
@@ -1872,7 +1955,7 @@ pub fn pixel_dissolve<'gc>(
     let src_height = src_height.max(0);
 
     if src_width == 0 || src_height == 0 {
-        return 0;
+        return Ok(0);
     }
 
     let (dest_min_x, dest_min_y) = dest_point;
@@ -1890,7 +1973,7 @@ pub fn pixel_dissolve<'gc>(
     );
 
     if dest_region.width() == 0 || dest_region.height() == 0 {
-        return 0;
+        return Ok(0);
     }
 
     let write_offset = (dest_region.x_min, dest_region.y_min);
@@ -1899,14 +1982,14 @@ pub fn pixel_dissolve<'gc>(
     let different_source_than_target = if source_bitmap.ptr_eq(target) {
         None
     } else {
-        Some(source_bitmap.read_area(source_region, renderer))
+        Some(source_bitmap.read_area(source_region, renderer)?)
     };
 
     let final_pixel_sequence_length = dest_region.width() * dest_region.height();
 
     let num_pixels = num_pixels.min(final_pixel_sequence_length as i32);
 
-    let target = target.sync(renderer);
+    let target = target.sync(renderer)?;
     let mut write = target.borrow_mut(mc);
 
     // For compliance with the official Flash Player, we always write the pixel at (0, 0).
@@ -1970,5 +2053,5 @@ pub fn pixel_dissolve<'gc>(
 
     write.set_cpu_dirty(mc, dest_region);
 
-    raw_perm_index as i32
+    Ok(raw_perm_index as i32)
 }

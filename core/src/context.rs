@@ -106,6 +106,10 @@ pub struct UpdateContext<'gc> {
     /// The renderer, used by the display objects to draw themselves.
     pub renderer: &'gc mut dyn RenderBackend,
 
+    /// The renderer's shared failure latch for hot VM boundaries. This is a live
+    /// handle, not a snapshot: device callbacks remain visible within this tick.
+    pub(crate) renderer_health: ruffle_render::error::RendererHealth,
+
     /// The UI backend, used to detect user interactions.
     pub ui: &'gc mut dyn UiBackend,
 
@@ -404,7 +408,7 @@ impl<'gc> UpdateContext<'gc> {
         activation
             .context
             .library
-            .library_for_movie_mut(*activation.context.root_swf)
+            .library_for_movie_mut(*activation.context.root_swf, activation.context.gc_context)
             .set_avm2_domain(stage_domain);
         activation.context.ui.set_mouse_visible(true);
 
@@ -585,6 +589,13 @@ impl Default for ActionQueue<'_> {
 /// As a convenience, this type can be deref-coerced to `Mutation<'gc>`, but note that explicitly
 /// writing `context.gc()` can be sometimes necessary to satisfy the borrow checker.
 pub struct RenderContext<'a, 'gc> {
+    pub render_epoch: u64,
+    pub snapshots: Option<&'a mut crate::display_object::snapshot::Cache>,
+    pub snapshot_allowed: bool,
+    /// An ancestor is currently recording a block, so leaf eligibility must
+    /// contribute barriers even when the leaf cannot own a snapshot itself.
+    pub snapshot_recording: bool,
+    pub snapshot_barriers: u64,
     /// The renderer, used by the display objects to register themselves.
     pub renderer: &'a mut dyn RenderBackend,
 

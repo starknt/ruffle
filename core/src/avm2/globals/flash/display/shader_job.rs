@@ -94,6 +94,7 @@ pub fn begin_frame(context: &mut crate::context::UpdateContext<'_>) {
     let mut pending = std::mem::take(context.pending_shader_jobs);
     let pending_depth = pending.len();
     for job in &mut pending {
+        context.shader_job_queue.cancel(job.id);
         let submitted_at = Instant::now();
         job.phase = AsyncShaderJobPhase::Submitted;
         ruffle_render::profile::async_event(
@@ -111,16 +112,35 @@ pub fn begin_frame(context: &mut crate::context::UpdateContext<'_>) {
 /// Run queued jobs at the end of a frame and dispatch their completion events.
 /// All AVM objects and renderer access stay on the player thread.
 pub fn process_post_frame(context: &mut crate::context::UpdateContext<'_>) {
+    if context.renderer.health().check().is_err() {
+        context.pending_shader_jobs.clear();
+        context.active_shader_jobs.clear();
+        context.shader_job_queue.pending.clear();
+        return;
+    }
     let mut jobs = std::mem::take(context.active_shader_jobs);
     let jobs_this_frame = jobs.len();
     for _ in 0..jobs_this_frame {
+        if context.renderer.health().check().is_err() {
+            context.pending_shader_jobs.clear();
+            context.active_shader_jobs.clear();
+            return;
+        }
         let Some(mut job) = jobs.pop_front() else {
             break;
         };
         if let Some(mut pending) = job.pending.take() {
             let polled_at = Instant::now();
-            match context.renderer.poll_pixelbender_shader(&mut pending) {
+            let health = context.renderer.health().clone();
+            match shader_operation(&health, || {
+                context.renderer.poll_pixelbender_shader(&mut pending)
+            }) {
                 Ok(Some(output)) => {
+                    if context.renderer.health().check().is_err() {
+                        context.pending_shader_jobs.clear();
+                        context.active_shader_jobs.clear();
+                        return;
+                    }
                     job.phase = AsyncShaderJobPhase::Ready;
                     ruffle_render::profile::async_event(
                         "shaderJobCompleted",
@@ -158,17 +178,24 @@ pub fn process_post_frame(context: &mut crate::context::UpdateContext<'_>) {
                         Some("readback"),
                     );
                     job.phase = AsyncShaderJobPhase::Canceled;
+                    context.pending_shader_jobs.clear();
+                    context.active_shader_jobs.clear();
+                    context.shader_job_queue.pending.clear();
+                    return;
                 }
             }
             continue;
         }
 
         let submitted_at = Instant::now();
-        match context.renderer.submit_pixelbender_shader(
-            job.shader_handle.clone(),
-            &job.arguments,
-            &job.pixel_bender_target,
-        ) {
+        let health = context.renderer.health().clone();
+        match shader_operation(&health, || {
+            context.renderer.submit_pixelbender_shader(
+                job.shader_handle.clone(),
+                &job.arguments,
+                &job.pixel_bender_target,
+            )
+        }) {
             Ok(pending) => {
                 job.phase = AsyncShaderJobPhase::WaitingReadback;
                 job.pending = Some(pending);
@@ -189,6 +216,10 @@ pub fn process_post_frame(context: &mut crate::context::UpdateContext<'_>) {
                     Some("submit"),
                 );
                 job.phase = AsyncShaderJobPhase::Canceled;
+                context.pending_shader_jobs.clear();
+                context.active_shader_jobs.clear();
+                context.shader_job_queue.pending.clear();
+                return;
             }
         }
     }
@@ -400,7 +431,8 @@ pub fn get_shader_args<'gc>(
                     let texture = if let Some(input) = input.as_object() {
                         let input_texture = if let Some(bitmap) = input.as_bitmap_data() {
                             ImageInputTexture::Bitmap(
-                                bitmap.bitmap_handle(activation.gc(), activation.context.renderer),
+                                bitmap
+                                    .bitmap_handle(activation.gc(), activation.context.renderer)?,
                             )
                         } else if let Some(byte_array) = input.as_bytearray() {
                             assert_eq!(byte_array.endian(), Endian::Little);
@@ -499,6 +531,16 @@ fn make_float_texture<'gc, S: PixelSource>(
     })
 }
 
+fn shader_operation<T>(
+    health: &ruffle_render::error::RendererHealth,
+    operation: impl FnOnce() -> Result<T, ruffle_render::error::Error>,
+) -> Result<T, ruffle_render::error::RenderFailure> {
+    health.check()?;
+    let result = operation().map_err(|error| health.record(error.into_render_failure()))?;
+    health.check()?;
+    Ok(result)
+}
+
 /// Implements `ShaderJob.start`.
 pub fn start<'gc>(
     activation: &mut Activation<'_, 'gc>,
@@ -526,7 +568,7 @@ pub fn start<'gc>(
 
     let pixel_bender_target = if let Some(bitmap) = target.as_bitmap_data() {
         PixelBenderTarget::Bitmap(
-            bitmap.bitmap_handle(activation.gc(), activation.context.renderer),
+            bitmap.bitmap_handle(activation.gc(), activation.context.renderer)?,
         )
     } else {
         PixelBenderTarget::Bytes {
@@ -573,11 +615,14 @@ pub fn start<'gc>(
         return Ok(Value::Undefined);
     }
 
-    let output = activation
-        .context
-        .renderer
-        .run_pixelbender_shader(shader_handle, &arguments, &pixel_bender_target)
-        .expect("Failed to run shader");
+    let health = activation.context.renderer.health().clone();
+    let output = shader_operation(&health, || {
+        activation.context.renderer.run_pixelbender_shader(
+            shader_handle,
+            &arguments,
+            &pixel_bender_target,
+        )
+    })?;
 
     match output {
         PixelBenderOutput::Bitmap(sync_handle) => {
@@ -624,6 +669,80 @@ pub fn start<'gc>(
 #[cfg(test)]
 mod tests {
     use super::ShaderJobQueue;
+
+    #[test]
+    fn shader_resource_failure_is_terminal_without_replaying_the_operation() {
+        use ruffle_render::error::{RenderFailure, RenderFailureKind, RendererHealth};
+        let health = RendererHealth::default();
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            let result: Result<(), _> = super::shader_operation(&health, || {
+                calls.set(calls.get() + 1);
+                Err(RenderFailure::new(
+                    RenderFailureKind::OutOfMemory,
+                    "injected shader allocation failure",
+                )
+                .into())
+            });
+            assert_eq!(result.unwrap_err().kind(), RenderFailureKind::OutOfMemory);
+        }
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            health.failure().unwrap().kind(),
+            RenderFailureKind::OutOfMemory
+        );
+    }
+
+    #[test]
+    fn real_shader_queue_releases_submitted_ids_and_stops_on_renderer_failure() {
+        use super::*;
+        #[derive(Debug)]
+        struct Shader(ruffle_render::pixel_bender::PixelBenderShader);
+        impl ruffle_render::pixel_bender::PixelBenderShaderImpl for Shader {
+            fn parsed_shader(&self) -> &ruffle_render::pixel_bender::PixelBenderShader {
+                &self.0
+            }
+        }
+        let player = crate::PlayerBuilder::new().build();
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                for _ in 0..3 {
+                    let object = crate::avm2::object::ScriptObject::new_object(context);
+                    let id = context.shader_job_queue.enqueue();
+                    context.pending_shader_jobs.push_back(PendingShaderJob {
+                        id,
+                        job: object,
+                        target: object,
+                        shader_handle: PixelBenderShaderHandle(std::sync::Arc::new(Shader(
+                            ruffle_render::pixel_bender::PixelBenderShader {
+                                name: "failure-test".into(),
+                                version: 1,
+                                params: vec![],
+                                metadata: vec![],
+                                operations: vec![],
+                            },
+                        ))),
+                        arguments: vec![],
+                        pixel_bender_target: PixelBenderTarget::Bytes {
+                            width: 1,
+                            height: 1,
+                        },
+                        phase: AsyncShaderJobPhase::Queued,
+                        pending: None,
+                    });
+                }
+                begin_frame(context);
+                assert_eq!(context.shader_job_queue.pending_len(), 0);
+                // The actual NullRenderer reports mandatory PixelBender execution
+                // as unsupported. That must become a terminal renderer error.
+                process_post_frame(context);
+                assert!(context.renderer.health().check().is_err());
+                assert!(context.active_shader_jobs.is_empty());
+                assert!(context.pending_shader_jobs.is_empty());
+            });
+    }
 
     #[test]
     fn async_jobs_are_fifo_and_cancellable_before_submission() {

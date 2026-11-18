@@ -1,12 +1,11 @@
 //use super::utils::create_debug_label;
 use bytemuck::{Pod, Zeroable};
 use ruffle_render::{matrix3d::Matrix3D, perspective_projection::PerspectiveProjection};
-use wgpu::util::DeviceExt;
 
 #[derive(Debug)]
 pub struct Globals {
-    bind_group: wgpu::BindGroup,
-    _buffer: wgpu::Buffer,
+    bind_group: crate::gpu_resources::BindGroup,
+    _buffer: crate::gpu_resources::Buffer,
 }
 
 #[repr(C)]
@@ -17,11 +16,11 @@ pub struct GlobalsUniform {
 
 impl Globals {
     pub fn new(
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
+        device: &crate::gpu_resources::Device,
+        layout: &crate::gpu_resources::BindGroupLayout,
         viewport_width: u32,
         viewport_height: u32,
-    ) -> Self {
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         // TODO: Currently, only the fixed default (Default::default) PerspectiveProjection is globally used for all objects.
         // Should support .transform.perspectiveProjection of each display object.
         // The global_matrix should be renamed/devided when supporting them.
@@ -72,7 +71,7 @@ impl Globals {
             label: temp_label.as_deref(),
             contents: bytemuck::cast_slice(&[GlobalsUniform { global_matrix }]),
             usage: wgpu::BufferUsages::UNIFORM,
-        });
+        })?;
 
         let bind_group_label = create_debug_label!("Globals bind group");
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -82,15 +81,15 @@ impl Globals {
                 binding: 0,
                 resource: buffer.as_entire_binding(),
             }],
-        });
+        })?;
 
-        Self {
+        Ok(Self {
             bind_group,
             _buffer: buffer,
-        }
+        })
     }
 
-    pub fn bind_group(&self) -> &wgpu::BindGroup {
+    pub fn bind_group(&self) -> &crate::gpu_resources::BindGroup {
         &self.bind_group
     }
 }

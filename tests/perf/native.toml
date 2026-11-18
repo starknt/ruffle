@@ -1,0 +1,51 @@
+[[case]]
+name = "sparse_blend"
+path = "../tests/swfs/native_perf/sparse_blend"
+
+[[case]]
+name = "alpha_mask"
+path = "../tests/swfs/native_perf/alpha_mask"
+
+[[case]]
+name = "filter_cache"
+path = "../tests/swfs/native_perf/filter_cache"
+
+[[case]]
+name = "static_tree"
+path = "../tests/swfs/native_perf/static_tree"
+
+[[case]]
+name = "dirty_1_percent"
+path = "../tests/swfs/native_perf/dirty_1_percent"
+
+[[case]]
+name = "dirty_all"
+path = "../tests/swfs/native_perf/dirty_all"
+
+[[case]]
+name = "dynamic_control"
+path = "../tests/swfs/native_perf/dynamic_control"
+
+[[case]]
+name = "load_unload"
+path = "../tests/swfs/native_perf/load_unload"
+
+[[case]]
+name = "traits_1"
+path = "../tests/swfs/native_perf/traits_1"
+
+[[case]]
+name = "traits_2"
+path = "../tests/swfs/native_perf/traits_2"
+
+[[case]]
+name = "traits_4"
+path = "../tests/swfs/native_perf/traits_4"
+
+[[case]]
+name = "traits_5"
+path = "../tests/swfs/native_perf/traits_5"
+
+[[case]]
+name = "worker_prepare"
+path = "../tests/swfs/native_perf/worker_prepare"

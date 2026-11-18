@@ -138,6 +138,107 @@ pub struct DistilledShape<'a> {
     pub id: CharacterId,
 }
 
+/// Immutable owned geometry for native preparation after display traversal.
+#[derive(Clone, Debug)]
+pub struct OwnedDistilledShape {
+    pub paths: Vec<OwnedDrawPath>,
+    pub shape_bounds: Rectangle<Twips>,
+    pub edge_bounds: Rectangle<Twips>,
+    pub id: CharacterId,
+}
+#[derive(Clone, Debug)]
+pub enum OwnedDrawPath {
+    Stroke {
+        style: LineStyle,
+        is_closed: bool,
+        commands: Vec<DrawCommand>,
+    },
+    Fill {
+        style: FillStyle,
+        commands: Vec<DrawCommand>,
+        winding_rule: FillRule,
+    },
+}
+impl From<DistilledShape<'_>> for OwnedDistilledShape {
+    fn from(shape: DistilledShape<'_>) -> Self {
+        Self {
+            id: shape.id,
+            shape_bounds: shape.shape_bounds,
+            edge_bounds: shape.edge_bounds,
+            paths: shape
+                .paths
+                .into_iter()
+                .map(|path| match path {
+                    DrawPath::Stroke {
+                        style,
+                        is_closed,
+                        commands,
+                    } => OwnedDrawPath::Stroke {
+                        style: style.clone(),
+                        is_closed,
+                        commands,
+                    },
+                    DrawPath::Fill {
+                        style,
+                        commands,
+                        winding_rule,
+                    } => OwnedDrawPath::Fill {
+                        style: style.clone(),
+                        commands,
+                        winding_rule,
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+impl OwnedDistilledShape {
+    pub fn bitmap_ids(&self) -> impl Iterator<Item = CharacterId> + '_ {
+        self.paths.iter().filter_map(|path| {
+            let style = match path {
+                OwnedDrawPath::Stroke { style, .. } => style.fill_style(),
+                OwnedDrawPath::Fill { style, .. } => style,
+            };
+            if let FillStyle::Bitmap { id, .. } = style {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+    }
+    pub fn as_distilled(&self) -> DistilledShape<'_> {
+        DistilledShape {
+            id: self.id,
+            shape_bounds: self.shape_bounds,
+            edge_bounds: self.edge_bounds,
+            paths: self
+                .paths
+                .iter()
+                .map(|path| match path {
+                    OwnedDrawPath::Stroke {
+                        style,
+                        is_closed,
+                        commands,
+                    } => DrawPath::Stroke {
+                        style,
+                        is_closed: *is_closed,
+                        commands: commands.clone(),
+                    },
+                    OwnedDrawPath::Fill {
+                        style,
+                        commands,
+                        winding_rule,
+                    } => DrawPath::Fill {
+                        style,
+                        commands: commands.clone(),
+                        winding_rule: *winding_rule,
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
 impl<'a> From<&'a swf::Shape> for DistilledShape<'a> {
     fn from(shape: &'a Shape) -> Self {
         Self {

@@ -3,6 +3,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error<'gc> {
+    #[error(transparent)]
+    Render(#[from] ruffle_render::error::RenderFailure),
     #[error("Prototype recursion limit has been exceeded")]
     PrototypeRecursionLimit,
 

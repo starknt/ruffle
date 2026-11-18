@@ -17,7 +17,7 @@ use std::{
 };
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[derive(Debug)]
 pub struct SymbolImage {
@@ -64,18 +64,24 @@ impl Pixels {
             data: OnceCell::new(),
         }
     }
-    pub fn view(&mut self, renderer: &mut dyn RenderBackend) -> Option<BitmapHandle> {
-        let s = self.symbol.as_ref()?;
+    pub fn view(
+        &mut self,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<Option<BitmapHandle>, ruffle_render::error::Error> {
+        renderer.health().check()?;
+        let Some(s) = self.symbol.as_ref() else {
+            return Ok(None);
+        };
         if let Some(view) = &self.view {
-            return Some(view.clone());
+            return Ok(Some(view.clone()));
         }
-        let view = s.view(renderer).ok()?;
+        let view = s.view(renderer)?;
         // Only unmodified symbols reach this path. Their compressed source can
         // recreate an evicted upload without readback or changing AS3 lifetime.
         if !renderer.cache_immutable_bitmap(&view) {
             self.view = Some(view.clone());
         }
-        Some(view)
+        Ok(Some(view))
     }
     fn materialize(&self) -> &(Vec<Color>, BitmapAllocation) {
         self.data.get_or_init(|| {

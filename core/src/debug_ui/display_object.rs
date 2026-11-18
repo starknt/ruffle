@@ -973,7 +973,14 @@ impl DisplayObjectWindow {
             .num_columns(2)
             .show(ui, |ui| {
                 let bitmap_data = object.bitmap_data();
-                let bitmap_data = bitmap_data.sync(context.renderer).borrow();
+                let bitmap_data = match bitmap_data.sync(context.renderer) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        ui.label(error.to_string());
+                        return;
+                    }
+                };
+                let bitmap_data = bitmap_data.borrow();
 
                 ui.label("Width");
                 ui.label(format!("{} px", bitmap_data.width()));
@@ -1001,12 +1008,16 @@ impl DisplayObjectWindow {
 
                 ui.label("Dirty State");
                 match bitmap_data.dirty_state() {
+                    DirtyState::Failed(error) => ui.label(error.to_string()),
                     DirtyState::Clean => ui.label("Clean"),
+                    DirtyState::Mixed { cpu, gpu } => {
+                        ui.label(format!("CPU modified {cpu:?}; GPU modified {gpu:?}"))
+                    }
                     DirtyState::CpuModified(region) => ui.label(format!(
                         "CPU Modified ({},{} to {},{})",
                         region.x_min, region.y_min, region.x_max, region.y_max
                     )),
-                    DirtyState::GpuModified(_, region) => ui.label(format!(
+                    DirtyState::GpuModified(region) => ui.label(format!(
                         "GPU Modified ({},{} to {},{})",
                         region.x_min, region.y_min, region.x_max, region.y_max
                     )),
@@ -1018,7 +1029,14 @@ impl DisplayObjectWindow {
             .id_salt(ui.id().with("bitmap-preview"))
             .show(ui, |ui| {
                 let bitmap_data = object.bitmap_data();
-                let bitmap_data = bitmap_data.sync(context.renderer).borrow();
+                let bitmap_data = match bitmap_data.sync(context.renderer) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        ui.label(error.to_string());
+                        return;
+                    }
+                };
+                let bitmap_data = bitmap_data.borrow();
 
                 if bitmap_data.width() == 0 || bitmap_data.height() == 0 {
                     ui.weak("(no pixels)");
@@ -1662,15 +1680,14 @@ impl DisplayObjectWindow {
 
                 ui.label("Character");
                 let id = object.id();
-                if let Some(name) =
-                    context
-                        .library
-                        .library_for_movie(object.movie())
-                        .and_then(|l| {
-                            l.export_characters()
-                                .iter()
-                                .find_map(|(k, v)| if *v == id { Some(k) } else { None })
-                        })
+                if let Some(name) = context
+                    .library
+                    .library_for_movie(object.movie(), context.gc_context)
+                    .and_then(|l| {
+                        l.export_characters()
+                            .iter()
+                            .find_map(|(k, v)| if *v == id { Some(k) } else { None })
+                    })
                 {
                     ui.label(format!("{id} {name}"));
                 } else {

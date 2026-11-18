@@ -59,11 +59,18 @@ impl<'gc> Stage3DObject<'gc> {
     }
 
     pub fn update_context3d_status(self, context: &mut UpdateContext<'gc>) {
+        if context.renderer.health().check().is_err() {
+            return;
+        }
         if let Context3DStatus::Requested { profile } = self.0.context3d_status.get() {
             let context3d = match context.renderer.create_context3d(profile) {
                 Ok(context3d) => context3d,
                 Err(err) => {
                     tracing::error!("Failed to create Context3d: {}", err);
+                    if let ruffle_render::error::Error::Render(failure) = err {
+                        context.renderer.health().record(failure);
+                        self.clear_context3d(context.gc());
+                    }
                     // TODO the docs say FP dispatches an "error" event here
                     return;
                 }
@@ -138,4 +145,39 @@ pub enum Context3DStatus<'gc> {
         profile: Context3DProfile,
     },
     Ready(Context3DObject<'gc>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_creation_allocation_failure_stops_publication_and_retry() {
+        use ruffle_render::error::{RenderFailure, RenderFailureKind};
+        let mut renderer = crate::bitmap::symbol_pixels::tests::renderer(false);
+        renderer.allocation_failure = Some(RenderFailure::new(
+            RenderFailureKind::BudgetExceeded,
+            "context allocation fault",
+        ));
+        let calls = renderer.allocation_calls.clone();
+        let player = crate::PlayerBuilder::new().with_renderer(renderer).build();
+        let mut player = player.lock().unwrap();
+        player.mutate_with_update_context(|context| {
+            let stage = Stage3DObject::new(context);
+            stage.set_requesting_context3d(context.gc(), Context3DProfile::Baseline);
+            stage.update_context3d_status(context);
+            stage.update_context3d_status(context);
+            assert!(stage.context3d().is_none());
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "terminal context creation must not be retried next frame"
+        );
+        assert_eq!(
+            player.render_failure().unwrap().kind(),
+            RenderFailureKind::BudgetExceeded
+        );
+        assert!(player.render().is_err());
+    }
 }

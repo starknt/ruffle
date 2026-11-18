@@ -323,6 +323,8 @@ enum RunState {
 }
 
 pub struct Player {
+    render_epoch: u64,
+    snapshots: crate::display_object::snapshot::Cache,
     /// The version of the player we're emulating.
     ///
     /// This serves a few purposes, primarily for compatibility:
@@ -610,7 +612,26 @@ impl Player {
             .set_simulated_output(rate != crate::playback::PlaybackRate::Normal);
     }
 
-    pub fn tick(&mut self, dt: FloatDuration) {
+    pub fn render_failure(&self) -> Option<ruffle_render::error::RenderFailure> {
+        self.renderer.health().failure()
+    }
+
+    fn check_render_health(&mut self) -> Result<(), ruffle_render::error::RenderFailure> {
+        if let Err(error) = self.renderer.health().check() {
+            self.set_is_playing(false);
+            self.needs_render = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn tick(&mut self, dt: FloatDuration) -> Result<(), ruffle_render::error::RenderFailure> {
+        self.check_render_health()?;
+        self.tick_inner(dt);
+        self.check_render_health()
+    }
+
+    fn tick_inner(&mut self, dt: FloatDuration) {
         let _logic = ruffle_render::profile::time(ruffle_render::profile::Phase::Logic);
         if !self.is_playing() {
             return;
@@ -736,6 +757,8 @@ impl Player {
             }
         }
 
+        ruffle_render::profile::work(|w| w.catch_up_frames += u64::from(frame.saturating_sub(1)));
+
         // Now that we're done running code,
         // we can stop pretending that more time passed than actually did.
         // Note: update_timers(dt) doesn't need to see this either.
@@ -748,6 +771,9 @@ impl Player {
         // Sanity: If we had too many frames to tick, just reset the accumulator
         // to prevent running at turbo speed.
         if self.frame_accumulator >= frame_duration {
+            ruffle_render::profile::work(|w| {
+                w.discarded_frame_debt_us += (self.frame_accumulator.as_millis() * 1000.0) as u64
+            });
             self.frame_accumulator = FloatDuration::ZERO;
         }
 
@@ -829,6 +855,9 @@ impl Player {
     }
 
     pub fn is_playing(&self) -> bool {
+        if self.renderer.health().check().is_err() {
+            return false;
+        }
         match self.run_state {
             RunState::Playing | RunState::Stepping => true,
             RunState::Suspended => false,
@@ -1183,7 +1212,10 @@ impl Player {
 
     pub fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions) {
         self.mutate_with_update_context(|context| {
-            context.renderer.set_viewport_dimensions(dimensions);
+            if let Err(error) = context.renderer.set_viewport_dimensions(dimensions) {
+                context.renderer.health().fail(error);
+                return;
+            }
             context.stage.build_matrices(context);
         });
 
@@ -1249,6 +1281,9 @@ impl Player {
     /// Handle an event sent into the player from the external windowing system
     /// or an HTML element.
     pub fn handle_event(&mut self, event: PlayerEvent) -> bool {
+        if self.check_render_health().is_err() {
+            return false;
+        }
         match event {
             PlayerEvent::FocusGained | PlayerEvent::FocusLost => self.handle_focus_event(event),
             PlayerEvent::KeyDown { .. }
@@ -2265,6 +2300,9 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn run_frame(&mut self) {
+        if self.check_render_health().is_err() {
+            return;
+        }
         let frame_time = self.frame_time(750_000_000.0);
         let frame_time = Duration::from_nanos(frame_time as u64);
         let (mut execution_limit, may_execute_while_streaming) = match self.load_behavior {
@@ -2324,7 +2362,16 @@ impl Player {
     }
 
     #[instrument(level = "debug", skip_all)]
-    pub fn render(&mut self) {
+    pub fn render(&mut self) -> Result<(), ruffle_render::error::RenderFailure> {
+        self.check_render_health()?;
+        let result = self.render_inner();
+        if let Err(error) = result {
+            self.renderer.health().fail(error);
+        }
+        self.check_render_health()
+    }
+
+    fn render_inner(&mut self) -> Result<(), ruffle_render::error::RenderFailure> {
         let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
 
         if invalidated {
@@ -2334,6 +2381,7 @@ impl Player {
             });
         }
 
+        self.render_epoch = self.render_epoch.wrapping_add(1);
         let mut background_color = Color::WHITE;
 
         let (cache_draws, commands) = self.enter_arena_mut(|gc_context, gc_root, this| {
@@ -2342,7 +2390,16 @@ impl Player {
             let stage = gc_root.stage;
 
             let mut cache_draws = vec![];
+            this.snapshots.prune();
             let mut render_context = RenderContext {
+                render_epoch: this.render_epoch,
+                snapshots: Some(&mut this.snapshots),
+                snapshot_allowed: stage
+                    .stage3ds()
+                    .iter()
+                    .all(|s| !s.visible() || s.context3d().is_none()),
+                snapshot_barriers: 0,
+                snapshot_recording: false,
                 renderer: this.renderer.deref_mut(),
                 commands: CommandList::new(),
                 cache_draws: &mut cache_draws,
@@ -2378,10 +2435,12 @@ impl Player {
             (cache_draws, commands)
         });
 
+        self.check_render_health()?;
         self.renderer
-            .submit_frame(background_color, commands, cache_draws);
-
+            .submit_frame(background_color, commands, cache_draws)?;
+        self.check_render_health()?;
         self.needs_render = false;
+        Ok(())
     }
 
     /// The current frame of the main timeline, if available.
@@ -2570,6 +2629,7 @@ impl Player {
                 root_swf,
                 library,
                 rng: &mut this.rng,
+                renderer_health: this.renderer.health().clone(),
                 renderer: this.renderer.deref_mut(),
                 audio: this.audio.deref_mut(),
                 navigator: this.navigator.deref_mut(),
@@ -2700,7 +2760,33 @@ impl Player {
         #[cfg(feature = "tracy_avm")]
         let _gc_span = tracy_client::Client::running()
             .map(|client| client.span(tracy_client::span_location!("Aola GC collect_debt"), 0));
-        self.gc_arena.borrow_mut().collect_debt();
+        let mut arena = self.gc_arena.borrow_mut();
+        let phase_name = |phase| match phase {
+            gc_arena::arena::CollectionPhase::Sleeping => "sleeping",
+            gc_arena::arena::CollectionPhase::Marking => "marking",
+            gc_arena::arena::CollectionPhase::Marked => "marked",
+            gc_arena::arena::CollectionPhase::Sweeping => "sweeping",
+        };
+        let before = ruffle_render::profile::enabled().then(|| {
+            (
+                Instant::now(),
+                phase_name(arena.collection_phase()),
+                arena.metrics().total_gc_count(),
+                arena.metrics().allocation_debt(),
+            )
+        });
+        arena.collect_debt();
+        if let Some((started, phase_before, objects_before, debt_before)) = before {
+            ruffle_render::profile::record_gc(ruffle_render::profile::GcSample {
+                nanos: started.elapsed().as_nanos() as u64,
+                phase_before,
+                phase_after: phase_name(arena.collection_phase()),
+                objects_before,
+                objects_after: arena.metrics().total_gc_count(),
+                debt_before,
+                debt_after: arena.metrics().allocation_debt(),
+            });
+        }
 
         rval
     }
@@ -3351,6 +3437,8 @@ impl PlayerBuilder {
         let forced_frame_rate = self.frame_rate.is_some();
         let player = Arc::new_cyclic(|self_ref| {
             Mutex::new(Player {
+                render_epoch: 0,
+                snapshots: Default::default(),
                 // Backends
                 audio,
                 log,
@@ -3610,4 +3698,38 @@ pub enum PlayerMode {
 
     /// Represents the debug version of Flash Player, i.e. flashplayerdebugger.
     Debug,
+}
+
+#[cfg(test)]
+mod render_failure_tests {
+    use super::*;
+    use ruffle_render::error::{RenderFailure, RenderFailureKind};
+
+    #[test]
+    fn fatal_renderer_failure_stops_tick_and_frame_publication() {
+        let player = PlayerBuilder::new().build();
+        let mut player = player.lock().unwrap();
+        player.set_is_playing(true);
+        let frame = player.current_frame();
+        player.mutate_with_update_context(|context| {
+            assert!(context.renderer_health.check().is_ok());
+            context.renderer.health().fail(RenderFailure::new(
+                RenderFailureKind::DeviceLost,
+                "injected loss",
+            ));
+            assert_eq!(
+                context.renderer_health.check().unwrap_err().kind(),
+                RenderFailureKind::DeviceLost,
+                "an existing VM context must observe a newly recorded failure"
+            );
+        });
+        assert!(player.tick(FloatDuration::from_millis(40.0)).is_err());
+        assert!(player.render().is_err());
+        assert!(!player.is_playing());
+        assert!(!player.needs_render());
+        assert_eq!(player.current_frame(), frame);
+        player.set_is_playing(true);
+        assert!(player.tick(FloatDuration::from_millis(40.0)).is_err());
+        assert_eq!(player.render_failure().unwrap().message(), "injected loss");
+    }
 }

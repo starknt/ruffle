@@ -20,8 +20,11 @@ impl HostAdapter {
         player.mutate_with_update_context(|ctx| {
             let anchor = AvmString::new_utf8(ctx.gc(), anchor);
             let anchor = QName::from_qualified_name(anchor, ctx);
-            let found = ctx.library.known_movies().find_map(|movie| {
-                let domain = ctx.library.library_for_movie(movie)?.try_avm2_domain()?;
+            let found = ctx.library.known_movies(ctx.gc_context).find_map(|movie| {
+                let domain = ctx
+                    .library
+                    .library_for_movie(movie, ctx.gc_context)?
+                    .try_avm2_domain()?;
                 domain
                     .classes()
                     .contains_key(anchor)

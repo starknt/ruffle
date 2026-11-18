@@ -1,0 +1,8 @@
+num_frames = 3
+[player_options]
+with_renderer = { optional = false, quality = "high" }
+[[compilers]]
+type = "Asc"
+class = "Test"
+scripts = ["Test.as"]
+swf_version = 11

@@ -1,5 +1,9 @@
-// Remove this when we decide on how to handle multithreaded rendering (especially on wasm)
+#![recursion_limit = "256"]
+// Renderer ownership stays on the player thread; preparation workers use owned CPU data.
 #![allow(clippy::arc_with_non_send_sync)]
+
+#[cfg(target_family = "wasm")]
+compile_error!("ruffle_render_wgpu supports native targets only");
 
 use crate::backend::ActiveFrame;
 use crate::bitmaps::BitmapSamplers;
@@ -10,32 +14,47 @@ use crate::target::{RenderTarget, SwapChainTarget};
 use crate::utils::{BufferDimensions, capture_image, format_list, get_backend_names};
 use bytemuck::{Pod, Zeroable};
 use descriptors::Descriptors;
+pub use gpu_profiler as wgpu_profiler;
 use ruffle_render::backend::RawTexture;
 use ruffle_render::bitmap::{BitmapHandle, BitmapHandleImpl, PixelRegion, SyncHandle};
 use ruffle_render::shape_utils::GradientType;
 use ruffle_render::tessellator::{Gradient as TessGradient, Vertex as TessVertex};
 use std::any::Any;
-use std::cell::{Cell, OnceCell};
+use std::sync::OnceLock;
 use std::sync::{
     Arc,
     mpsc::{Receiver, TryRecvError},
 };
 use swf::GradientSpread;
 pub use wgpu;
-pub use wgpu_profiler;
 
 type Error = Box<dyn std::error::Error>;
 
 #[macro_use]
 pub mod utils;
 
+mod bitmap_batch;
+mod bitmap_cache;
+mod bitmap_recipe;
 mod bitmap_residency;
 mod bitmaps;
 mod context3d;
+mod frame_upload;
 mod globals;
+mod gpu_metrics;
+pub mod gpu_profiler;
+pub mod gpu_resources;
+pub mod gpu_runtime;
+mod graph_encoder;
+mod pass_graph;
 mod pipelines;
 mod pixel_bender;
+mod prepare;
+mod render_snapshot;
+mod resource_scheduler;
+mod shape_recipe;
 pub mod target;
+mod transfers;
 pub use ruffle_render::profile;
 mod idle_pool;
 
@@ -48,17 +67,60 @@ pub mod clap;
 pub mod descriptors;
 mod filters;
 mod layouts;
+mod material_cache;
 mod mesh;
 mod shaders;
 mod surface;
 
 impl BitmapHandleImpl for Texture {}
 
-pub fn as_texture(handle: &BitmapHandle) -> &Texture {
-    <dyn Any>::downcast_ref(&*handle.0).unwrap()
+pub fn as_texture<'a>(
+    handle: &'a BitmapHandle,
+    device: &crate::gpu_resources::Device,
+) -> Result<&'a Texture, crate::gpu_runtime::RenderFailure> {
+    let value = &*handle.0 as &dyn Any;
+    if let Some(recipe) = value.downcast_ref::<crate::bitmap_recipe::BitmapRecipe>() {
+        return recipe.resolve(device);
+    }
+    if let Some(cache) = value.downcast_ref::<crate::bitmap_cache::CacheImage>() {
+        return cache.resolve(device);
+    }
+    value.downcast_ref::<Texture>().ok_or_else(|| {
+        crate::gpu_runtime::RenderFailure::new(
+            crate::gpu_runtime::RenderFailureKind::Validation,
+            "bitmap handle belongs to another renderer",
+        )
+    })
 }
 
-pub fn raw_texture_as_texture(handle: &dyn RawTexture) -> &wgpu::Texture {
+fn record_bitmap_write(handle: &BitmapHandle) -> Result<(), crate::gpu_runtime::RenderFailure> {
+    if let Some(recipe) =
+        (&*handle.0 as &dyn Any).downcast_ref::<crate::bitmap_recipe::BitmapRecipe>()
+    {
+        recipe.record_gpu_write()?;
+    } else if let Some(cache) =
+        (&*handle.0 as &dyn Any).downcast_ref::<crate::bitmap_cache::CacheImage>()
+    {
+        cache.written()?;
+    } else if let Some(texture) = (&*handle.0 as &dyn Any).downcast_ref::<Texture>() {
+        texture
+            .version
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| v.checked_add(1),
+            )
+            .map_err(|_| {
+                crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Internal,
+                    "texture content version exhausted",
+                )
+            })?;
+    }
+    Ok(())
+}
+
+pub fn raw_texture_as_texture(handle: &dyn RawTexture) -> &crate::gpu_resources::Texture {
     <dyn Any>::downcast_ref(handle).unwrap()
 }
 
@@ -86,7 +148,7 @@ impl From<TessVertex> for PosVertex {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct PosUvVertex {
+pub(crate) struct PosUvVertex {
     position: [f32; 2],
     uv: [f32; 3],
 }
@@ -115,7 +177,7 @@ impl PosUvVertex {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct PosColorVertex {
+pub(crate) struct PosColorVertex {
     position: [f32; 2],
     color: [f32; 4],
 }
@@ -163,15 +225,17 @@ impl From<TessGradient> for GradientUniforms {
 }
 
 pub struct AsyncReadback {
-    buffer: PoolEntry<wgpu::Buffer, BufferDimensions>,
+    buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
     dimensions: BufferDimensions,
     descriptors: Arc<Descriptors>,
     receiver: Receiver<Result<(), wgpu::BufferAsyncError>>,
+    started: std::time::Instant,
+    mapping: bool,
 }
 
 impl AsyncReadback {
     fn new(
-        buffer: PoolEntry<wgpu::Buffer, BufferDimensions>,
+        buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
         dimensions: BufferDimensions,
         descriptors: Arc<Descriptors>,
         index: Option<wgpu::SubmissionIndex>,
@@ -189,27 +253,80 @@ impl AsyncReadback {
             dimensions,
             descriptors,
             receiver,
+            started: std::time::Instant::now(),
+            mapping: true,
         }
     }
 
-    pub fn poll(&mut self) -> Result<Option<(Vec<u8>, u32)>, String> {
+    pub fn poll(&mut self) -> Result<Option<(Vec<u8>, u32)>, crate::gpu_runtime::RenderFailure> {
+        use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
+        self.descriptors.runtime.check_health()?;
+        if !self.mapping {
+            return Ok(None);
+        }
         self.descriptors
             .device
             .poll(wgpu::PollType::Poll)
-            .map_err(|error| format!("wgpu poll failed: {error:?}"))?;
+            .map_err(|error| {
+                self.descriptors
+                    .runtime
+                    .health()
+                    .record(crate::utils::poll_failure(error))
+            })?;
         match self.receiver.try_recv() {
             Ok(Ok(())) => {
-                let Ok(map) = self.buffer.slice(..).get_mapped_range() else {
-                    return Ok(None);
-                };
+                let map = self.buffer.slice(..).get_mapped_range().map_err(|error| {
+                    self.descriptors.runtime.health().record(RenderFailure::new(
+                        RenderFailureKind::MapFailed,
+                        error.to_string(),
+                    ))
+                })?;
                 let bytes = map.to_vec();
                 drop(map);
                 self.buffer.unmap();
+                self.mapping = false;
                 Ok(Some((bytes, self.dimensions.padded_bytes_per_row)))
             }
-            Ok(Err(error)) => Err(format!("buffer map failed: {error:?}")),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err("buffer map callback disconnected".into()),
+            Ok(Err(error)) => {
+                self.mapping = false;
+                Err(self.descriptors.runtime.health().record(RenderFailure::new(
+                    RenderFailureKind::MapFailed,
+                    error.to_string(),
+                )))
+            }
+            Err(TryRecvError::Empty)
+                if self.started.elapsed() < std::time::Duration::from_secs(2) =>
+            {
+                Ok(None)
+            }
+            Err(TryRecvError::Empty) => {
+                Err(self.descriptors.runtime.health().record(RenderFailure::new(
+                    RenderFailureKind::Timeout,
+                    "asynchronous readback timed out",
+                )))
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.mapping = false;
+                Err(self.descriptors.runtime.health().record(RenderFailure::new(
+                    RenderFailureKind::MapFailed,
+                    "buffer map callback disconnected",
+                )))
+            }
+        }
+    }
+}
+
+impl Drop for AsyncReadback {
+    fn drop(&mut self) {
+        // Completed reads already unmapped the buffer. An unobserved failed map
+        // is also unmapped; only cancel a pending map or release a successful one.
+        if self.mapping
+            && !matches!(
+                self.receiver.try_recv(),
+                Ok(Err(_)) | Err(TryRecvError::Disconnected)
+            )
+        {
+            self.buffer.unmap();
         }
     }
 }
@@ -218,7 +335,7 @@ impl AsyncReadback {
 pub enum QueueSyncHandle {
     AlreadyCopied {
         index: Option<wgpu::SubmissionIndex>,
-        buffer: PoolEntry<wgpu::Buffer, BufferDimensions>,
+        buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
         copy_dimensions: BufferDimensions,
         descriptors: Arc<Descriptors>,
     },
@@ -226,15 +343,18 @@ pub enum QueueSyncHandle {
         handle: BitmapHandle,
         copy_area: PixelRegion,
         descriptors: Arc<Descriptors>,
-        pool: Arc<BufferPool<wgpu::Buffer, BufferDimensions>>,
+        pool: Arc<BufferPool<crate::gpu_resources::Buffer, BufferDimensions>>,
     },
 }
 
 impl SyncHandle for QueueSyncHandle {}
 
 impl QueueSyncHandle {
-    pub fn prepare_async(self, frame: &mut ActiveFrame) -> AsyncReadback {
-        match self {
+    pub fn prepare_async(
+        self,
+        frame: &mut ActiveFrame,
+    ) -> Result<AsyncReadback, crate::gpu_runtime::RenderFailure> {
+        Ok(match self {
             QueueSyncHandle::AlreadyCopied {
                 index,
                 buffer,
@@ -247,49 +367,32 @@ impl QueueSyncHandle {
                 descriptors,
                 pool,
             } => {
-                let texture = as_texture(&handle);
+                let texture = as_texture(&handle, &descriptors.device)?;
                 let dimensions = BufferDimensions::new(
                     copy_area.width() as usize,
                     copy_area.height() as usize,
                     texture.texture.format(),
                 );
-                let buffer = pool.take(&descriptors, dimensions.clone());
-                frame.encoder().copy_texture_to_buffer(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &texture.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: copy_area.x_min,
-                            y: copy_area.y_min,
-                            z: 0,
-                        },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &buffer,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(dimensions.padded_bytes_per_row),
-                            rows_per_image: None,
-                        },
-                    },
-                    wgpu::Extent3d {
-                        width: copy_area.width(),
-                        height: copy_area.height(),
-                        depth_or_array_layers: 1,
-                    },
-                );
-                let index = frame.submit_direct(&descriptors);
+                let buffer = pool.take(&descriptors, dimensions.clone())?;
+                crate::transfers::readback(
+                    &descriptors,
+                    frame.encoder(),
+                    &handle,
+                    copy_area,
+                    &buffer,
+                    &dimensions,
+                )?;
+                let index = frame.submit_direct(&descriptors)?;
                 AsyncReadback::new(buffer, dimensions, descriptors, Some(index))
             }
-        }
+        })
     }
 
     pub fn capture<R, F: FnOnce(&[u8], u32) -> R>(
         self,
         with_rgba: F,
         frame: &mut ActiveFrame,
-    ) -> R {
+    ) -> Result<R, crate::gpu_runtime::RenderFailure> {
         let _readback = ruffle_render::profile::time(ruffle_render::profile::Phase::Readback);
         match self {
             QueueSyncHandle::AlreadyCopied {
@@ -310,7 +413,7 @@ impl QueueSyncHandle {
                 descriptors,
                 pool,
             } => {
-                let texture = as_texture(&handle);
+                let texture = as_texture(&handle, &descriptors.device)?;
 
                 let buffer_dimensions = BufferDimensions::new(
                     copy_area.width() as usize,
@@ -318,33 +421,16 @@ impl QueueSyncHandle {
                     texture.texture.format(),
                 );
 
-                let buffer = pool.take(&descriptors, buffer_dimensions.clone());
-                frame.encoder().copy_texture_to_buffer(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &texture.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: copy_area.x_min,
-                            y: copy_area.y_min,
-                            z: 0,
-                        },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &buffer,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(buffer_dimensions.padded_bytes_per_row),
-                            rows_per_image: None,
-                        },
-                    },
-                    wgpu::Extent3d {
-                        width: copy_area.width(),
-                        height: copy_area.height(),
-                        depth_or_array_layers: 1,
-                    },
-                );
-                let index = frame.submit_direct(&descriptors);
+                let buffer = pool.take(&descriptors, buffer_dimensions.clone())?;
+                crate::transfers::readback(
+                    &descriptors,
+                    frame.encoder(),
+                    &handle,
+                    copy_area,
+                    &buffer,
+                    &buffer_dimensions,
+                )?;
+                let index = frame.submit_direct(&descriptors)?;
 
                 let image = capture_image(
                     &descriptors.device,
@@ -356,9 +442,11 @@ impl QueueSyncHandle {
 
                 // After we've read pixels from a texture enough times, we'll store this buffer so that
                 // future reads will be faster (it'll copy as part of the draw process instead)
-                texture
-                    .copy_count
-                    .set(texture.copy_count.get().saturating_add(1));
+                let _ = texture.copy_count.try_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |count| Some(count.saturating_add(1)),
+                );
 
                 image
             }
@@ -368,14 +456,16 @@ impl QueueSyncHandle {
 
 #[derive(Debug)]
 pub struct Texture {
+    batch_source: crate::bitmap_batch::Source,
     pub(crate) _allocation: ruffle_render::profile::GpuBitmap,
-    pub(crate) texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    repeating_linear: OnceCell<BitmapBinds>,
-    repeating_nearest: OnceCell<BitmapBinds>,
-    clamped_linear: OnceCell<BitmapBinds>,
-    clamped_nearest: OnceCell<BitmapBinds>,
-    copy_count: Cell<u8>,
+    pub(crate) texture: crate::gpu_resources::Texture,
+    view: crate::gpu_resources::TextureView,
+    repeating_linear: OnceLock<BitmapBinds>,
+    repeating_nearest: OnceLock<BitmapBinds>,
+    clamped_linear: OnceLock<BitmapBinds>,
+    clamped_nearest: OnceLock<BitmapBinds>,
+    copy_count: std::sync::atomic::AtomicU8,
+    version: std::sync::atomic::AtomicU64,
 }
 
 impl Texture {
@@ -383,18 +473,18 @@ impl Texture {
         &self,
         repeating: bool,
         smoothed: bool,
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
+        device: &crate::gpu_resources::Device,
+        layout: &crate::gpu_resources::BindGroupLayout,
         handle: BitmapHandle,
         samplers: &BitmapSamplers,
-    ) -> &BitmapBinds {
+    ) -> Result<&BitmapBinds, crate::gpu_runtime::RenderFailure> {
         let bind = match (repeating, smoothed) {
             (true, true) => &self.repeating_linear,
             (true, false) => &self.repeating_nearest,
             (false, true) => &self.clamped_linear,
             (false, false) => &self.clamped_nearest,
         };
-        bind.get_or_init(|| {
+        crate::gpu_resources::try_sync_cell(bind, || {
             BitmapBinds::new(
                 device,
                 layout,

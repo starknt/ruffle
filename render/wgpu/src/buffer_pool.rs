@@ -7,13 +7,23 @@ use std::ops::Deref;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
-type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> Type>;
+type Constructor<Type, Description> =
+    Box<dyn Fn(&Descriptors, &Description) -> Result<Type, crate::gpu_runtime::RenderFailure>>;
 
 #[derive(Debug)]
 pub struct TexturePool {
     clock: u64,
     budget: Budget,
-    pools: FnvHashMap<TextureKey, BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>>,
+    pools: FnvHashMap<
+        TextureKey,
+        BufferPool<
+            (
+                crate::gpu_resources::Texture,
+                crate::gpu_resources::TextureView,
+            ),
+            AlwaysCompatible,
+        >,
+    >,
     globals_cache: FnvHashMap<GlobalsKey, (u64, Arc<Globals>)>,
 }
 
@@ -44,7 +54,16 @@ impl TexturePool {
         usage: wgpu::TextureUsages,
         format: wgpu::TextureFormat,
         sample_count: u32,
-    ) -> PoolEntry<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible> {
+    ) -> Result<
+        PoolEntry<
+            (
+                crate::gpu_resources::Texture,
+                crate::gpu_resources::TextureView,
+            ),
+            AlwaysCompatible,
+        >,
+        crate::gpu_runtime::RenderFailure,
+    > {
         let key = TextureKey {
             size,
             usage,
@@ -70,22 +89,25 @@ impl TexturePool {
                 0,
                 Box::new(move |_| bytes),
                 Box::new(move |descriptors, _description| {
-                    let texture = descriptors.device.create_texture(&wgpu::TextureDescriptor {
-                        label: label.as_deref(),
-                        size,
-                        mip_level_count: 1,
-                        sample_count,
-                        dimension: wgpu::TextureDimension::D2,
-                        format,
-                        view_formats: &[format],
-                        usage,
-                    });
-                    let view = texture.create_view(&Default::default());
-                    (texture, view)
+                    let texture = descriptors.device.create_texture_with_kind(
+                        &wgpu::TextureDescriptor {
+                            label: label.as_deref(),
+                            size,
+                            mip_level_count: 1,
+                            sample_count,
+                            dimension: wgpu::TextureDimension::D2,
+                            format,
+                            view_formats: &[format],
+                            usage,
+                        },
+                        crate::gpu_runtime::ResourceKind::OffscreenTarget,
+                    )?;
+                    let view = texture.create_view(&Default::default())?;
+                    Ok((texture, view))
                 }),
             )
         });
-        pool.take(descriptors, AlwaysCompatible)
+        Ok(pool.take(descriptors, AlwaysCompatible)?)
     }
 
     pub fn get_globals(
@@ -93,26 +115,27 @@ impl TexturePool {
         descriptors: &Descriptors,
         viewport_width: u32,
         viewport_height: u32,
-    ) -> Arc<Globals> {
-        let slot = self
-            .globals_cache
-            .entry(GlobalsKey {
+    ) -> Result<Arc<Globals>, crate::gpu_runtime::RenderFailure> {
+        let slot = crate::gpu_resources::try_cached(
+            &mut self.globals_cache,
+            GlobalsKey {
                 viewport_width,
                 viewport_height,
-            })
-            .or_insert_with(|| {
-                (
+            },
+            || {
+                Ok::<_, crate::gpu_runtime::RenderFailure>((
                     self.clock,
                     Arc::new(Globals::new(
                         &descriptors.device,
                         &descriptors.bind_layouts.globals,
                         viewport_width,
                         viewport_height,
-                    )),
-                )
-            });
+                    )?),
+                ))
+            },
+        )?;
         slot.0 = self.clock;
-        slot.1.clone()
+        Ok(slot.1.clone())
     }
 }
 
@@ -130,7 +153,7 @@ struct GlobalsKey {
     viewport_height: u32,
 }
 
-pub trait BufferDescription: Clone + Debug + 'static {
+pub trait BufferDescription: Clone + Debug + Send + Sync + 'static {
     type Cost: Ord;
 
     /// If the potential buffer represented by this description (`self`)
@@ -170,17 +193,17 @@ impl<T, D> Drop for Owner<T, D> {
         }
     }
 }
-pub struct BufferPool<T: 'static, D: BufferDescription> {
+pub struct BufferPool<T: PooledResource, D: BufferDescription> {
     owner: Rc<Owner<T, D>>,
     constructor: Constructor<T, D>,
     bytes: Box<dyn Fn(&D) -> u64>,
 }
-impl<T, D: BufferDescription> Debug for BufferPool<T, D> {
+impl<T: PooledResource, D: BufferDescription> Debug for BufferPool<T, D> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BufferPool").finish()
     }
 }
-impl<T: 'static, D: BufferDescription> BufferPool<T, D> {
+impl<T: PooledResource, D: BufferDescription> BufferPool<T, D> {
     pub fn new(
         budget: Budget,
         kind: usize,
@@ -200,7 +223,11 @@ impl<T: 'static, D: BufferDescription> BufferPool<T, D> {
             bytes,
         }
     }
-    pub fn take(&self, descriptors: &Descriptors, description: D) -> PoolEntry<T, D> {
+    pub fn take(
+        &self,
+        descriptors: &Descriptors,
+        description: D,
+    ) -> Result<PoolEntry<T, D>, crate::gpu_runtime::RenderFailure> {
         let cached = if let Some(stock) = &self.owner.stock {
             let mut v = stock.borrow_mut();
             let best = v
@@ -218,42 +245,46 @@ impl<T: 'static, D: BufferDescription> BufferPool<T, D> {
                 .budget
                 .take(self.owner.key, |v: &(T, D)| description.cost_to_use(&v.1))
         };
-        let (item, description) =
-            cached.unwrap_or_else(|| ((self.constructor)(descriptors, &description), description));
+        let (item, description) = match cached {
+            Some(cached) => cached,
+            None => ((self.constructor)(descriptors, &description)?, description),
+        };
         let bytes = (self.bytes)(&description);
-        PoolEntry {
+        item.set_idle(false);
+        Ok(PoolEntry {
             item: Some(item),
             description,
             owner: Rc::downgrade(&self.owner),
             bytes,
-        }
+        })
     }
 }
-pub struct PoolEntry<T: 'static, D: BufferDescription> {
+pub struct PoolEntry<T: PooledResource, D: BufferDescription> {
     item: Option<T>,
     description: D,
     owner: Weak<Owner<T, D>>,
     bytes: u64,
 }
-impl<T: PartialEq, D: BufferDescription> PartialEq for PoolEntry<T, D> {
+impl<T: PooledResource + PartialEq, D: BufferDescription> PartialEq for PoolEntry<T, D> {
     fn eq(&self, other: &Self) -> bool {
         Weak::ptr_eq(&self.owner, &other.owner) && self.item == other.item
     }
 }
-impl<T: Debug, D: BufferDescription> Debug for PoolEntry<T, D> {
+impl<T: PooledResource + Debug, D: BufferDescription> Debug for PoolEntry<T, D> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("PoolEntry").field(&self.item).finish()
     }
 }
-impl<T, D: BufferDescription> Deref for PoolEntry<T, D> {
+impl<T: PooledResource, D: BufferDescription> Deref for PoolEntry<T, D> {
     type Target = T;
     fn deref(&self) -> &T {
         self.item.as_ref().unwrap()
     }
 }
-impl<T, D: BufferDescription> Drop for PoolEntry<T, D> {
+impl<T: PooledResource, D: BufferDescription> Drop for PoolEntry<T, D> {
     fn drop(&mut self) {
         if let (Some(item), Some(owner)) = (self.item.take(), self.owner.upgrade()) {
+            item.set_idle(true);
             if let Some(stock) = &owner.stock {
                 stock
                     .borrow_mut()
@@ -268,5 +299,25 @@ impl<T, D: BufferDescription> Drop for PoolEntry<T, D> {
                 );
             }
         }
+    }
+}
+
+pub trait PooledResource: Send + Sync + 'static {
+    fn set_idle(&self, idle: bool);
+}
+impl PooledResource for crate::gpu_resources::Buffer {
+    fn set_idle(&self, idle: bool) {
+        self.lease().set_idle(idle);
+    }
+}
+impl PooledResource
+    for (
+        crate::gpu_resources::Texture,
+        crate::gpu_resources::TextureView,
+    )
+{
+    fn set_idle(&self, idle: bool) {
+        self.0.lease().set_idle(idle);
+        self.1.lease().set_idle(idle);
     }
 }

@@ -10,8 +10,6 @@ use wgpu::SamplerBindingType;
 
 use super::MAX_VERTEX_ATTRIBUTES;
 
-use crate::descriptors::Descriptors;
-
 pub struct ShaderPairAgal {
     vertex_shader: ParsedBytecode,
 
@@ -25,9 +23,9 @@ pub struct ShaderPairAgal {
 impl ShaderModule for ShaderPairAgal {}
 
 pub struct CompiledShaderProgram {
-    pub vertex_module: wgpu::ShaderModule,
-    pub fragment_module: wgpu::ShaderModule,
-    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub vertex_module: crate::gpu_resources::ShaderModule,
+    pub fragment_module: crate::gpu_resources::ShaderModule,
+    pub bind_group_layout: crate::gpu_resources::BindGroupLayout,
 }
 
 impl ShaderPairAgal {
@@ -51,32 +49,27 @@ impl ShaderPairAgal {
 
     pub fn compile(
         &self,
-        descriptors: &Descriptors,
+        device: &crate::gpu_resources::Device,
         data: ShaderCompileData,
-    ) -> Result<RefMut<'_, CompiledShaderProgram>, naga_agal::Error> {
+    ) -> Result<RefMut<'_, CompiledShaderProgram>, super::PipelineError> {
         let compiled = self.compiled.borrow_mut();
         let mut error = None;
         RefMut::filter_map(compiled, |compiled| {
             let result = compiled.try_get_or_insert_mut_with_key(data, |data| {
                 let vertex_naga_module =
                     naga_agal::agal_to_naga(&self.vertex_shader, &data.vertex_attributes)?;
-                let vertex_module =
-                    descriptors
-                        .device
-                        .create_shader_module(wgpu::ShaderModuleDescriptor {
-                            label: Some("AGAL vertex shader"),
-                            source: wgpu::ShaderSource::Naga(Cow::Owned(vertex_naga_module)),
-                        });
+                let vertex_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("AGAL vertex shader"),
+                    source: wgpu::ShaderSource::Naga(Cow::Owned(vertex_naga_module)),
+                })?;
 
                 let fragment_naga_module =
                     naga_agal::agal_to_naga(&self.fragment_shader, &data.vertex_attributes)?;
                 let fragment_module =
-                    descriptors
-                        .device
-                        .create_shader_module(wgpu::ShaderModuleDescriptor {
-                            label: Some("AGAL fragment shader"),
-                            source: wgpu::ShaderSource::Naga(Cow::Owned(fragment_naga_module)),
-                        });
+                    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("AGAL fragment shader"),
+                        source: wgpu::ShaderSource::Naga(Cow::Owned(fragment_naga_module)),
+                    })?;
 
                 let mut layout_entries = vec![
                     // Vertex shader program constants
@@ -130,12 +123,10 @@ impl ShaderPairAgal {
 
                 let globals_layout_label = create_debug_label!("Globals bind group layout");
                 let bind_group_layout =
-                    descriptors
-                        .device
-                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                            label: globals_layout_label.as_deref(),
-                            entries: &layout_entries,
-                        });
+                    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: globals_layout_label.as_deref(),
+                        entries: &layout_entries,
+                    })?;
 
                 Ok(CompiledShaderProgram {
                     vertex_module,

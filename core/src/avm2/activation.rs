@@ -625,6 +625,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     }
 
     pub fn run_actions(&mut self, method: Method<'gc>) -> Result<Value<'gc>, Error<'gc>> {
+        self.context.renderer_health.check()?;
         // The method must be verified at this point
 
         let verified_info = method.get_verified_info();
@@ -633,6 +634,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         self.timeout_check()?;
 
         let mut ip = 0;
+        let mut pic_counters = super::call_site::Counters::default();
 
         loop {
             let op = &opcodes[ip];
@@ -669,7 +671,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 Op::CallProperty {
                     multiname,
                     num_args,
-                } => self.op_call_property(*multiname, *num_args),
+                } => {
+                    self.op_call_property(*multiname, *num_args, method, ip - 1, &mut pic_counters)
+                }
                 Op::CallPropLex {
                     multiname,
                     num_args,
@@ -677,16 +681,22 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 Op::CallPropVoid {
                     multiname,
                     num_args,
-                } => self.op_call_prop_void(*multiname, *num_args),
+                } => {
+                    self.op_call_prop_void(*multiname, *num_args, method, ip - 1, &mut pic_counters)
+                }
                 Op::CallStatic { method, num_args } => self.op_call_static(*method, *num_args),
                 Op::CallSuper {
                     multiname,
                     num_args,
                 } => self.op_call_super(*multiname, *num_args),
-                Op::GetPropertyStatic { multiname } => self.op_get_property_static(*multiname),
+                Op::GetPropertyStatic { multiname } => {
+                    self.op_get_property_static(*multiname, method, ip - 1, &mut pic_counters)
+                }
                 Op::GetPropertyFast { multiname } => self.op_get_property_fast(*multiname),
                 Op::GetPropertySlow { multiname } => self.op_get_property_slow(*multiname),
-                Op::SetPropertyStatic { multiname } => self.op_set_property_static(*multiname),
+                Op::SetPropertyStatic { multiname } => {
+                    self.op_set_property_static(*multiname, method, ip - 1, &mut pic_counters)
+                }
                 Op::SetPropertyFast { multiname } => self.op_set_property_fast(*multiname),
                 Op::SetPropertySlow { multiname } => self.op_set_property_slow(*multiname),
                 Op::InitProperty { multiname } => self.op_init_property(*multiname),
@@ -927,6 +937,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     pub(super) fn timeout_check(&mut self) -> Result<(), Error<'gc>> {
         *self.context.actions_since_timeout_check += 1;
         if *self.context.actions_since_timeout_check >= 10000 {
+            self.context.renderer_health.check()?;
             *self.context.actions_since_timeout_check = 0;
             if self.context.update_start.elapsed() >= self.context.max_execution_duration {
                 return Err(
@@ -1087,12 +1098,22 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         &mut self,
         multiname: Gc<'gc, Multiname<'gc>>,
         arg_count: u32,
+        method: Method<'gc>,
+        opcode: usize,
+        counters: &mut super::call_site::Counters,
     ) -> Result<(), Error<'gc>> {
         let args = self.get_args(arg_count);
+        let static_name = !multiname.has_lazy_component();
         let multiname = multiname.fill_with_runtime_params(self)?;
         let receiver = self.pop_stack().null_check(self, Some(&multiname))?;
 
-        let value = receiver.call_property(&multiname, args, self)?;
+        let vtable = receiver.vtable(self);
+        let property = if static_name {
+            method.lookup_trait(opcode, receiver, vtable, &multiname, self, counters)
+        } else {
+            vtable.get_trait(&multiname)
+        };
+        let value = receiver.call_property_with_trait(&multiname, vtable, property, args, self)?;
 
         self.push_stack(value);
 
@@ -1119,12 +1140,22 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         &mut self,
         multiname: Gc<'gc, Multiname<'gc>>,
         arg_count: u32,
+        method: Method<'gc>,
+        opcode: usize,
+        counters: &mut super::call_site::Counters,
     ) -> Result<(), Error<'gc>> {
         let args = self.get_args(arg_count);
+        let static_name = !multiname.has_lazy_component();
         let multiname = multiname.fill_with_runtime_params(self)?;
         let receiver = self.pop_stack().null_check(self, Some(&multiname))?;
 
-        receiver.call_property(&multiname, args, self)?;
+        let vtable = receiver.vtable(self);
+        let property = if static_name {
+            method.lookup_trait(opcode, receiver, vtable, &multiname, self, counters)
+        } else {
+            vtable.get_trait(&multiname)
+        };
+        receiver.call_property_with_trait(&multiname, vtable, property, args, self)?;
 
         Ok(())
     }
@@ -1214,11 +1245,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     fn op_get_property_static(
         &mut self,
         multiname: Gc<'gc, Multiname<'gc>>,
+        method: Method<'gc>,
+        opcode: usize,
+        counters: &mut super::call_site::Counters,
     ) -> Result<(), Error<'gc>> {
         // default path for static names
         let object = self.pop_stack().null_check(self, Some(&multiname))?;
 
-        let value = object.get_property(&multiname, self)?;
+        let vtable = object.vtable(self);
+        let property = method.lookup_trait(opcode, object, vtable, &multiname, self, counters);
+        let value = object.get_property_with_trait(&multiname, vtable, property, self)?;
         self.push_stack(value);
 
         Ok(())
@@ -1314,6 +1350,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     fn op_set_property_static(
         &mut self,
         multiname: Gc<'gc, Multiname<'gc>>,
+        method: Method<'gc>,
+        opcode: usize,
+        counters: &mut super::call_site::Counters,
     ) -> Result<(), Error<'gc>> {
         // default path for static names
 
@@ -1321,7 +1360,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let object = self.pop_stack().null_check(self, Some(&multiname))?;
 
-        object.set_property(&multiname, value, self)?;
+        let vtable = object.vtable(self);
+        let property = method.lookup_trait(opcode, object, vtable, &multiname, self, counters);
+        object.set_property_with_trait(&multiname, vtable, property, value, self)?;
 
         Ok(())
     }
