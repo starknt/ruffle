@@ -129,6 +129,11 @@ pub trait RenderBackend: Any {
 
     fn set_quality(&mut self, quality: StageQuality);
 
+    /// Sample count used to rasterize the stage and its bitmap caches.
+    fn stage_sample_count(&self) -> u32 {
+        1
+    }
+
     fn compile_pixelbender_shader(
         &mut self,
         shader: PixelBenderShader,

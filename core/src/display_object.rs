@@ -119,6 +119,8 @@ pub struct BitmapCache {
     /// The `Matrix.d` value that was last used with this cache
     matrix_d: f32,
 
+    sample_count: u32,
+
     /// The width of the original bitmap, pre-filters
     source_width: u32,
 
@@ -184,6 +186,7 @@ impl BitmapCache {
         draw_offset: Point<i32>,
         swf_version: u8,
     ) {
+        self.sample_count = renderer.stage_sample_count();
         self.matrix_a = matrix.a;
         self.matrix_b = matrix.b;
         self.matrix_c = matrix.c;
@@ -1148,7 +1151,9 @@ pub fn render_base<'gc>(
                     y_max: filter_rect.y_max.to_pixels().ceil() as i32,
                 };
                 let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
-                if cache.is_dirty(&base_transform.matrix, width, height) {
+                if cache.sample_count != context.renderer.stage_sample_count()
+                    || cache.is_dirty(&base_transform.matrix, width, height)
+                {
                     cache.update(
                         context.renderer,
                         base_transform.matrix,

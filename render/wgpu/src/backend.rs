@@ -76,6 +76,8 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     budget: crate::idle_pool::Budget,
     target: T,
     surface: Surface,
+    stage_quality: StageQuality,
+    sampling_override: Option<StageQuality>,
     meshes: Vec<Mesh>,
     shape_tessellator: ShapeTessellator,
     // This is currently unused - we just store it to report in
@@ -294,6 +296,8 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             descriptors,
             target,
             surface,
+            stage_quality: StageQuality::Low,
+            sampling_override: None,
             meshes: Vec::new(),
             shape_tessellator: ShapeTessellator::new(),
             viewport_scale_factor: 1.0,
@@ -465,6 +469,32 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
     }
 }
 
+impl<T: RenderTarget + 'static> WgpuRenderBackend<T> {
+    /// Select stage MSAA independently of the SWF's Stage.quality property.
+    pub fn set_stage_sample_override(&mut self, samples: Option<u32>) -> Result<(), &'static str> {
+        let mode = match samples {
+            None => None,
+            Some(1) => Some(StageQuality::Low),
+            Some(2) => Some(StageQuality::Medium),
+            Some(4) => Some(StageQuality::High),
+            Some(8) => Some(StageQuality::High8x8),
+            _ => return Err("invalid stage sample count"),
+        };
+        if let Some(count) = samples
+            && !crate::utils::stage_sample_count_supported(
+                &self.descriptors.adapter,
+                self.target.format(),
+                count,
+            )
+        {
+            return Err("GPU does not support the requested MSAA level");
+        }
+        self.sampling_override = mode;
+        self.set_quality(self.stage_quality);
+        Ok(())
+    }
+}
+
 enum WgpuPixelBenderPending {
     Bitmap(Option<Box<dyn SyncHandle>>),
     Bytes {
@@ -556,7 +586,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         }
     }
 
+    fn stage_sample_count(&self) -> u32 {
+        self.surface.sample_count()
+    }
+
     fn set_quality(&mut self, quality: StageQuality) {
+        self.stage_quality = quality;
+        let quality = self.sampling_override.unwrap_or(quality);
         self.surface = Surface::new(
             &self.descriptors,
             quality,

@@ -179,6 +179,20 @@ pub fn buffer_to_image(
     })
 }
 
+pub fn stage_sample_count_supported(
+    adapter: &wgpu::Adapter,
+    format: wgpu::TextureFormat,
+    count: u32,
+) -> bool {
+    let color = adapter.get_texture_format_features(format).flags;
+    let stencil = adapter
+        .get_texture_format_features(wgpu::TextureFormat::Stencil8)
+        .flags;
+    color.sample_count_supported(count)
+        && stencil.sample_count_supported(count)
+        && (count == 1 || color.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE))
+}
+
 pub fn supported_sample_count(
     adapter: &wgpu::Adapter,
     mut sample_count: u32,

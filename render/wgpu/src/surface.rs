@@ -17,7 +17,7 @@ use crate::surface::buffers::ChunkBuffers;
 pub use crate::surface::commands::LayerRef;
 use crate::surface::commands::chunk_blends;
 use crate::utils::run_copy_pipeline;
-use crate::utils::supported_sample_count;
+use crate::utils::stage_sample_count_supported;
 use crate::{Descriptors, Pipelines};
 use batches::CommandBatches;
 use chunk::{Chunk, CommandRenderer};
@@ -55,11 +55,16 @@ impl Surface {
             depth_or_array_layers: 1,
         };
 
-        let sample_count = supported_sample_count(
-            &descriptors.adapter,
-            quality.sample_count(),
-            frame_buffer_format,
-        );
+        let mut sample_count = quality.sample_count();
+        while sample_count > 1
+            && !stage_sample_count_supported(
+                &descriptors.adapter,
+                frame_buffer_format,
+                sample_count,
+            )
+        {
+            sample_count /= 2;
+        }
         let pipelines = descriptors.pipelines(sample_count, frame_buffer_format);
         Self {
             size,
