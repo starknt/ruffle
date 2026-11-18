@@ -58,6 +58,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, Ref, RefCell, RefMut};
 use std::cmp::max;
 use std::collections::HashMap;
+use std::ops::Range;
 use swf::extensions::ReadSwfExt;
 use swf::{ClipEventFlag, DefineBitsLossless, FrameLabelData, TagCode, UTF_8};
 
@@ -2306,6 +2307,40 @@ impl<'gc> MovieClip<'gc> {
         unlock!(Gc::write(mc, self.0), MovieClipData, hit_area).set(hit_area);
     }
 
+    /// Render-list indices hidden from this point by timeline masks.
+    fn clipped_mouse_pick_ranges(
+        self,
+        context: &mut UpdateContext<'gc>,
+        point: Point<Twips>,
+        options: HitTestOptions,
+    ) -> SmallVec<[Range<usize>; 1]> {
+        let mut clipped = SmallVec::<[Range<usize>; 1]>::new();
+        let mut masks = SmallVec::<[(Depth, bool); 2]>::new();
+        for (index, child) in self.iter_render_list().enumerate() {
+            // As in render_children, a mask starts at its display-list position
+            // and ends at the first later placement beyond its clip depth.
+            // Children added by AS3 can have depth zero anywhere in the list.
+            while masks.last().is_some_and(|&(end, _)| child.depth() > end) {
+                masks.pop();
+            }
+            let inside = masks.last().is_none_or(|&(_, inside)| inside);
+            if !inside {
+                if let Some(range) = clipped.last_mut()
+                    && range.end == index
+                {
+                    range.end += 1;
+                } else {
+                    clipped.push(index..index + 1);
+                }
+            }
+            if child.clip_depth() > 0 && child.allow_as_mask() {
+                let inside = inside && child.hit_test_shape(context, point, options);
+                masks.push((child.clip_depth(), inside));
+            }
+        }
+        clipped
+    }
+
     /// Resolve the AVM1 `hitArea` property for mouse picking, if set.
     ///
     /// Unlike AVM2's `Sprite.hitArea`, AVM1 keeps no dedicated storage for the
@@ -3407,40 +3442,36 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
 
             let mut found_propagate = None;
 
-            let mut clip_layers = self
-                .iter_render_list()
-                .flat_map(|child| {
-                    if child.clip_depth() > 0 {
-                        // Note - we intentionally use 'child.depth()' here insteado
-                        // of the position in the render list - this matches Flash's
-                        // behavior. The 'depth' value comes from the PlaceObject tag
-                        Some((child, (child.depth() + 1)..=(child.clip_depth())))
-                    } else {
-                        None
-                    }
-                })
-                .rev()
-                .peekable();
+            let clipped = self.clipped_mouse_pick_ranges(context, point, options);
 
             // Interactive children run first, followed by non-interactive children.
             // Depth is considered within each group.
 
             let interactive = self
                 .iter_render_list()
+                .enumerate()
                 .rev()
-                .filter(|child| child.as_interactive().is_some());
+                .filter(|(_, child)| child.as_interactive().is_some());
             let non_interactive = self
                 .iter_render_list()
+                .enumerate()
                 .rev()
-                .filter(|child| child.as_interactive().is_none());
+                .filter(|(_, child)| child.as_interactive().is_none());
 
-            for child in interactive.into_iter().chain(non_interactive) {
+            for (index, child) in interactive.chain(non_interactive) {
                 // Mask children are not clickable
                 if child.clip_depth() > 0 || child.maskee().is_some() {
                     continue;
                 }
+                let next_range = clipped.partition_point(|range| range.end <= index);
+                if clipped
+                    .get(next_range)
+                    .is_some_and(|range| range.contains(&index))
+                {
+                    continue;
+                }
 
-                let mut res = if let Some(child) = child.as_interactive() {
+                let res = if let Some(child) = child.as_interactive() {
                     if child.as_displayobject().movie().is_action_script_3() {
                         child.mouse_pick_avm2(context, point, require_button_mode)
                     } else {
@@ -3466,26 +3497,6 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                 } else {
                     Avm2MousePick::Miss
                 };
-
-                while let Some((clip, clip_range)) = clip_layers.peek() {
-                    // This clip layer no longer applies to the remaining children (which all have lower depth values).
-                    // This is a rare case where we actually use 'child.depth()' in AVM2 - child.depth()
-                    // gets set from a PlaceObject tag, and may be *greater* than position in the render list.
-                    if *clip_range.start() > child.depth() {
-                        clip_layers.next();
-                        continue;
-                    }
-
-                    if clip_range.contains(&child.depth()) {
-                        // If the clip layer applies to the current child, check if the child is masked by the clip.
-                        // If the position isn't within the mask region, then treat this as a miss unconditionally.
-                        // We'll continue the outer loop over the children, as another child may be hit.
-                        if !clip.hit_test_shape(context, point, options) {
-                            res = Avm2MousePick::Miss;
-                        }
-                    }
-                    break;
-                }
 
                 match res {
                     Avm2MousePick::Hit(_) => {
