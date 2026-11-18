@@ -925,7 +925,7 @@ impl<'gc> Class<'gc> {
         activation: &mut Activation<'_, 'gc>,
         translation_unit: TranslationUnit<'gc>,
         method: &AbcMethod,
-        body: &AbcMethodBody,
+        body: &AbcMethodBody<std::ops::Range<usize>>,
     ) -> Result<Class<'gc>, Error<'gc>> {
         let name = translation_unit.pool_string(method.name, activation)?;
 

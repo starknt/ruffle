@@ -25,6 +25,36 @@ use bytemuck::{Pod, Zeroable};
 use ruffle_render::filters::Filter;
 use wgpu::vertex_attr_array;
 
+#[derive(Default)]
+struct FilterPipelines {
+    rgba: crate::utils::SampleCountMap<std::sync::OnceLock<crate::gpu_resources::RenderPipeline>>,
+    bgra: crate::utils::SampleCountMap<std::sync::OnceLock<crate::gpu_resources::RenderPipeline>>,
+}
+
+impl FilterPipelines {
+    fn get_or_init(
+        &self,
+        format: wgpu::TextureFormat,
+        samples: u32,
+        build: impl FnOnce() -> Result<
+            crate::gpu_resources::RenderPipeline,
+            crate::gpu_runtime::RenderFailure,
+        >,
+    ) -> Result<&crate::gpu_resources::RenderPipeline, crate::gpu_runtime::RenderFailure> {
+        let cache = match format {
+            wgpu::TextureFormat::Rgba8Unorm => &self.rgba,
+            wgpu::TextureFormat::Bgra8Unorm => &self.bgra,
+            _ => {
+                return Err(crate::gpu_runtime::RenderFailure::new(
+                    crate::gpu_runtime::RenderFailureKind::Validation,
+                    "unsupported filter attachment format",
+                ));
+            }
+        };
+        cache.get_or_init(samples, build)
+    }
+}
+
 #[derive(Debug)]
 pub struct FilterSource<'a> {
     pub texture: &'a crate::gpu_resources::Texture,
@@ -217,19 +247,24 @@ impl Filters {
         staging_belt: &mut StagingBelt,
         source: FilterSource,
         filters: Vec<Filter>,
-    ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
+    ) -> Result<Option<CommandTarget>, crate::gpu_runtime::RenderFailure> {
         let graph = graph::FilterGraph::new(
             &filters,
             source.texture.sample_count() == 1
                 && source.texture.format() == wgpu::TextureFormat::Rgba8Unorm,
         );
         let mut current: Option<CommandTarget> = None;
+        let mut premultiplied = false;
         for step in graph.steps {
             draw_encoder.flush_uploads_if_needed(staging_belt.page_size())?;
             let input = current
                 .as_ref()
                 .map(|target| FilterSource::for_entire_texture(target.color_texture()));
             let source = input.as_ref().unwrap_or(&source);
+            let matrix_output = match &step {
+                graph::FilterStep::Pointwise(_) => true,
+                graph::FilterStep::Single(i) => matches!(filters[*i], Filter::ColorMatrixFilter(_)),
+            };
             let next = match step {
                 graph::FilterStep::Pointwise(range) => {
                     let matrices: smallvec::SmallVec<[swf::ColorMatrixFilter; 16]> = filters[range]
@@ -242,14 +277,21 @@ impl Filters {
                             }
                         })
                         .collect();
-                    self.color_matrix.apply_chain(
+                    if premultiplied
+                        && matrices
+                            .iter()
+                            .all(|matrix| *matrix == swf::ColorMatrixFilter::default())
+                    {
+                        continue;
+                    }
+                    Some(self.color_matrix.apply_chain(
                         descriptors,
                         texture_pool,
                         draw_encoder,
                         staging_belt,
                         source,
                         &matrices,
-                    )?
+                    )?)
                 }
                 graph::FilterStep::Single(index) => self.apply(
                     descriptors,
@@ -262,18 +304,17 @@ impl Filters {
                         size: source.size,
                     },
                     filters[index].clone(),
+                    premultiplied,
                 )?,
             };
             // Encoding consumed the old input; returning its exact-key pool
             // entry here makes the following operation a legal ping-pong reuse.
-            current = Some(next);
+            if next.is_some() {
+                current = next;
+                premultiplied = matrix_output;
+            }
         }
-        current.ok_or_else(|| {
-            crate::gpu_runtime::RenderFailure::new(
-                crate::gpu_runtime::RenderFailureKind::Validation,
-                "empty filter graph",
-            )
-        })
+        Ok(current)
     }
 
     pub fn apply(
@@ -284,8 +325,14 @@ impl Filters {
         staging_belt: &mut StagingBelt,
         source: FilterSource,
         filter: Filter,
-    ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
+        can_skip_identity: bool,
+    ) -> Result<Option<CommandTarget>, crate::gpu_runtime::RenderFailure> {
         let target = match filter {
+            Filter::ColorMatrixFilter(filter)
+                if can_skip_identity && filter == Default::default() =>
+            {
+                None
+            }
             Filter::ColorMatrixFilter(filter) => Some(descriptors.filters.color_matrix.apply(
                 descriptors,
                 texture_pool,
@@ -371,25 +418,19 @@ impl Filters {
         };
 
         let target = match target {
-            Some(target) => target,
-            None => {
-                // Apply a default color matrix - it's essentially a blit
-                // TODO: Not need to do this.
-                descriptors.filters.color_matrix.apply(
-                    descriptors,
-                    texture_pool,
-                    draw_encoder,
-                    staging_belt,
-                    &source,
-                    &Default::default(),
-                )?
-            }
+            None if !can_skip_identity => Some(self.color_matrix.apply(
+                descriptors,
+                texture_pool,
+                draw_encoder,
+                staging_belt,
+                &source,
+                &Default::default(),
+            )?),
+            target => target,
         };
-
-        // We're about to perform a copy, so make sure that we've applied
-        // a clear (in case no other draw commands were issued, we still need
-        // the background clear color applied)
-        target.ensure_cleared(draw_encoder);
+        if let Some(target) = &target {
+            target.ensure_cleared(draw_encoder);
+        }
         Ok(target)
     }
 }

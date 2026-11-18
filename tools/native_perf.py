@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Paired native-perf runs. Unfinished traces never count as acceptance."""
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 import subprocess
+import sys
+import tempfile
 import tomllib
 
 
@@ -115,6 +119,18 @@ def compare(baseline, candidate, phase, control=False):
             'peakRssGrowth':rss, 'phase':phase, 'phaseP95Gain':improvement}
 
 
+@contextmanager
+def driver_environment(isolate_shader_cache):
+    if not isolate_shader_cache:
+        yield None
+        return
+    # Include cold shader compilation in both process high-water marks. A
+    # shared disk cache lets one executable warm the other between samples.
+    with tempfile.TemporaryDirectory(prefix='ruffle-native-perf-') as directory:
+        yield {**os.environ, '__GL_SHADER_DISK_CACHE': '1',
+               '__GL_SHADER_DISK_CACHE_PATH': directory, 'MESA_SHADER_CACHE_DIR': directory}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--baseline', type=Path, required=True)
@@ -137,6 +153,8 @@ def main():
     metadata = {label: {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
                 for label,path in binaries.items()}
     metadata['manifestSha256'] = hashlib.sha256(args.manifest.read_bytes()).hexdigest()
+    isolate_shader_cache = sys.platform.startswith('linux') and args.backend in ('vulkan', 'gl')
+    metadata['shaderDiskCache'] = 'empty-per-process' if isolate_shader_cache else 'system'
     (args.output/'builds.json').write_text(json.dumps(metadata, indent=2)+'\n')
     report = {}
     for case in cases:
@@ -149,8 +167,8 @@ def main():
                            '--output',str(path.resolve()),'--backend',args.backend,'--warmup',str(args.warmup),'--frames',str(args.frames)]
                 if args.profile_off:
                     command.append('--profile-off')
-                with path.with_suffix('.log').open('w') as log:
-                    subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=3600)
+                with path.with_suffix('.log').open('w') as log, driver_environment(isolate_shader_cache) as env:
+                    subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=3600, env=env)
                 runs[label].append(summarize(path))
             print(f'{case}: pair {pair+1}/{args.pairs} complete', flush=True)
         report[case] = {'runs':runs, 'comparison': compare(runs['baseline'], runs['candidate'], args.phase, args.control)}

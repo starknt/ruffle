@@ -18,7 +18,8 @@ use crate::avm2::object::{
     ArrayObject, ByteArrayObject, ClassObject, FunctionObject, NamespaceObject, ScriptObject,
     XmlListObject,
 };
-use crate::avm2::op::{LookupSwitch, Op};
+use crate::avm2::op::{LookupSwitch, Op, SuperTrait};
+use crate::avm2::property::Property;
 use crate::avm2::scope::{Scope, ScopeChain, search_scope_stack};
 use crate::avm2::script::Script;
 use crate::avm2::stack::StackFrame;
@@ -688,7 +689,12 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 Op::CallSuper {
                     multiname,
                     num_args,
-                } => self.op_call_super(*multiname, *num_args),
+                } => self.op_call_super(*multiname, *num_args, None),
+                Op::CallSuperTrait { target, num_args } => {
+                    self.op_call_super(target.name, *num_args, Some(*target))
+                }
+                Op::GetSuperTrait { target } => self.op_get_super(target.name, Some(*target)),
+                Op::SetSuperTrait { target } => self.op_set_super(target.name, Some(*target)),
                 Op::GetPropertyStatic { multiname } => {
                     self.op_get_property_static(*multiname, method, ip - 1, &mut pic_counters)
                 }
@@ -701,8 +707,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 Op::SetPropertySlow { multiname } => self.op_set_property_slow(*multiname),
                 Op::InitProperty { multiname } => self.op_init_property(*multiname),
                 Op::DeleteProperty { multiname } => self.op_delete_property(*multiname),
-                Op::GetSuper { multiname } => self.op_get_super(*multiname),
-                Op::SetSuper { multiname } => self.op_set_super(*multiname),
+                Op::GetSuper { multiname } => self.op_get_super(*multiname, None),
+                Op::SetSuper { multiname } => self.op_set_super(*multiname, None),
                 Op::In => self.op_in(),
                 Op::PushScope { .. } => self.op_push_scope(),
                 Op::NewCatch { index } => self.op_newcatch(method, *index),
@@ -1185,29 +1191,40 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         Ok(())
     }
 
+    fn super_receiver(
+        &mut self,
+        name: &Multiname<'gc>,
+        target: Option<Gc<'gc, SuperTrait<'gc>>>,
+    ) -> Result<(ClassObject<'gc>, super::Object<'gc>, Option<Property>), Error<'gc>> {
+        let base = self
+            .bound_superclass_object()
+            .expect("Expected a superclass for super access");
+        let receiver = self
+            .pop_stack()
+            .coerce_to_type(self, base.inner_class_definition())?
+            .null_check(self, Some(name))?
+            .as_object()
+            .expect("Super ops should not appear in primitive functions");
+        let table = base.instance_vtable();
+        let property = match target {
+            Some(target) if target.vtable.matches(table) => Some(target.property),
+            _ => table.get_trait(name),
+        };
+        Ok((base, receiver, property))
+    }
+
     fn op_call_super(
         &mut self,
         multiname: Gc<'gc, Multiname<'gc>>,
         arg_count: u32,
+        target: Option<Gc<'gc, SuperTrait<'gc>>>,
     ) -> Result<(), Error<'gc>> {
         let args = self.get_args(arg_count);
         let multiname = multiname.fill_with_runtime_params(self)?;
 
-        let bound_superclass_object = self
-            .bound_superclass_object()
-            .expect("Expected a superclass when running callsuper");
+        let (base, receiver, property) = self.super_receiver(&multiname, target)?;
 
-        // Ensure the receiver is of the correct type
-        let receiver = self
-            .pop_stack()
-            .coerce_to_type(self, bound_superclass_object.inner_class_definition())?;
-
-        let receiver = receiver
-            .null_check(self, Some(&multiname))?
-            .as_object()
-            .expect("Super ops should not appear in primitive functions");
-
-        let value = bound_superclass_object.call_super(&multiname, receiver, args, self)?;
+        let value = base.call_super(&multiname, property, receiver, args, self)?;
 
         self.push_stack(value);
 
@@ -1504,49 +1521,33 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         Ok(())
     }
 
-    fn op_get_super(&mut self, multiname: Gc<'gc, Multiname<'gc>>) -> Result<(), Error<'gc>> {
+    fn op_get_super(
+        &mut self,
+        multiname: Gc<'gc, Multiname<'gc>>,
+        target: Option<Gc<'gc, SuperTrait<'gc>>>,
+    ) -> Result<(), Error<'gc>> {
         let multiname = multiname.fill_with_runtime_params(self)?;
 
-        let bound_superclass_object = self
-            .bound_superclass_object()
-            .expect("Expected a superclass when running callsuper");
+        let (base, receiver, property) = self.super_receiver(&multiname, target)?;
 
-        // Ensure the receiver is of the correct type
-        let receiver = self
-            .pop_stack()
-            .coerce_to_type(self, bound_superclass_object.inner_class_definition())?;
-
-        let receiver = receiver
-            .null_check(self, Some(&multiname))?
-            .as_object()
-            .expect("Super ops should not appear in primitive functions");
-
-        let value = bound_superclass_object.get_super(&multiname, receiver, self)?;
+        let value = base.get_super(&multiname, property, receiver, self)?;
 
         self.push_stack(value);
 
         Ok(())
     }
 
-    fn op_set_super(&mut self, multiname: Gc<'gc, Multiname<'gc>>) -> Result<(), Error<'gc>> {
+    fn op_set_super(
+        &mut self,
+        multiname: Gc<'gc, Multiname<'gc>>,
+        target: Option<Gc<'gc, SuperTrait<'gc>>>,
+    ) -> Result<(), Error<'gc>> {
         let value = self.pop_stack();
         let multiname = multiname.fill_with_runtime_params(self)?;
 
-        let bound_superclass_object = self
-            .bound_superclass_object()
-            .expect("Expected a superclass when running callsuper");
+        let (base, receiver, property) = self.super_receiver(&multiname, target)?;
 
-        // Ensure the receiver is of the correct type
-        let receiver = self
-            .pop_stack()
-            .coerce_to_type(self, bound_superclass_object.inner_class_definition())?;
-
-        let receiver = receiver
-            .null_check(self, Some(&multiname))?
-            .as_object()
-            .expect("Super ops should not appear in primitive functions");
-
-        bound_superclass_object.set_super(&multiname, value, receiver, self)?;
+        base.set_super(&multiname, property, value, receiver, self)?;
 
         Ok(())
     }

@@ -2,11 +2,22 @@ use crate::avm2::class::Class;
 use crate::avm2::method::{Method, NativeMethodImpl};
 use crate::avm2::multiname::Multiname;
 use crate::avm2::namespace::Namespace;
+use crate::avm2::property::Property;
 use crate::avm2::script::Script;
+use crate::avm2::vtable::WeakVTable;
 use crate::string::AvmAtom;
 
 use gc_arena::{Collect, Gc};
 use std::cell::Cell;
+
+/// A super trait is valid only for the class object that owns its vtable.
+#[derive(Clone, Copy, Collect, Debug)]
+#[collect(no_drop)]
+pub struct SuperTrait<'gc> {
+    pub name: Gc<'gc, Multiname<'gc>>,
+    pub vtable: WeakVTable<'gc>,
+    pub property: Property,
+}
 
 #[derive(Clone, Collect, Copy, Debug)]
 #[collect(no_drop)]
@@ -69,6 +80,16 @@ pub enum Op<'gc> {
     CallSuper {
         multiname: Gc<'gc, Multiname<'gc>>,
 
+        num_args: u32,
+    },
+    GetSuperTrait {
+        target: Gc<'gc, SuperTrait<'gc>>,
+    },
+    SetSuperTrait {
+        target: Gc<'gc, SuperTrait<'gc>>,
+    },
+    CallSuperTrait {
+        target: Gc<'gc, SuperTrait<'gc>>,
         num_args: u32,
     },
     CheckFilter,

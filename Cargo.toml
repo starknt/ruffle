@@ -52,6 +52,7 @@ repository = "https://github.com/ruffle-rs/ruffle"
 version = "0.7.1"
 
 [workspace.dependencies]
+memchr = { version = "2.7", default-features = false }
 rand = { version = "0.10.1", default-features = false }
 png = "0.18.1"
 proc-macro2 = "1.0.106"

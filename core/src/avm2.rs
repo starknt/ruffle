@@ -531,7 +531,7 @@ impl<'gc> Avm2<'gc> {
         movie: SwfMovie<'gc>,
     ) -> Result<Option<Script<'gc>>, Error<'gc>> {
         let mut reader = Reader::new(data);
-        let abc = match reader.read() {
+        let abc = match reader.read_ranges() {
             Ok(abc) => abc,
             Err(AbcParseError::MethodInfoOutOfBounds {
                 method_count,
@@ -556,7 +556,7 @@ impl<'gc> Avm2<'gc> {
         }
 
         let num_scripts = abc.scripts.len();
-        let tunit = TranslationUnit::from_abc(abc, domain, name, movie, activation.gc());
+        let tunit = TranslationUnit::from_abc(abc, data, domain, name, movie, activation.gc());
         tunit.load_classes(&mut activation)?;
         for i in 0..num_scripts {
             tunit.load_script(i as u32, &mut activation)?;
@@ -576,7 +576,7 @@ impl<'gc> Avm2<'gc> {
         movie: SwfMovie<'gc>,
     ) {
         let mut reader = Reader::new(data);
-        let abc = match reader.read() {
+        let abc = match reader.read_ranges() {
             Ok(abc) => abc,
             Err(_) => panic!("Builtin ABC should be valid"),
         };
@@ -586,7 +586,7 @@ impl<'gc> Avm2<'gc> {
         // domain using `activation.domain()`
         activation.set_outer(ScopeChain::new(domain));
 
-        let tunit = TranslationUnit::from_abc(abc, domain, None, movie, activation.gc());
+        let tunit = TranslationUnit::from_abc(abc, data, domain, None, movie, activation.gc());
 
         globals::init_early_classes(&mut activation, tunit).expect("Early classes should load");
 

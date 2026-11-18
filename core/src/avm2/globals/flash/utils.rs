@@ -43,7 +43,7 @@ pub fn set_interval<'gc>(
 
     let callback = crate::timer::TimerCallback::Avm2Callback {
         closure,
-        params: params.to_vec(),
+        params: params.into(),
     };
 
     let wall = activation.context.in_wall_clock_method();
@@ -78,7 +78,7 @@ pub fn set_timeout<'gc>(
 
     let callback = crate::timer::TimerCallback::Avm2Callback {
         closure,
-        params: params.to_vec(),
+        params: params.into(),
     };
 
     let wall = activation.context.in_wall_clock_method();

@@ -113,7 +113,7 @@ impl RenderedPreview {
         let data = data.borrow();
         let width = data.width();
         let height = data.height();
-        let rgba_premultiplied = data.pixels_rgba().to_vec();
+        let rgba_premultiplied = data.pixels_rgba();
         let image = egui::ColorImage::from_rgba_premultiplied(
             [width as usize, height as usize],
             &rgba_premultiplied,

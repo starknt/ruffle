@@ -47,15 +47,15 @@ impl LehmerRng {
 /// unmultiplied values. Make sure to convert the color to the correct form beforehand.
 // TODO: Maybe split the type into `PremultipliedColor(u32)` and
 //   `UnmultipliedColor(u32)`?
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, bytemuck::NoUninit)]
+#[derive(
+    Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, bytemuck::Pod, bytemuck::Zeroable,
+)]
 #[repr(C, align(4))]
 pub struct Color {
-    // Note: even though AS2/AS3 represent colors as (little-endian) BGRA `u32`s, this is stored
-    // in RGBA order to be compatible with what the render backend expects.
-    // TODO: consider switching renderers to use BGRA to avoid byteswaps when talking to ActionScript?
-    r: u8,
-    g: u8,
+    // Byte order of a little-endian ActionScript ARGB word.
     b: u8,
+    g: u8,
+    r: u8,
     a: u8,
 }
 
@@ -207,7 +207,7 @@ impl Color {
         Self::rgba(r, g, b, a)
     }
 
-    fn slice_as_rgba(slice: &[Self]) -> &[u8] {
+    fn slice_as_bgra(slice: &[Self]) -> &[u8] {
         bytemuck::cast_slice(slice)
     }
 }
@@ -706,12 +706,12 @@ mod wrapper {
                 ));
                 let result = if let Some(handle) = write.bitmap_handle.clone() {
                     renderer
-                        .read_bitmap_region(
+                        .read_bitmap_region_native(
                             &handle,
                             region,
-                            Box::new(|buffer, stride| {
+                            Box::new(|buffer, stride, format| {
                                 copied = copy_pixels_to_bitmapdata(
-                                    &mut write, buffer, stride, region, region,
+                                    &mut write, buffer, stride, format, region, region,
                                 );
                             }),
                         )
@@ -730,12 +730,12 @@ mod wrapper {
                         )
                     })?;
                     renderer
-                        .resolve_sync_handle(
+                        .resolve_sync_handle_native(
                             pending,
-                            Box::new(|buffer, stride| {
+                            Box::new(|buffer, stride, format| {
                                 copied = gpu.for_each(|part| {
                                     copy_pixels_to_bitmapdata(
-                                        &mut write, buffer, stride, origin, part,
+                                        &mut write, buffer, stride, format, origin, part,
                                     )
                                 });
                             }),
@@ -1082,8 +1082,8 @@ impl<'gc> BitmapRawData<'gc> {
         let bitmap = Bitmap::new(
             self.width(),
             self.height(),
-            BitmapFormat::Rgba,
-            self.pixels_rgba(),
+            BitmapFormat::Bgra,
+            Color::slice_as_bgra(&self.pixels),
         );
         let bitmap_handle = renderer.register_bitmap(bitmap);
         if let Ok(ref handle) = bitmap_handle {
@@ -1156,8 +1156,15 @@ impl<'gc> BitmapRawData<'gc> {
         &self.pixels
     }
 
-    pub fn pixels_rgba(&self) -> &[u8] {
-        Color::slice_as_rgba(&self.pixels)
+    pub fn pixels_bgra(&self) -> &[u8] {
+        Color::slice_as_bgra(&self.pixels)
+    }
+
+    pub fn pixels_rgba(&self) -> Vec<u8> {
+        self.pixels
+            .iter()
+            .flat_map(|c| [c.r, c.g, c.b, c.a])
+            .collect()
     }
 
     pub fn width(&self) -> u32 {
@@ -1222,8 +1229,8 @@ impl<'gc> BitmapRawData<'gc> {
                     Bitmap::new(
                         self.width(),
                         self.height(),
-                        BitmapFormat::Rgba,
-                        self.pixels_rgba(),
+                        BitmapFormat::Bgra,
+                        Color::slice_as_bgra(&self.pixels),
                     ),
                     region,
                 )
@@ -1274,6 +1281,7 @@ fn copy_pixels_to_bitmapdata(
     write: &mut BitmapRawData,
     buffer: &[u8],
     stride: u32,
+    format: BitmapFormat,
     origin: PixelRegion,
     area: PixelRegion,
 ) -> Result<(), RenderFailure> {
@@ -1294,25 +1302,27 @@ fn copy_pixels_to_bitmapdata(
             "bitmap readback does not cover authoritative pixels",
         ));
     }
+    let width = write.width as usize;
+    let transparent = write.transparency();
     for y in area.y_min..area.y_max {
-        for x in area.x_min..area.x_max {
-            let offset = ((u64::from(y - origin.y_min) * u64::from(stride))
-                + u64::from(x - origin.x_min) * 4) as usize;
-            let alpha = if write.transparency() {
-                buffer[offset + 3]
-            } else {
-                255
-            };
-            write.set_pixel32_raw(
-                x,
-                y,
-                Color::rgba(
-                    buffer[offset],
-                    buffer[offset + 1],
-                    buffer[offset + 2],
-                    alpha,
-                ),
-            );
+        let src = (y - origin.y_min) as usize * stride as usize
+            + (area.x_min - origin.x_min) as usize * 4;
+        let count = area.width() as usize;
+        let dst = y as usize * width + area.x_min as usize;
+        let pixels = &mut write.pixels[dst..dst + count];
+        let source = &buffer[src..src + count * 4];
+        if format == BitmapFormat::Bgra && transparent {
+            bytemuck::cast_slice_mut(pixels).copy_from_slice(source);
+        } else {
+            for (pixel, bytes) in pixels.iter_mut().zip(source.as_chunks::<4>().0) {
+                let [r, g, b, a] = *bytes;
+                let a = if transparent { a } else { 255 };
+                *pixel = if format == BitmapFormat::Bgra {
+                    Color::rgba(b, g, r, a)
+                } else {
+                    Color::rgba(r, g, b, a)
+                };
+            }
         }
     }
     Ok(())

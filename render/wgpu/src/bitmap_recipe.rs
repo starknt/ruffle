@@ -3,7 +3,7 @@
 pub(crate) use crate::gpu_runtime::{OwnerKind, RenderFailure, RenderFailureKind, ResourceOwner};
 use crate::{Texture, bitmap_residency::BitmapResidency, gpu_resources::Device};
 use ruffle_render::bitmap::coverage::Coverage;
-use ruffle_render::bitmap::{Bitmap, BitmapHandleImpl, PixelRegion};
+use ruffle_render::bitmap::{Bitmap, BitmapFormat, BitmapHandleImpl, PixelRegion};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[derive(Clone, Debug)]
@@ -15,12 +15,14 @@ struct PendingUpload {
 struct State {
     version: u64,
     pending: Option<PendingUpload>,
+    premultiplied: bool,
     cache: Weak<BitmapResidency<BitmapRecipe>>,
 }
 #[derive(Debug)]
 pub struct BitmapRecipe {
     pub owner: ResourceOwner,
     pub device_generation: u64,
+    format: BitmapFormat,
     pub width: u32,
     pub height: u32,
     weak_self: Weak<Self>,
@@ -35,12 +37,14 @@ impl BitmapRecipe {
         Ok(Arc::new_cyclic(|weak_self| Self {
             owner,
             device_generation: device.runtime().generation(),
+            format: pixels.format(),
             width,
             height,
             weak_self: weak_self.clone(),
             resident: OnceLock::new(),
             state: Mutex::new(State {
                 version: 1,
+                premultiplied: false,
                 cache: Weak::new(),
                 pending: Some(PendingUpload {
                     pixels: Arc::new(pixels.into_owned()),
@@ -52,6 +56,48 @@ impl BitmapRecipe {
                 }),
             }),
         }))
+    }
+    /// Default color matrices clamp RGB to alpha. A native copy is equivalent
+    /// only for matching formats and already-premultiplied source pixels.
+    pub fn can_blit_identity(
+        &self,
+        destination: &Self,
+        (x, y): (u32, u32),
+        (width, height): (u32, u32),
+    ) -> bool {
+        if self.format != destination.format || width == 0 || height == 0 {
+            return false;
+        }
+        let Some(right) = x.checked_add(width).filter(|&r| r <= self.width) else {
+            return false;
+        };
+        let Some(bottom) = y.checked_add(height).filter(|&b| b <= self.height) else {
+            return false;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.premultiplied {
+            return true;
+        }
+        // Only an unrealized recipe has an authoritative copy of every row.
+        // Subsequent partial CPU updates may coexist with GPU-only regions.
+        if self.is_resident() {
+            return false;
+        }
+        let Some(pending) = &state.pending else {
+            return false;
+        };
+        let pixels = pending.pixels.data().as_chunks::<4>().0;
+        let valid = (y..bottom).all(|row| {
+            let start = row as usize * self.width as usize;
+            pixels[start + x as usize..start + right as usize]
+                .iter()
+                .all(|&[b, g, r, a]| r <= a && g <= a && b <= a)
+        });
+        state.premultiplied = valid && width == self.width && height == self.height;
+        valid
     }
     pub fn pending_upload(&self) -> Option<(Arc<Bitmap<'static>>, Coverage)> {
         self.state
@@ -107,10 +153,16 @@ impl BitmapRecipe {
                 "bitmap update exceeds its recipe dimensions",
             ));
         }
+        let pixels = if self.format == BitmapFormat::Bgra {
+            pixels.to_bgra()
+        } else {
+            pixels.to_rgba()
+        };
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.premultiplied = false;
         state.version = state.version.checked_add(1).ok_or_else(|| {
             RenderFailure::new(RenderFailureKind::Internal, "bitmap version exhausted")
         })?;
@@ -143,6 +195,7 @@ impl BitmapRecipe {
                 "GPU destination has unresolved CPU writes",
             ));
         }
+        state.premultiplied = false;
         state.version = state.version.checked_add(1).ok_or_else(|| {
             RenderFailure::new(RenderFailureKind::Internal, "bitmap version exhausted")
         })?;
@@ -158,6 +211,11 @@ impl BitmapRecipe {
         }
         let device = device.with_owner(self.owner);
         let texture = crate::gpu_resources::try_sync_cell(&self.resident, || {
+            let format = if self.format == BitmapFormat::Bgra {
+                wgpu::TextureFormat::Bgra8Unorm
+            } else {
+                wgpu::TextureFormat::Rgba8Unorm
+            };
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Bitmap recipe"),
                 size: wgpu::Extent3d {
@@ -168,8 +226,8 @@ impl BitmapRecipe {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+                format,
+                view_formats: &[],
                 usage: wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_DST
                     | wgpu::TextureUsages::COPY_SRC

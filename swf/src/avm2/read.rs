@@ -36,16 +36,29 @@ impl<'a> Reader<'a> {
     }
 
     pub fn read(&mut self) -> Result<AbcFile> {
+        self.read_with_bytes(<[u8]>::to_vec)
+    }
+
+    /// Read with checked string and method-body ranges relative to the current input.
+    pub fn read_ranges(&mut self) -> Result<AbcFile<std::ops::Range<usize>>> {
+        let base = self.input.as_ptr().addr();
+        self.read_with_bytes(|bytes| {
+            let start = bytes.as_ptr().addr() - base;
+            start..start + bytes.len()
+        })
+    }
+
+    fn read_with_bytes<B>(&mut self, payload: impl Fn(&'a [u8]) -> B) -> Result<AbcFile<B>> {
         let minor_version = self.read_u16()?;
         let major_version = self.read_u16()?;
-        let constant_pool = self.read_constant_pool()?;
+        let constant_pool = self.read_constant_pool(&payload)?;
 
         let mut methods = self.read_vec_with_len(Self::read_method)?;
         let metadata = self.read_vec_with_len(Self::read_metadata_entry)?;
         let instances = self.read_vec_with_len(Self::read_instance)?;
         let classes = self.read_vec(instances.len(), Self::read_class)?;
         let scripts = self.read_vec_with_len(Self::read_script)?;
-        let method_bodies = self.read_vec_with_len(Self::read_method_body)?;
+        let method_bodies = self.read_vec_with_len(|r| r.read_method_body(&payload))?;
 
         for (body_idx, body) in method_bodies.iter().enumerate() {
             let Some(dst) = methods.get_mut(body.method.0 as usize) else {
@@ -90,11 +103,9 @@ impl<'a> Reader<'a> {
         Ok(self.read_encoded_u32()? as i32)
     }
 
-    fn read_string(&mut self) -> Result<Vec<u8>> {
+    fn read_payload(&mut self) -> Result<&'a [u8]> {
         let len = self.read_u30()?;
-        // TODO: Avoid allocating a String.
-        let s = self.read_slice(len as usize)?;
-        Ok(s.to_vec())
+        Ok(self.read_slice(len as usize)?)
     }
 
     fn read_index<T>(&mut self) -> Result<Index<T>> {
@@ -184,7 +195,10 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn read_constant_pool(&mut self) -> Result<ConstantPool> {
+    fn read_constant_pool<B>(
+        &mut self,
+        payload: &impl Fn(&'a [u8]) -> B,
+    ) -> Result<ConstantPool<B>> {
         fn read_vec_with_len_sub_1<'a, T>(
             this: &mut Reader<'a>,
             read_elem: impl FnMut(&mut Reader<'a>) -> Result<T>,
@@ -197,7 +211,7 @@ impl<'a> Reader<'a> {
             ints: read_vec_with_len_sub_1(self, Self::read_i32)?,
             uints: read_vec_with_len_sub_1(self, Self::read_u30)?,
             doubles: read_vec_with_len_sub_1(self, |this| this.read_f64().map_err(Into::into))?,
-            strings: read_vec_with_len_sub_1(self, Self::read_string)?,
+            strings: read_vec_with_len_sub_1(self, |r| Ok(payload(r.read_payload()?)))?,
             namespaces: read_vec_with_len_sub_1(self, Self::read_namespace)?,
             namespace_sets: read_vec_with_len_sub_1(self, Self::read_namespace_set)?,
             multinames: read_vec_with_len_sub_1(self, Self::read_multiname)?,
@@ -403,19 +417,14 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn read_method_body(&mut self) -> Result<MethodBody> {
+    fn read_method_body<B>(&mut self, payload: &impl Fn(&'a [u8]) -> B) -> Result<MethodBody<B>> {
         Ok(MethodBody {
             method: self.read_index()?,
             max_stack: self.read_u30()?,
             num_locals: self.read_u30()?,
             init_scope_depth: self.read_u30()?,
             max_scope_depth: self.read_u30()?,
-            code: {
-                // Read the code data.
-                let code_len = self.read_u30()?;
-                // TODO: Avoid allocating a Vec.
-                self.read_slice(code_len as usize)?.to_vec()
-            },
+            code: payload(self.read_payload()?),
             exceptions: self.read_vec_with_len(Self::read_exception)?,
             traits: self.read_vec_with_len(Self::read_trait)?,
         })
@@ -798,6 +807,25 @@ pub mod tests {
             }
         }
         panic!("ABC tag not found in {path}");
+    }
+
+    #[test]
+    fn abc_payloads_can_reference_the_input_bytes() {
+        let bytes = read_abc_from_file("tests/swfs/Avm2Dummy.swf");
+        let indexed = Reader::new(&bytes).read_ranges().unwrap();
+        let owned = Reader::new(&bytes).read().unwrap();
+        assert!(!indexed.constant_pool.strings.is_empty() && !indexed.method_bodies.is_empty());
+        for (range, string) in indexed
+            .constant_pool
+            .strings
+            .iter()
+            .zip(&owned.constant_pool.strings)
+        {
+            assert_eq!(&bytes[range.clone()], string);
+        }
+        for (body, expected) in indexed.method_bodies.iter().zip(&owned.method_bodies) {
+            assert_eq!(&bytes[body.code.clone()], &expected.code);
+        }
     }
 
     #[test]

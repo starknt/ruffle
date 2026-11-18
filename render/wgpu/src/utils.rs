@@ -87,6 +87,7 @@ pub fn create_buffer_with_data(
 // Based off wgpu example 'capture'
 #[derive(Debug, Clone)]
 pub struct BufferDimensions {
+    pub format: TextureFormat,
     pub width: usize,
     pub height: usize,
     pub unpadded_bytes_per_row: usize,
@@ -102,6 +103,7 @@ impl BufferDimensions {
         let padded_bytes_per_row = (unpadded_bytes_per_row + padded_bytes_per_row_padding) as u32;
 
         Self {
+            format,
             width,
             height,
             unpadded_bytes_per_row,

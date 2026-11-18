@@ -408,6 +408,7 @@ impl<'a, 'gc> LayoutBuilder<'a, 'gc> {
 
         self.lines.push(LayoutLine {
             index: self.current_line_index,
+            min_remaining_box_y: boxes.iter().map(|b| b.bounds.offset_y()).min().unwrap(),
             bounds,
             start,
             end,
@@ -781,6 +782,13 @@ impl<'a, 'gc> LayoutBuilder<'a, 'gc> {
         let last_span = fs.last_span().expect("At least one span should be present");
         self.fixup_line(true, true, fs.displayed_text().len(), last_span);
 
+        // Negative leading and bullet placement can put a later box above its
+        // predecessor. Store a suffix minimum so the renderer can stop safely.
+        let mut min_y = Twips::new(i32::MAX);
+        for line in self.lines.iter_mut().rev() {
+            min_y = min_y.min(line.min_remaining_box_y);
+            line.min_remaining_box_y = min_y;
+        }
         let text_size = self.text_size_bounds.unwrap_or_default();
         Layout {
             bounds: self.bounds.unwrap_or_default(),
@@ -925,6 +933,9 @@ pub struct LayoutLine<'gc> {
     /// Zero-based index of the line in the text.
     #[collect(require_static)]
     index: usize,
+
+    #[collect(require_static)]
+    pub(crate) min_remaining_box_y: Twips,
 
     /// Line bounds.
     ///

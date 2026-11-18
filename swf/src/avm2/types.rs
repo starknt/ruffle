@@ -2,24 +2,24 @@ use bitflags::bitflags;
 use std::marker::PhantomData;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AbcFile {
+pub struct AbcFile<B = Vec<u8>> {
     pub major_version: u16,
     pub minor_version: u16,
-    pub constant_pool: ConstantPool,
+    pub constant_pool: ConstantPool<B>,
     pub methods: Vec<Method>,
     pub metadata: Vec<Metadata>,
     pub instances: Vec<Instance>,
     pub classes: Vec<Class>,
     pub scripts: Vec<Script>,
-    pub method_bodies: Vec<MethodBody>,
+    pub method_bodies: Vec<MethodBody<B>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ConstantPool {
+pub struct ConstantPool<B = Vec<u8>> {
     pub ints: Vec<i32>,
     pub uints: Vec<u32>,
     pub doubles: Vec<f64>,
-    pub strings: Vec<Vec<u8>>,
+    pub strings: Vec<B>,
     pub namespaces: Vec<Namespace>,
     pub namespace_sets: Vec<NamespaceSet>,
     pub multinames: Vec<Multiname>,
@@ -131,13 +131,13 @@ pub struct MethodParam {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct MethodBody {
+pub struct MethodBody<B = Vec<u8>> {
     pub method: Index<Method>,
     pub max_stack: u32,
     pub num_locals: u32,
     pub init_scope_depth: u32,
     pub max_scope_depth: u32,
-    pub code: Vec<u8>,
+    pub code: B,
     pub exceptions: Vec<Exception>,
     pub traits: Vec<Trait>,
 }

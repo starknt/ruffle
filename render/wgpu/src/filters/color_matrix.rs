@@ -1,11 +1,10 @@
+use super::FilterPipelines;
 use crate::backend::RenderTargetMode;
 use crate::buffer_pool::TexturePool;
 use crate::descriptors::Descriptors;
 use crate::filters::{FilterSource, FilterVertex, VERTEX_BUFFERS_DESCRIPTION_FILTERS};
 use crate::gpu_resources::StagingBelt;
 use crate::surface::target::CommandTarget;
-use crate::utils::SampleCountMap;
-use std::sync::OnceLock;
 use swf::ColorMatrixFilter as ColorMatrixFilterArgs;
 
 #[repr(C)]
@@ -22,7 +21,7 @@ pub struct ColorMatrixFilter {
     uniform_buffer: crate::gpu_resources::Buffer,
     vertices_size: wgpu::BufferSize,
     uniform_size: wgpu::BufferSize,
-    pipelines: SampleCountMap<OnceLock<crate::gpu_resources::RenderPipeline>>,
+    pipelines: FilterPipelines,
 }
 
 impl ColorMatrixFilter {
@@ -100,8 +99,9 @@ impl ColorMatrixFilter {
         &self,
         descriptors: &Descriptors,
         msaa_sample_count: u32,
+        format: wgpu::TextureFormat,
     ) -> Result<&crate::gpu_resources::RenderPipeline, crate::gpu_runtime::RenderFailure> {
-        self.pipelines.get_or_init(msaa_sample_count, || {
+        self.pipelines.get_or_init(format, msaa_sample_count, || {
             let label = create_debug_label!("Color Matrix Filter ({} msaa)", msaa_sample_count);
             descriptors
                 .persistent_device
@@ -132,7 +132,7 @@ impl ColorMatrixFilter {
                     fragment: Some(wgpu::FragmentState {
                         module: &descriptors.shaders.color_matrix_filter,
                         entry_point: Some("main_fragment"),
-                        targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+                        targets: &[Some(format.into())],
                         compilation_options: Default::default(),
                     }),
                     multiview_mask: None,
@@ -193,7 +193,7 @@ impl ColorMatrixFilter {
         }
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
-        let pipeline = self.pipeline(descriptors, sample_count)?;
+        let pipeline = self.pipeline(descriptors, sample_count, format)?;
 
         let target = CommandTarget::new(
             descriptors,

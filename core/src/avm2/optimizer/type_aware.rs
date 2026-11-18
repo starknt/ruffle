@@ -5,7 +5,7 @@ use crate::avm2::error::{
 };
 use crate::avm2::method::{Method, MethodAssociation, MethodKind, ResolvedParamConfig};
 use crate::avm2::multiname::Multiname;
-use crate::avm2::op::Op;
+use crate::avm2::op::{Op, SuperTrait};
 use crate::avm2::optimizer::blocks::assemble_blocks;
 use crate::avm2::property::Property;
 use crate::avm2::verify::Exception;
@@ -231,7 +231,7 @@ impl<'gc> OptValue<'gc> {
     }
 
     // Whether this value is known not to represent a primitive type (Boolean,
-    // String, int, uint, Object, void, or String)
+    // String, int, uint, Object, void, or Number)
     pub fn is_not_primitive(self) -> bool {
         self.class.is_some_and(|c| {
             !c.is_builtin_boolean()
@@ -240,7 +240,7 @@ impl<'gc> OptValue<'gc> {
                 && !c.is_builtin_uint()
                 && !c.is_builtin_object()
                 && !c.is_builtin_void()
-                && !c.is_builtin_string()
+                && !c.is_builtin_number()
         })
     }
 
@@ -709,8 +709,7 @@ pub fn type_aware_optimize<'gc>(
     if activation.avm2().optimizer_enabled() {
         // Now run through the ops and actually optimize them
         for (i, block) in block_list.iter().enumerate() {
-            // todo: don't need to clone here
-            let block_entry_state = abstract_states[i].clone().expect("Entry state not found");
+            let block_entry_state = abstract_states[i].take().expect("Entry state not found");
             abstract_interpret_ops(
                 activation,
                 block.start_index,
@@ -790,7 +789,7 @@ fn abstract_interpret_ops<'gc>(
     let mut scope_stack = initial_state.scope_stack;
 
     for (i, op) in ops.iter().enumerate() {
-        if op.get().can_throw_error() {
+        if !do_optimize && op.get().can_throw_error() {
             let current_idx = start_index + i;
             for exception in method_exceptions {
                 if current_idx >= exception.from_offset && current_idx < exception.to_offset {
@@ -1193,12 +1192,10 @@ fn abstract_interpret_ops<'gc>(
                     // if T is not non-nullable, we can assume the result is typed T
                     new_value = OptValue::of_type(class);
                 }
-                if let Some(stack_class) = stack_value.class
-                    && class == stack_class
+                if stack_value.matches_type(Some(class))
+                    && stack_value.class.is_some_and(|c| !c.is_builtin_void())
                 {
-                    // If type check is guaranteed, preserve original type
-                    // TODO: there are more cases when this can succeed,
-                    // like inheritance and numbers (`x: Number = 1; x as int;`)
+                    optimize_op_to!(Op::Nop);
                     new_value = stack_value;
                 }
                 if stack_value.is_null() {
@@ -1220,8 +1217,9 @@ fn abstract_interpret_ops<'gc>(
                         new_value.constant_value = Some(ConstantValue::Null);
                     }
                 } else if let Some(stack_class) = stack_value.class {
-                    // TODO: this could check for inheritance
-                    if class == stack_class {
+                    if class == stack_class
+                        || (stack_value.is_not_primitive() && stack_class.has_class_in_chain(class))
+                    {
                         optimize_op_to!(Op::Nop);
                         new_value.not_null = stack_value.not_null;
                     }
@@ -1918,15 +1916,26 @@ fn abstract_interpret_ops<'gc>(
                 // Push return value to the stack
                 if !multiname.has_lazy_component() {
                     let vtable = bound_superclass_object.instance_vtable();
-                    match vtable.get_trait(&multiname) {
+                    let property = vtable.get_trait(&multiname);
+                    if let Some(property) = property {
+                        optimize_op_to!(Op::GetSuperTrait {
+                            target: Gc::new(
+                                activation.gc(),
+                                SuperTrait {
+                                    name: multiname,
+                                    vtable: vtable.downgrade(),
+                                    property
+                                }
+                            ),
+                        });
+                    }
+                    match property {
                         Some(Property::Slot { slot_id } | Property::ConstSlot { slot_id }) => {
                             let mut value_class =
                                 vtable.slot_class(slot_id).expect("Slot should exist");
                             let resolved_value_class = value_class.get_class(activation)?;
 
                             vtable.set_slot_class(activation.gc(), slot_id, value_class);
-
-                            // TODO: We can optimize the op to GetSlot here
 
                             if let Some(resolved_value_class) = resolved_value_class {
                                 stack.push_class(activation, resolved_value_class)?;
@@ -1940,8 +1949,6 @@ fn abstract_interpret_ops<'gc>(
                             let method = vtable.get_method(disp_id).expect("Method should exist");
 
                             method.resolve_info(activation)?;
-
-                            // TODO: Use `maybe_optimize_static_call` here
 
                             let return_type = method.resolved_return_type();
                             if let Some(return_type) = return_type {
@@ -1959,9 +1966,9 @@ fn abstract_interpret_ops<'gc>(
                 }
             }
             Op::SetSuper { multiname } => {
-                if activation.bound_superclass_object().is_none() {
+                let Some(base) = activation.bound_superclass_object() else {
                     return Err(make_error_1035(activation));
-                }
+                };
 
                 stack.pop(activation)?;
 
@@ -1970,7 +1977,21 @@ fn abstract_interpret_ops<'gc>(
                 // Receiver
                 stack.pop(activation)?;
 
-                // TODO: Optimize the op when possible
+                if do_optimize && !multiname.has_lazy_component() {
+                    let vtable = base.instance_vtable();
+                    if let Some(property) = vtable.get_trait(&multiname) {
+                        op.set(Op::SetSuperTrait {
+                            target: Gc::new(
+                                activation.gc(),
+                                SuperTrait {
+                                    name: multiname,
+                                    vtable: vtable.downgrade(),
+                                    property,
+                                },
+                            ),
+                        });
+                    }
+                }
             }
             Op::CallSuper {
                 multiname,
@@ -1991,13 +2012,25 @@ fn abstract_interpret_ops<'gc>(
                 // Push return value to the stack
                 if !multiname.has_lazy_component() {
                     let vtable = bound_superclass_object.instance_vtable();
-                    match vtable.get_trait(&multiname) {
+                    let property = vtable.get_trait(&multiname);
+                    if let Some(property) = property {
+                        optimize_op_to!(Op::CallSuperTrait {
+                            target: Gc::new(
+                                activation.gc(),
+                                SuperTrait {
+                                    name: multiname,
+                                    vtable: vtable.downgrade(),
+                                    property
+                                }
+                            ),
+                            num_args,
+                        });
+                    }
+                    match property {
                         Some(Property::Method { disp_id }) => {
                             let method = vtable.get_method(disp_id).expect("Method should exist");
 
                             method.resolve_info(activation)?;
-
-                            // TODO: Use `maybe_optimize_static_call` here
 
                             let return_type = method.resolved_return_type();
                             if let Some(return_type) = return_type {
@@ -2178,6 +2211,9 @@ fn abstract_interpret_ops<'gc>(
             }
 
             Op::CallMethod { .. }
+            | Op::GetSuperTrait { .. }
+            | Op::SetSuperTrait { .. }
+            | Op::CallSuperTrait { .. }
             | Op::CallNative { .. }
             | Op::CoerceSwapPop { .. }
             | Op::CoerceDSwapPop

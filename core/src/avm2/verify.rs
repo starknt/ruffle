@@ -86,7 +86,8 @@ pub fn verify_method<'gc>(
 
     use swf::extensions::ReadSwfExt;
 
-    if body.code.is_empty() {
+    let code = method.translation_unit().payload(&body.code);
+    if code.is_empty() {
         return Err(make_error_1043(activation));
     }
 
@@ -99,14 +100,14 @@ pub fn verify_method<'gc>(
 
     let mut worklist = vec![0];
 
-    let mut byte_info = vec![ByteInfo::NotYetReached; body.code.len()];
+    let mut byte_info = vec![ByteInfo::NotYetReached; code.len()];
     let mut seen_targets = HashSet::new();
 
-    let mut reader = Reader::new(&body.code);
+    let mut reader = Reader::new(code);
     while let Some(i) = worklist.pop() {
-        reader.seek_absolute(&body.code, i as usize);
+        reader.seek_absolute(code, i as usize);
         loop {
-            let previous_position = reader.pos(&body.code);
+            let previous_position = reader.pos(code);
 
             // We've already verified this chunk of code, let's not run the logic again
             if matches!(byte_info.get(previous_position), Some(ByteInfo::OpStart(_))) {
@@ -152,7 +153,7 @@ pub fn verify_method<'gc>(
                 }
             }
 
-            let new_position = reader.pos(&body.code) as i32;
+            let new_position = reader.pos(code) as i32;
 
             let mut check_target = |seen_targets: &HashSet<i32>, offs: i32, is_jump: bool| {
                 let target_position = if is_jump {
@@ -170,17 +171,17 @@ pub fn verify_method<'gc>(
                     return Err(make_error_1021(activation));
                 }
 
-                if target_position < 0 || target_position as usize >= body.code.len() {
+                if target_position < 0 || target_position as usize >= code.len() {
                     return Err(make_error_1021(activation));
                 }
 
                 // Ensure backwards jumps to not-yet-jumped-to code target a `Label` op
                 if !seen_targets.contains(&target_position) && offs < 0 {
-                    reader.seek_absolute(&body.code, target_position as usize);
+                    reader.seek_absolute(code, target_position as usize);
                     let read_op = reader.read_op();
 
                     // Seek back to the original position
-                    reader.seek_absolute(&body.code, new_position as usize);
+                    reader.seek_absolute(code, new_position as usize);
 
                     if !matches!(read_op, Ok(AbcOp::Label)) {
                         return Err(make_error_1021(activation));
@@ -399,7 +400,7 @@ pub fn verify_method<'gc>(
                 .copied();
 
             offs += 1;
-            if (exception.from_offset + offs) as usize >= body.code.len() {
+            if (exception.from_offset + offs) as usize >= code.len() {
                 return Err(make_error_1054(activation));
             }
         }
@@ -414,7 +415,7 @@ pub fn verify_method<'gc>(
                 .copied();
 
             offs += 1;
-            if (exception.to_offset + offs) as usize >= body.code.len() {
+            if (exception.to_offset + offs) as usize >= code.len() {
                 return Err(make_error_1054(activation));
             }
         }

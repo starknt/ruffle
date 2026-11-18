@@ -153,12 +153,21 @@ impl Surface {
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
     ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
+        // A uniform clear has no sample coverage to resolve. The final view can
+        // receive the clear directly when there are no draw commands.
+        let samples = if commands.is_empty()
+            && matches!(render_target_mode, RenderTargetMode::ExistingWithView(..))
+        {
+            1
+        } else {
+            self.sample_count
+        };
         let target = CommandTarget::new(
             descriptors,
             texture_pool,
             self.size,
             self.format,
-            self.sample_count,
+            samples,
             render_target_mode,
             draw_encoder,
         )?;

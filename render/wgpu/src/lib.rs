@@ -388,12 +388,20 @@ impl QueueSyncHandle {
         })
     }
 
-    pub fn capture<R, F: FnOnce(&[u8], u32) -> R>(
+    pub fn capture_native<R, F: FnOnce(&[u8], u32, ruffle_render::bitmap::BitmapFormat) -> R>(
         self,
-        with_rgba: F,
+        read: F,
         frame: &mut ActiveFrame,
     ) -> Result<R, crate::gpu_runtime::RenderFailure> {
         let _readback = ruffle_render::profile::time(ruffle_render::profile::Phase::Readback);
+        let capture = |bytes: &[u8], stride, format| {
+            let format = if format == wgpu::TextureFormat::Bgra8Unorm {
+                ruffle_render::bitmap::BitmapFormat::Bgra
+            } else {
+                ruffle_render::bitmap::BitmapFormat::Rgba
+            };
+            read(bytes, stride, format)
+        };
         match self {
             QueueSyncHandle::AlreadyCopied {
                 index,
@@ -405,7 +413,7 @@ impl QueueSyncHandle {
                 &buffer,
                 &copy_dimensions,
                 index,
-                with_rgba,
+                |bytes, stride| capture(bytes, stride, copy_dimensions.format),
             ),
             QueueSyncHandle::NotCopied {
                 handle,
@@ -437,7 +445,7 @@ impl QueueSyncHandle {
                     &buffer,
                     &buffer_dimensions,
                     Some(index),
-                    with_rgba,
+                    |bytes, stride| capture(bytes, stride, buffer_dimensions.format),
                 );
 
                 // After we've read pixels from a texture enough times, we'll store this buffer so that

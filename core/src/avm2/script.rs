@@ -46,6 +46,8 @@ pub struct TranslationUnit<'gc>(Gc<'gc, TranslationUnitData<'gc>>);
 #[derive(Clone, Collect)]
 #[collect(no_drop)]
 struct TranslationUnitData<'gc> {
+    #[collect(require_static)]
+    bytes: AbcBytes,
     /// The domain that all scripts in the translation unit export defs to.
     domain: Domain<'gc>,
 
@@ -54,7 +56,7 @@ struct TranslationUnitData<'gc> {
 
     /// The ABC file that all of the following loaded data comes from.
     #[collect(require_static)]
-    abc: Rc<AbcFile>,
+    abc: Rc<AbcFile<std::ops::Range<usize>>>,
 
     /// All classes loaded from the ABC's class list.
     classes: Box<[OnceLock<Class<'gc>>]>,
@@ -81,11 +83,42 @@ struct TranslationUnitData<'gc> {
     movie: SwfMovie<'gc>,
 }
 
+#[derive(Clone)]
+enum AbcBytes {
+    Movie(crate::tag_utils::SwfSlice),
+    Owned(Box<[u8]>),
+}
+
+impl AbcBytes {
+    fn new(movie: SwfMovie<'_>, data: &[u8]) -> Self {
+        let movie_range = movie.data().as_ptr_range();
+        let range = data.as_ptr_range();
+        if range.start >= movie_range.start && range.end <= movie_range.end {
+            Self::Movie(crate::tag_utils::SwfSlice::from(movie).to_subslice(data))
+        } else {
+            // Host adapters can supply ABC data independently of the movie.
+            Self::Owned(data.into())
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Movie(data) => data.as_ref(),
+            Self::Owned(data) => data,
+        }
+    }
+}
+
 impl<'gc> TranslationUnit<'gc> {
+    pub fn payload(self, range: &std::ops::Range<usize>) -> &'gc [u8] {
+        &Gc::as_ref(self.0).bytes.as_slice()[range.clone()]
+    }
+
     /// Construct a new `TranslationUnit` for a given ABC file intended to
     /// execute within a particular domain.
     pub fn from_abc(
-        abc: AbcFile,
+        abc: AbcFile<std::ops::Range<usize>>,
+        data: &[u8],
         domain: Domain<'gc>,
         name: Option<AvmString<'gc>>,
         movie: SwfMovie<'gc>,
@@ -93,6 +126,7 @@ impl<'gc> TranslationUnit<'gc> {
     ) -> Self {
         use std::iter::repeat_n;
         let this = TranslationUnitData {
+            bytes: AbcBytes::new(movie, data),
             domain,
             name,
             classes: repeat_n(OnceLock::new(), abc.classes.len()).collect(),
@@ -147,7 +181,7 @@ impl<'gc> TranslationUnit<'gc> {
     }
 
     /// Retrieve the underlying `AbcFile` for this translation unit.
-    pub fn abc(self) -> Rc<AbcFile> {
+    pub fn abc(self) -> Rc<AbcFile<std::ops::Range<usize>>> {
         self.0.abc.clone()
     }
 
@@ -303,10 +337,11 @@ impl<'gc> TranslationUnit<'gc> {
         } else {
             let strings = &self.0.abc.constant_pool.strings;
 
-            strings
-                .get(idx - 1)
-                .ok_or_else(|| make_error_1032(activation, idx, strings.len()))?
-                .as_slice()
+            self.payload(
+                strings
+                    .get(idx - 1)
+                    .ok_or_else(|| make_error_1032(activation, idx, strings.len()))?,
+            )
         };
 
         let atom = activation

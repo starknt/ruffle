@@ -427,7 +427,8 @@ impl<'gc> Context3DObject<'gc> {
 
         self.with_context_3d_result(|ctx| {
             ctx.process_command(Context3DCommand::CopyBitmapToTexture {
-                source: source.pixels_rgba(),
+                source: source.pixels_bgra(),
+                source_is_bgra: true,
                 source_width: source.width(),
                 source_height: source.height(),
                 dest,
@@ -448,6 +449,7 @@ impl<'gc> Context3DObject<'gc> {
         self.with_context_3d_result(|ctx| {
             ctx.process_command(Context3DCommand::CopyBitmapToTexture {
                 source: &source,
+                source_is_bgra: false,
                 source_width: dest.width(),
                 source_height: dest.height(),
                 dest,

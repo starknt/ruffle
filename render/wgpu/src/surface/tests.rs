@@ -41,6 +41,43 @@ fn measurement_target_never_allocates_a_readback_buffer_even_after_resize() {
 }
 
 #[test]
+#[ignore = "requires native Vulkan and GL adapters"]
+fn empty_multisampled_frames_clear_the_output_without_intermediate_textures() {
+    use crate::gpu_runtime::ResourceKind;
+
+    for backend in [wgpu::Backends::VULKAN, wgpu::Backends::GL] {
+        let descriptors = gpu_with_backend(backend, None, None);
+        let target = TextureTarget::new(&descriptors.device, (32, 24)).unwrap();
+        let mut renderer =
+            WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+        renderer.set_quality(StageQuality::High).unwrap();
+        assert!(renderer.sample_count() > 1);
+        let offscreen =
+            || descriptors.runtime.stats().kind_counts[ResourceKind::OffscreenTarget as usize];
+        let initial = offscreen();
+
+        for (color, expected) in [
+            (Color::RED, [255, 0, 0, 255]),
+            (
+                Color {
+                    a: 128,
+                    ..Color::BLACK
+                },
+                [0, 0, 0, 128],
+            ),
+        ] {
+            renderer
+                .submit_frame(color, CommandList::new(), vec![])
+                .unwrap();
+            let image = renderer.capture_frame().unwrap().unwrap();
+            assert_eq!(image.get_pixel(0, 0).0, expected);
+            assert!(image.pixels().all(|pixel| pixel.0 == expected));
+        }
+        assert_eq!(offscreen(), initial);
+    }
+}
+
+#[test]
 #[ignore = "requires a Vulkan adapter"]
 fn measurement_counts_encoded_draws_and_passes() {
     let descriptors = gpu();
@@ -1272,6 +1309,7 @@ fn deferred_partial_uploads_preserve_unwritten_and_gpu_written_pixels() {
 #[test]
 #[ignore = "requires a Vulkan adapter"]
 fn shape_registration_owns_styles_and_allocates_only_when_visible() {
+    use crate::render_snapshot::{PreparedSnapshot, ResourceRecipe};
     use ruffle_render::{
         bitmap::{BitmapHandle, BitmapSize, BitmapSource},
         shape_utils::{DistilledShape, DrawCommand, DrawPath, FillRule},
@@ -1318,9 +1356,28 @@ fn shape_registration_owns_styles_and_allocates_only_when_visible() {
     assert_eq!(descriptors.runtime.stats().total_bytes, before);
     let mut commands = CommandList::new();
     commands.render_shape(handle.clone(), Transform::default());
+    assert!(matches!(
+        PreparedSnapshot::capture(&commands)
+            .unwrap()
+            .snapshot
+            .recipes
+            .as_slice(),
+        [ResourceRecipe::Shape {
+            geometry: Some(_),
+            ..
+        }]
+    ));
     renderer
-        .submit_frame(Color::BLACK, commands, vec![])
+        .submit_frame(Color::BLACK, commands.clone(), vec![])
         .unwrap();
+    assert!(matches!(
+        PreparedSnapshot::capture(&commands)
+            .unwrap()
+            .snapshot
+            .recipes
+            .as_slice(),
+        [ResourceRecipe::Resident(_)]
+    ));
     let recipe = (&*handle.0 as &dyn std::any::Any)
         .downcast_ref::<crate::shape_recipe::ShapeRecipe>()
         .unwrap();
@@ -2070,6 +2127,110 @@ fn render_filter_chain_test(
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn default_color_matrix_normalizes_channels_above_alpha() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
+    use ruffle_render::filters::Filter;
+    for backend in [wgpu::Backends::VULKAN, wgpu::Backends::GL] {
+        let descriptors = gpu_with_backend(backend, None, None);
+        let target = TextureTarget::new(&descriptors.device, (3, 1)).unwrap();
+        let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+        let source = renderer
+            .register_bitmap(Bitmap::new(
+                3,
+                1,
+                BitmapFormat::Bgra,
+                vec![64, 20, 240, 64, 0, 0, 0, 0, 37, 23, 17, 255],
+            ))
+            .unwrap();
+        let destination = renderer
+            .register_bitmap(Bitmap::new(3, 1, BitmapFormat::Rgba, vec![0; 12]))
+            .unwrap();
+        renderer
+            .apply_filter(
+                source,
+                (0, 0),
+                (3, 1),
+                destination.clone(),
+                (0, 0),
+                Filter::default(),
+            )
+            .unwrap()
+            .unwrap();
+        renderer
+            .read_bitmap_region(
+                &destination,
+                PixelRegion::for_whole_size(3, 1),
+                Box::new(|bytes, _| {
+                    assert_eq!(&bytes[..12], &[64, 20, 64, 64, 0, 0, 0, 0, 17, 23, 37, 255]);
+                }),
+            )
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn identity_filter_bounds_its_work_to_the_requested_pixel() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (2, 1)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    for format in [BitmapFormat::Bgra, BitmapFormat::Rgba] {
+        let mut pixels = [40, 20, 10, 128].repeat(2048);
+        // This pixel needs normalization but is outside the requested region.
+        if format == BitmapFormat::Bgra {
+            pixels[0] = 255;
+        }
+        let source = renderer
+            .register_bitmap(Bitmap::new(2048, 1, BitmapFormat::Bgra, pixels))
+            .unwrap();
+        let dest = renderer
+            .register_bitmap(Bitmap::new(2, 1, format, vec![0; 8]))
+            .unwrap();
+        let metrics = ruffle_render::profile::RenderMetrics::default();
+        let _scope = ruffle_render::profile::enter(Some(&metrics));
+        renderer
+            .apply_filter(
+                source,
+                (2047, 0),
+                (1, 1),
+                dest.clone(),
+                (0, 0),
+                Default::default(),
+            )
+            .unwrap()
+            .unwrap();
+        renderer
+            .read_bitmap_region(
+                &dest,
+                PixelRegion::for_pixel(0, 0),
+                Box::new(|bytes, _| {
+                    assert_eq!(&bytes[..4], &[10, 20, 40, 128]);
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        if format == BitmapFormat::Bgra {
+            assert_eq!(
+                metrics.snapshot().work.filter_passes,
+                0,
+                "out-of-region pixels must not force a shader pass"
+            );
+        } else {
+            let work = metrics.snapshot().work;
+            assert_eq!(work.filter_passes, 1);
+            assert!(
+                work.pass_pixels <= 2,
+                "one pixel should need at most a matrix and a conversion pass: {}",
+                work.pass_pixels
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn pointwise_filter_chain_matches_rgba8_rounding_at_half_steps() {
     let filters = [
         swf::ColorMatrixFilter {
@@ -2365,6 +2526,56 @@ fn chained_gpu_copies_preserve_self_overlap_in_both_directions() {
         renderer.capture_frame().unwrap().unwrap().into_raw(),
         expected
     );
+}
+
+#[test]
+#[ignore = "requires native Vulkan and GL adapters"]
+fn bgra_bitmap_cache_supports_multisample_draw_and_region_updates() {
+    use ruffle_render::backend::BitmapCacheEntry;
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
+    for backend in [wgpu::Backends::VULKAN, wgpu::Backends::GL] {
+        let descriptors = gpu_with_backend(backend, None, None);
+        let target = TextureTarget::new(&descriptors.device, (4, 2)).unwrap();
+        let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+        renderer.set_quality(StageQuality::High).unwrap();
+        let bitmap = renderer
+            .register_bitmap(Bitmap::new(4, 2, BitmapFormat::Bgra, vec![0; 32]))
+            .unwrap();
+        let mut commands = CommandList::new();
+        rect(&mut commands, 0.0, 0.0, 4.0, 2.0, Color::RED);
+        renderer
+            .submit_frame(
+                Color::TRANSPARENT,
+                CommandList::new(),
+                vec![BitmapCacheEntry {
+                    handle: bitmap.clone(),
+                    commands,
+                    clear: Color::TRANSPARENT,
+                    filters: Vec::new(),
+                }],
+            )
+            .unwrap();
+        renderer
+            .update_texture(
+                &bitmap,
+                Bitmap::new(4, 2, BitmapFormat::Bgra, [255, 0, 0, 255].repeat(8)),
+                PixelRegion::for_pixel(1, 1),
+            )
+            .unwrap();
+        renderer
+            .read_bitmap_region(
+                &bitmap,
+                PixelRegion::for_region(0, 1, 3, 1),
+                Box::new(|bytes, _| {
+                    assert_eq!(
+                        &bytes[..12],
+                        &[255, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0, 255]
+                    );
+                }),
+            )
+            .unwrap()
+            .unwrap();
+    }
 }
 
 #[test]

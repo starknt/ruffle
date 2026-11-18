@@ -1,3 +1,4 @@
+use super::FilterPipelines;
 use crate::backend::RenderTargetMode;
 use crate::buffer_pool::TexturePool;
 use crate::descriptors::Descriptors;
@@ -7,9 +8,7 @@ use crate::filters::{
 };
 use crate::gpu_resources::StagingBelt;
 use crate::surface::target::CommandTarget;
-use crate::utils::SampleCountMap;
 use bytemuck::{Pod, Zeroable};
-use std::sync::OnceLock;
 use swf::BevelFilter as BevelFilterArgs;
 
 #[repr(C)]
@@ -30,7 +29,7 @@ pub struct BevelFilter {
     uniform_buffer: crate::gpu_resources::Buffer,
     vertices_size: wgpu::BufferSize,
     uniform_size: wgpu::BufferSize,
-    pipeline: SampleCountMap<OnceLock<crate::gpu_resources::RenderPipeline>>,
+    pipeline: FilterPipelines,
 }
 
 impl BevelFilter {
@@ -117,8 +116,9 @@ impl BevelFilter {
         &self,
         descriptors: &Descriptors,
         msaa_sample_count: u32,
+        format: wgpu::TextureFormat,
     ) -> Result<&crate::gpu_resources::RenderPipeline, crate::gpu_runtime::RenderFailure> {
-        self.pipeline.get_or_init(msaa_sample_count, || {
+        self.pipeline.get_or_init(format, msaa_sample_count, || {
             let label = create_debug_label!("Bevel Filter ({} msaa)", msaa_sample_count);
             descriptors
                 .persistent_device
@@ -149,7 +149,7 @@ impl BevelFilter {
                     fragment: Some(wgpu::FragmentState {
                         module: &descriptors.shaders.bevel_filter,
                         entry_point: Some("main_fragment"),
-                        targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+                        targets: &[Some(format.into())],
                         compilation_options: Default::default(),
                     }),
                     multiview_mask: None,
@@ -171,7 +171,7 @@ impl BevelFilter {
     ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
-        let pipeline = self.pipeline(descriptors, sample_count)?;
+        let pipeline = self.pipeline(descriptors, sample_count, format)?;
         let blurred = blur_filter.apply(
             descriptors,
             texture_pool,

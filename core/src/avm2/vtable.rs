@@ -241,7 +241,7 @@ mod tests {
 #[collect(no_drop)]
 pub struct VTable<'gc>(Gc<'gc, VTableData<'gc>>);
 
-#[derive(Collect, Clone, Copy)]
+#[derive(Collect, Clone, Copy, Debug)]
 #[collect(no_drop)]
 pub struct WeakVTable<'gc>(gc_arena::GcWeak<'gc, VTableData<'gc>>);
 

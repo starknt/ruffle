@@ -1,10 +1,5 @@
 //! Like [`core::str::pattern::Pattern`], but for [`WStr`].
 
-// TODO: Is performance good? ideas for improvements:
-//  - add some inlines?
-//  - remove implicit bound checks?
-//  - use memchr crate?
-
 use super::{Units, WStr};
 
 /// A pattern that can be searched in a [`WStr`].
@@ -164,7 +159,7 @@ impl<'a, F: FnMut(u16) -> bool> Pattern<'a> for F {
 
 impl<'a> Pattern<'a> for &'a WStr {
     type Searcher = Either<
-        Either<Either<SliceSearcher<'a, u8>, SliceSearcher<'a, u16>>, StrSearcher<'a>>,
+        Either<Either<ByteSliceSearcher<'a>, SliceSearcher<'a, u16>>, StrSearcher<'a>>,
         EmptySearcher,
     >;
 
@@ -174,10 +169,12 @@ impl<'a> Pattern<'a> for &'a WStr {
         }
 
         let s = match (haystack.units(), self.units()) {
-            (Units::Bytes(h), Units::Bytes(n)) => Either::Left(SliceSearcher::new(h, n)),
+            (Units::Bytes(h), Units::Bytes(n)) => {
+                Either::Left(ByteSliceSearcher(SliceSearcher::new(h, n)))
+            }
             (Units::Wide(h), Units::Wide(n)) => Either::Right(SliceSearcher::new(h, n)),
             (Units::Bytes(_), _) if self.len() > haystack.len() || !self.is_latin1() => {
-                Either::Left(SliceSearcher::new(&[], &[0]))
+                Either::Left(ByteSliceSearcher(SliceSearcher::new(&[], &[0])))
             }
             _ => return Either::Left(Either::Right(StrSearcher::new(haystack, self))),
         };
@@ -342,6 +339,56 @@ impl<'a, T: Copy, M: Predicate<T>> Searcher<'a> for PredSearcher<'a, T, M> {
             SearchStep::Match(len - 1, len)
         } else {
             SearchStep::Reject(len - 1, len)
+        }
+    }
+}
+
+/// A byte substring search can skip rejected positions when the caller asks for a match.
+pub struct ByteSliceSearcher<'a>(SliceSearcher<'a, u8>);
+
+impl Searcher<'_> for ByteSliceSearcher<'_> {
+    fn next(&mut self) -> SearchStep {
+        self.0.next()
+    }
+
+    fn next_back(&mut self) -> SearchStep {
+        self.0.next_back()
+    }
+
+    fn next_match(&mut self) -> Option<(usize, usize)> {
+        let s = &mut self.0;
+        if s.front > s.back {
+            return None;
+        }
+        let remaining = &s.haystack[s.front..s.back + s.needle.len()];
+        if let Some(index) = memchr::memmem::find(remaining, s.needle) {
+            let start = s.front + index;
+            s.front = start + s.needle.len();
+            Some((start, s.front))
+        } else {
+            s.front = s.back + 1;
+            None
+        }
+    }
+
+    fn next_match_back(&mut self) -> Option<(usize, usize)> {
+        let s = &mut self.0;
+        if s.front > s.back {
+            return None;
+        }
+        let remaining = &s.haystack[s.front..s.back + s.needle.len()];
+        if let Some(index) = memchr::memmem::rfind(remaining, s.needle) {
+            let start = s.front + index;
+            if let Some(back) = start.checked_sub(s.needle.len()) {
+                s.back = back;
+            } else {
+                s.front = 1;
+                s.back = 0;
+            }
+            Some((start, start + s.needle.len()))
+        } else {
+            s.front = s.back + 1;
+            None
         }
     }
 }

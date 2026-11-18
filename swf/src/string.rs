@@ -53,13 +53,7 @@ impl SwfStr {
     /// ```
     #[inline]
     pub fn from_bytes_null_terminated(string: &[u8]) -> Option<&Self> {
-        // If investigations show that the bounds check is not elided,
-        // it should be safe to use `get_unchecked` here instead.
-        // Initial Godbolt research shows it doesn't make a difference.
-        string
-            .iter()
-            .position(|&c| c == 0)
-            .map(|i| Self::from_bytes(&string[..i]))
+        memchr::memchr(0, string).map(|i| Self::from_bytes(&string[..i]))
     }
 
     /// Creates a new UTF-8 `SwfStr` from a Rust [`str`].

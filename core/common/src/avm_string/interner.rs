@@ -103,8 +103,6 @@ impl<'gc> AvmStringInterner<'gc> {
         start_index: usize,
         end_index: usize,
     ) -> AvmString<'gc> {
-        // TODO: return original string if full range
-
         // It's assumed that start<=end. This is tested later via a range check.
         if start_index == end_index {
             self.common.str_.into() // this is the empty string
@@ -113,6 +111,8 @@ impl<'gc> AvmStringInterner<'gc> {
             && let Some(s) = self.common.ascii_chars.get(c as usize)
         {
             (*s).into()
+        } else if start_index == 0 && end_index == s.len() {
+            s
         } else {
             AvmString::substring(mc, s, start_index, end_index)
         }
@@ -251,6 +251,38 @@ unsafe impl<'gc, T> Collect<'gc> for WeakSet<'gc, T> {
                 cc.trace(weak);
             }
             keep
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AvmString, AvmStringInterner};
+
+    #[test]
+    fn full_range_reuses_input_and_short_ascii_is_interned() {
+        gc_arena::arena::rootless_mutate(|mc| {
+            let interner = AvmStringInterner::new(mc);
+            for text in ["runtime text", "中文"] {
+                let input = AvmString::new_utf8(mc, text);
+                assert_eq!(
+                    input.ptr_id(),
+                    interner.substring(mc, input, 0, input.len()).ptr_id()
+                );
+                assert_ne!(
+                    input.ptr_id(),
+                    interner.substring(mc, input, 1, input.len()).ptr_id()
+                );
+            }
+            for text in ["", "a"] {
+                let input = AvmString::new_utf8(mc, text);
+                assert!(
+                    interner
+                        .substring(mc, input, 0, input.len())
+                        .as_interned()
+                        .is_some()
+                );
+            }
         });
     }
 }

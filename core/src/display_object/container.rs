@@ -17,13 +17,24 @@ use crate::tag_utils::SwfMovieData;
 use gc_arena::{Collect, Mutation};
 use ruffle_macros::{enum_trait_object, istr};
 use ruffle_render::commands::CommandHandler;
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::cell::{Ref, RefMut};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::Bound;
 use std::rc::Rc;
+
+// A child can temporarily occur in a list other than its current parent's
+// during reentrant timeline operations. A rename invalidates every cached hit
+// on this player thread without borrowing any container during the mutation.
+thread_local! {
+    static CHILD_NAME_GENERATION: Cell<u64> = const { Cell::new(0) };
+}
+
+pub(super) fn invalidate_child_names() {
+    CHILD_NAME_GENERATION.set(CHILD_NAME_GENERATION.get().wrapping_add(1));
+}
 
 /// Dispatch the `removedFromStage` event on a child and all of it's
 /// grandchildren, recursively.
@@ -671,6 +682,9 @@ pub struct ChildContainer<'gc> {
     #[collect(require_static)]
     lifecycle_indices: OnceCell<Option<Rc<Vec<usize>>>>,
 
+    #[collect(require_static)]
+    last_name_hit: Cell<Option<(u64, usize, bool)>>,
+
     /// The mapping from timeline Depths to child display objects.
     ///
     /// This list is the list used to map depths to actual display objects.
@@ -706,6 +720,7 @@ impl<'gc> ChildContainer<'gc> {
         Self {
             render_list: Rc::new(Vec::new()),
             lifecycle_indices: OnceCell::new(),
+            last_name_hit: Cell::new(None),
             depth_list: BTreeMap::new(),
             has_pending_removals: false,
             mouse_children: true,
@@ -909,43 +924,36 @@ impl<'gc> ChildContainer<'gc> {
     /// If multiple children with the same name exist, the one that occurs
     /// first in the render list wins.
     fn get_name(&self, name: &WStr, case_sensitive: bool) -> Option<DisplayObject<'gc>> {
+        let matches = |child: &DisplayObject<'gc>| {
+            child.name().is_some_and(|n| {
+                if case_sensitive {
+                    n == name
+                } else {
+                    n.eq_ignore_case(name)
+                }
+            })
+        };
         if self.has_pending_removals {
-            // Find matching children by searching the depth list
-            let mut matching_render_children = if case_sensitive {
-                self.depth_list
-                    .iter()
-                    .filter(|(_, child)| child.name().is_some_and(|n| n == name))
-                    .collect::<Vec<_>>()
-            } else {
-                self.depth_list
-                    .iter()
-                    .filter(|(_, child)| child.name().is_some_and(|n| n.eq_ignore_case(name)))
-                    .collect::<Vec<_>>()
-            };
-
-            // Sort so we can get the lowest depth child
-            matching_render_children.sort_by_key(|&(depth, _child)| *depth);
-
-            // First child will have the lowest depth
-            matching_render_children
-                .first()
-                .map(|&(_depth, child)| child)
-                .copied()
-        } else {
-            // TODO: Make a HashMap from name -> child?
-            // But need to handle conflicting names (lowest in depth order takes priority).
-            if case_sensitive {
-                self.render_list
-                    .iter()
-                    .copied()
-                    .find(|child| child.name().is_some_and(|n| n == name))
-            } else {
-                self.render_list
-                    .iter()
-                    .copied()
-                    .find(|child| child.name().is_some_and(|n| n.eq_ignore_case(name)))
-            }
+            // BTreeMap values already iterate in ascending depth order.
+            return self
+                .depth_list
+                .values()
+                .find(|child| matches(child))
+                .copied();
         }
+
+        let generation = CHILD_NAME_GENERATION.get();
+        if let Some((cached_generation, index, mode)) = self.last_name_hit.get()
+            && cached_generation == generation
+            && mode == case_sensitive
+            && matches(&self.render_list[index])
+        {
+            return Some(self.render_list[index]);
+        }
+        let index = self.render_list.iter().position(matches)?;
+        self.last_name_hit
+            .set(Some((generation, index, case_sensitive)));
+        Some(self.render_list[index])
     }
 
     /// Get a child by it's render list position (ID).
@@ -1180,6 +1188,7 @@ impl<'gc> ChildContainer<'gc> {
 
     fn render_list_mut(&mut self) -> &mut Vec<DisplayObject<'gc>> {
         self.lifecycle_indices.take();
+        self.last_name_hit.set(None);
         Rc::make_mut(&mut self.render_list)
     }
 }

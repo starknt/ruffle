@@ -11,6 +11,7 @@ use std::time::Duration;
 #[serde(default, deny_unknown_fields)]
 pub struct PlayerOptions {
     max_execution_duration: Option<Duration>,
+    avm2_optimizer_enabled: Option<bool>,
     viewport_dimensions: Option<ViewportDimensions>,
     with_renderer: Option<RenderOptions>,
     with_audio: bool,
@@ -24,6 +25,9 @@ pub struct PlayerOptions {
 
 impl PlayerOptions {
     pub fn setup(&self, mut player_builder: PlayerBuilder) -> anyhow::Result<PlayerBuilder> {
+        if let Some(enabled) = self.avm2_optimizer_enabled {
+            player_builder = player_builder.with_avm2_optimizer_enabled(enabled);
+        }
         if let Some(max_execution_duration) = self.max_execution_duration {
             player_builder = player_builder.with_max_execution_duration(max_execution_duration);
         }

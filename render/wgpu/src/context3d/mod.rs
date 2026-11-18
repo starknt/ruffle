@@ -1028,6 +1028,7 @@ impl Context3D for WgpuContext3D {
             }
             Context3DCommand::CopyBitmapToTexture {
                 source,
+                source_is_bgra,
                 source_width,
                 source_height,
                 dest,
@@ -1053,6 +1054,7 @@ impl Context3D for WgpuContext3D {
                         aspect: wgpu::TextureAspect::All,
                     },
                     source,
+                    source_is_bgra,
                     wgpu::Extent3d {
                         width: source_width,
                         height: source_height,

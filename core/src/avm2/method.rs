@@ -106,7 +106,7 @@ struct MethodData<'gc> {
 
     /// The underlying ABC file of the above translation unit.
     #[collect(require_static)]
-    abc: Rc<AbcFile>,
+    abc: Rc<AbcFile<std::ops::Range<usize>>>,
 
     /// The ABC method this function uses.
     abc_method: u32,
@@ -325,7 +325,7 @@ impl<'gc> Method<'gc> {
     }
 
     /// Get the underlying ABC file.
-    pub fn abc(self) -> Rc<AbcFile> {
+    pub fn abc(self) -> Rc<AbcFile<std::ops::Range<usize>>> {
         self.0.txunit.abc()
     }
 
@@ -351,7 +351,7 @@ impl<'gc> Method<'gc> {
     /// Get a reference to the ABC method body entry this refers to.
     ///
     /// Some methods do not have bodies; this returns `None` in that case.
-    pub fn body(&self) -> Option<&AbcMethodBody> {
+    pub fn body(&self) -> Option<&AbcMethodBody<std::ops::Range<usize>>> {
         if let Some(abc_method_body) = self.0.abc_method_body {
             self.0.abc.method_bodies.get(abc_method_body as usize)
         } else {
@@ -437,7 +437,7 @@ impl<'gc> Method<'gc> {
                 .constant_pool
                 .strings
                 .get(name_index - 1)
-                .map(|s| String::from_utf8_lossy(s))
+                .map(|range| String::from_utf8_lossy(self.translation_unit().payload(range)))
                 .unwrap_or(Cow::Borrowed("")),
         )
     }

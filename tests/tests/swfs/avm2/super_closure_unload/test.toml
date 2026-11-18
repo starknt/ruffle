@@ -1,0 +1,20 @@
+num_frames = 8
+
+[[compilers]]
+type = "Asc"
+class = "Test"
+scripts = ["Test.as"]
+swf_version = 11
+
+[[compilers]]
+type = "Asc"
+target = "child.swf"
+class = "Child"
+scripts = ["ParentCounter.as", "Child.as"]
+swf_version = 11
+
+[subtests.optimized.player_options]
+avm2_optimizer_enabled = true
+
+[subtests.interpreted.player_options]
+avm2_optimizer_enabled = false

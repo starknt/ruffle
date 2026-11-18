@@ -56,6 +56,9 @@ pub trait BitmapSource {
 
 pub type RgbaBufRead<'a> = Box<dyn FnOnce(&[u8], u32) + 'a>;
 
+/// Native premultiplied RGBA or BGRA pixels and their padded row stride.
+pub type BitmapBufRead<'a> = Box<dyn FnOnce(&[u8], u32, BitmapFormat) + 'a>;
+
 pub trait SyncHandle: Any + Debug {}
 
 /// How bitmaps should snap to the pixel grid when rendering
@@ -214,7 +217,9 @@ impl<'a> Bitmap<'a> {
         // Converts this bitmap to RGB, if it is not already.
         match self.format {
             BitmapFormat::Rgb => {} // no-op
-            BitmapFormat::Rgba => unreachable!("Can't convert RGBA Bitmap to RGB"),
+            BitmapFormat::Rgba | BitmapFormat::Bgra => {
+                unreachable!("Can't convert RGBA Bitmap to RGB")
+            }
             BitmapFormat::Yuv420p => {
                 let luma_len = (self.width * self.height) as usize;
                 let chroma_len = (self.chroma_width() * self.chroma_height()) as usize;
@@ -251,6 +256,7 @@ impl<'a> Bitmap<'a> {
                     .collect();
             }
             BitmapFormat::Rgba => {} // no-op
+            BitmapFormat::Bgra => self.swap_red_blue(),
             BitmapFormat::Yuv420p => {
                 let luma_len = (self.width * self.height) as usize;
                 let chroma_len = (self.chroma_width() * self.chroma_height()) as usize;
@@ -286,6 +292,22 @@ impl<'a> Bitmap<'a> {
         self.format = BitmapFormat::Rgba;
 
         self
+    }
+
+    pub fn to_bgra(self) -> Self {
+        if self.format == BitmapFormat::Bgra {
+            return self;
+        }
+        let mut bitmap = self.to_rgba();
+        bitmap.swap_red_blue();
+        bitmap.format = BitmapFormat::Bgra;
+        bitmap
+    }
+
+    fn swap_red_blue(&mut self) {
+        for pixel in self.data.to_mut().chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
     }
 
     #[inline]
@@ -400,12 +422,15 @@ impl<'a> Bitmap<'a> {
     pub fn as_colors(&self) -> impl Iterator<Item = u32> + '_ {
         let chunks = match self.format {
             BitmapFormat::Rgb => self.data.chunks_exact(3),
-            BitmapFormat::Rgba => self.data.chunks_exact(4),
+            BitmapFormat::Rgba | BitmapFormat::Bgra => self.data.chunks_exact(4),
             _ => unimplemented!(
                 "Can't iterate over non-RGB(A) bitmaps as colors, convert with `to_rgba` first"
             ),
         };
         chunks.map(|chunk| {
+            if self.format == BitmapFormat::Bgra {
+                return u32::from_le_bytes(chunk.try_into().unwrap());
+            }
             let red = chunk[0];
             let green = chunk[1];
             let blue = chunk[2];
@@ -424,6 +449,9 @@ pub enum BitmapFormat {
     /// 32-bit RGBA with premultiplied alpha.
     Rgba,
 
+    /// 32-bit BGRA with premultiplied alpha.
+    Bgra,
+
     /// planar YUV 420
     Yuv420p,
 
@@ -436,7 +464,7 @@ impl BitmapFormat {
     pub fn length_for_size(self, width: usize, height: usize) -> usize {
         match self {
             BitmapFormat::Rgb => width * height * 3,
-            BitmapFormat::Rgba => width * height * 4,
+            BitmapFormat::Rgba | BitmapFormat::Bgra => width * height * 4,
             BitmapFormat::Yuv420p => width * height + width.div_ceil(2) * height.div_ceil(2) * 2,
             BitmapFormat::Yuva420p => {
                 width * height * 2 + width.div_ceil(2) * height.div_ceil(2) * 2
@@ -447,7 +475,7 @@ impl BitmapFormat {
     pub fn supports_transparency(self) -> bool {
         match self {
             BitmapFormat::Rgb => false,
-            BitmapFormat::Rgba => true,
+            BitmapFormat::Rgba | BitmapFormat::Bgra => true,
             BitmapFormat::Yuv420p => false,
             BitmapFormat::Yuva420p => true,
         }
@@ -458,7 +486,7 @@ impl BitmapFormat {
             #[allow(clippy::unwrap_used)]
             BitmapFormat::Rgb => Some(NonZero::new(3).unwrap()),
             #[allow(clippy::unwrap_used)]
-            BitmapFormat::Rgba => Some(NonZero::new(4).unwrap()),
+            BitmapFormat::Rgba | BitmapFormat::Bgra => Some(NonZero::new(4).unwrap()),
             BitmapFormat::Yuv420p => None,
             BitmapFormat::Yuva420p => None,
         }

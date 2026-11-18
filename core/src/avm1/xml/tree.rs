@@ -419,9 +419,11 @@ impl<'gc> XmlNode<'gc> {
     /// If the `deep` flag is set true, then the entire node tree will be cloned.
     pub fn duplicate(self, gc_context: &Mutation<'gc>, deep: bool) -> Self {
         let attributes = Object::new_without_proto(gc_context);
-        for (key, value) in self.attributes().own_properties() {
-            attributes.define_value(gc_context, key, value, Attribute::empty());
-        }
+        self.attributes().with_own_properties(|properties| {
+            for (key, value) in properties {
+                attributes.define_value(gc_context, key, value, Attribute::empty());
+            }
+        });
 
         let clone = Self(Gc::new(
             gc_context,
@@ -455,14 +457,17 @@ impl<'gc> XmlNode<'gc> {
         for node in self.ancestors() {
             // Iterate attributes by their definition order, so the first matching one
             // is returned.
-            for (key, value) in node.attributes().own_properties() {
-                if let Some(namespace) = key.strip_prefix(WStr::from_units(b"xmlns")) {
-                    // The empty prefix matches every attribute that starts with "xmlns"
-                    // (with/without a colon).
-                    if prefix.is_empty() || namespace.strip_prefix(b':') == Some(prefix) {
+            if let Some(value) = node.attributes().with_own_properties(|properties| {
+                for (key, value) in properties {
+                    if let Some(ns) = key.strip_prefix(WStr::from_units(b"xmlns"))
+                        && (prefix.is_empty() || ns.strip_prefix(b':') == Some(prefix))
+                    {
                         return Some(value);
                     }
                 }
+                None
+            }) {
+                return Some(value);
             }
         }
 

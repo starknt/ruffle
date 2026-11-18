@@ -46,9 +46,16 @@ fn bitmap_uploads_exceeding_staging_budget_are_sliced_and_preserve_rows() {
             .unwrap(),
     });
     let source: Vec<u8> = (0..130 * 33 * 4).map(|i| (i % 251) as u8).collect();
+    let bgra: Vec<u8> = source
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&[r, g, b, a]| [b, g, r, a])
+        .collect();
     context
         .process_command(Context3DCommand::CopyBitmapToTexture {
-            source: &source,
+            source: &bgra,
+            source_is_bgra: true,
             source_width: 130,
             source_height: 33,
             dest: destination.clone(),

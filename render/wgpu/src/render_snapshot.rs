@@ -219,7 +219,11 @@ impl Capture {
                 })
                 .unwrap_or(ResourceRecipe::Resident(resource)),
             Handle::Shape(handle) => {
-                if let Some(shape) = (&*handle.0 as &dyn Any).downcast_ref::<ShapeRecipe>() {
+                // Published solid meshes need only their resource identity.
+                // Textured meshes still carry the current bitmap versions.
+                if let Some(shape) = (&*handle.0 as &dyn Any).downcast_ref::<ShapeRecipe>()
+                    && (shape.mesh.get().is_none() || !shape.bitmaps.0.is_empty())
+                {
                     let mut bitmaps = Vec::new();
                     let mut sources: Vec<_> = shape.bitmaps.0.iter().collect();
                     sources.sort_by_key(|(id, _)| **id);

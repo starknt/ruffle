@@ -30,6 +30,10 @@ renderTree` for snapshot work, `--phase avm2` for PIC work, and `--control` for
 workloads which should not speed up but must not regress. Existing image and
 AVM regression fixtures provide independent semantic references.
 
+For Linux Vulkan and GL runs, the evaluator gives each process an empty NVIDIA
+and Mesa shader disk cache. This includes cold shader compilation in both peak
+RSS measurements. The cache policy is recorded in `builds.json`.
+
 The load/unload case performs one cycle every 12 frames, so the default 1200
 measured frames include 100 cycles. Its tiny `child.swf` is the repository's
 existing `visual/blend_modes/multiply/test.swf`, not an external download.
@@ -42,8 +46,10 @@ target/dist/native-perf --manifest tests/perf/soak.toml --case cache_soak \
   --warmup 120 --frames 108000 --pace-fps 60 --output /absolute/soak.jsonl
 ```
 
-This AVM2 child exercises retained trees, sealed property calls, blend targets
-and alpha masks, and reloads every 120 frames (900 measured cycles). Pacing
+The loader's child supplies a static subtree, sealed property calls, blend
+targets and an alpha mask. On each load the parent displays the static subtree
+beside the Loader so it can enter the retained-command cache, and detaches it
+before reloading every 120 frames (900 measured cycles). Pacing
 is outside the per-frame CPU timer. The evaluator rejects paced traces for
 throughput comparisons. Validate that snapshot/PIC/mask/blend counters are
 nonzero, GPU samples have full coverage, and RSS reaches a stable plateau.

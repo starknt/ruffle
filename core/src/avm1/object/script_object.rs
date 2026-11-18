@@ -202,20 +202,22 @@ impl<'gc> Object<'gc> {
         Ok(())
     }
 
-    // TODO: Make an iterator?
+    /// Visit properties while borrowed. Visitors that can run ActionScript
+    /// must take a snapshot with `own_properties` first.
+    pub fn with_own_properties<R>(
+        self,
+        visit: impl FnOnce(&mut dyn Iterator<Item = (AvmString<'gc>, Value<'gc>)>) -> R,
+    ) -> R {
+        let object = self.0.borrow();
+        visit(
+            &mut object.properties.iter().filter_map(|(key, property)| {
+                property.is_enumerable().then(|| (key, property.data()))
+            }),
+        )
+    }
+
     pub fn own_properties(self) -> Vec<(AvmString<'gc>, Value<'gc>)> {
-        self.0
-            .borrow()
-            .properties
-            .iter()
-            .filter_map(|(k, p)| {
-                if p.is_enumerable() {
-                    Some((k, p.data()))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.with_own_properties(|properties| properties.collect())
     }
 
     /// Retrieve a named, non-virtual property from this object exclusively, taking

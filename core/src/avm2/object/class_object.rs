@@ -438,11 +438,11 @@ impl<'gc> ClassObject<'gc> {
     pub fn call_super(
         self,
         multiname: &Multiname<'gc>,
+        property: Option<Property>,
         receiver: Object<'gc>,
         arguments: FunctionArgs<'_, 'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        let property = self.instance_vtable().get_trait(multiname);
         match property {
             Some(Property::Slot { slot_id } | Property::ConstSlot { slot_id }) => {
                 let func = receiver.get_slot(slot_id);
@@ -500,11 +500,10 @@ impl<'gc> ClassObject<'gc> {
     pub fn get_super(
         self,
         multiname: &Multiname<'gc>,
+        property: Option<Property>,
         receiver: Object<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        let property = self.instance_vtable().get_trait(multiname);
-
         match property {
             Some(Property::Slot { slot_id } | Property::ConstSlot { slot_id }) => {
                 Ok(receiver.get_slot(slot_id))
@@ -566,11 +565,11 @@ impl<'gc> ClassObject<'gc> {
     pub fn set_super(
         self,
         multiname: &Multiname<'gc>,
+        property: Option<Property>,
         value: Value<'gc>,
         receiver: Object<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<(), Error<'gc>> {
-        let property = self.instance_vtable().get_trait(multiname);
         match property {
             Some(Property::Slot { slot_id }) => {
                 // Comment placed for formatting reasons

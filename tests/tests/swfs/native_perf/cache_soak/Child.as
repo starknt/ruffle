@@ -7,6 +7,7 @@ package {
         private var checksum:int;
         public function Child() {
             var group:Sprite = new Sprite();
+            group.name = "snapshotGroup";
             addChild(group);
             for (var i:int = 0; i < 80; i++) {
                 var s:Sprite = box(i);

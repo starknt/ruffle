@@ -96,12 +96,12 @@ impl<'gc> ScopeChain<'gc> {
             // If we are not actually adding any new scopes, we don't need to do anything.
             return *self;
         }
-        // TODO: This current implementation is a bit expensive, but it is exactly what avmplus does, so it's good enough for now.
         match self.scopes {
             Some(scopes) => {
                 // The new ScopeChain is created by cloning the scopes of this ScopeChain,
                 // and pushing the new scopes on top of that.
-                let mut cloned = (*scopes).clone();
+                let mut cloned = Vec::with_capacity(scopes.len() + new_scopes.len());
+                cloned.extend_from_slice(&scopes);
                 cloned.extend_from_slice(new_scopes);
                 Self {
                     scopes: Some(Gc::new(mc, cloned)),

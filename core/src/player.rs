@@ -1774,9 +1774,7 @@ impl Player {
                 new_position
             };
 
-            // TODO: Introduce `DisplayObject::set_position()`?
-            display_object.set_x(new_position.x);
-            display_object.set_y(new_position.y);
+            display_object.set_position(new_position.x, new_position.y);
 
             // Update `_droptarget` property of dragged object.
             if let Some(movie_clip) = display_object.as_movie_clip() {

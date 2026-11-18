@@ -323,7 +323,7 @@ pub fn create_timer<'gc>(
         Some(Value::Object(o)) if o.as_function().is_some() => (
             TimerCallback::Avm1Function {
                 func: *o,
-                params: args.get(2..).unwrap_or_default().to_vec(),
+                params: args.get(2..).unwrap_or_default().into(),
             },
             args.get(1),
         ),
@@ -334,7 +334,7 @@ pub fn create_timer<'gc>(
                     .get(1)
                     .unwrap_or(&Value::Undefined)
                     .coerce_to_string(activation)?,
-                params: args.get(3..).map(|s| s.to_vec()).unwrap_or_default(),
+                params: args.get(3..).unwrap_or_default().into(),
             },
             args.get(2),
         ),

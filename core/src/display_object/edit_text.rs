@@ -1118,9 +1118,15 @@ impl<'gc> EditText<'gc> {
         render_state: &mut EditTextRenderState,
     ) {
         self.render_selection_background(context);
-        self.render_lines(context, |context, line| {
+        let skip = self.scroll().saturating_sub(1);
+        let scroll_y = self.0.vertical_scroll_offset();
+        let height = self.0.bounds.get().height();
+        for line in self.0.layout.borrow().lines().iter().skip(skip) {
+            if line.min_remaining_box_y + Self::GUTTER - scroll_y > height {
+                break;
+            }
             self.render_layout_line(context, line, render_state);
-        });
+        }
     }
 
     /// Render the black selection background.
@@ -2632,6 +2638,13 @@ impl<'gc> TDisplayObject<'gc> for EditText<'gc> {
         self.apply_autosize_bounds();
         let offset = self.bounds_y_offset();
         self.base().set_y(y - offset);
+        self.invalidate_cached_bitmap();
+    }
+
+    fn set_position(self, x: Twips, y: Twips) {
+        self.apply_autosize_bounds();
+        self.base()
+            .set_position(x - self.bounds_x_offset(), y - self.bounds_y_offset());
         self.invalidate_cached_bitmap();
     }
 
