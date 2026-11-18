@@ -2760,7 +2760,33 @@ impl Player {
         #[cfg(feature = "tracy_avm")]
         let _gc_span = tracy_client::Client::running()
             .map(|client| client.span(tracy_client::span_location!("Aola GC collect_debt"), 0));
-        self.gc_arena.borrow_mut().collect_debt();
+        let mut arena = self.gc_arena.borrow_mut();
+        let phase_name = |phase| match phase {
+            gc_arena::arena::CollectionPhase::Sleeping => "sleeping",
+            gc_arena::arena::CollectionPhase::Marking => "marking",
+            gc_arena::arena::CollectionPhase::Marked => "marked",
+            gc_arena::arena::CollectionPhase::Sweeping => "sweeping",
+        };
+        let before = ruffle_render::profile::enabled().then(|| {
+            (
+                Instant::now(),
+                phase_name(arena.collection_phase()),
+                arena.metrics().total_gc_count(),
+                arena.metrics().allocation_debt(),
+            )
+        });
+        arena.collect_debt();
+        if let Some((started, phase_before, objects_before, debt_before)) = before {
+            ruffle_render::profile::record_gc(ruffle_render::profile::GcSample {
+                nanos: started.elapsed().as_nanos() as u64,
+                phase_before,
+                phase_after: phase_name(arena.collection_phase()),
+                objects_before,
+                objects_after: arena.metrics().total_gc_count(),
+                debt_before,
+                debt_after: arena.metrics().allocation_debt(),
+            });
+        }
 
         rval
     }

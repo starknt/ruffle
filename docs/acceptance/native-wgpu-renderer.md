@@ -156,3 +156,53 @@ Chronological ledger entries follow; later entries supersede earlier implementat
 - Ruling: Apply the identical gpu_metrics.rs, GpuSample phase storage/recording and native-perf GPU phase serialization to the archived baseline before the final comparison — the contract requires common measurement instrumentation — this is an additive harness-only baseline correction, not an optimization or tolerance change. Keep original frozen baseline and all old evidence, save baseline-common-gpu-phases.patch, and rerun fresh-process pairs with both executable paths cold. No renderer algorithms or workload changed in the baseline.
 - Ruling: Cache at most64 fixed-binding bitmap groups under the shared cache byte governor and source-lifetime invalidation — global strong material entries keep evicted images resident; per-source weak registrations immediately drop cached bindings when any source expires, while recorded command clones remain valid — adds bounded key/token metadata, no cross-frame image ownership.
 - Ruling: Reuse exact single-solid-mesh raster inputs within one bounded sibling set (at most64 keys); key includes immutable vertex/index identities and ranges, complete target-local transform, clear value and target size — repeated equivalent blend inputs need only one rasterization, with every ordered composite preserved — excludes shaders/perspective/non-solid/multiple draws, never persists across frames, and shared pool ownership prevents reuse before the last command.
+
+
+## Manual-session fixes and investigation (2026-11-18)
+
+Evidence is under `.ryugi/sdd/2026-11-17-native-wgpu-renderer-design/manual-fixes-20261118/`.
+This follow-up repairs the scalar readback amplification and Linux/Android RSS reader. It does not close the original Task16 performance, image or platform gaps, and does not establish the same official-game interaction sequence after the fix.
+
+### Scalar readback
+
+`getPixel` and `getPixel32` retain exact synchronization for the first isolated dirty pixel. A second dirty read in the same 32x32 tile enables bounded prefetch, clipped to the bitmap. Only GPU-authoritative coverage is copied, preserving CPU-written holes; a GPU write resets the locality hint. Each tile contains at most 4 KiB of logical pixel data. Other area reads, aliased hit tests and copy operations retain their exact coverage behavior. Calls that need GPU data are still synchronous; this amortizes their queue/map waits.
+
+The patterned 130x126 core regression failed with 16380 synchronizations before the change and passes after it, checking every pixel, the synchronization bound, and the exact 65520-byte payload. The second regression checks isolated reads, the 4 KiB bound, CPU overwrites, distant untouched pixels and subsequent GPU writes. An early broader implementation broke two existing aliasing/hit-test tests; restricting prefetch to scalar getters fixed them without changing their assertions.
+
+The real SWF scanner verifies all 16380 pixels against four changing quadrant colors. Its constructor consumes the first regression frame, so the fixture runs four frames to preserve all three expected scan results. Twelve selected bitmap/readback/copy/mask regression cases pass on each actual NVIDIA and Radeon Vulkan adapter, with unchanged existing image tolerances.
+
+The actual Slint host completed 361 submitted frames / 360 scans. Every scan used **22 readbacks and 65520 bytes**, with no failed pixel oracle in the regression runner. Completed-frame diagnostic comparisons use identical settings and input digest `888755a29b9cb51d99423d6a06816458edf5da9f584e47370806264066d3e813`, two warmup and eight measured frames per process:
+
+| Actual Vulkan adapter | Retained pairs | Baseline mean ms/frame | Candidate mean ms/frame |
+| --- | ---: | ---: | ---: |
+| NVIDIA RTX 5060 Laptop | 4 | 820.628552 | 4.221764 |
+| Radeon 780M / RADV | 2 | 1106.009009 | 6.204547 |
+
+These are short targeted diagnostics, not the formal performance matrix or official-game FPS. All measured GPU samples match their frame IDs and none were dropped. Logical pixel copy volume is unchanged. The cached readback-buffer storage after drain increases from 1024 to 16896 bytes in this fixture; all readback buffers are reclaimed after unload/purge.
+
+Measurement corrections are retained: the initial candidate builds enabled the tests package's default `avm_debug` feature and are excluded from equal-setting comparisons. The final candidate uses `--no-default-features`. `WGPU_ADAPTER_NAME` did not select the requested adapter in this harness; four runs labelled Radeon actually used NVIDIA and remain included as NVIDIA data. The real Radeon AB/BA runs use `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.json`, with device identity asserted from the session record.
+
+Frozen baseline SHA256: `30aff5b47527db290f0f6135eb0f19bb2e113999240e7a840d8a9678bb814df3`.
+Frozen candidate SHA256: `7a301fc5105593b3af9a93616ea73ba0da3f19c0eff49ac38d9fe047fe9c8073`.
+
+### RSS and slow-GC telemetry
+
+Linux/Android now reads approximate `/proc/self/status` `VmRSS` rather than scanning `smaps`. It validates the field, units, duplicates and overflow; missing/unreadable values stay missing, with no expensive fallback. The shared background sampler, 500 ms cadence and nonblocking shutdown remain. Session metadata records `rssSource=procStatusVmRss`; other platforms retain `memory-stats`.
+
+Two isolated local Slint-host runs produced 24 RSS samples: sampling medians 61/68 microseconds, maximum 103 microseconds. Sample peaks were 387084288 and 634331136 bytes, both within independently polled kernel VmHWM. These are small controlled runs, not an equivalent-load comparison with the earlier 507-second official session; VmRSS remains approximate. The desktop binary SHA256 is `eb5493a973b17029948a8443919f1e53f0d8c27fe3f1d9abf49519cc5455e5a4`, including the preserved independent parent profiling diff.
+
+GC pauses of at least 8 ms now produce bounded numeric-only samples containing before/after phase, object count and allocation debt. At most 32 samples await draining; overflow is counted. Profiling-disabled execution does not collect these samples. The host emits frame-associated `gc` events and drains again before its end record. No collector scheduling or pacing was changed.
+
+An isolated allocation/release SWF completed 181 stage submissions, producing ten slow-GC samples without drops. The longest collection took **200.814034 ms**, transitioned marking to sweeping, reduced allocated GC objects from 1125500 to 698551, and paid debt from 399993 to zero. The first diagnostic version stopped mutating visible content and could not satisfy the host's submitted-frame exit condition; its timed-out, truncated trace is retained separately. The final fixture keeps a small shape animated and exits normally.
+
+`gc-arena 0.7.0::Arena::collect_debt()` continues until allocation debt is paid, without a time deadline; one VM update can therefore impose a long collection. Large `ByteArrayStorage::from_vec` inputs also add debt. The diagnostic confirms the mechanism, not the cause of the earlier game's individual pauses. GC object counts include allocations not yet freed, not only reachable objects; debt-driven partial collection can retain garbage after allocation stops. A time-budgeted collector would require a separate correctness/memory tradeoff, not simply clearing debt.
+
+### Resource holding and validation
+
+Source inspection confirms weak movie/library indexes, weak network transfer groups with removal on completion/drop, and a 32 MiB shared network-body allowance. Application-domain definitions/classes intentionally retain scripts, translation units and defining movies; `ClassData::symbol` also retains its defining movie. These are candidate holding paths for the official game's live movies, not evidence of an erroneous root. Existing real-Arena tests prove both unreachable movie reclamation and intentional class retention.
+
+A fresh paced NVIDIA load/unload diagnostic ran **1800 measured frames / 29.999722 seconds**, with 1800 matching GPU samples and ten explicit GC/drain/purge checkpoints. Every checkpoint has exactly 305 resources / 3754092 active bytes, with reserved/idle/retiring zero. After dropping the player and purging, unloaded-owner resources are zero and the remaining 295 resource identities exactly match warmed descriptors. This is a short follow-up with explicit reclamation, not a new 30-minute soak or proof of natural official-game unload.
+
+Validation: core 250 passed / 9 existing ignored, render 65 passed, host 30 passed / 1 existing ignored; the stricter 4 KiB scalar-read regressions pass separately. The desktop release builds successfully. Twelve selected native bitmap regressions pass per GPU. Existing warnings remain; strict Clippy and other platforms were not rerun. The unrelated 21-line parent `render_profile.rs` diff remains untouched and excluded from commits.
+
+Remaining: the official game's repeated-scene ownership baseline and post-fix frame/RSS trace; its long GC and socket-handler pauses; the original Task16 acceptance gaps. No new engine leak or safe GC scheduling repair is claimed by this follow-up.

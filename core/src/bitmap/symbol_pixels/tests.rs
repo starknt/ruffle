@@ -425,6 +425,114 @@ fn failed_bitmap_upload_preserves_dirty_cpu_pixels() {
 }
 
 #[test]
+fn sequential_pixel_reads_amortize_native_synchronization_without_changing_pixels() {
+    use crate::bitmap::{bitmap_data::BitmapData, operations::get_pixel32};
+    gc_arena::arena::rootless_mutate(|mc| {
+        // The manual game trace scanned 16,380 pixels using 16,380 synchronous reads.
+        let bitmap = BitmapData::new(mc, 130, 126, true, 0xff000000);
+        let mut renderer = renderer(false);
+        renderer.regional = true;
+        let handle = bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+        {
+            let mut pixels = test_handle(&handle).pixels.borrow_mut();
+            for y in 0..126usize {
+                for x in 0..130usize {
+                    let offset = (y * 130 + x) * 4;
+                    pixels[offset..offset + 4].copy_from_slice(&[
+                        x as u8,
+                        y as u8,
+                        (x ^ y) as u8,
+                        255,
+                    ]);
+                }
+            }
+        }
+        let full = PixelRegion::for_whole_size(130, 126);
+        bitmap.mark_gpu_dirty(mc, Box::new(snapshot(&handle, full)), full);
+        for y in 0..126 {
+            for x in 0..130 {
+                assert_eq!(
+                    get_pixel32(bitmap, &mut renderer, x, y).unwrap(),
+                    0xff000000 | (x << 16) | (y << 8) | (x ^ y),
+                    "pixel ({x}, {y})"
+                );
+            }
+        }
+        assert!(
+            renderer.reads.len() <= 32,
+            "a coherent pixel scan issued {} GPU synchronizations",
+            renderer.reads.len()
+        );
+        let bytes: u64 = renderer
+            .reads
+            .iter()
+            .map(|r| u64::from(r.width()) * u64::from(r.height()) * 4)
+            .sum();
+        assert_eq!(
+            bytes, 65_520,
+            "each authoritative pixel should be copied once"
+        );
+        assert!(bitmap.can_read(full));
+    });
+}
+
+#[test]
+fn nearby_pixel_reads_keep_prefetch_bounded_and_preserve_cpu_writes() {
+    use crate::bitmap::{
+        bitmap_data::BitmapData,
+        operations::{get_pixel32, set_pixel32},
+    };
+    gc_arena::arena::rootless_mutate(|mc| {
+        let bitmap = BitmapData::new(mc, 256, 128, true, 0xff000000);
+        let mut renderer = renderer(false);
+        renderer.regional = true;
+        let handle = bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+        let full = PixelRegion::for_whole_size(256, 128);
+        bitmap.mark_gpu_dirty(mc, gpu_fill(&handle, full, [10, 20, 30, 255]), full);
+        set_pixel32(mc, &mut renderer, bitmap, 6, 3, 0xffabcdef).unwrap();
+        assert_eq!(
+            get_pixel32(bitmap, &mut renderer, 2, 1).unwrap(),
+            0xff0a141e
+        );
+        assert_eq!(
+            renderer.reads,
+            [PixelRegion::for_pixel(2, 1)],
+            "one isolated read stays exact"
+        );
+        assert_eq!(
+            get_pixel32(bitmap, &mut renderer, 3, 1).unwrap(),
+            0xff0a141e
+        );
+        assert!(
+            bitmap.can_read(PixelRegion::for_pixel(4, 1)),
+            "nearby reads should warm adjacent pixels"
+        );
+        assert_eq!(
+            get_pixel32(bitmap, &mut renderer, 6, 3).unwrap(),
+            0xffabcdef
+        );
+        assert!(
+            !bitmap.can_read(PixelRegion::for_pixel(255, 127)),
+            "do not download the entire bitmap"
+        );
+        let bytes: u64 = renderer
+            .reads
+            .iter()
+            .map(|r| u64::from(r.width()) * u64::from(r.height()) * 4)
+            .sum();
+        assert!(bytes <= 4_096, "bounded locality hint read {bytes} bytes");
+        bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+        assert_eq!(renderer.uploads, [PixelRegion::for_pixel(6, 3)]);
+        let changed = PixelRegion::for_pixel(4, 1);
+        bitmap.mark_gpu_dirty(mc, gpu_fill(&handle, changed, [70, 80, 90, 255]), changed);
+        assert_eq!(
+            get_pixel32(bitmap, &mut renderer, 4, 1).unwrap(),
+            0xff46505a
+        );
+    });
+}
+
+#[test]
 fn bitmap_validity_reads_only_requested_gpu_pixels_and_preserves_cpu_holes() {
     use crate::bitmap::{
         bitmap_data::BitmapData,

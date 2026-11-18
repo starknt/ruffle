@@ -350,6 +350,15 @@ impl<'gc> BitmapData<'gc> {
         self.0.read_area(read_area, renderer)
     }
 
+    pub(crate) fn read_pixel(
+        &self,
+        x: u32,
+        y: u32,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<Ref<'_, BitmapRawData<'gc>>, RenderFailure> {
+        self.0.read_pixel(x, y, renderer)
+    }
+
     pub fn write_area(
         &self,
         area: PixelRegion,
@@ -480,6 +489,9 @@ pub struct BitmapValidity {
     gpu: Coverage,
     pending: Option<(Box<dyn SyncHandle>, PixelRegion)>,
     failure: Option<RenderFailure>,
+    /// Locality hint only: authoritative coverage still decides what is readable.
+    last_pixel_read_tile: Option<(u32, u32)>,
+    coherent_pixel_reads: bool,
 }
 impl BitmapValidity {
     fn new(width: u32, height: u32) -> Self {
@@ -488,6 +500,8 @@ impl BitmapValidity {
             gpu: Coverage::empty(width, height),
             pending: None,
             failure: None,
+            last_pixel_read_tile: None,
+            coherent_pixel_reads: false,
         }
     }
     fn check(&self) -> Result<(), RenderFailure> {
@@ -563,7 +577,7 @@ mod wrapper {
     use ruffle_render::error::RenderFailureKind;
 
     /// Guards CPU pixel access with exact GPU validity. Metadata and GPU handle
-    /// access do not wait; reads synchronize only their requested dirty coverage.
+    /// access do not wait; nearby scalar reads can prefetch bounded dirty coverage.
     #[derive(Copy, Clone, Collect, Debug)]
     #[collect(no_drop)]
     pub struct BitmapRawDataWrapper<'gc>(GcRefLock<'gc, BitmapRawData<'gc>>);
@@ -630,6 +644,7 @@ mod wrapper {
         ) -> Result<GcRefLock<'gc, BitmapRawData<'gc>>, RenderFailure> {
             self.sync_area(
                 PixelRegion::for_whole_size(self.width(), self.height()),
+                false,
                 renderer,
             )?;
             Ok(self.0)
@@ -637,10 +652,13 @@ mod wrapper {
 
         fn sync_area(
             &self,
-            area: PixelRegion,
+            mut area: PixelRegion,
+            prefetch: bool,
             renderer: &mut dyn RenderBackend,
         ) -> Result<(), RenderFailure> {
             renderer.health().check()?;
+            let mut pixel_read_tile = None;
+            let mut coherent_pixel_reads = false;
             {
                 let read = self.0.borrow();
                 read.validity.check()?;
@@ -648,6 +666,26 @@ mod wrapper {
                 // A clean region needs no exclusive access to those pixels.
                 if !read.validity.gpu.intersects(area) {
                     return Ok(());
+                }
+                if prefetch
+                    && area.width() == 1
+                    && area.height() == 1
+                    && renderer.supports_bitmap_region_readback()
+                {
+                    // Keep isolated reads exact. Repeated nearby reads amortize the
+                    // queue/map wait over at most 4 KiB, not the whole bitmap.
+                    let tile = (area.x_min / 32 * 32, area.y_min / 32 * 32);
+                    pixel_read_tile = Some(tile);
+                    coherent_pixel_reads = read.validity.coherent_pixel_reads
+                        || read.validity.last_pixel_read_tile == Some(tile);
+                    if coherent_pixel_reads {
+                        area = PixelRegion::for_region(
+                            tile.0,
+                            tile.1,
+                            read.width.saturating_sub(tile.0).min(32),
+                            read.height.saturating_sub(tile.1).min(32),
+                        );
+                    }
                 }
             }
             // SAFETY: Only owned pixel/validity data changes; no GC references are written.
@@ -725,6 +763,8 @@ mod wrapper {
                 write.validity.pending = None;
             }
             write.validity.gpu = gpu;
+            write.validity.last_pixel_read_tile = pixel_read_tile;
+            write.validity.coherent_pixel_reads = coherent_pixel_reads;
             #[cfg(feature = "egui")]
             write.egui_texture.borrow_mut().take();
             Ok(())
@@ -741,7 +781,7 @@ mod wrapper {
             renderer.health().check()?;
             self.0.borrow().validity.check()?;
             if read {
-                self.sync_area(area, renderer)?;
+                self.sync_area(area, false, renderer)?;
             }
             Ok(self.0)
         }
@@ -798,7 +838,17 @@ mod wrapper {
             read_area: PixelRegion,
             renderer: &mut dyn RenderBackend,
         ) -> Result<Ref<'_, BitmapRawData<'gc>>, RenderFailure> {
-            self.sync_area(read_area, renderer)?;
+            self.sync_area(read_area, false, renderer)?;
+            Ok(self.0.borrow())
+        }
+
+        pub fn read_pixel(
+            &self,
+            x: u32,
+            y: u32,
+            renderer: &mut dyn RenderBackend,
+        ) -> Result<Ref<'_, BitmapRawData<'gc>>, RenderFailure> {
+            self.sync_area(PixelRegion::for_pixel(x, y), true, renderer)?;
             Ok(self.0.borrow())
         }
 
@@ -1082,6 +1132,8 @@ impl<'gc> BitmapRawData<'gc> {
         self.validity.cpu.remove(region);
         self.validity.gpu.add(region);
         self.validity.pending = Some((sync_handle, region));
+        self.validity.last_pixel_read_tile = None;
+        self.validity.coherent_pixel_reads = false;
         self.inform_display_objects(gc_context);
     }
 

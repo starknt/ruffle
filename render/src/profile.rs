@@ -194,6 +194,17 @@ pub struct Timing {
     pub nanos: u64,
     pub max_nanos: u64,
 }
+/// Numeric-only evidence for long collector pauses; never roots arena objects.
+#[derive(Debug, Clone, Copy)]
+pub struct GcSample {
+    pub nanos: u64,
+    pub phase_before: &'static str,
+    pub phase_after: &'static str,
+    pub objects_before: usize,
+    pub objects_after: usize,
+    pub debt_before: f64,
+    pub debt_after: f64,
+}
 #[derive(Debug, Clone)]
 pub struct AsyncEvent {
     pub kind: &'static str,
@@ -233,6 +244,8 @@ pub struct Counters {
     pub native_resources: Option<NativeResources>,
     pub gpu_samples: Vec<GpuSample>,
     pub dropped_gpu_samples: u64,
+    pub gc_samples: Vec<GcSample>,
+    pub dropped_gc_samples: u64,
     #[cfg(feature = "lifecycle_counts")]
     pub lifecycle: lifecycle::Counters,
     pub timings: [Timing; 32],
@@ -341,6 +354,13 @@ impl Drop for Scope {
     }
 }
 impl RenderMetrics {
+    pub fn take_gc_samples(&self) -> (Vec<GcSample>, u64) {
+        let mut counters = self.0.borrow_mut();
+        (
+            std::mem::take(&mut counters.gc_samples),
+            std::mem::take(&mut counters.dropped_gc_samples),
+        )
+    }
     pub fn take_gpu_samples(&self) -> Vec<GpuSample> {
         std::mem::take(&mut self.0.borrow_mut().gpu_samples)
     }
@@ -412,6 +432,22 @@ pub fn record_host_duration(phase: Phase, nanos: u64) {
     CURRENT.with_borrow(|m| {
         if let Some(m) = m {
             m.record(phase, nanos);
+        }
+    });
+}
+
+pub fn record_gc(sample: GcSample) {
+    if sample.nanos < 8_000_000 {
+        return;
+    }
+    CURRENT.with_borrow(|current| {
+        if let Some(metrics) = current {
+            let mut counters = metrics.0.borrow_mut();
+            if counters.gc_samples.len() < 32 {
+                counters.gc_samples.push(sample);
+            } else {
+                counters.dropped_gc_samples += 1;
+            }
         }
     });
 }
@@ -660,6 +696,44 @@ mod tests {
     use super::{
         RenderMetrics, bitmap_gpu_copy, bitmap_readback, enabled, enter, executor_queue_depth,
     };
+
+    #[test]
+    fn slow_gc_diagnostics_are_scoped_bounded_and_drained_once() {
+        let metrics = RenderMetrics::default();
+        let sample = super::GcSample {
+            nanos: 10_000_000,
+            phase_before: "marking",
+            phase_after: "sweeping",
+            objects_before: 100,
+            objects_after: 80,
+            debt_before: 500.0,
+            debt_after: 0.0,
+        };
+        {
+            let _scope = enter(Some(&metrics));
+            super::record_gc(super::GcSample {
+                nanos: 100,
+                ..sample
+            });
+            for i in 0..40 {
+                super::record_gc(super::GcSample {
+                    objects_before: 100 + i,
+                    ..sample
+                });
+            }
+        }
+        super::record_gc(sample);
+        let (samples, dropped) = metrics.take_gc_samples();
+        assert_eq!((samples.len(), dropped), (32, 8));
+        assert_eq!(samples.first().unwrap().objects_before, 100);
+        assert_eq!(samples.last().unwrap().objects_before, 131);
+        assert_eq!(samples[0].phase_after, "sweeping");
+        assert_eq!(samples[0].debt_before, 500.0);
+        assert_eq!(samples[0].objects_after, 80);
+        let (samples, dropped) = metrics.take_gc_samples();
+        assert!(samples.is_empty());
+        assert_eq!(dropped, 0);
+    }
 
     #[test]
     fn completed_gpu_samples_preserve_each_frame_and_drain_once() {

@@ -98,7 +98,7 @@ pub fn get_pixel32(
     if x >= target.width() || y >= target.height() {
         return Ok(0);
     }
-    let read = target.read_area(PixelRegion::for_pixel(x, y), renderer)?;
+    let read = target.read_pixel(x, y, renderer)?;
     Ok(if read.transparency() {
         read.get_pixel32_raw(x, y).to_un_multiplied_alpha().into()
     } else {
@@ -145,7 +145,7 @@ pub fn get_pixel(
     if x >= target.width() || y >= target.height() {
         return Ok(0);
     }
-    let read = target.read_area(PixelRegion::for_pixel(x, y), renderer)?;
+    let read = target.read_pixel(x, y, renderer)?;
     Ok(read
         .get_pixel32_raw(x, y)
         .to_un_multiplied_alpha()
