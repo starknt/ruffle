@@ -1207,8 +1207,8 @@ impl Player {
         })
     }
 
-    pub fn quality(&mut self) -> StageQuality {
-        self.mutate_with_update_context(|context| context.stage.quality())
+    pub fn quality(&self) -> StageQuality {
+        self.enter_arena(|_, root, _| root.stage.quality())
     }
 
     pub fn set_quality(&mut self, quality: StageQuality) {
