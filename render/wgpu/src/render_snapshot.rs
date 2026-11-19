@@ -615,10 +615,9 @@ impl PreparedSnapshot {
             value: Input::Graph(&self.snapshot),
         })
         .chain(std::iter::from_fn(|| {
-            let partition: Vec<_> = shapes
-                .by_ref()
-                .take(if parallel { 32 } else { 1 })
-                .collect();
+            // Serial batches share the same bounded tessellator and validate
+            // once at publication, just as a partition dispatched to a worker.
+            let partition: Vec<_> = shapes.by_ref().take(32).collect();
             if partition.is_empty() {
                 return None;
             }

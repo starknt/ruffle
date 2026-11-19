@@ -913,24 +913,57 @@ impl WgpuCommandHandler<'_, '_> {
         }
         let result = (|| -> Result<(), crate::gpu_runtime::RenderFailure> {
             let direct = self.alpha_mask_bitmap_input(&maskee_commands, region)?;
-            let inputs = if direct.is_some() { 1 } else { 2 };
+            let scheduler = self.descriptors.runtime.scheduler();
+            let cache_input = match mask_commands.single_leaf() {
+                Some(Command::RenderBitmap {
+                    bitmap,
+                    transform,
+                    smoothing,
+                    pixel_snapping,
+                    region: source,
+                }) => (&*bitmap.0 as &dyn std::any::Any)
+                    .downcast_ref::<crate::bitmap_cache::CacheImage>()
+                    .map(|image| {
+                        (
+                            image.mask_raster(scheduler),
+                            crate::bitmap_cache::MaskKey {
+                                version: image.version(),
+                                output: region,
+                                quality: self.quality,
+                                transform: transform.clone(),
+                                source: *source,
+                                snapping: *pixel_snapping,
+                                smoothing: *smoothing,
+                            },
+                        )
+                    }),
+                _ => None,
+            };
+            let (cached, ticket) = cache_input
+                .as_ref()
+                .map_or((None, None), |(raster, key)| raster.lookup(key, scheduler));
+            let inputs = u64::from(direct.is_none()) + u64::from(cached.is_none());
             ruffle_render::profile::work(|w| {
                 w.offscreen_targets += inputs;
                 w.offscreen_pixels += inputs * u64::from(region.width) * u64::from(region.height);
             });
-            let surface = Surface::new(
-                self.descriptors,
-                self.quality,
-                region.width,
-                region.height,
-                wgpu::TextureFormat::Rgba8Unorm,
-            )?
-            .with_origin([region.x, region.y]);
+            let surface = (inputs != 0)
+                .then(|| {
+                    Surface::new(
+                        self.descriptors,
+                        self.quality,
+                        region.width,
+                        region.height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )
+                    .map(|surface| surface.with_origin([region.x, region.y]))
+                })
+                .transpose()?;
 
             let (maskee, vertices) = if let Some((texture, vertices)) = direct {
                 (texture, Some(vertices))
             } else {
-                let maskee = surface.draw_commands(
+                let maskee = surface.as_ref().expect("uncached content").draw_commands(
                     RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
                     self.descriptors,
                     self.meshes,
@@ -950,20 +983,30 @@ impl WgpuCommandHandler<'_, '_> {
                 ..Matrix::scale(region.width as f32, region.height as f32)
             };
 
-            let mask = surface.draw_commands(
-                RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
-                self.descriptors,
-                self.meshes,
-                mask_commands,
-                self.staging_belt,
-                self.chunk_buffers,
-                self.draw_encoder,
-                LayerRef::None,
-                self.texture_pool,
-            )?;
-            mask.ensure_cleared(self.draw_encoder);
-            let mask = mask.take_color_texture();
-
+            let mask = if let Some(texture) = cached {
+                PoolOrArcTexture::Manual(texture)
+            } else {
+                let mask = surface.as_ref().expect("uncached mask").draw_commands(
+                    RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
+                    self.descriptors,
+                    self.meshes,
+                    mask_commands,
+                    self.staging_belt,
+                    self.chunk_buffers,
+                    self.draw_encoder,
+                    LayerRef::None,
+                    self.texture_pool,
+                )?;
+                mask.ensure_cleared(self.draw_encoder);
+                match (mask.take_color_texture(), cache_input, ticket) {
+                    (PoolOrArcTexture::Pool(entry), Some((cache, key)), Some(ticket)) => {
+                        let texture = entry.into_owned();
+                        cache.store(&key, texture.clone(), ticket, scheduler);
+                        PoolOrArcTexture::Manual(texture)
+                    }
+                    (texture, _, _) => texture,
+                }
+            };
             let binds = self
                 .descriptors
                 .cached_bind_group(&wgpu::BindGroupDescriptor {

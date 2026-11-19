@@ -36,6 +36,23 @@ pub struct PlannedList {
     reads_layer: bool,
 }
 impl PlannedList {
+    pub fn from_cache_bitmaps(list: CommandList, bounds: RenderRect) -> Self {
+        let mut plan = Self::default();
+        plan.commands.reserve(list.iter().len());
+        for command in list.into_commands() {
+            let region = command.region();
+            if region.clip(bounds).is_some() {
+                plan.push(PlannedCommand {
+                    op: PlannedOp::Leaf(command),
+                    region,
+                    transient_bytes: 0,
+                    inputs: 0,
+                    reads_layer: false,
+                });
+            }
+        }
+        plan
+    }
     pub fn push(&mut self, command: PlannedCommand) {
         self.region = self.region.union(command.region);
         self.transient_bytes = self.transient_bytes.saturating_add(command.transient_bytes);
@@ -71,6 +88,43 @@ impl PlannedList {
             ] => Some(command),
             _ => None,
         }
+    }
+}
+
+/// A stage made entirely of already rasterized, pixel-aligned cache images
+/// needs no uploads, temporary targets or geometry preparation for this frame.
+pub enum SurfaceCommands {
+    Graph(GraphEncoder),
+    CachedBitmaps(CommandList),
+}
+
+impl SurfaceCommands {
+    pub fn pixel_aligned_caches(commands: &CommandList, device: u64) -> bool {
+        !commands.is_empty()
+            && commands.iter().all(|cmd| {
+                let Command::RenderBitmap {
+                    bitmap,
+                    transform,
+                    pixel_snapping,
+                    ..
+                } = cmd
+                else {
+                    return false;
+                };
+                let mut matrix = transform.matrix;
+                pixel_snapping.apply(&mut matrix);
+                matrix.a == 1.0
+                    && matrix.d == 1.0
+                    && matrix.b == 0.0
+                    && matrix.c == 0.0
+                    && matrix.tx.to_pixels().fract() == 0.0
+                    && matrix.ty.to_pixels().fract() == 0.0
+                    && transform.tz == 0.0
+                    && transform.perspective_projection.is_none()
+                    && (&*bitmap.0 as &dyn std::any::Any)
+                        .downcast_ref::<crate::bitmap_cache::CacheImage>()
+                        .is_some_and(|cache| cache.is_resident_on(device))
+            })
     }
 }
 

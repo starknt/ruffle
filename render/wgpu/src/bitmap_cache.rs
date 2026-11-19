@@ -34,6 +34,7 @@ pub struct CacheImage {
     version: AtomicU64,
     resident: OnceLock<Texture>,
     history: Mutex<Option<History>>,
+    mask: OnceLock<Arc<MaskRaster>>,
 }
 impl BitmapHandleImpl for CacheImage {}
 impl CacheImage {
@@ -59,6 +60,7 @@ impl CacheImage {
             version: AtomicU64::new(1),
             resident: OnceLock::new(),
             history: Mutex::new(None),
+            mask: OnceLock::new(),
         }))
     }
     pub fn resolve(&self, device: &Device) -> Result<&Texture, RenderFailure> {
@@ -106,10 +108,25 @@ impl CacheImage {
             })
         })
     }
+    pub fn is_resident_on(&self, device: u64) -> bool {
+        self.device_generation == device && self.resident.get().is_some()
+    }
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Relaxed)
     }
+    pub fn mask_raster(&self, scheduler: &ResourceScheduler) -> Arc<MaskRaster> {
+        self.mask
+            .get_or_init(|| {
+                let cache = Arc::new(MaskRaster::default());
+                scheduler.register(ReclaimClass::Cache, cache.clone());
+                cache
+            })
+            .clone()
+    }
     pub fn written(&self) -> Result<(), RenderFailure> {
+        if let Some(mask) = self.mask.get() {
+            mask.evict_oldest();
+        }
         self.version
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
             .map(|_| ())
@@ -164,6 +181,105 @@ impl CacheImage {
             .history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = history;
+    }
+}
+
+/// Single-input alpha masks reproduce the original intermediate's MSAA and
+/// unorm rounding by retaining its actual resolved pixels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaskKey {
+    pub version: u64,
+    pub output: RenderRect,
+    pub quality: StageQuality,
+    pub transform: ruffle_render::transform::Transform,
+    pub source: ruffle_render::bitmap::PixelRegion,
+    pub snapping: ruffle_render::bitmap::PixelSnapping,
+    pub smoothing: bool,
+}
+
+type MaskTexture = (
+    crate::gpu_resources::Texture,
+    crate::gpu_resources::TextureView,
+);
+
+#[derive(Debug)]
+struct MaskEntry {
+    key: MaskKey,
+    resident: Option<(MaskTexture, CacheTicket, u64)>,
+}
+#[derive(Debug, Default)]
+pub struct MaskRaster(Mutex<Option<MaskEntry>>);
+
+impl MaskRaster {
+    pub fn lookup(
+        &self,
+        key: &MaskKey,
+        scheduler: &ResourceScheduler,
+    ) -> (Option<MaskTexture>, Option<CacheTicket>) {
+        let bytes = u64::from(key.output.width) * u64::from(key.output.height) * 4;
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.as_mut()
+            && entry.key == *key
+        {
+            if let Some((texture, _, used)) = &mut entry.resident {
+                *used = scheduler.tick();
+                return (Some(texture.clone()), None);
+            }
+            drop(state);
+            return (None, scheduler.admit(ReclaimClass::Cache, bytes));
+        }
+        // Wait for a second identical placement before admitting a pooled
+        // texture. Moving or continuously redrawn masks stay transient.
+        let previous = state.replace(MaskEntry {
+            key: key.clone(),
+            resident: None,
+        });
+        drop(state);
+        drop(previous);
+        (None, None)
+    }
+
+    pub fn store(
+        &self,
+        key: &MaskKey,
+        texture: MaskTexture,
+        ticket: CacheTicket,
+        scheduler: &ResourceScheduler,
+    ) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.as_mut()
+            && entry.key == *key
+        {
+            entry.resident = Some((texture, ticket, scheduler.tick()));
+        }
+    }
+}
+
+impl Reclaim for MaskRaster {
+    fn oldest(&self) -> Option<u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()?
+            .resident
+            .as_ref()
+            .map(|r| r.2)
+    }
+
+    fn evict_oldest(&self) -> bool {
+        let removed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|entry| entry.resident.take());
+        removed.is_some()
     }
 }
 

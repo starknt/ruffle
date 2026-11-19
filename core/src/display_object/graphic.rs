@@ -19,6 +19,7 @@ use ruffle_common::utils::HasPrefixField;
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::commands::CommandHandler;
 use std::cell::{OnceCell, RefCell, RefMut};
+use std::rc::Rc;
 
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
@@ -56,7 +57,7 @@ impl<'gc> Graphic<'gc> {
             id: swf_shape.id,
             shape_bounds: swf_shape.shape_bounds,
             edge_bounds: swf_shape.edge_bounds,
-            shape: swf_shape,
+            shape: Rc::new(swf_shape),
             movie,
             scaled_handle: RefCell::new(TessellationCache::new()),
         };
@@ -79,7 +80,7 @@ impl<'gc> Graphic<'gc> {
             id: 0,
             shape_bounds: Default::default(),
             edge_bounds: Default::default(),
-            shape: swf::Shape {
+            shape: Rc::new(swf::Shape {
                 version: 32,
                 id: 0,
                 shape_bounds: Default::default(),
@@ -90,7 +91,7 @@ impl<'gc> Graphic<'gc> {
                     line_styles: Vec::new(),
                 },
                 shape: Vec::new(),
-            },
+            }),
             movie: *context.root_swf,
             scaled_handle: RefCell::new(TessellationCache::new()),
         };
@@ -157,8 +158,8 @@ impl<'gc> Graphic<'gc> {
             .library
             .library_for_movie(shared.movie, context.gc_context)
             .expect("Graphic's movie has a library");
-        let new_handle = context.renderer.register_shape_with_scale(
-            (&shared.shape).into(),
+        let new_handle = context.renderer.register_swf_shape(
+            &shared.shape,
             &MovieLibrarySource { library: &library },
             current_scale,
         )?;
@@ -347,7 +348,7 @@ struct GraphicShared<'gc> {
     id: CharacterId,
 
     #[collect(require_static)]
-    shape: swf::Shape,
+    shape: Rc<swf::Shape>,
 
     #[collect(require_static)]
     shape_bounds: Rectangle<Twips>,

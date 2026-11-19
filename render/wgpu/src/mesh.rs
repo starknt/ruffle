@@ -84,6 +84,47 @@ impl SmallMeshCache {
     }
 }
 
+/// A reloaded movie may still have a live immutable shape on this renderer.
+/// The character ID selects a slot. Only the full definition and exact scale
+/// establish a hit. Neither the definition nor its renderer handle is rooted.
+#[derive(Default)]
+pub(crate) struct DefinitionMeshes(Vec<Option<DefinitionMesh>>);
+
+struct DefinitionMesh {
+    shape: std::rc::Weak<swf::Shape>,
+    scale: u32,
+    handle: std::sync::Weak<dyn ShapeHandleImpl>,
+}
+
+impl DefinitionMeshes {
+    const SLOTS: usize = 64;
+
+    pub fn get(&mut self, shape: &std::rc::Rc<swf::Shape>, scale: f32) -> Option<ShapeHandle> {
+        let slot = self
+            .0
+            .get_mut(usize::from(shape.id) % Self::SLOTS)?
+            .as_mut()?;
+        if slot.scale != scale.to_bits() || *slot.shape.upgrade()? != **shape {
+            return None;
+        }
+        let handle = slot.handle.upgrade()?;
+        // The next lookup can use this definition after the previous movie is collected.
+        slot.shape = std::rc::Rc::downgrade(shape);
+        Some(ShapeHandle(handle))
+    }
+
+    pub fn insert(&mut self, shape: &std::rc::Rc<swf::Shape>, scale: f32, handle: &ShapeHandle) {
+        if self.0.is_empty() {
+            self.0.resize_with(Self::SLOTS, || None);
+        }
+        self.0[usize::from(shape.id) % Self::SLOTS] = Some(DefinitionMesh {
+            shape: std::rc::Rc::downgrade(shape),
+            scale: scale.to_bits(),
+            handle: std::sync::Arc::downgrade(&handle.0),
+        });
+    }
+}
+
 impl ShapeHandleImpl for Mesh {
     fn retained_bytes(&self) -> Option<usize> {
         self.retained_bytes
