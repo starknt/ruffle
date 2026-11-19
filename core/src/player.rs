@@ -2388,7 +2388,7 @@ impl Player {
             let stage = gc_root.stage;
 
             let mut cache_draws = vec![];
-            this.snapshots.prune();
+            this.snapshots.begin_frame();
             let mut render_context = RenderContext {
                 render_epoch: this.render_epoch,
                 snapshots: Some(&mut this.snapshots),

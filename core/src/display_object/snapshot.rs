@@ -217,6 +217,8 @@ const ENTRY_OVERHEAD: usize = std::mem::size_of::<Node>() + 2 * std::mem::size_o
 pub struct Cache {
     empty: std::cell::OnceCell<Rc<CommandList>>,
     records: Vec<Record>,
+    next_record: usize,
+    admissions: usize,
     limit: usize,
     bytes: usize,
     node_bytes: Rc<Cell<usize>>,
@@ -235,6 +237,8 @@ impl Cache {
         Self {
             empty: Default::default(),
             records: Vec::new(),
+            next_record: 0,
+            admissions: 0,
             limit,
             bytes: 0,
             node_bytes: Rc::new(Cell::new(0)),
@@ -249,21 +253,37 @@ impl Cache {
         self.clock = self.clock.wrapping_add(1);
         node.used.set(self.clock);
     }
-    pub fn prune(&mut self) {
-        self.records.retain(|r| {
-            if r.commands.strong_count() == 0 {
-                self.bytes -= r.bytes;
-                self.used_bytes.set(self.used_bytes.get() - r.bytes);
-                false
-            } else {
-                true
+    pub fn begin_frame(&mut self) -> usize {
+        // Scan a fixed amount on a stable stage. With churn, service the
+        // registry faster than new records arrive. Pinned blocks stay charged.
+        let new = std::mem::take(&mut self.admissions);
+        self.sweep(new.saturating_mul(2).saturating_add(4))
+    }
+
+    fn prune(&mut self) {
+        self.next_record = 0;
+        self.admissions = 0;
+        self.sweep(self.records.len());
+    }
+
+    fn sweep(&mut self, limit: usize) -> usize {
+        let count = limit.min(self.records.len());
+        for _ in 0..count {
+            if self.next_record >= self.records.len() {
+                self.next_record = 0;
             }
-        });
-        // Entry charges cover spare capacity up to twice the live record count.
-        // Do not retain an old large registry alongside a new large block.
+            if self.records[self.next_record].commands.strong_count() == 0 {
+                let dead = self.records.swap_remove(self.next_record);
+                self.bytes -= dead.bytes;
+                self.used_bytes.set(self.used_bytes.get() - dead.bytes);
+            } else {
+                self.next_record += 1;
+            }
+        }
         if self.records.capacity() > self.records.len().saturating_mul(2) {
             self.records.shrink_to_fit();
         }
+        count
     }
     fn charge(&mut self, bytes: usize) -> Option<NodeCharge> {
         if !self.make_room(bytes) {
@@ -336,6 +356,7 @@ impl Cache {
         entry.commands.charge_storage(&self.used_bytes, self.limit);
         self.used_bytes.set(self.used_bytes.get() + ENTRY_OVERHEAD);
         self.bytes += ENTRY_OVERHEAD;
+        self.admissions = self.admissions.saturating_add(1);
         self.records.push(Record {
             node: Rc::downgrade(node),
             commands: Rc::downgrade(&entry.commands),
@@ -365,6 +386,26 @@ mod tests {
             commands: Rc::new(CommandList::new()),
         }
     }
+    #[test]
+    fn a_warm_frame_does_bounded_registry_work_and_eventually_releases_dead_blocks() {
+        let mut cache = Cache::default();
+        let owners: Vec<_> = (0..128)
+            .map(|_| {
+                let node = cache.new_node().unwrap();
+                assert!(cache.insert(&node, entry()));
+                node
+            })
+            .collect();
+        cache.begin_frame();
+        assert!(cache.begin_frame() <= 8, "scanned every stable stage block");
+        drop(owners);
+        for _ in 0..128 {
+            cache.begin_frame();
+        }
+        assert!(cache.records.is_empty());
+        assert_eq!(cache.used_bytes.get(), 0);
+    }
+
     #[test]
     fn pinned_blocks_charge_weak_node_storage_and_prune_releases_registry_capacity() {
         let mut cache = Cache::default();

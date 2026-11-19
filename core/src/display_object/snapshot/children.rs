@@ -467,7 +467,7 @@ pub(in crate::display_object) fn render<'gc>(
     };
     // A fully live painter order has no reusable geometry to hide its
     // recording cost. Stream it directly until an edit or a periodic probe.
-    if !index.live.is_empty() && stable_root.as_ref().is_some_and(|root| root.is_empty()) {
+    if index.live.len() == index.scopes.len() && stable_root.is_some() {
         node.live_until.set(context.render_epoch.saturating_add(64));
         context.commands.push(Command::Shared(output));
         return true;
@@ -527,24 +527,26 @@ mod tests {
     #[test]
     fn wholly_live_video_children_are_examined_once_per_draw() {
         use ruffle_render::profile::{RenderMetrics, enter};
-        let player = PlayerBuilder::new()
-            .with_viewport_dimensions(128, 128, 1.)
-            .build();
-        let mut player = player.lock().unwrap();
-        player.mutate_with_update_context(|ctx| {
-            let root = MovieClip::new(ctx.stage.movie(), ctx.gc());
-            for depth in 1..=16 {
-                let video = Video::new(ctx.gc(), ctx.stage.movie(), 32, 32, None);
-                root.replace_at_depth(ctx, video.into(), depth);
-            }
-            ctx.stage.replace_at_depth(ctx, root.into(), 1);
-        });
-        player.render().unwrap();
-        let metrics = RenderMetrics::default();
-        let _scope = enter(Some(&metrics));
-        player.render().unwrap();
-        let slots = metrics.snapshot().work.child_slots_examined;
-        assert!(slots <= 18, "examined {slots} slots for 16 live children");
+        let examined = |count| {
+            let player = PlayerBuilder::new()
+                .with_viewport_dimensions(128, 128, 1.)
+                .build();
+            let mut player = player.lock().unwrap();
+            player.mutate_with_update_context(|ctx| {
+                let root = MovieClip::new(ctx.stage.movie(), ctx.gc());
+                for depth in 1..=count {
+                    let video = Video::new(ctx.gc(), ctx.stage.movie(), 32, 32, None);
+                    root.replace_at_depth(ctx, video.into(), depth);
+                }
+                ctx.stage.replace_at_depth(ctx, root.into(), 1);
+            });
+            player.render().unwrap();
+            let metrics = RenderMetrics::default();
+            let _scope = enter(Some(&metrics));
+            player.render().unwrap();
+            metrics.snapshot().work.child_slots_examined
+        };
+        assert_eq!(examined(32) - examined(16), 16);
     }
 
     #[test]
