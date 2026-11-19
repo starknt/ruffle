@@ -1476,6 +1476,12 @@ struct DrawCacheInfo {
 
 fn invalidate_bitmap(this: DisplayObject<'_>, change: snapshot::Change) {
     this.base().invalidate_component(change);
+    invalidate_raster(this);
+}
+
+// A typed transform, color or visibility edit already notified the stage
+// snapshot. Only the ancestors' raster caches still need the notification.
+fn invalidate_raster(this: DisplayObject<'_>) {
     let mut object = Some(this);
     while let Some(current) = object {
         if !current.base().invalidate_cached_bitmap() {
@@ -2249,7 +2255,7 @@ pub trait TDisplayObject<'gc>:
         {
             // Self-transform changes are automatically handled,
             // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
     }
 
@@ -2361,7 +2367,7 @@ pub trait TDisplayObject<'gc>:
         {
             // Self-transform changes are automatically handled,
             // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
     }
 
@@ -2380,7 +2386,7 @@ pub trait TDisplayObject<'gc>:
         {
             // Self-transform changes are automatically handled,
             // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
     }
 
@@ -2389,7 +2395,7 @@ pub trait TDisplayObject<'gc>:
         if self.base().set_position(x, y)
             && let Some(parent) = self.parent()
         {
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
     }
 
@@ -2408,7 +2414,7 @@ pub trait TDisplayObject<'gc>:
         {
             // Self-transform changes are automatically handled,
             // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
     }
 
@@ -2431,7 +2437,7 @@ pub trait TDisplayObject<'gc>:
             if let Some(parent) = self.parent() {
                 // Self-transform changes are automatically handled,
                 // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-                parent.invalidate_cached_bitmap();
+                invalidate_raster(parent);
             }
         }
     }
@@ -2455,7 +2461,7 @@ pub trait TDisplayObject<'gc>:
             if let Some(parent) = self.parent() {
                 // Self-transform changes are automatically handled,
                 // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-                parent.invalidate_cached_bitmap();
+                invalidate_raster(parent);
             }
         }
     }
@@ -2479,7 +2485,7 @@ pub trait TDisplayObject<'gc>:
             if let Some(parent) = self.parent() {
                 // Self-transform changes are automatically handled,
                 // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-                parent.invalidate_cached_bitmap();
+                invalidate_raster(parent);
             }
         }
     }
@@ -2611,7 +2617,7 @@ pub trait TDisplayObject<'gc>:
             && let Some(parent) = self.parent()
         {
             // Self-transform changes are automatically handled
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
     }
 
@@ -2896,7 +2902,7 @@ pub trait TDisplayObject<'gc>:
             && let Some(parent) = self.parent()
         {
             // We don't need to invalidate ourselves, we're just toggling if the bitmap is rendered.
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
 
         if !value && let Some(int) = self.as_interactive() {

@@ -322,3 +322,22 @@ fn observed_leaf_coordinate_queries_rebuild_only_the_moved_path() {
         assert_eq!(metrics.snapshot().work.world_matrix_builds, 1);
     });
 }
+
+#[test]
+fn alpha_and_visibility_edits_keep_exact_parent_bounds() {
+    let player = PlayerBuilder::new().build();
+    player.lock().unwrap().mutate_with_update_context(|ctx| {
+        let root = MovieClip::new(ctx.stage.movie(), ctx.gc());
+        let child = Graphic::empty(ctx);
+        root.replace_at_depth(ctx, child.into(), 1);
+        let mut cache = snapshot::Cache::default();
+        root.base().snapshots.node(&mut cache).unwrap();
+        root.render_bounds_with_transform(&Matrix::IDENTITY, true, &Matrix::IDENTITY);
+        let metrics = RenderMetrics::default();
+        let _scope = enter(Some(&metrics));
+        child.set_alpha(0.5);
+        child.set_visible(ctx, false);
+        root.render_bounds_with_transform(&Matrix::IDENTITY, true, &Matrix::IDENTITY);
+        assert_eq!(metrics.snapshot().work.render_bounds_nodes, 0);
+    });
+}
