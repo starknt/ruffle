@@ -54,7 +54,8 @@ impl Instance {
         child: DisplayObject<'gc>,
         reason: Change,
         context: &mut RenderContext<'_, 'gc>,
-    ) -> Option<Block> {
+        empty: &Block,
+    ) -> Option<Command> {
         if !(reason - (Change::TRANSFORM | Change::COLOR | Change::VISIBILITY)).is_empty() {
             return None;
         }
@@ -73,20 +74,21 @@ impl Instance {
         {
             return None;
         }
-        let mut list = CommandList::new();
-        if self.visible
+        let command = if self.visible
             && (!self.graphic
                 || child
                     .world_bounds(super::super::BoundsMode::Engine)
                     .intersects(&context.stage.view_bounds()))
         {
-            list.push(Command::RenderShape {
+            Command::RenderShape {
                 shape: ShapeHandle(self.shape.upgrade()?),
                 transform: world,
-            });
-        }
+            }
+        } else {
+            Command::Shared(empty.clone())
+        };
         ruffle_render::profile::work(|w| w.render_instances_updated += 1);
-        Some(Rc::new(list))
+        Some(command)
     }
 }
 
@@ -126,59 +128,77 @@ impl Children {
     }
 }
 
-fn join(items: impl IntoIterator<Item = Block>) -> Block {
-    let mut list = CommandList::new();
+// Keep one painter-order slot per child or complete mask scope. Simple
+// geometry lives directly in its leaf page; only compound slots need a block.
+fn slot_command(block: Block) -> Command {
+    match block.iter().as_slice() {
+        [
+            cmd @ (Command::RenderShape { .. }
+            | Command::DrawRect { .. }
+            | Command::DrawLine { .. }
+            | Command::DrawLineRect { .. }
+            | Command::Shared(_)),
+        ] => cmd.clone(),
+        _ => Command::Shared(block),
+    }
+}
+
+fn chunk(items: impl ExactSizeIterator<Item = Command>) -> Block {
+    let mut list = CommandList::with_capacity(items.len());
     for item in items {
-        list.push(Command::Shared(item));
+        list.push(item);
     }
     Rc::new(list)
 }
 
-fn pack(mut level: Vec<Block>) -> (Block, usize) {
+fn pack(mut level: Vec<Command>) -> (Block, usize) {
     let mut stride = 1;
     while level.len() > WIDTH {
-        level = level
-            .chunks(WIDTH)
-            .map(|group| join(group.iter().cloned()))
-            .collect();
+        let mut items = level.into_iter();
+        let mut next = Vec::with_capacity(items.len().div_ceil(WIDTH));
+        while items.len() != 0 {
+            next.push(Command::Shared(chunk((&mut items).take(WIDTH))));
+        }
+        level = next;
         stride *= WIDTH;
     }
-    (join(level), stride)
+    (chunk(level.into_iter()), stride)
 }
 
-// Each patch copies at most WIDTH command references per affected tree level.
-fn patch(root: &Block, stride: usize, offset: usize, changes: &[(usize, Block)]) -> Block {
+// Stable siblings keep their pages. Only pages intersecting a patch are copied.
+fn patch(root: &Block, stride: usize, offset: usize, changes: &[(usize, Command)]) -> Block {
     if changes.is_empty() {
         return root.clone();
     }
     let mut rest = changes;
-    join(root.iter().enumerate().map(|(i, command)| {
-        let Command::Shared(child) = command else {
-            unreachable!("invalid chunk directory")
-        };
+    chunk(root.iter().enumerate().map(|(i, command)| {
         let start = offset + i * stride;
         let n = rest.partition_point(|(slot, _)| *slot < start + stride);
         let (here, tail) = rest.split_at(n);
         rest = tail;
         if here.is_empty() {
-            child.clone()
-        } else if stride == 1 {
-            here[0].1.clone()
-        } else {
-            patch(child, stride / WIDTH, start, here)
+            return command.clone();
         }
+        if stride == 1 {
+            return here[0].1.clone();
+        }
+        let Command::Shared(child) = command else {
+            unreachable!("invalid chunk directory")
+        };
+        Command::Shared(patch(child, stride / WIDTH, start, here))
     }))
 }
 
-fn slot_at(root: &Block, mut stride: usize, mut index: usize) -> Block {
+fn slot_at(root: &Block, mut stride: usize, mut index: usize) -> Command {
     let mut node = root;
     loop {
-        let Command::Shared(child) = &node.iter().as_slice()[index / stride] else {
+        let command = &node.iter().as_slice()[index / stride];
+        if stride == 1 {
+            return command.clone();
+        }
+        let Command::Shared(child) = command else {
             unreachable!("invalid chunk directory")
         };
-        if stride == 1 {
-            return child.clone();
-        }
         index %= stride;
         stride /= WIDTH;
         node = child;
@@ -224,7 +244,7 @@ fn capture<'gc>(
     );
     context.snapshot_recording = recording;
     let commands = Rc::new(std::mem::replace(&mut context.commands, original));
-    let stable = before == context.snapshot_barriers && commands.retained_bytes().is_some();
+    let stable = before == context.snapshot_barriers && commands.is_retainable();
     if !stable && before == context.snapshot_barriers {
         context.snapshot_barriers += 1;
     }
@@ -286,7 +306,7 @@ pub(in crate::display_object) fn render<'gc>(
             })
             .map(|entry| (entry.commands.clone(), entry.key.inherited != key.inherited))
     });
-    let empty = Rc::new(CommandList::new());
+    let empty = cache.empty();
     let (index, stable_root, output) = if let Some((old, inherited_changed)) = previous {
         let mut index = index.take().unwrap();
         if count >= 128 && index.dirty.len() > index.scopes.len() / 2 {
@@ -299,7 +319,7 @@ pub(in crate::display_object) fn render<'gc>(
         } else {
             dirty.union(&index.live).copied().collect()
         };
-        let mut stable_patches = Vec::new();
+        let mut stable_patches = Vec::with_capacity(work.len());
         let mut live_patches = Vec::new();
         ruffle_render::profile::work(|w| w.child_slots_examined += work.len() as u64);
         for slot in work {
@@ -308,7 +328,7 @@ pub(in crate::display_object) fn render<'gc>(
             let child = container.child_by_index(scope.start).unwrap();
             let instance = index.instances[slot]
                 .as_mut()
-                .and_then(|i| i.update(child, reason, context));
+                .and_then(|i| i.update(child, reason, context, &empty));
             let (block, stable) = if let Some(block) = instance {
                 (block, true)
             } else {
@@ -319,14 +339,14 @@ pub(in crate::display_object) fn render<'gc>(
                 } else {
                     None
                 };
-                (block, stable)
+                (slot_command(block), stable)
             };
             if stable {
                 index.live.remove(&slot);
                 stable_patches.push((slot, block));
             } else {
                 if index.live.insert(slot) {
-                    stable_patches.push((slot, empty.clone()));
+                    stable_patches.push((slot, Command::Shared(empty.clone())));
                 }
                 live_patches.push((slot, block));
             }
@@ -412,10 +432,10 @@ pub(in crate::display_object) fn render<'gc>(
             };
             index.instances.push(instance);
             if reusable {
-                stable.push(block);
+                stable.push(slot_command(block));
             } else {
-                stable.push(empty.clone());
-                live.push((slot, block));
+                stable.push(Command::Shared(empty.clone()));
+                live.push((slot, slot_command(block)));
                 index.live.insert(slot);
             }
         }
@@ -445,6 +465,49 @@ mod tests {
     use super::*;
     use crate::display_object::{Graphic, MovieClip, StageScaleMode, Video};
     use crate::player::PlayerBuilder;
+
+    #[test]
+    fn simple_draws_share_one_allocation_per_leaf_page() {
+        let movie = crate::tag_utils::SwfMovieData::from_data(
+            include_bytes!("../../../../tests/tests/swfs/native_perf/static_tree/test.swf"),
+            "file:///chunks.swf".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let player = PlayerBuilder::new()
+            .with_movie(movie)
+            .with_autoplay(true)
+            .with_viewport_dimensions(1280, 720, 1.0)
+            .build();
+        let mut player = player.lock().unwrap();
+        assert!(player.preload(&mut crate::limits::ExecutionLimit::none()));
+        player.run_frame();
+        player.render().unwrap();
+        player.mutate_with_update_context(|ctx| {
+            let mut stack = vec![DisplayObject::from(ctx.stage)];
+            while let Some(object) = stack.pop() {
+                if let Some(c) = object.as_container() {
+                    if c.num_children() == 40 {
+                        let node = object.base().snapshots.node.borrow().clone().unwrap();
+                        let index = node.children.borrow();
+                        let entry = index.as_ref().unwrap().owner.entry.borrow();
+                        let root = &entry.as_ref().unwrap().commands;
+                        let Command::Shared(page) = &root.iter().as_slice()[0] else {
+                            panic!("expected page")
+                        };
+                        assert!(
+                            page.iter()
+                                .all(|c| matches!(c, Command::RenderShape { .. }))
+                        );
+                        return;
+                    }
+                    stack.extend(c.iter_render_list());
+                }
+            }
+            panic!("fixture group missing");
+        });
+    }
 
     #[test]
     fn empty_video_remains_live_until_its_first_decoded_frame() {

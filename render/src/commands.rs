@@ -206,22 +206,25 @@ impl CommandList {
             + 32
             + self.commands.capacity() * size_of::<Command>();
         for command in &self.commands {
-            bytes = bytes.checked_add(match command {
-                Command::RenderShape { shape, .. } => shape.0.retained_bytes()?,
-                Command::RenderBitmap { bitmap, .. } => bitmap.0.retained_bytes()?,
-                Command::PopMask
-                | Command::DeactivateMask
-                | Command::PushMask
-                | Command::ActivateMask
-                | Command::Shared(_)
-                | Command::DrawRect { .. }
-                | Command::DrawLine { .. }
-                | Command::DrawLineRect { .. } => 0,
-                _ => return None,
-            })?;
+            bytes = bytes.checked_add(command.pinned_bytes()?)?;
         }
         self.retention().local_bytes.set(Some(bytes));
         Some(bytes)
+    }
+
+    /// Stage admission can stop at a previously validated shared page.
+    pub fn is_retainable(&self) -> bool {
+        if self
+            .retention
+            .get()
+            .is_some_and(|s| s.charge.borrow().is_some() || s.total_bytes.get().is_some())
+        {
+            return true;
+        }
+        self.commands.iter().all(|cmd| match cmd {
+            Command::Shared(page) => page.is_retainable(),
+            _ => cmd.pinned_bytes().is_some(),
+        })
     }
 
     pub fn retained_bytes(&self) -> Option<usize> {
@@ -333,6 +336,13 @@ impl CommandList {
         Self::default()
     }
 
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            commands: Vec::with_capacity(capacity),
+            ..Default::default()
+        }
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         !self.has_commands
@@ -358,6 +368,24 @@ impl CommandList {
 }
 
 impl Command {
+    // Storage pinned directly by this command. Shared children are charged
+    // separately when the page graph is admitted to its player's budget.
+    fn pinned_bytes(&self) -> Option<usize> {
+        match self {
+            Command::RenderShape { shape, .. } => shape.0.retained_bytes(),
+            Command::RenderBitmap { bitmap, .. } => bitmap.0.retained_bytes(),
+            Command::PopMask
+            | Command::DeactivateMask
+            | Command::PushMask
+            | Command::ActivateMask
+            | Command::Shared(_)
+            | Command::DrawRect { .. }
+            | Command::DrawLine { .. }
+            | Command::DrawLineRect { .. } => Some(0),
+            _ => None,
+        }
+    }
+
     pub fn temporary_inputs(&self) -> usize {
         match self {
             Self::Blend(..) => 1,

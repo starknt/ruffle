@@ -27,16 +27,14 @@ bitflags::bitflags! {
 struct RenderGeneration {
     // Source stamps are allocated with an observed node. World transforms
     // incorporate inherited stamps at use time.
-    revisions: Cell<[u64; 7]>,
+    revisions: [Cell<u64>; 7],
 }
 impl RenderGeneration {
     fn advance(&self, change: Change) {
-        let mut revisions = self.revisions.get();
         for flag in change.iter() {
-            let revision = &mut revisions[flag.bits().trailing_zeros() as usize];
-            *revision = revision.wrapping_add(1);
+            let revision = &self.revisions[flag.bits().trailing_zeros() as usize];
+            revision.set(revision.get().wrapping_add(1));
         }
-        self.revisions.set(revisions);
     }
 }
 
@@ -124,7 +122,7 @@ impl State {
     pub(super) fn revision(&self, component: Change) -> u64 {
         debug_assert_eq!(component.bits().count_ones(), 1);
         self.node.borrow().as_ref().map_or(0, |node| {
-            node.revisions.revisions.get()[component.bits().trailing_zeros() as usize]
+            node.revisions.revisions[component.bits().trailing_zeros() as usize].get()
         })
     }
     pub(super) fn changed(&self, change: Change) {
@@ -199,6 +197,7 @@ struct Record {
 const ENTRY_OVERHEAD: usize = std::mem::size_of::<Node>() + 2 * std::mem::size_of::<Record>() + 256;
 
 pub struct Cache {
+    empty: std::cell::OnceCell<Rc<CommandList>>,
     records: Vec<Record>,
     limit: usize,
     bytes: usize,
@@ -216,6 +215,7 @@ impl Default for Cache {
 impl Cache {
     fn new(limit: usize) -> Self {
         Self {
+            empty: Default::default(),
             records: Vec::new(),
             limit,
             bytes: 0,
@@ -223,6 +223,9 @@ impl Cache {
             used_bytes: Rc::new(Cell::new(0)),
             clock: 0,
         }
+    }
+    fn empty(&self) -> Rc<CommandList> {
+        self.empty.get_or_init(Default::default).clone()
     }
     pub fn touch(&mut self, node: &Node) {
         self.clock = self.clock.wrapping_add(1);

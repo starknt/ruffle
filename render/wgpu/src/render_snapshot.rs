@@ -288,8 +288,17 @@ impl Capture {
         Ok(resource)
     }
     fn commands(&mut self, commands: &CommandList) -> Result<Arc<[SnapshotNode]>, RenderFailure> {
-        let mut leaves = 0;
         let mut nodes = Vec::with_capacity(commands.iter().len());
+        self.commands_into(commands, &mut nodes)?;
+        Ok(nodes.into())
+    }
+
+    fn commands_into(
+        &mut self,
+        commands: &CommandList,
+        nodes: &mut Vec<SnapshotNode>,
+    ) -> Result<(), RenderFailure> {
+        let mut leaves = 0;
         for command in commands.iter() {
             let region = command.region();
             let command = match command {
@@ -333,6 +342,13 @@ impl Capture {
                     ruffle_render::profile::work(|w| w.prepared_chunk_hits += 1);
                     SnapshotCommand::Retained(index)
                 }
+                Command::Shared(children) if self.device.is_some() => {
+                    // An unprepared directory is just painter order. Expanding it
+                    // into this array avoids a worker allocation and scratch
+                    // reservation per logical slot on cold or volatile frames.
+                    self.commands_into(children, nodes)?;
+                    continue;
+                }
                 Command::Shared(children) => SnapshotCommand::Shared(self.commands(children)?),
                 Command::Blend(children, mode) => SnapshotCommand::Blend {
                     children: self.commands(children)?,
@@ -365,7 +381,7 @@ impl Capture {
             nodes.push(SnapshotNode { command, region });
         }
         ruffle_render::profile::work(|w| w.captured_command_leaves += leaves);
-        Ok(nodes.into())
+        Ok(())
     }
 }
 impl PreparedSnapshot {
@@ -716,5 +732,34 @@ impl PreparedSnapshot {
                 "native preparation produced no graph",
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod stage_capture_tests {
+    use super::*;
+    use ruffle_render::commands::CommandHandler;
+
+    #[test]
+    fn unprepared_stage_blocks_flatten_in_painter_order_for_workers() {
+        let mut mixed = CommandList::new();
+        mixed.push_mask();
+        mixed.draw_rect(swf::Color::WHITE, Default::default());
+        mixed.activate_mask();
+        mixed.deactivate_mask();
+        mixed.draw_rect(swf::Color::BLACK, Default::default());
+        mixed.pop_mask();
+        let mut stage = CommandList::new();
+        stage.push(Command::Shared(Rc::new(mixed)));
+        let prepared = PreparedSnapshot::capture_for_device(&stage, Some(1)).unwrap();
+        assert_eq!(prepared.snapshot.commands.len(), 6);
+        assert!(matches!(
+            prepared.snapshot.commands[0].command,
+            SnapshotCommand::Mask(MaskCommand::Push)
+        ));
+        assert!(matches!(
+            prepared.snapshot.commands[5].command,
+            SnapshotCommand::Mask(MaskCommand::Pop)
+        ));
     }
 }
