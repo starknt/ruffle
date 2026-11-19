@@ -290,3 +290,35 @@ fn narrow_static_branch_next_to_a_live_effect_stays_collapsed() {
         metrics.snapshot().work.tree_visits
     );
 }
+
+#[test]
+fn observed_leaf_coordinate_queries_rebuild_only_the_moved_path() {
+    let player = PlayerBuilder::new()
+        .with_viewport_dimensions(128, 128, 1.0)
+        .with_scale_mode(StageScaleMode::NoScale, true)
+        .build();
+    let mut player = player.lock().unwrap();
+    player.mutate_with_update_context(|ctx| {
+        let root = MovieClip::new(ctx.stage.movie(), ctx.gc());
+        for i in 1..=64 {
+            let shape = Graphic::empty(ctx);
+            root.replace_at_depth(ctx, shape.into(), i);
+        }
+        ctx.stage.replace_at_depth(ctx, root.into(), 1);
+    });
+    player.render().unwrap();
+    player.mutate_with_update_context(|ctx| {
+        let root = ctx.stage.child_by_depth(1).unwrap().as_container().unwrap();
+        for shape in root.iter_render_list() {
+            shape.local_to_global_matrix_without_own_scroll_rect();
+        }
+        root.child_by_index(31).unwrap().set_x(Twips::new(73));
+        let metrics = RenderMetrics::default();
+        let _scope = enter(Some(&metrics));
+        for (i, shape) in root.iter_render_list().enumerate() {
+            let matrix = shape.local_to_global_matrix_without_own_scroll_rect();
+            assert_eq!(matrix.tx, Twips::new(if i == 31 { 73 } else { 0 }));
+        }
+        assert_eq!(metrics.snapshot().work.world_matrix_builds, 1);
+    });
+}

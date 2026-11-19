@@ -96,7 +96,7 @@ pub(in crate::display_object) struct Children {
     layout_revision: u64,
     ids: FnvHashMap<u64, usize>,
     scopes: Vec<Range<usize>>,
-    dirty: BTreeSet<usize>,
+    dirty: Vec<usize>,
     reasons: Vec<Change>,
     instances: Vec<Option<Instance>>,
     live: BTreeSet<usize>,
@@ -122,8 +122,10 @@ impl super::State {
 impl Children {
     pub(super) fn mark(&mut self, child: u64, reason: Change) {
         if let Some(index) = self.ids.get(&child) {
+            if self.reasons[*index].is_empty() {
+                self.dirty.push(*index);
+            }
             self.reasons[*index] |= reason;
-            self.dirty.insert(*index);
         }
     }
 }
@@ -166,27 +168,31 @@ fn pack(mut level: Vec<Command>) -> (Block, usize) {
 }
 
 // Stable siblings keep their pages. Only pages intersecting a patch are copied.
-fn patch(root: &Block, stride: usize, offset: usize, changes: &[(usize, Command)]) -> Block {
-    if changes.is_empty() {
-        return root.clone();
+fn patch(root: &Block, stride: usize, changes: Vec<(usize, Command)>) -> Block {
+    type Patches = std::iter::Peekable<std::vec::IntoIter<(usize, Command)>>;
+    fn update(root: &Block, stride: usize, offset: usize, changes: &mut Patches) -> Block {
+        let end = offset + root.iter().len() * stride;
+        if changes.peek().is_none_or(|(slot, _)| *slot >= end) {
+            return root.clone();
+        }
+        chunk(root.iter().enumerate().map(|(i, command)| {
+            let start = offset + i * stride;
+            if changes
+                .peek()
+                .is_none_or(|(slot, _)| *slot >= start + stride)
+            {
+                return command.clone();
+            }
+            if stride == 1 {
+                return changes.next().unwrap().1;
+            }
+            let Command::Shared(child) = command else {
+                unreachable!("invalid chunk directory")
+            };
+            Command::Shared(update(child, stride / WIDTH, start, changes))
+        }))
     }
-    let mut rest = changes;
-    chunk(root.iter().enumerate().map(|(i, command)| {
-        let start = offset + i * stride;
-        let n = rest.partition_point(|(slot, _)| *slot < start + stride);
-        let (here, tail) = rest.split_at(n);
-        rest = tail;
-        if here.is_empty() {
-            return command.clone();
-        }
-        if stride == 1 {
-            return here[0].1.clone();
-        }
-        let Command::Shared(child) = command else {
-            unreachable!("invalid chunk directory")
-        };
-        Command::Shared(patch(child, stride / WIDTH, start, here))
-    }))
+    update(root, stride, 0, &mut changes.into_iter().peekable())
 }
 
 fn slot_at(root: &Block, mut stride: usize, mut index: usize) -> Command {
@@ -205,7 +211,11 @@ fn slot_at(root: &Block, mut stride: usize, mut index: usize) -> Command {
     }
 }
 
-fn layout<'gc>(container: DisplayObjectContainer<'gc>, children: &mut Children) -> bool {
+fn layout<'gc>(
+    container: DisplayObjectContainer<'gc>,
+    children: &mut Children,
+    cache: &mut super::Cache,
+) -> bool {
     let mut depths = Vec::new();
     for (i, child) in container.iter_render_list().enumerate() {
         while depths.last().is_some_and(|end| child.depth() > *end) {
@@ -216,6 +226,7 @@ fn layout<'gc>(container: DisplayObjectContainer<'gc>, children: &mut Children) 
         }
         let index = children.scopes.len() - 1;
         children.scopes[index].end = i + 1;
+        child.base().snapshots.observe_spatial(cache);
         if children
             .ids
             .insert(child.base().snapshots.id(), index)
@@ -313,16 +324,21 @@ pub(in crate::display_object) fn render<'gc>(
             node.dense.set(true);
             return false;
         }
-        let dirty = std::mem::take(&mut index.dirty);
-        let work: Vec<_> = if inherited_changed {
-            (0..index.scopes.len()).collect()
+        let mut work = std::mem::take(&mut index.dirty);
+        if inherited_changed {
+            work.clear();
+            work.extend(0..index.scopes.len());
         } else {
-            dirty.union(&index.live).copied().collect()
-        };
+            work.extend(index.live.iter().copied());
+            work.sort_unstable();
+            if !index.live.is_empty() {
+                work.dedup();
+            }
+        }
         let mut stable_patches = Vec::with_capacity(work.len());
         let mut live_patches = Vec::new();
         ruffle_render::profile::work(|w| w.child_slots_examined += work.len() as u64);
-        for slot in work {
+        for slot in work.drain(..) {
             let scope = index.scopes[slot].clone();
             let reason = std::mem::take(&mut index.reasons[slot]);
             let child = container.child_by_index(scope.start).unwrap();
@@ -351,11 +367,12 @@ pub(in crate::display_object) fn render<'gc>(
                 live_patches.push((slot, block));
             }
         }
+        index.dirty = work;
         if stable_patches.is_empty() {
             ruffle_render::profile::work(|w| w.snapshot_hits += 1);
         }
-        let root = patch(&old, index.stride, 0, &stable_patches);
-        let output = patch(&root, index.stride, 0, &live_patches);
+        let root = patch(&old, index.stride, stable_patches);
+        let output = patch(&root, index.stride, live_patches);
         let changed = inherited_changed || !Rc::ptr_eq(&root, &old);
         (index, changed.then_some(root), output)
     } else {
@@ -393,7 +410,7 @@ pub(in crate::display_object) fn render<'gc>(
             stride: 1,
             _metadata: metadata,
         };
-        if !layout(container, &mut index) {
+        if !layout(container, &mut index, cache) {
             return false;
         }
         let mut stable = Vec::with_capacity(index.scopes.len());
@@ -413,7 +430,7 @@ pub(in crate::display_object) fn render<'gc>(
                 if let Some(&prior) = old.ids.get(&id)
                     && old.scopes[prior].len() == 1
                     && !old.live.contains(&prior)
-                    && !old.dirty.contains(&prior)
+                    && old.reasons[prior].is_empty()
                 {
                     stable.push(slot_at(root, old.stride, prior));
                     index.instances.push(old.instances[prior].take());
@@ -441,7 +458,7 @@ pub(in crate::display_object) fn render<'gc>(
         }
         let (root, stride) = pack(stable);
         index.stride = stride;
-        let output = patch(&root, stride, 0, &live);
+        let output = patch(&root, stride, live);
         (index, Some(root), output)
     };
     let cache = context.snapshots.as_deref_mut().unwrap();

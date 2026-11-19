@@ -56,8 +56,6 @@ pub struct Entry {
 
 #[derive(Default)]
 pub struct Node {
-    bounds: Cell<Option<(bounds::Key, Rectangle<Twips>)>>,
-    world: Cell<Option<bounds::World>>,
     layout_revision: Cell<u64>,
     revisions: RenderGeneration,
     children: RefCell<Option<children::Children>>,
@@ -85,6 +83,7 @@ thread_local! { static NEXT_ID: Cell<u64> = const { Cell::new(1) }; }
 
 #[derive(Default)]
 pub struct State {
+    spatial: RefCell<Option<Box<bounds::Spatial>>>,
     id: Cell<u64>,
     pub(super) transform_stamp: Cell<u64>,
     pub(super) bounds_observed: Cell<bool>,
@@ -137,8 +136,8 @@ impl State {
         if !self.bounds_observed.replace(false) {
             return false;
         }
-        if let Some(node) = self.node.borrow().as_ref() {
-            node.bounds.set(None);
+        if let Some(space) = self.spatial.borrow().as_ref() {
+            space.clear_bounds();
         }
         true
     }
@@ -176,11 +175,21 @@ impl State {
     pub fn clear(&self) {
         self.invalidate();
         self.node.borrow_mut().take();
+        self.spatial.borrow_mut().take();
+    }
+    fn observe_spatial(&self, cache: &mut Cache) {
+        let mut space = self.spatial.borrow_mut();
+        if space.is_none()
+            && let Some(charge) = cache.charge(size_of::<bounds::Spatial>() + 32)
+        {
+            *space = Some(Box::new(bounds::Spatial::new(charge)));
+        }
     }
     pub fn node(&self, cache: &mut Cache) -> Option<Rc<Node>> {
         let mut node = self.node.borrow_mut();
         if node.is_none() {
             *node = Some(cache.new_node()?);
+            self.observe_spatial(cache);
         }
         node.clone()
     }
