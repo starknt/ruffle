@@ -81,15 +81,13 @@ pub struct GraphEncoder {
 impl GraphEncoder {
     pub fn prepare<T: crate::target::RenderTarget>(
         backend: &mut crate::backend::WgpuRenderBackend<T>,
-        commands: &CommandList,
+        commands: CommandList,
         bounds: RenderRect,
         samples: u32,
         load: Load,
     ) -> Result<Self, RenderFailure> {
-        let prepared = PreparedSnapshot::capture_for_device(
-            commands,
-            Some(backend.descriptors.runtime.generation()),
-        )?;
+        let prepared =
+            PreparedSnapshot::capture_owned(commands, backend.descriptors.runtime.generation())?;
         Self::from_prepared(backend, prepared, bounds, samples, load)
     }
     pub fn from_prepared<T: crate::target::RenderTarget>(

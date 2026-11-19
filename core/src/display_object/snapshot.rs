@@ -10,6 +10,8 @@ use std::{
 };
 use swf::{Rectangle, Twips};
 
+pub(super) const LIVE_RETRY_FRAMES: u64 = 64;
+
 bitflags::bitflags! {
     #[derive(Clone, Copy, Default, PartialEq, Eq)]
     pub(super) struct Change: u8 {
@@ -61,6 +63,7 @@ pub struct Node {
     children: RefCell<Option<children::Children>>,
     dense: Cell<bool>,
     live_until: Cell<u64>,
+    pub(super) retry_recording: Cell<u64>,
     dirty_children: Cell<usize>,
     pub entry: RefCell<Option<Entry>>,
     pub used: Cell<u64>,

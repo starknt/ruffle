@@ -290,6 +290,22 @@ pub(in crate::display_object) fn render<'gc>(
         return false;
     }
     node.dense.set(false);
+    if node.children.borrow().is_none()
+        && container.raw_container().iter_render_list().all(|child| {
+            matches!(child, DisplayObject::Video(_) | DisplayObject::EditText(_))
+                || child.is_bitmap_cached()
+                || child.masker().is_some()
+                || child.maskee().is_some()
+        })
+    {
+        node.live_until.set(
+            context
+                .render_epoch
+                .saturating_add(super::LIVE_RETRY_FRAMES),
+        );
+        context.snapshot_barriers += 1;
+        return false;
+    }
     let dimensions = context.renderer.viewport_dimensions();
     let key = Key {
         mask_geometry: false,
@@ -468,7 +484,11 @@ pub(in crate::display_object) fn render<'gc>(
     // A fully live painter order has no reusable geometry to hide its
     // recording cost. Stream it directly until an edit or a periodic probe.
     if index.live.len() == index.scopes.len() && stable_root.is_some() {
-        node.live_until.set(context.render_epoch.saturating_add(64));
+        node.live_until.set(
+            context
+                .render_epoch
+                .saturating_add(super::LIVE_RETRY_FRAMES),
+        );
         context.commands.push(Command::Shared(output));
         return true;
     }
@@ -540,13 +560,19 @@ mod tests {
                 }
                 ctx.stage.replace_at_depth(ctx, root.into(), 1);
             });
-            player.render().unwrap();
             let metrics = RenderMetrics::default();
             let _scope = enter(Some(&metrics));
             player.render().unwrap();
-            metrics.snapshot().work.child_slots_examined
+            let first = metrics.snapshot().work;
+            player.render().unwrap();
+            (
+                first.child_slots_examined,
+                metrics.snapshot().work.delta(first).child_slots_examined,
+            )
         };
-        assert_eq!(examined(32) - examined(16), 16);
+        let small = examined(16);
+        let large = examined(32);
+        assert_eq!((large.0 - small.0, large.1 - small.1), (16, 16));
     }
 
     #[test]

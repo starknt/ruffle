@@ -458,7 +458,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
 
     fn prepare_commands(
         &mut self,
-        commands: &CommandList,
+        commands: CommandList,
         width: u32,
         height: u32,
         quality: StageQuality,
@@ -901,7 +901,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         }
 
         let graph = self.prepare_commands(
-            &commands,
+            commands,
             self.target.width(),
             self.target.height(),
             self.surface.quality(),
@@ -1170,7 +1170,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             texture.texture.format(),
         )?;
         let graph = self.prepare_commands(
-            &commands,
+            commands,
             extent.width,
             extent.height,
             quality,

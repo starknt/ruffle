@@ -478,6 +478,28 @@ impl PreparedSnapshot {
         Self::capture_for_device(commands, None)
     }
 
+    /// A dense frame can change every transform while all geometry is already
+    /// resident. Move a long, dependency-free command stream to the owner
+    /// table for this submission. The next submission supplies fresh commands.
+    pub(super) fn capture_owned(commands: CommandList, device: u64) -> Result<Self, RenderFailure> {
+        if commands.iter().len() >= 64 && Capture::immutable(&commands, device) {
+            let node = SnapshotNode {
+                command: SnapshotCommand::Retained(0),
+                region: commands.region(),
+            };
+            return Ok(Self {
+                snapshot: RenderSnapshot {
+                    commands: Arc::from([node]),
+                    recipes: Vec::new(),
+                },
+                resources: Vec::new(),
+                resource_indices: Default::default(),
+                retained: vec![Rc::new(commands)],
+            });
+        }
+        Self::capture_for_device(&commands, Some(device))
+    }
+
     pub(super) fn capture_for_device(
         commands: &CommandList,
         device: Option<u64>,

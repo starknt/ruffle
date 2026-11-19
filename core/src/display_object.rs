@@ -1603,13 +1603,18 @@ fn render_snapshot<'gc>(
             return;
         }
         node.entry.borrow_mut().take();
-        let stable = node
-            .observed
-            .borrow()
-            .as_ref()
-            .is_none_or(|old| *old == key);
-        *node.observed.borrow_mut() = Some(key.clone());
-        if !stable {
+        let mut observed = node.observed.borrow_mut();
+        let changed = observed.as_ref().is_some_and(|old| *old != key);
+        if observed.is_none() || changed {
+            *observed = Some(key.clone());
+            node.retry_recording.set(0);
+        }
+        drop(observed);
+        let live = node.retry_recording.get() > context.render_epoch;
+        if live {
+            context.snapshot_barriers += 1;
+        }
+        if changed || live {
             render_base_inner(this, context, options);
             context.snapshot_allowed = allowed;
             return;
@@ -1630,6 +1635,16 @@ fn render_snapshot<'gc>(
     context.snapshot_recording = recording;
     if let Some((node, key, original, barriers)) = prepared {
         let commands = std::rc::Rc::new(std::mem::replace(&mut context.commands, original));
+        if context.snapshot_barriers != barriers {
+            // A stable wrapper around a live child still paints its child
+            // directory. Retry a whole-subtree recording after a key change
+            // or a bounded interval for resources that become resident.
+            node.retry_recording.set(
+                context
+                    .render_epoch
+                    .saturating_add(snapshot::LIVE_RETRY_FRAMES),
+            );
+        }
         let stored = context.snapshot_barriers == barriers
             && context.snapshots.as_deref_mut().unwrap().insert(
                 &node,

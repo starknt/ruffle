@@ -341,3 +341,29 @@ fn alpha_and_visibility_edits_keep_exact_parent_bounds() {
         assert_eq!(metrics.snapshot().work.render_bounds_nodes, 0);
     });
 }
+
+#[test]
+fn unchanged_alpha_mask_wrapper_does_not_retry_recording_a_whole_subtree() {
+    let movie = crate::tag_utils::SwfMovieData::from_data(
+        include_bytes!("../../../tests/tests/swfs/native_perf/alpha_mask/test.swf"),
+        "file:///masks.swf".into(),
+        None,
+        None,
+    )
+    .unwrap();
+    let player = PlayerBuilder::new()
+        .with_movie(movie)
+        .with_autoplay(true)
+        .with_viewport_dimensions(1280, 720, 1.)
+        .build();
+    let mut player = player.lock().unwrap();
+    assert!(player.preload(&mut crate::limits::ExecutionLimit::none()));
+    player.run_frame();
+    for _ in 0..3 {
+        player.render().unwrap();
+    }
+    let metrics = RenderMetrics::default();
+    let _scope = enter(Some(&metrics));
+    player.render().unwrap();
+    assert_eq!(metrics.snapshot().work.snapshot_misses, 0);
+}

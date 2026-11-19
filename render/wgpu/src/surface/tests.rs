@@ -3416,3 +3416,35 @@ fn prepared_groups_fill_the_same_uniform_windows_as_flat_draws() {
     }
     panic!("expected three warm replays");
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn flat_resident_draws_use_current_transforms_without_recapturing_each_leaf() {
+    use ruffle_render::profile::{RenderMetrics, enter};
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (16, 4)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let metrics = RenderMetrics::default();
+    let _scope = enter(Some(&metrics));
+    for x in [0., 8.] {
+        let mut frame = CommandList::new();
+        for _ in 0..80 {
+            rect(&mut frame, x, 0., 4., 4., Color::RED);
+        }
+        let before = metrics.snapshot().work;
+        renderer.submit_frame(Color::WHITE, frame, vec![]).unwrap();
+        if x != 0. {
+            assert_eq!(
+                metrics
+                    .snapshot()
+                    .work
+                    .delta(before)
+                    .captured_command_leaves,
+                0
+            );
+        }
+    }
+    let image = renderer.capture_frame().unwrap().unwrap();
+    assert_eq!(image.get_pixel(2, 2).0, [255, 255, 255, 255]);
+    assert_eq!(image.get_pixel(10, 2).0, [255, 0, 0, 255]);
+}
