@@ -37,6 +37,16 @@ pub(super) fn invalidate_child_names() {
     CHILD_NAME_GENERATION.set(CHILD_NAME_GENERATION.get().wrapping_add(1));
 }
 
+/// Publish the logical edit before callbacks can read bounds or draw the list.
+fn children_changed(container: DisplayObjectContainer<'_>) {
+    let object: DisplayObject<'_> = container.into();
+    object
+        .base()
+        .snapshots
+        .resize_children(container.num_children());
+    super::invalidate_bitmap(object, super::snapshot::Change::CHILDREN);
+}
+
 /// Dispatch the `removedFromStage` event on a child and all of it's
 /// grandchildren, recursively.
 pub fn dispatch_removed_from_stage_event<'gc>(
@@ -226,6 +236,7 @@ pub trait TDisplayObjectContainer<'gc>:
         let removed_child = self
             .raw_container_mut(context.gc())
             .replace_at_depth(child, depth);
+        children_changed(self.into());
 
         child.set_parent(context, Some(self.into()));
         child.set_place_frame(0);
@@ -241,9 +252,6 @@ pub trait TDisplayObjectContainer<'gc>:
             // (See https://github.com/ruffle-rs/ruffle/issues/21500)
             removed_child.avm1_unload(context);
         }
-
-        let this: DisplayObject<'_> = self.into();
-        this.invalidate_cached_bitmap();
 
         removed_child
     }
@@ -270,8 +278,7 @@ pub trait TDisplayObjectContainer<'gc>:
 
         self.raw_container_mut(context.gc())
             .swap_at_depth(context, this, child, depth);
-
-        this.invalidate_cached_bitmap();
+        children_changed((*self).into());
     }
 
     /// Insert a child display object into the container at a specific position
@@ -312,12 +319,11 @@ pub trait TDisplayObjectContainer<'gc>:
 
         self.raw_container_mut(context.gc())
             .insert_at_id(child, index);
+        children_changed((*self).into());
 
         if parent_changed {
             dispatch_added_event(this, child, child_was_on_stage, context);
         }
-
-        this.invalidate_cached_bitmap();
     }
 
     /// Swap two children in the render list.
@@ -327,8 +333,7 @@ pub trait TDisplayObjectContainer<'gc>:
     fn swap_at_index(&mut self, context: &mut UpdateContext<'gc>, index1: usize, index2: usize) {
         self.raw_container_mut(context.gc())
             .swap_at_id(index1, index2);
-        let this: DisplayObject<'_> = (*self).into();
-        this.invalidate_cached_bitmap();
+        children_changed((*self).into());
     }
 
     /// Remove (and unloads) a child display object from this container's render and depth lists.
@@ -407,9 +412,6 @@ pub trait TDisplayObjectContainer<'gc>:
                 //don't.
                 child.set_parent(context, None);
             }
-
-            let this: DisplayObject<'_> = this.into();
-            this.invalidate_cached_bitmap();
         }
     }
 
@@ -785,6 +787,7 @@ impl<'gc> ChildContainer<'gc> {
         if let Some(position) = render_list_position {
             this.render_list_mut().remove(position);
             drop(this);
+            children_changed(container);
 
             // Only set the parent's field to 'null' if the child was not placed/modified
             // on the render list by AVM2 code.
@@ -1016,6 +1019,9 @@ impl<'gc> ChildContainer<'gc> {
                 self.render_list_mut().move_to(old_id, id);
             }
         } else {
+            // REMOVED on the old parent can shrink the destination after
+            // ActionScript validated the index.
+            let id = id.min(self.render_list.len());
             self.render_list_mut().insert(id, child);
         }
     }

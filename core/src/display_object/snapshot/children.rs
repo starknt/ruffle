@@ -103,6 +103,20 @@ pub(in crate::display_object) struct Children {
     _metadata: NodeCharge,
 }
 
+impl super::State {
+    pub(in crate::display_object) fn resize_children(&self, count: usize) {
+        if let Some(node) = self.node.borrow().as_ref() {
+            let mut children = node.children.borrow_mut();
+            if children
+                .as_ref()
+                .is_some_and(|index| count < 2 || index.ids.len() > count.saturating_mul(2))
+            {
+                children.take();
+            }
+        }
+    }
+}
+
 impl Children {
     pub(super) fn mark(&mut self, child: u64, reason: Change) {
         if let Some(index) = self.ids.get(&child) {
@@ -222,7 +236,7 @@ pub(in crate::display_object) fn render<'gc>(
     context: &mut RenderContext<'_, 'gc>,
 ) -> bool {
     let count = container.num_children();
-    if count < 8
+    if count < 2
         || !context.snapshot_allowed
         || context.is_offscreen
         || context.commands.drawing_mask()
@@ -316,6 +330,9 @@ pub(in crate::display_object) fn render<'gc>(
                 }
                 live_patches.push((slot, block));
             }
+        }
+        if stable_patches.is_empty() {
+            ruffle_render::profile::work(|w| w.snapshot_hits += 1);
         }
         let root = patch(&old, index.stride, 0, &stable_patches);
         let output = patch(&root, index.stride, 0, &live_patches);
@@ -421,4 +438,64 @@ pub(in crate::display_object) fn render<'gc>(
         *node.children.borrow_mut() = Some(index);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::display_object::{Graphic, MovieClip, StageScaleMode, Video};
+    use crate::player::PlayerBuilder;
+
+    #[test]
+    fn empty_video_remains_live_until_its_first_decoded_frame() {
+        let player = PlayerBuilder::new()
+            .with_viewport_dimensions(128, 128, 1.0)
+            .with_scale_mode(StageScaleMode::NoScale, true)
+            .build();
+        let mut player = player.lock().unwrap();
+        player.mutate_with_update_context(|ctx| {
+            let root = MovieClip::new(ctx.stage.movie(), ctx.gc());
+            let video = Video::new(ctx.gc(), ctx.stage.movie(), 32, 32, None);
+            root.replace_at_depth(ctx, video.into(), 1);
+            for i in 2..=16 {
+                let g = Graphic::empty(ctx);
+                root.replace_at_depth(ctx, g.into(), i);
+            }
+            ctx.stage.replace_at_depth(ctx, root.into(), 1);
+        });
+        player.render().unwrap();
+        player.mutate_with_update_context(|ctx| {
+            let root = ctx.stage.child_by_depth(1).unwrap();
+            let node = root.base().snapshots.node.borrow().clone().unwrap();
+            assert!(node.children.borrow().as_ref().unwrap().live.contains(&0));
+        });
+    }
+
+    #[test]
+    fn emptying_a_wide_container_releases_its_index_before_the_next_frame() {
+        let player = PlayerBuilder::new()
+            .with_viewport_dimensions(128, 128, 1.0)
+            .with_scale_mode(StageScaleMode::NoScale, true)
+            .build();
+        let mut player = player.lock().unwrap();
+        player.mutate_with_update_context(|ctx| {
+            let root = MovieClip::new(ctx.stage.movie(), ctx.gc());
+            for i in 1..=256 {
+                let g = Graphic::empty(ctx);
+                root.replace_at_depth(ctx, g.into(), i);
+            }
+            ctx.stage.replace_at_depth(ctx, root.into(), 1);
+        });
+        player.render().unwrap();
+        player.mutate_with_update_context(|ctx| {
+            let root = ctx.stage.child_by_depth(1).unwrap();
+            let node = root.base().snapshots.node.borrow().clone().unwrap();
+            assert!(node.children.borrow().is_some());
+            let container = root.as_container().unwrap();
+            for child in container.iter_render_list() {
+                container.remove_child_directly(ctx, child);
+            }
+            assert!(node.children.borrow().is_none());
+        });
+    }
 }

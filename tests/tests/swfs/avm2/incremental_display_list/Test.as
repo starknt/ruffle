@@ -64,6 +64,24 @@ package {
             trace("removed", group.numChildren, group.getChildAt(1) == red, sample());
             group.addChildAt(blue, 0);
             trace("added", group.numChildren, group.getChildIndex(blue), group.getChildIndex(red), sample());
+            trace("before add", group.width);
+            var extent:Sprite = box(0xff0000);
+            extent.x = 44;
+            extent.addEventListener(Event.ADDED, function(e:Event):void {
+                trace("during add", group.getChildIndex(extent), group.width);
+            });
+            group.addChild(extent);
+            group.removeChild(extent);
+            var from:Sprite = new Sprite();
+            var to:Sprite = new Sprite();
+            var moving:Sprite = new Sprite();
+            from.addChild(moving);
+            to.addChild(new Sprite());
+            moving.addEventListener(Event.REMOVED, function(e:Event):void {
+                to.removeChildAt(0);
+            });
+            to.addChild(moving);
+            trace("reparented", from.numChildren, to.numChildren, to.getChildAt(0) == moving);
             group.scrollRect = new Rectangle(0, 0, 4, 8);
             maskParent.x += 4;
             filtered.filters = [];

@@ -58,8 +58,8 @@ pub struct Entry {
 
 #[derive(Default)]
 pub struct Node {
-    pub(super) bounds: Cell<Option<(bounds::Key, Rectangle<Twips>)>>,
-    pub(super) world: Cell<Option<bounds::World>>,
+    bounds: Cell<Option<(bounds::Key, Rectangle<Twips>)>>,
+    world: Cell<Option<bounds::World>>,
     layout_revision: Cell<u64>,
     revisions: RenderGeneration,
     children: RefCell<Option<children::Children>>,

@@ -5,7 +5,7 @@ use crate::pixel_bender::PixelBenderShaderHandle;
 use crate::region::RenderRegion;
 use crate::transform::Transform;
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     rc::Rc,
 };
 use swf::{BlendMode, Color};
@@ -51,11 +51,7 @@ pub enum RenderBlendMode {
 pub struct CommandList {
     commands: Vec<Command>,
     has_commands: bool,
-    retained_size: std::cell::Cell<Option<usize>>,
-    prepared_device: Cell<Option<u64>>,
-    charge: RefCell<Option<StorageCharge>>,
-    prepared: RefCell<Option<Box<PreparedData>>>,
-    observed: Cell<bool>,
+    retention: OnceCell<Box<Retention>>,
     region: RenderRegion,
     temporary_inputs: usize,
     samples_ancestor_layer: bool,
@@ -63,6 +59,19 @@ pub struct CommandList {
     /// The number of mask regions in the process of being drawn.
     /// This is used to discard drawing commands of nested maskers, which Flash does not support.
     maskers_in_progress: u32,
+}
+
+// Live command lists and inline blend/mask operands pay one pointer.
+// Allocate this state only when observing a retained block.
+#[derive(Default, Debug)]
+struct Retention {
+    total_bytes: Cell<Option<usize>>,
+    local_bytes: Cell<Option<usize>>,
+    device: Cell<Option<u64>>,
+    charge: RefCell<Option<StorageCharge>>,
+    prepared: RefCell<Option<PreparedData>>,
+    observed: Cell<bool>,
+    required_bytes: Cell<usize>,
 }
 
 #[derive(Debug)]
@@ -98,20 +107,31 @@ impl Clone for CommandList {
 }
 
 impl CommandList {
+    fn retention(&self) -> &Retention {
+        self.retention.get_or_init(Default::default)
+    }
     /// A positive certificate covers only immutable resident draws on one device.
     /// Mutation of the command list revokes it, including after Rc::make_mut.
     pub fn certify_immutable(&self, device: u64, check: impl FnOnce() -> bool) -> bool {
-        if self.prepared_device.get() == Some(device) {
+        if self
+            .retention
+            .get()
+            .is_some_and(|state| state.device.get() == Some(device))
+        {
             return true;
         }
         if !check() {
             return false;
         }
-        self.prepared_device.set(Some(device));
+        let state = self.retention();
+        state.device.set(Some(device));
+        state.required_bytes.set(0);
         true
     }
     pub fn prepared_draws<T: std::any::Any>(&self) -> Option<Rc<T>> {
-        self.prepared
+        self.retention
+            .get()?
+            .prepared
             .borrow()
             .as_ref()?
             .value
@@ -120,29 +140,42 @@ impl CommandList {
             .ok()
     }
     pub fn may_prepare_draws(&self, device: u64) -> bool {
-        self.prepared_device.get() == Some(device)
-            && self.charge.borrow().is_some()
-            && self.observed.replace(true)
+        let Some(state) = self.retention.get() else {
+            return false;
+        };
+        state.device.get() == Some(device)
+            && state.observed.replace(true)
+            && state.charge.borrow().as_ref().is_some_and(|charge| {
+                state.required_bytes.get() <= charge.limit.saturating_sub(charge.budget.get())
+            })
     }
+
+    pub fn decline_draw_packet(&self) {
+        self.retention().required_bytes.set(usize::MAX);
+    }
+
     pub fn store_draws<T: std::any::Any>(&self, value: Rc<T>, bytes: usize) {
-        self.prepared.borrow_mut().take();
-        let charge = self.charge.borrow();
+        let state = self.retention();
+        state.prepared.borrow_mut().take();
+        let charge = state.charge.borrow();
         let Some(charge) = charge.as_ref() else {
             return;
         };
         let bytes = bytes.saturating_add(size_of::<PreparedData>() + 64);
         if bytes > charge.limit.saturating_sub(charge.budget.get()) {
+            state.required_bytes.set(bytes);
             return;
         }
         charge.budget.set(charge.budget.get() + bytes);
-        *self.prepared.borrow_mut() = Some(Box::new(PreparedData {
+        state.required_bytes.set(0);
+        *state.prepared.borrow_mut() = Some(PreparedData {
             value,
             _charge: StorageCharge {
                 budget: charge.budget.clone(),
                 bytes,
                 limit: charge.limit,
             },
-        }));
+        });
     }
     pub fn temporary_inputs(&self) -> usize {
         self.temporary_inputs
@@ -151,11 +184,7 @@ impl CommandList {
         self.samples_ancestor_layer
     }
     pub fn append(&mut self, mut other: CommandList) {
-        self.prepared.get_mut().take();
-        self.observed.set(false);
-        self.charge.get_mut().take();
-        self.retained_size.set(None);
-        self.prepared_device.set(None);
+        self.retention.take();
         debug_assert_eq!(other.maskers_in_progress, 0);
         self.region = self.region.union(other.region);
         self.temporary_inputs = self.temporary_inputs.saturating_add(other.temporary_inputs);
@@ -165,7 +194,17 @@ impl CommandList {
     }
 
     fn local_bytes(&self) -> Option<usize> {
-        let mut bytes = size_of::<Self>() + self.commands.capacity() * size_of::<Command>();
+        if let Some(bytes) = self
+            .retention
+            .get()
+            .and_then(|state| state.local_bytes.get())
+        {
+            return Some(bytes);
+        }
+        let mut bytes = size_of::<Self>()
+            + size_of::<Retention>()
+            + 32
+            + self.commands.capacity() * size_of::<Command>();
         for command in &self.commands {
             bytes = bytes.checked_add(match command {
                 Command::RenderShape { shape, .. } => shape.0.retained_bytes()?,
@@ -181,11 +220,16 @@ impl CommandList {
                 _ => return None,
             })?;
         }
+        self.retention().local_bytes.set(Some(bytes));
         Some(bytes)
     }
 
     pub fn retained_bytes(&self) -> Option<usize> {
-        if let Some(bytes) = self.retained_size.get() {
+        if let Some(bytes) = self
+            .retention
+            .get()
+            .and_then(|state| state.total_bytes.get())
+        {
             return Some(bytes);
         }
         let mut bytes = self.local_bytes()?;
@@ -194,14 +238,16 @@ impl CommandList {
                 bytes = bytes.checked_add(child.retained_bytes()?)?;
             }
         }
-        self.retained_size.set(Some(bytes));
+        self.retention().total_bytes.set(Some(bytes));
         Some(bytes)
     }
 
     /// Additional storage this player would retain. Already charged shared
     /// blocks are constant-time stops, including blocks pinned by older frames.
     pub fn additional_bytes(&self, budget: &Rc<Cell<usize>>) -> Option<usize> {
-        if let Some(charge) = self.charge.borrow().as_ref() {
+        if let Some(state) = self.retention.get()
+            && let Some(charge) = state.charge.borrow().as_ref()
+        {
             return Rc::ptr_eq(&charge.budget, budget).then_some(0);
         }
         let mut bytes = self.local_bytes()?;
@@ -215,14 +261,15 @@ impl CommandList {
 
     /// Called after the complete graph and its size have been validated.
     pub fn charge_storage(&self, budget: &Rc<Cell<usize>>, limit: usize) {
-        if self.charge.borrow().is_some() {
+        let state = self.retention();
+        if state.charge.borrow().is_some() {
             return;
         }
         let bytes = self
             .local_bytes()
             .expect("validated retained command block");
         budget.set(budget.get() + bytes);
-        *self.charge.borrow_mut() = Some(StorageCharge {
+        *state.charge.borrow_mut() = Some(StorageCharge {
             budget: budget.clone(),
             bytes,
             limit,
@@ -261,11 +308,7 @@ impl CommandList {
         self.region
     }
     pub fn push(&mut self, command: Command) {
-        self.prepared.get_mut().take();
-        self.observed.set(false);
-        self.charge.get_mut().take();
-        self.retained_size.set(None);
-        self.prepared_device.set(None);
+        self.retention.take();
         self.region = self.region.union(command.region());
         self.temporary_inputs = self
             .temporary_inputs
@@ -548,5 +591,26 @@ impl Command {
                 RenderRegion::Empty
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod prepared_budget_tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_packet_budget_retries_only_when_space_is_available() {
+        let mut block = CommandList::new();
+        block.draw_rect(swf::Color::WHITE, Matrix::IDENTITY);
+        let storage = block.retained_bytes().unwrap();
+        let used = Rc::new(Cell::new(2048));
+        block.charge_storage(&used, storage + 2048);
+        assert!(block.certify_immutable(1, || true));
+        assert!(!block.may_prepare_draws(1));
+        assert!(block.may_prepare_draws(1));
+        block.store_draws(Rc::new(()), 1024);
+        assert!(!block.may_prepare_draws(1));
+        used.set(used.get() - 2048);
+        assert!(block.may_prepare_draws(1));
     }
 }

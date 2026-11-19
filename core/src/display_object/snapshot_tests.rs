@@ -255,3 +255,38 @@ fn stable_external_stencil_reuses_its_geometry_and_rechecks_moved_ancestors() {
     player.render().unwrap();
     assert!(metrics.snapshot().work.delta(before).tree_visits >= 64);
 }
+
+#[test]
+fn narrow_static_branch_next_to_a_live_effect_stays_collapsed() {
+    let player = PlayerBuilder::new()
+        .with_viewport_dimensions(128, 128, 1.0)
+        .with_scale_mode(StageScaleMode::NoScale, true)
+        .build();
+    let mut player = player.lock().unwrap();
+    player.mutate_with_update_context(|ctx| {
+        let movie = ctx.stage.movie();
+        let root = MovieClip::new(movie, ctx.gc());
+        let live = MovieClip::new(movie, ctx.gc());
+        live.set_blend_mode(ExtendedBlendMode::Shader);
+        root.replace_at_depth(ctx, live.into(), 1);
+        let branch = MovieClip::new(movie, ctx.gc());
+        root.replace_at_depth(ctx, branch.into(), 2);
+        let mut current = branch;
+        for _ in 0..40 {
+            let next = MovieClip::new(movie, ctx.gc());
+            current.replace_at_depth(ctx, next.into(), 1);
+            current = next;
+        }
+        ctx.stage.replace_at_depth(ctx, root.into(), 1);
+    });
+    player.render().unwrap();
+    player.render().unwrap();
+    let metrics = RenderMetrics::default();
+    let _scope = enter(Some(&metrics));
+    player.render().unwrap();
+    assert!(
+        metrics.snapshot().work.tree_visits < 8,
+        "expanded {} objects",
+        metrics.snapshot().work.tree_visits
+    );
+}

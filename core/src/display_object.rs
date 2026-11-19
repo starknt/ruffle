@@ -1474,6 +1474,17 @@ struct DrawCacheInfo {
     filters: Vec<Filter>,
 }
 
+fn invalidate_bitmap(this: DisplayObject<'_>, change: snapshot::Change) {
+    this.base().invalidate_component(change);
+    let mut object = Some(this);
+    while let Some(current) = object {
+        if !current.base().invalidate_cached_bitmap() {
+            break;
+        }
+        object = current.parent();
+    }
+}
+
 pub fn render_base<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
@@ -1540,8 +1551,13 @@ fn render_snapshot<'gc>(
         && eligible
         && !context.commands.drawing_mask()
         && this.maskee().is_none()
-        && matches!(this, DisplayObject::MovieClip(_))
-        && this.as_container().is_some_and(|c| c.num_children() >= 8);
+        && matches!(
+            this,
+            DisplayObject::MovieClip(_) | DisplayObject::LoaderDisplay(_)
+        )
+        && this.as_container().is_some_and(|c| {
+            c.num_children() >= 8 || (!context.snapshot_recording && c.num_children() != 0)
+        });
     let prepared = if candidate {
         let dimensions = context.renderer.viewport_dimensions();
         let key = snapshot::Key {
@@ -3751,14 +3767,7 @@ pub trait TDisplayObject<'gc>:
     /// If this object or any ancestor is marked as cacheAsBitmap, it will invalidate that cache.
     #[no_dynamic]
     fn invalidate_cached_bitmap(self) {
-        self.base().invalidate_render();
-        let mut object: Option<DisplayObject<'gc>> = Some(self.into());
-        while let Some(current) = object {
-            if !current.base().invalidate_cached_bitmap() {
-                break;
-            }
-            object = current.parent();
-        }
+        invalidate_bitmap(self.into(), snapshot::Change::VISUAL);
     }
 
     /// Retrieve a named property from the AVM1 object.

@@ -374,6 +374,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             self.replay_groups(&prepared);
             commands.store_draws(prepared, bytes);
         } else {
+            commands.decline_draw_packet();
             commands.execute_ref(self);
         }
     }
