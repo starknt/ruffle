@@ -541,12 +541,17 @@ fn cached_bitmap_alpha_mask_reuses_the_exact_raster_until_an_input_changes() {
             )
             .unwrap();
         for (x, alpha) in [
+            // End and start the two source versions at the same placement.
+            (4., Fixed8::from_f32(0.5)),
             (-2., Fixed8::ONE),
             (-2., Fixed8::from_f32(0.5)),
             (4., Fixed8::from_f32(0.5)),
         ] {
             let mut reference = None;
-            for frame in 0..4 {
+            for frame in 0..6 {
+                if frame == 4 {
+                    descriptors.runtime.scheduler().reclaim();
+                }
                 let content = input(image.clone(), x, Fixed8::ONE);
                 let mut mask = input(cached.clone(), x + 3., alpha);
                 if frame == 0 {
@@ -568,7 +573,14 @@ fn cached_bitmap_alpha_mask_reuses_the_exact_raster_until_an_input_changes() {
                 } else {
                     reference = Some(output);
                 }
-                if frame == 3 {
+                if frame == 1 || frame == 4 {
+                    assert_eq!(
+                        metrics.snapshot().work.offscreen_targets,
+                        1,
+                        "changed or reclaimed mask must be rasterized"
+                    );
+                }
+                if frame == 3 || frame == 5 {
                     assert_eq!(
                         metrics.snapshot().work.offscreen_targets,
                         0,
@@ -577,7 +589,6 @@ fn cached_bitmap_alpha_mask_reuses_the_exact_raster_until_an_input_changes() {
                 }
             }
         }
-        descriptors.runtime.scheduler().reclaim();
     }
 }
 
