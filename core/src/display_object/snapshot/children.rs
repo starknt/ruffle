@@ -16,6 +16,11 @@ use std::{collections::BTreeSet, ops::Range, rc::Rc};
 const WIDTH: usize = 16;
 type Block = Rc<CommandList>;
 
+enum SlotEdit {
+    Draw(Command),
+    Color(swf::ColorTransform),
+}
+
 struct Instance {
     shape: std::sync::Weak<dyn ShapeHandleImpl>,
     basis: [f32; 4],
@@ -49,17 +54,31 @@ impl Instance {
         &self,
         child: DisplayObject<'gc>,
         reason: Change,
+        parent_change: Change,
+        inherited: &Transform,
         context: &mut RenderContext<'_, 'gc>,
         empty: &Block,
-    ) -> Option<Command> {
+    ) -> Option<SlotEdit> {
         if !(reason - (Change::TRANSFORM | Change::COLOR | Change::VISIBILITY)).is_empty() {
             return None;
         }
         if !reason.is_empty() {
             child.pre_render(context);
         }
+        if ((reason | parent_change) - Change::COLOR).is_empty() {
+            // Visibility and coverage are unchanged, even for a culled slot.
+            let color = inherited.color_transform * child.base().color_transform();
+            ruffle_render::profile::work(|w| w.render_instances_updated += 1);
+            return Some(SlotEdit::Color(color));
+        }
+        if !child.visible() {
+            ruffle_render::profile::work(|w| w.render_instances_updated += 1);
+            return Some(SlotEdit::Draw(Command::Shared(empty.clone())));
+        }
         let local = child.base().transform(true);
-        let world = context.transform_stack.transform().concat(&local);
+        #[cfg(test)]
+        tests::INSTANCE_MATRICES.update(|count| count + 1);
+        let world = inherited.concat(&local);
         let m = world.matrix;
         // Timeline shapes choose their tessellation using the linear matrix.
         // Script graphics use the Drawing's existing, scale-independent handle.
@@ -69,11 +88,10 @@ impl Instance {
         {
             return None;
         }
-        let command = if child.visible()
-            && (!self.graphic
-                || child
-                    .world_bounds(super::super::BoundsMode::Engine)
-                    .intersects(&context.stage.view_bounds()))
+        let command = if !self.graphic
+            || child
+                .world_bounds(super::super::BoundsMode::Engine)
+                .intersects(&context.stage.view_bounds())
         {
             Command::RenderShape {
                 shape: ShapeHandle(self.shape.upgrade()?),
@@ -83,7 +101,7 @@ impl Instance {
             Command::Shared(empty.clone())
         };
         ruffle_render::profile::work(|w| w.render_instances_updated += 1);
-        Some(command)
+        Some(SlotEdit::Draw(command))
     }
 }
 
@@ -163,8 +181,8 @@ fn pack(mut level: Vec<Command>) -> (Block, usize) {
 }
 
 // Stable siblings keep their pages. Only pages intersecting a patch are copied.
-fn patch(root: &Block, stride: usize, changes: Vec<(usize, Command)>) -> Block {
-    type Patches = std::iter::Peekable<std::vec::IntoIter<(usize, Command)>>;
+fn patch(root: &Block, stride: usize, changes: Vec<(usize, SlotEdit)>) -> Block {
+    type Patches = std::iter::Peekable<std::vec::IntoIter<(usize, SlotEdit)>>;
     fn update(root: &Block, stride: usize, offset: usize, changes: &mut Patches) -> Block {
         let end = offset + root.iter().len() * stride;
         if changes.peek().is_none_or(|(slot, _)| *slot >= end) {
@@ -179,7 +197,20 @@ fn patch(root: &Block, stride: usize, changes: Vec<(usize, Command)>) -> Block {
                 return (command.clone(), root.command_region(i));
             }
             let command = if stride == 1 {
-                changes.next().unwrap().1
+                match changes.next().unwrap().1 {
+                    SlotEdit::Draw(draw) => draw,
+                    SlotEdit::Color(color) => {
+                        let mut draw = command.clone();
+                        match &mut draw {
+                            Command::RenderShape { transform, .. } => {
+                                transform.color_transform = color
+                            }
+                            Command::Shared(block) => debug_assert!(block.is_empty()),
+                            _ => unreachable!("only a simple shape instance can be recolored"),
+                        }
+                        return (draw, root.command_region(i));
+                    }
+                }
             } else {
                 let Command::Shared(child) = command else {
                     unreachable!("invalid chunk directory")
@@ -285,6 +316,17 @@ pub(in crate::display_object) fn render<'gc>(
         return false;
     }
     node.dense.set(false);
+    if node.live_until.get() == 0
+        && node.children.borrow().is_none()
+        && matches!(container.child_by_index(0), Some(DisplayObject::Graphic(g)) if g.needs_first_tessellation())
+    {
+        // The first real timeline frame of a loaded movie can appear after
+        // the Loader itself has already drawn. Stream cold shape handles
+        // directly and allow admission again on the next stage submission.
+        node.live_until.set(context.render_epoch.saturating_add(1));
+        context.snapshot_barriers += 1;
+        return false;
+    }
     if node.children.borrow().is_none()
         && container.raw_container().iter_render_list().all(|child| {
             matches!(child, DisplayObject::Video(_) | DisplayObject::EditText(_))
@@ -330,17 +372,32 @@ pub(in crate::display_object) fn render<'gc>(
                     && entry.key.view == key.view
                     && entry.key.quality == key.quality
             })
-            .map(|entry| (entry.commands.clone(), entry.key.inherited != key.inherited))
+            .map(|entry| {
+                let prior = &entry.key.inherited;
+                let current = &key.inherited;
+                let mut inherited = Change::empty();
+                inherited.set(
+                    Change::TRANSFORM,
+                    prior.matrix != current.matrix
+                        || prior.tz != current.tz
+                        || prior.perspective_projection != current.perspective_projection,
+                );
+                inherited.set(
+                    Change::COLOR,
+                    prior.color_transform != current.color_transform,
+                );
+                (entry.commands.clone(), inherited)
+            })
     });
     let empty = cache.empty();
-    let (index, stable_root, output) = if let Some((old, inherited_changed)) = previous {
+    let (index, stable_root, output) = if let Some((old, inherited)) = previous {
         let mut index = index.take().unwrap();
         if count >= 128 && index.dirty.len() > index.scopes.len() / 2 {
             node.dense.set(true);
             return false;
         }
         let mut work = std::mem::take(&mut index.dirty);
-        if inherited_changed {
+        if !inherited.is_empty() {
             work.clear();
             work.extend(0..index.scopes.len());
         } else {
@@ -359,7 +416,7 @@ pub(in crate::display_object) fn render<'gc>(
             let child = container.child_by_index(scope.start).unwrap();
             let instance = index.instances[slot]
                 .as_ref()
-                .and_then(|i| i.update(child, reason, context, &empty));
+                .and_then(|i| i.update(child, reason, inherited, &key.inherited, context, &empty));
             let (block, stable) = if let Some(block) = instance {
                 (block, true)
             } else {
@@ -370,14 +427,14 @@ pub(in crate::display_object) fn render<'gc>(
                 } else {
                     None
                 };
-                (slot_command(block), stable)
+                (SlotEdit::Draw(slot_command(block)), stable)
             };
             if stable {
                 index.live.remove(&slot);
                 stable_patches.push((slot, block));
             } else {
                 if index.live.insert(slot) {
-                    stable_patches.push((slot, Command::Shared(empty.clone())));
+                    stable_patches.push((slot, SlotEdit::Draw(Command::Shared(empty.clone()))));
                 }
                 live_patches.push((slot, block));
             }
@@ -388,7 +445,7 @@ pub(in crate::display_object) fn render<'gc>(
         }
         let root = patch(&old, index.stride, stable_patches);
         let output = patch(&root, index.stride, live_patches);
-        let changed = inherited_changed || !Rc::ptr_eq(&root, &old);
+        let changed = !inherited.is_empty() || !Rc::ptr_eq(&root, &old);
         (index, changed.then_some(root), output)
     } else {
         let mut old = index.take().and_then(|previous| {
@@ -467,7 +524,7 @@ pub(in crate::display_object) fn render<'gc>(
                 stable.push(slot_command(block));
             } else {
                 stable.push(Command::Shared(empty.clone()));
-                live.push((slot, slot_command(block)));
+                live.push((slot, SlotEdit::Draw(slot_command(block))));
                 index.live.insert(slot);
             }
         }
@@ -509,6 +566,115 @@ mod tests {
     use crate::display_object::{Graphic, MovieClip, StageScaleMode, Video};
     use crate::player::PlayerBuilder;
 
+    thread_local! {
+        pub(super) static INSTANCE_MATRICES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn alpha_only_edits_keep_leaf_matrices_and_coverage() {
+        let movie = crate::tag_utils::SwfMovieData::from_data(
+            include_bytes!("../../../../tests/tests/swfs/native_perf/static_tree/test.swf"),
+            "file:///colors.swf".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let player = PlayerBuilder::new()
+            .with_movie(movie)
+            .with_viewport_dimensions(1280, 720, 1.)
+            .with_autoplay(true)
+            .build();
+        let mut player = player.lock().unwrap();
+        assert!(player.preload(&mut crate::limits::ExecutionLimit::none()));
+        player.run_frame();
+        player.render().unwrap();
+        fn group<'gc>(root: DisplayObject<'gc>) -> Option<DisplayObjectContainer<'gc>> {
+            let c = root.as_container()?;
+            if c.num_children() == 40 {
+                return Some(c);
+            }
+            c.iter_render_list().find_map(group)
+        }
+        let sample = |ctx: &mut crate::context::UpdateContext<'_>| {
+            let c = group(ctx.stage.into()).unwrap();
+            let node = DisplayObject::from(c)
+                .base()
+                .snapshots
+                .node
+                .borrow()
+                .clone()
+                .unwrap();
+            let index = node.children.borrow();
+            let index = index.as_ref().unwrap();
+            let entry = index.owner.entry.borrow();
+            let root = &entry.as_ref().unwrap().commands;
+            let Command::Shared(page) = &root.iter().as_slice()[0] else {
+                panic!("missing leaf page")
+            };
+            let Command::RenderShape { transform, .. } = &page.iter().as_slice()[0] else {
+                panic!("missing leaf draw")
+            };
+            (transform.clone(), page.command_region(0))
+        };
+        let (before, region) = player.mutate_with_update_context(sample);
+        for inherited in [false, true] {
+            player.mutate_with_update_context(|ctx| {
+                let g = group(ctx.stage.into()).unwrap();
+                let object = if inherited {
+                    g.into()
+                } else {
+                    g.child_by_index(0).unwrap()
+                };
+                object.set_alpha(0.5);
+            });
+            INSTANCE_MATRICES.set(0);
+            player.render().unwrap();
+            let (after, coverage) = player.mutate_with_update_context(sample);
+            assert_eq!(after.matrix, before.matrix);
+            assert_eq!(coverage, region);
+            assert_eq!(
+                after.color_transform.a_multiply.to_f32(),
+                if inherited { 0.25 } else { 0.5 }
+            );
+            assert_eq!(
+                INSTANCE_MATRICES.get(),
+                0,
+                "color change rebuilt a world matrix"
+            );
+        }
+    }
+
+    #[test]
+    fn first_draw_of_untessellated_timeline_children_streams_their_order_once() {
+        use ruffle_render::profile::{RenderMetrics, enter};
+        let movie = crate::tag_utils::SwfMovieData::from_data(
+            include_bytes!("../../../../tests/tests/swfs/native_perf/load_unload/child.swf"),
+            "file:///timeline-child.swf".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let player = PlayerBuilder::new()
+            .with_movie(movie)
+            .with_viewport_dimensions(1280, 720, 1.)
+            .with_autoplay(true)
+            .build();
+        let mut player = player.lock().unwrap();
+        assert!(player.preload(&mut crate::limits::ExecutionLimit::none()));
+        player.run_frame();
+        let metrics = RenderMetrics::default();
+        let _scope = enter(Some(&metrics));
+        player.render().unwrap();
+        let first = metrics.snapshot().work;
+        assert!(first.tree_visits >= 40);
+        assert!(
+            first.child_slots_examined <= first.tree_visits + 12,
+            "visited {} tree nodes, examined {} slots",
+            first.tree_visits,
+            first.child_slots_examined
+        );
+    }
+
     #[test]
     fn patching_one_draw_does_not_measure_its_stable_siblings() {
         use std::sync::{
@@ -534,7 +700,14 @@ mod tests {
             color: swf::Color::WHITE,
             matrix: Default::default(),
         };
-        let updated = patch(&root, stride, vec![(1, replacement)]);
+        let updated = patch(
+            &root,
+            stride,
+            vec![
+                (1, SlotEdit::Draw(replacement)),
+                (17, SlotEdit::Color(Default::default())),
+            ],
+        );
         assert_eq!(root.region(), updated.region());
         assert_eq!(shape.0.load(Ordering::Relaxed), 0);
     }

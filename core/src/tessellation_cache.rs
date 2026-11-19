@@ -24,6 +24,10 @@ pub(crate) struct TessellationCache {
 ///
 /// This is used to avoid retessellating shapes at similar scales multiple times, which can be expensive.
 impl TessellationCache {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Creates a new, empty tessellation cache.
     pub(crate) fn new() -> Self {
         Self {

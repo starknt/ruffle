@@ -111,6 +111,13 @@ impl<'gc> Graphic<'gc> {
         Self(Gc::new(mc, (*self.0).clone()))
     }
 
+    pub(super) fn needs_first_tessellation(self) -> bool {
+        let shared = self.0.shared.get();
+        self.0.drawing.get().is_none()
+            && !shared.shape.shape.is_empty()
+            && shared.scaled_handle.borrow().is_empty()
+    }
+
     pub fn drawing_mut(&self) -> RefMut<'_, Drawing> {
         self.invalidate_cached_bitmap();
         self.0.drawing.get_or_init(Default::default).borrow_mut()
