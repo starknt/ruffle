@@ -405,6 +405,195 @@ fn alpha_mask_samples_aligned_bitmap_content_without_an_intermediate_copy() {
 
 #[test]
 #[ignore = "requires a real native adapter"]
+fn cached_stage_bitmaps_draw_from_current_images_without_recapture() {
+    use ruffle_render::backend::BitmapCacheEntry;
+    use ruffle_render::bitmap::{PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    use std::num::NonZeroU32;
+
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (32, 16)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    renderer.set_quality(StageQuality::High).unwrap();
+    let size = NonZeroU32::new(6).unwrap();
+    let a = renderer.create_bitmap_cache(size, size).unwrap();
+    let b = renderer.create_bitmap_cache(size, size).unwrap();
+    for (offset, color) in [(2.5, Color::RED), (6.0, Color::BLUE)] {
+        renderer
+            .submit_frame(
+                Color::WHITE,
+                CommandList::new(),
+                vec![
+                    BitmapCacheEntry {
+                        handle: a.clone(),
+                        commands: CommandList::new(),
+                        clear: color,
+                        filters: vec![],
+                    },
+                    BitmapCacheEntry {
+                        handle: b.clone(),
+                        commands: CommandList::new(),
+                        clear: Color::from_rgb(0x008000, 193),
+                        filters: vec![],
+                    },
+                ],
+            )
+            .unwrap();
+        let mut images = Vec::new();
+        for reference in [true, false] {
+            let mut stage = CommandList::new();
+            if reference {
+                rect(&mut stage, 0.25, 0.25, 1., 1., Color::TRANSPARENT);
+            }
+            for (bitmap, x) in [(&a, offset), (&b, offset + 3.0)] {
+                stage.render_bitmap(
+                    bitmap.clone(),
+                    Transform {
+                        matrix: Matrix::translate(Twips::from_pixels(x), Twips::from_pixels(2.0)),
+                        ..Default::default()
+                    },
+                    true,
+                    PixelSnapping::Always,
+                    PixelRegion::for_whole_size(6, 6),
+                );
+            }
+            let metrics = ruffle_render::profile::RenderMetrics::default();
+            let _scope = ruffle_render::profile::enter(Some(&metrics));
+            renderer.submit_frame(Color::WHITE, stage, vec![]).unwrap();
+            if !reference {
+                assert_eq!(
+                    metrics.snapshot().work.captured_command_leaves,
+                    0,
+                    "already resident stage cache images were recaptured"
+                );
+            }
+            images.push(renderer.capture_frame().unwrap().unwrap());
+        }
+        assert_eq!(images[0], images[1]);
+        assert_eq!(
+            images[1].get_pixel(offset.round() as u32, 4).0,
+            [color.r, color.g, color.b, 255]
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a real native adapter"]
+fn cached_bitmap_alpha_mask_reuses_the_exact_raster_until_an_input_changes() {
+    use ruffle_render::backend::BitmapCacheEntry;
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    use std::num::NonZeroU32;
+    use swf::{ColorTransform, Fixed8};
+
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (32, 16)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    renderer.set_quality(StageQuality::High).unwrap();
+    let pixels: Vec<u8> = (0..64)
+        .flat_map(|i| {
+            let a = (i * 37 % 256) as u8;
+            [a, 0, 0, a]
+        })
+        .collect();
+    let image = renderer
+        .register_bitmap(Bitmap::new(8, 8, BitmapFormat::Rgba, pixels))
+        .unwrap();
+    let size = NonZeroU32::new(8).unwrap();
+    let cached = renderer.create_bitmap_cache(size, size).unwrap();
+    let input = |bitmap, x: f64, alpha| {
+        let mut list = CommandList::new();
+        list.render_bitmap(
+            bitmap,
+            Transform {
+                matrix: Matrix::translate(Twips::from_pixels(x), Twips::from_pixels(2.0)),
+                color_transform: ColorTransform {
+                    a_multiply: alpha,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            true,
+            PixelSnapping::Never,
+            PixelRegion::for_whole_size(8, 8),
+        );
+        list
+    };
+    for clear in [Color::TRANSPARENT, Color::from_rgb(0xffffff, 73)] {
+        let mut source = CommandList::new();
+        source.render_bitmap(
+            image.clone(),
+            Transform::default(),
+            true,
+            PixelSnapping::Never,
+            PixelRegion::for_whole_size(8, 8),
+        );
+        renderer
+            .submit_frame(
+                Color::WHITE,
+                CommandList::new(),
+                vec![BitmapCacheEntry {
+                    handle: cached.clone(),
+                    commands: source,
+                    clear,
+                    filters: vec![],
+                }],
+            )
+            .unwrap();
+        for (x, alpha) in [
+            // End and start the two source versions at the same placement.
+            (4., Fixed8::from_f32(0.5)),
+            (-2., Fixed8::ONE),
+            (-2., Fixed8::from_f32(0.5)),
+            (4., Fixed8::from_f32(0.5)),
+        ] {
+            let mut reference = None;
+            for frame in 0..6 {
+                if frame == 4 {
+                    descriptors.runtime.scheduler().reclaim();
+                }
+                let content = input(image.clone(), x, Fixed8::ONE);
+                let mut mask = input(cached.clone(), x + 3., alpha);
+                if frame == 0 {
+                    rect(&mut mask, 1., 3., 1., 1., Color::TRANSPARENT);
+                }
+                let mut commands = CommandList::new();
+                commands.render_alpha_mask(content, mask);
+                let metrics = ruffle_render::profile::RenderMetrics::default();
+                let _scope = ruffle_render::profile::enter(Some(&metrics));
+                renderer
+                    .submit_frame(Color::WHITE, commands, vec![])
+                    .unwrap();
+                let output = renderer.capture_frame().unwrap().unwrap();
+                if let Some(expected) = &reference {
+                    assert!(
+                        output == *expected,
+                        "mask pixels differ at {x}, alpha={alpha:?}, frame={frame}"
+                    );
+                } else {
+                    reference = Some(output);
+                }
+                if frame == 1 || frame == 4 {
+                    assert_eq!(
+                        metrics.snapshot().work.offscreen_targets,
+                        1,
+                        "changed or reclaimed mask must be rasterized"
+                    );
+                }
+                if frame == 3 || frame == 5 {
+                    assert_eq!(
+                        metrics.snapshot().work.offscreen_targets,
+                        0,
+                        "repainted an unchanged mask"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a real native adapter"]
 fn chunk_uniform_windows_reuse_the_same_buffer_binding() {
     let descriptors = gpu();
     let mut buffers = super::buffers::ChunkBuffers::new(&descriptors).unwrap();
@@ -1394,6 +1583,62 @@ fn shape_registration_owns_styles_and_allocates_only_when_visible() {
     );
     let image = renderer.capture_frame().unwrap().unwrap();
     assert!(image.pixels().all(|p| p.0 == [255, 0, 0, 255]));
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn reloaded_shape_definitions_reuse_only_exact_live_geometry() {
+    use std::rc::Rc;
+
+    let bytes = include_bytes!("../../../../tests/tests/swfs/native_perf/load_unload/child.swf");
+    let stream = swf::decompress_swf(&bytes[..]).unwrap();
+    let movie = swf::parse_swf(&stream).unwrap();
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (64, 64)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let source = crate::shape_recipe::FrozenBitmapSource::default();
+    let mut register =
+        |shape: &Rc<swf::Shape>, scale| renderer.register_swf_shape(shape, &source, scale).unwrap();
+    let mut definitions = 0;
+    for tag in movie.tags {
+        let swf::Tag::DefineShape(shape) = tag else {
+            continue;
+        };
+        let first = Rc::new(*shape);
+        let handle = register(&first, 1.0);
+        let reloaded = Rc::new((*first).clone());
+        let again = register(&reloaded, 1.0);
+        assert!(Arc::ptr_eq(&handle.0, &again.0), "shape {}", first.id);
+        drop(first);
+        let third = Rc::new((*reloaded).clone());
+        assert!(Arc::ptr_eq(&register(&third, 1.0).0, &handle.0));
+        let mut changed = (*third).clone();
+        changed.shape.clear();
+        assert!(!Arc::ptr_eq(&register(&Rc::new(changed), 1.0).0, &handle.0));
+        let exact = register(&third, 1.0);
+        let scaled = register(&third, 1.25);
+        assert!(!Arc::ptr_eq(&scaled.0, &exact.0));
+        let weak_handle = Arc::downgrade(&scaled.0);
+        let weak_shape = Rc::downgrade(&third);
+        drop((third, scaled));
+        assert!(weak_handle.upgrade().is_none() && weak_shape.upgrade().is_none());
+        if definitions == 0 {
+            let mut bitmap = (*reloaded).clone();
+            assert!(!bitmap.styles.fill_styles.is_empty());
+            bitmap.styles.fill_styles.fill(swf::FillStyle::Bitmap {
+                id: 99,
+                matrix: Default::default(),
+                is_smoothed: true,
+                is_repeating: false,
+            });
+            let bitmap = Rc::new(bitmap);
+            let a = register(&bitmap, 1.0);
+            let b = register(&Rc::new((*bitmap).clone()), 1.0);
+            assert!(!Arc::ptr_eq(&a.0, &b.0), "movie-local bitmap dependency");
+        }
+        definitions += 1;
+    }
+    assert_eq!(definitions, 14);
 }
 
 #[test]
@@ -2968,6 +3213,8 @@ fn native_preparation_parallel_shapes_match_serial_pixels_and_join_before_encodi
             let target = TextureTarget::new(&descriptors.device, (64, 64)).unwrap();
             let mut renderer =
                 WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+            let metrics = ruffle_render::profile::RenderMetrics::default();
+            let _scope = ruffle_render::profile::enter(Some(&metrics));
             let before = descriptors.runtime.preparation().stats().submitted;
             let mut commands = CommandList::new();
             for n in 0..count {
@@ -3026,6 +3273,15 @@ fn native_preparation_parallel_shapes_match_serial_pixels_and_join_before_encodi
             renderer
                 .submit_frame(Color::BLACK, commands, vec![])
                 .unwrap();
+            if count == 20 && !parallel {
+                let waves = metrics.snapshot().native_timings
+                    [ruffle_render::profile::NativePhase::Preparation as usize]
+                    .samples;
+                assert!(
+                    waves <= 4,
+                    "{waves} preparation waves for 20 small cold meshes"
+                );
+            }
             let stats = descriptors.runtime.preparation().stats();
             assert!(stats.peak_active <= 4);
             assert_eq!(stats.active, 0, "all CPU tasks joined in this frame");
@@ -3331,4 +3587,120 @@ fn pixelbender_allocations_are_attributed_to_the_shader_until_drop() {
             .iter()
             .all(|r| baseline.contains(&r.id))
     );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn shared_stage_chunk_replays_without_recapturing_its_leaves() {
+    use ruffle_render::commands::Command;
+    use ruffle_render::profile::{RenderMetrics, enter};
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (32, 24)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let mut block = CommandList::new();
+    rect(&mut block, 0., 0., 16., 24., Color::RED);
+    rect(&mut block, 16., 0., 16., 24., Color::BLACK);
+    let block = std::rc::Rc::new(block);
+    block.charge_storage(&std::rc::Rc::new(std::cell::Cell::new(0)), 1 << 20);
+    let metrics = RenderMetrics::default();
+    let _scope = enter(Some(&metrics));
+    for _ in 0..2 {
+        let mut frame = CommandList::new();
+        frame.push(Command::Shared(block.clone()));
+        renderer.submit_frame(Color::WHITE, frame, vec![]).unwrap();
+    }
+    let before = metrics.snapshot().work;
+    let mut frame = CommandList::new();
+    frame.push(Command::Shared(block));
+    renderer.submit_frame(Color::WHITE, frame, vec![]).unwrap();
+    let work = metrics.snapshot().work.delta(before);
+    assert_eq!(work.captured_command_leaves, 0);
+    assert!(work.prepared_chunk_hits > 0);
+    assert!(work.prepared_draw_replays > 0);
+    let image = renderer.capture_frame().unwrap().unwrap();
+    assert_eq!(image.get_pixel(2, 2).0, [255, 0, 0, 255]);
+    assert_eq!(image.get_pixel(24, 2).0, [0, 0, 0, 255]);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn prepared_groups_fill_the_same_uniform_windows_as_flat_draws() {
+    use ruffle_render::commands::Command;
+    use ruffle_render::profile::{RenderMetrics, enter};
+    use std::{cell::Cell, rc::Rc};
+    let descriptors = gpu();
+    let window = super::buffers::transforms_per_draw(&descriptors.limits) as usize;
+    let target = TextureTarget::new(&descriptors.device, (4, 4)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let mut block = CommandList::new();
+    for i in 0..window / 2 + 1 {
+        let color = if i == window / 2 {
+            Color::BLACK
+        } else {
+            Color::RED
+        };
+        rect(&mut block, 0., 0., 4., 4., color);
+    }
+    let block = Rc::new(block);
+    block.charge_storage(&Rc::new(Cell::new(0)), 4 << 20);
+    let metrics = RenderMetrics::default();
+    let _scope = enter(Some(&metrics));
+    let mut flat = CommandList::new();
+    for _ in 0..3 {
+        flat.append((*block).clone());
+    }
+    let before = metrics.snapshot().work;
+    renderer.submit_frame(Color::WHITE, flat, vec![]).unwrap();
+    let reference = metrics.snapshot().work.delta(before);
+    for _ in 0..2 {
+        let mut frame = CommandList::new();
+        for _ in 0..3 {
+            frame.push(Command::Shared(block.clone()));
+        }
+        let before = metrics.snapshot().work;
+        renderer.submit_frame(Color::WHITE, frame, vec![]).unwrap();
+        let work = metrics.snapshot().work.delta(before);
+        if work.prepared_draw_replays == 3 {
+            assert_eq!(work.render_passes, reference.render_passes);
+            assert_eq!(work.draw_calls, reference.draw_calls);
+            assert_eq!(
+                renderer.capture_frame().unwrap().unwrap().get_pixel(1, 1).0,
+                [0, 0, 0, 255]
+            );
+            return;
+        }
+    }
+    panic!("expected three warm replays");
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn flat_resident_draws_use_current_transforms_without_recapturing_each_leaf() {
+    use ruffle_render::profile::{RenderMetrics, enter};
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (16, 4)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let metrics = RenderMetrics::default();
+    let _scope = enter(Some(&metrics));
+    for x in [0., 8.] {
+        let mut frame = CommandList::new();
+        for _ in 0..80 {
+            rect(&mut frame, x, 0., 4., 4., Color::RED);
+        }
+        let before = metrics.snapshot().work;
+        renderer.submit_frame(Color::WHITE, frame, vec![]).unwrap();
+        if x != 0. {
+            assert_eq!(
+                metrics
+                    .snapshot()
+                    .work
+                    .delta(before)
+                    .captured_command_leaves,
+                0
+            );
+        }
+    }
+    let image = renderer.capture_frame().unwrap().unwrap();
+    assert_eq!(image.get_pixel(2, 2).0, [255, 255, 255, 255]);
+    assert_eq!(image.get_pixel(10, 2).0, [255, 0, 0, 255]);
 }

@@ -23,7 +23,13 @@ impl PartialEq for BitmapHandle {
     }
 }
 
-pub trait BitmapHandleImpl: Any + Debug {}
+pub trait BitmapHandleImpl: Any + Debug {
+    /// Maximum storage pinned by retaining this handle in a stage command block.
+    /// Reclaimable filter targets and handles with unknown storage stay live.
+    fn retained_bytes(&self) -> Option<usize> {
+        None
+    }
+}
 
 /// Info returned by the `register_bitmap` methods.
 #[derive(Clone, Debug)]

@@ -501,6 +501,9 @@ impl<'gc> TDisplayObject<'gc> for Video<'gc> {
     }
 
     fn render_with_options(self, context: &mut RenderContext<'_, 'gc>, options: RenderOptions) {
+        // A stream can acquire its first frame without an AS display mutation.
+        // Keep the slot live even when culled or waiting for its first bitmap.
+        context.snapshot_barriers += 1;
         if !context.is_offscreen
             && !self
                 .world_bounds(BoundsMode::Engine)

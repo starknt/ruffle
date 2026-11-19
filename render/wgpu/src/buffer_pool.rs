@@ -265,6 +265,13 @@ pub struct PoolEntry<T: PooledResource, D: BufferDescription> {
     owner: Weak<Owner<T, D>>,
     bytes: u64,
 }
+impl<T: PooledResource, D: BufferDescription> PoolEntry<T, D> {
+    /// Transfer a checked-out resource to another budget without returning it
+    /// to the pool, where a later draw could overwrite its contents.
+    pub(crate) fn into_owned(mut self) -> T {
+        self.item.take().expect("checked-out pool entry")
+    }
+}
 impl<T: PooledResource + PartialEq, D: BufferDescription> PartialEq for PoolEntry<T, D> {
     fn eq(&self, other: &Self) -> bool {
         Weak::ptr_eq(&self.owner, &other.owner) && self.item == other.item

@@ -144,6 +144,7 @@ pub struct BitmapCache {
         std::sync::Weak<dyn ruffle_render::bitmap::BitmapHandleImpl>,
     )>,
     retention: AdaptiveBitmapCache,
+    filter_space: Option<(u64, [f32; 2])>,
     quality: Option<ruffle_render::quality::StageQuality>,
 }
 
@@ -702,15 +703,33 @@ impl Default for DisplayObjectBase<'_> {
 
 impl<'gc> DisplayObjectBase<'gc> {
     fn invalidate_render(&self) {
-        if !self.snapshots.invalidate() {
-            return;
-        }
+        self.invalidate_component(snapshot::Change::VISUAL);
+    }
+
+    fn invalidate_component(&self, change: snapshot::Change) {
+        self.snapshots.changed(change);
+        let mut bounds = change.intersects(
+            snapshot::Change::TRANSFORM
+                | snapshot::Change::VISUAL
+                | snapshot::Change::FILTER
+                | snapshot::Change::CHILDREN,
+        ) && self.snapshots.invalidate_bounds();
+        let mut propagate = self.snapshots.invalidate();
+        let mut child = self.snapshots.observed_id();
+        let mut reason = change;
         let mut parent = self.parent();
         while let Some(object) = parent {
-            if !object.base().snapshots.invalidate() {
+            let base = object.base();
+            // Merge the reason even for a second mutation before a render.
+            base.snapshots.mark_child(child, reason, propagate);
+            bounds = bounds && base.snapshots.invalidate_bounds();
+            if !propagate && !bounds {
                 break;
             }
-            parent = object.parent();
+            propagate = propagate && base.snapshots.invalidate();
+            child = base.snapshots.observed_id();
+            reason = snapshot::Change::CHILDREN;
+            parent = base.parent();
         }
     }
 
@@ -727,7 +746,12 @@ impl<'gc> DisplayObjectBase<'gc> {
                 | DisplayObjectFlags::CACHE_AS_BITMAP
                 | DisplayObjectFlags::AVM1_REMOVED,
         ) {
-            self.invalidate_render();
+            let change = if flag.bits() == DisplayObjectFlags::VISIBLE.bits() {
+                snapshot::Change::VISIBILITY
+            } else {
+                snapshot::Change::VISUAL
+            };
+            self.invalidate_component(change);
         }
         self.flags.set(flags);
     }
@@ -749,7 +773,13 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_depth(&self, depth: Depth) {
-        self.depth.set(depth);
+        if self.depth.get() != depth {
+            if let Some(parent) = self.parent() {
+                parent.base().snapshots.invalidate_child_layout();
+            }
+            self.invalidate_component(snapshot::Change::CHILDREN);
+            self.depth.set(depth);
+        }
     }
 
     fn place_frame(&self) -> u16 {
@@ -779,7 +809,7 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     pub fn set_matrix(&self, matrix: Matrix) {
         if self.matrix.get() != matrix {
-            self.invalidate_render();
+            self.invalidate_component(snapshot::Change::TRANSFORM);
         }
         self.matrix.set(matrix);
         self.set_scale_rotation_cached(false);
@@ -791,7 +821,7 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     pub fn set_color_transform(&self, color_transform: ColorTransform) {
         if self.color_transform.get() != color_transform {
-            self.invalidate_render();
+            self.invalidate_component(snapshot::Change::COLOR);
         }
         self.color_transform.set(color_transform);
     }
@@ -805,7 +835,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         perspective_projection: Option<PerspectiveProjection>,
     ) -> bool {
         if self.perspective_projection.get() != perspective_projection {
-            self.invalidate_render();
+            self.invalidate_component(snapshot::Change::TRANSFORM);
         }
         let old = self.perspective_projection.replace(perspective_projection);
         perspective_projection != old
@@ -833,7 +863,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         matrix.tx = x;
         matrix.ty = y;
         if self.matrix.get() != matrix {
-            self.invalidate_render();
+            self.invalidate_component(snapshot::Change::TRANSFORM);
         }
         self.matrix.set(matrix);
         self.set_transformed_by_script(true);
@@ -848,7 +878,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let changed = self.tz.get() != tz;
         self.set_transformed_by_script(true);
         if changed {
-            self.invalidate_render();
+            self.invalidate_component(snapshot::Change::TRANSFORM);
         }
         self.tz.set(tz);
         changed
@@ -927,7 +957,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         matrix.c = (scale_y * -sin_y) as f32;
         matrix.d = (scale_y * cos_y) as f32;
         if self.matrix.get() != matrix {
-            self.invalidate_render();
+            self.invalidate_component(snapshot::Change::TRANSFORM);
         }
         self.matrix.set(matrix);
 
@@ -965,7 +995,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         matrix.a = (cos * value.unit()) as f32;
         matrix.b = (sin * value.unit()) as f32;
         if self.matrix.get() != matrix {
-            self.invalidate_render();
+            self.invalidate_component(snapshot::Change::TRANSFORM);
         }
         self.matrix.set(matrix);
 
@@ -1004,7 +1034,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         matrix.c = (-sin * value.unit()) as f32;
         matrix.d = (cos * value.unit()) as f32;
         if self.matrix.get() != matrix {
-            self.invalidate_render();
+            self.invalidate_component(snapshot::Change::TRANSFORM);
         }
         self.matrix.set(matrix);
 
@@ -1032,6 +1062,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         write.filters = filters;
         drop(write);
         if changed {
+            self.invalidate_component(snapshot::Change::FILTER);
             self.recheck_cache_as_bitmap();
         }
         changed
@@ -1048,7 +1079,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let changed = tf.a_multiply != value;
         tf.a_multiply = value;
         if changed {
-            self.invalidate_render();
+            self.invalidate_component(snapshot::Change::COLOR);
         }
         self.color_transform.set(tf);
         changed
@@ -1060,7 +1091,10 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     fn set_clip_depth(&self, depth: Depth) {
         if self.clip_depth.get() != depth {
-            self.invalidate_render();
+            if let Some(parent) = self.parent() {
+                parent.base().snapshots.invalidate_child_layout();
+            }
+            self.invalidate_component(snapshot::Change::MASK);
         }
         self.clip_depth.set(depth);
     }
@@ -1072,7 +1106,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     /// You should almost always use `DisplayObject.set_parent` instead, which
     /// properly handles 'orphan' movie clips
     fn set_parent_ignoring_orphan_list(this: &Write<Self>, parent: Option<DisplayObject<'gc>>) {
-        this.invalidate_render();
+        this.invalidate_component(snapshot::Change::TRANSFORM | snapshot::Change::VISUAL);
         this.wake_orphan_worklists();
         unlock!(this, Self, parent).set(parent)
     }
@@ -1147,7 +1181,11 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_blend_mode(&self, value: ExtendedBlendMode) -> bool {
-        self.blend_mode.replace(value) != value
+        let changed = self.blend_mode.replace(value) != value;
+        if changed {
+            self.invalidate_render();
+        }
+        changed
     }
 
     fn blend_shader(&self) -> Option<PixelBenderShaderHandle> {
@@ -1370,7 +1408,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_masker(this: &Write<Self>, node: Option<DisplayObject<'gc>>) {
-        this.invalidate_render();
+        this.invalidate_component(snapshot::Change::MASK);
         unlock!(this, Self, masker).set(node);
     }
 
@@ -1379,7 +1417,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_maskee(this: &Write<Self>, node: Option<DisplayObject<'gc>>) {
-        this.invalidate_render();
+        this.invalidate_component(snapshot::Change::MASK);
         unlock!(this, Self, maskee).set(node);
     }
 
@@ -1402,7 +1440,7 @@ impl<'gc> DisplayObjectBase<'gc> {
 
 /// Indicates which kind of bounds should be returned by `self_bounds`.
 /// In most cases `BoundsMode::Engine` should be used.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum BoundsMode {
     /// The bounds visible on the stage (e.g. takes MorphShape ratio into
     /// account). Used for hit testing and rendering.
@@ -1436,6 +1474,23 @@ struct DrawCacheInfo {
     filters: Vec<Filter>,
 }
 
+fn invalidate_bitmap(this: DisplayObject<'_>, change: snapshot::Change) {
+    this.base().invalidate_component(change);
+    invalidate_raster(this);
+}
+
+// A typed transform, color or visibility edit already notified the stage
+// snapshot. Only the ancestors' raster caches still need the notification.
+fn invalidate_raster(this: DisplayObject<'_>) {
+    let mut object = Some(this);
+    while let Some(current) = object {
+        if !current.base().invalidate_cached_bitmap() {
+            break;
+        }
+        object = current.parent();
+    }
+}
+
 pub fn render_base<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
@@ -1460,21 +1515,17 @@ fn render_snapshot<'gc>(
     options: RenderOptions,
 ) {
     let base = this.base();
-    let eligible = matches!(
+    let planar = matches!(
         this,
-        DisplayObject::MovieClip(_) | DisplayObject::Graphic(_) | DisplayObject::Stage(_)
+        DisplayObject::MovieClip(_)
+            | DisplayObject::Graphic(_)
+            | DisplayObject::Stage(_)
+            | DisplayObject::LoaderDisplay(_)
+            | DisplayObject::Bitmap(_)
     ) && options.apply_transform
         && options.apply_matrix
-        && options.skip_masks
         && !context.is_offscreen
-        && !context.commands.drawing_mask()
-        && this.blend_mode() == ExtendedBlendMode::Normal
-        && !this.is_bitmap_cached()
-        && this.masker().is_none()
-        && this.maskee().is_none()
-        && this.clip_depth() == 0
-        && !base.has_scroll_rect()
-        && base.scroll_rect.get().is_none()
+        && this.blend_mode() != ExtendedBlendMode::Shader
         && base.scaling_grid.get() == Rectangle::default()
         && (base.perspective_projection.get().is_none()
             || (matches!(this, DisplayObject::Stage(_))
@@ -1491,17 +1542,32 @@ fn render_snapshot<'gc>(
         && base.tz.get() == 0.0
         && !base.has_matrix3d_stub();
     let allowed = context.snapshot_allowed;
-    context.snapshot_allowed &= eligible;
+    context.snapshot_allowed &= planar;
+    // A reference mask has an independent ancestry, and a raster cache can be
+    // reclaimed between frames. Recheck their wrappers while reusing the body.
+    let eligible = planar
+        && options.skip_masks
+        && !this.is_bitmap_cached()
+        && this.masker().is_none()
+        && this.blend_mode() == ExtendedBlendMode::Normal;
     if !eligible {
         context.snapshot_barriers += 1;
     }
     let candidate = context.snapshots.is_some()
-        && context.snapshot_allowed
-        && matches!(this, DisplayObject::MovieClip(_))
-        && this.as_container().is_some_and(|c| c.num_children() >= 8);
+        && eligible
+        && !context.commands.drawing_mask()
+        && this.maskee().is_none()
+        && matches!(
+            this,
+            DisplayObject::MovieClip(_) | DisplayObject::LoaderDisplay(_)
+        )
+        && this.as_container().is_some_and(|c| {
+            c.num_children() >= 8 || (!context.snapshot_recording && c.num_children() != 0)
+        });
     let prepared = if candidate {
         let dimensions = context.renderer.viewport_dimensions();
         let key = snapshot::Key {
+            mask_geometry: false,
             generation: base.snapshots.generation.get(),
             inherited: context.transform_stack.transform(),
             own: base.transform(true),
@@ -1537,13 +1603,18 @@ fn render_snapshot<'gc>(
             return;
         }
         node.entry.borrow_mut().take();
-        let stable = node
-            .observed
-            .borrow()
-            .as_ref()
-            .is_none_or(|old| *old == key);
-        *node.observed.borrow_mut() = Some(key.clone());
-        if !stable {
+        let mut observed = node.observed.borrow_mut();
+        let changed = observed.as_ref().is_some_and(|old| *old != key);
+        if observed.is_none() || changed {
+            *observed = Some(key.clone());
+            node.retry_recording.set(0);
+        }
+        drop(observed);
+        let live = node.retry_recording.get() > context.render_epoch;
+        if live {
+            context.snapshot_barriers += 1;
+        }
+        if changed || live {
             render_base_inner(this, context, options);
             context.snapshot_allowed = allowed;
             return;
@@ -1564,6 +1635,16 @@ fn render_snapshot<'gc>(
     context.snapshot_recording = recording;
     if let Some((node, key, original, barriers)) = prepared {
         let commands = std::rc::Rc::new(std::mem::replace(&mut context.commands, original));
+        if context.snapshot_barriers != barriers {
+            // A stable wrapper around a live child still paints its child
+            // directory. Retry a whole-subtree recording after a key change
+            // or a bounded interval for resources that become resident.
+            node.retry_recording.set(
+                context
+                    .render_epoch
+                    .saturating_add(snapshot::LIVE_RETRY_FRAMES),
+            );
+        }
         let stored = context.snapshot_barriers == barriers
             && context.snapshots.as_deref_mut().unwrap().insert(
                 &node,
@@ -1610,6 +1691,11 @@ fn render_base_inner<'gc>(
     };
 
     let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
+        if !context.is_offscreen
+            && let Some(cache) = context.snapshots.as_deref_mut()
+        {
+            this.base().snapshots.node(cache);
+        }
         let mut cache_info: Option<DrawCacheInfo> = None;
         let base_transform = context.transform_stack.transform();
         let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
@@ -1617,35 +1703,27 @@ fn render_base_inner<'gc>(
             false, // we want to do the filter growth for this object ourselves, to know the offsets
             &context.stage.view_matrix(),
         );
-        let mut filters: Vec<Filter> = this.filters().to_owned();
         let swf_version = this.swf_version();
-        filters.retain(|f| !f.impotent());
-
-        if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
+        let base = this.base();
+        let filter_revision = base.snapshots.revision(snapshot::Change::FILTER);
+        let mut storage = base.cell.borrow_mut();
+        let DisplayObjectBaseMut {
+            cache,
+            filters: source_filters,
+            ..
+        } = &mut *storage;
+        if let Some(cache) = cache {
             let width = bounds.width().to_pixels().ceil().max(0.0);
             let height = bounds.height().to_pixels().ceil().max(0.0);
             if width <= u16::MAX as f64 && height <= u16::MAX as f64 {
                 let width = width as u32;
                 let height = height as u32;
-                let mut filter_rect = Rectangle {
-                    x_min: Twips::ZERO,
-                    x_max: Twips::from_pixels_i32(width as i32),
-                    y_min: Twips::ZERO,
-                    y_max: Twips::from_pixels_i32(height as i32),
-                };
                 let stage_matrix = context.stage.view_matrix();
-                for filter in &mut filters {
-                    // Scaling is done by *stage view matrix* only, nothing in-between
-                    filter.scale(stage_matrix.a, stage_matrix.d);
-                    filter_rect = filter.calculate_dest_rect(filter_rect);
+                let filter_space = (filter_revision, [stage_matrix.a, stage_matrix.d]);
+                if !source_filters.is_empty() && cache.filter_space != Some(filter_space) {
+                    cache.make_dirty();
+                    cache.filter_space = Some(filter_space);
                 }
-                let filter_rect = Rectangle {
-                    x_min: filter_rect.x_min.to_pixels().floor() as i32,
-                    x_max: filter_rect.x_max.to_pixels().ceil() as i32,
-                    y_min: filter_rect.y_min.to_pixels().floor() as i32,
-                    y_max: filter_rect.y_max.to_pixels().ceil() as i32,
-                };
-                let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
                 if cache.quality != Some(context.stage.quality()) {
                     cache.make_dirty();
                     cache.quality = Some(context.stage.quality());
@@ -1654,6 +1732,29 @@ fn render_base_inner<'gc>(
                     || cache.content_changed(&base_transform.matrix, width, height);
                 cache.retention.observe(context.render_epoch, changed);
                 if changed || cache.bitmap().is_none() {
+                    let mut filters: Vec<Filter> = source_filters
+                        .iter()
+                        .filter(|f| !f.impotent())
+                        .cloned()
+                        .collect();
+                    let mut filter_rect = Rectangle {
+                        x_min: Twips::ZERO,
+                        x_max: Twips::from_pixels_i32(width as i32),
+                        y_min: Twips::ZERO,
+                        y_max: Twips::from_pixels_i32(height as i32),
+                    };
+                    for filter in &mut filters {
+                        // Scaling is done by *stage view matrix* only, nothing in-between
+                        filter.scale(stage_matrix.a, stage_matrix.d);
+                        filter_rect = filter.calculate_dest_rect(filter_rect);
+                    }
+                    let filter_rect = Rectangle {
+                        x_min: filter_rect.x_min.to_pixels().floor() as i32,
+                        x_max: filter_rect.x_max.to_pixels().ceil() as i32,
+                        y_min: filter_rect.y_min.to_pixels().floor() as i32,
+                        y_max: filter_rect.y_max.to_pixels().ceil() as i32,
+                    };
+                    let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
                     cache.update(
                         context.renderer,
                         base_transform.matrix,
@@ -1678,8 +1779,8 @@ fn render_base_inner<'gc>(
                         dirty: false,
                         base_transform,
                         bounds,
-                        draw_offset,
-                        filters,
+                        draw_offset: cache.draw_offset,
+                        filters: Vec::new(),
                     });
                 }
             } else {
@@ -1873,7 +1974,7 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
     if let RenderMask::Stencil(m) = mask {
         context.commands.push_mask();
         context.transform_stack.push(&mask_transform);
-        m.render_self(context);
+        snapshot::stencil::draw(m, context);
         context.transform_stack.pop();
         context.commands.activate_mask();
     }
@@ -1932,7 +2033,7 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
     if let RenderMask::Stencil(m) = mask {
         context.commands.deactivate_mask();
         context.transform_stack.push(&mask_transform);
-        m.render_self(context);
+        snapshot::stencil::draw(m, context);
         context.transform_stack.pop();
         context.commands.pop_mask();
     }
@@ -2059,28 +2160,36 @@ pub trait TDisplayObject<'gc>:
     ///
     /// The `mode` parameter indicates which kind of bounds to return.
     fn bounds_with_transform(self, matrix: &Matrix, mode: BoundsMode) -> Rectangle<Twips> {
-        // A scroll rect completely overrides an object's bounds,
-        // and can even grow the bounding box to be larger than the actual content
-        if let Some(scroll_rect) = self.scroll_rect() {
-            return *matrix
-                * Rectangle {
-                    x_min: Twips::ZERO,
-                    y_min: Twips::ZERO,
-                    x_max: scroll_rect.width(),
-                    y_max: scroll_rect.height(),
-                };
-        }
+        snapshot::bounds::measure(
+            self.into(),
+            *matrix,
+            snapshot::bounds::Kind::Geometry(mode),
+            || {
+                // A scroll rect completely overrides an object's bounds,
+                // and can even grow the bounding box to be larger than the actual content
+                if let Some(scroll_rect) = self.scroll_rect() {
+                    return *matrix
+                        * Rectangle {
+                            x_min: Twips::ZERO,
+                            y_min: Twips::ZERO,
+                            x_max: scroll_rect.width(),
+                            y_max: scroll_rect.height(),
+                        };
+                }
 
-        let mut bounds = *matrix * self.self_bounds(mode);
+                let mut bounds = *matrix * self.self_bounds(mode);
 
-        if let Some(ctr) = self.as_container() {
-            for child in ctr.iter_render_list() {
-                let matrix = *matrix * child.base().matrix();
-                bounds = bounds.union(&child.bounds_with_transform(&matrix, mode));
-            }
-        }
+                if let Some(ctr) = self.as_container() {
+                    for child in ctr.iter_render_list() {
+                        snapshot::bounds::observe_child(child);
+                        let matrix = *matrix * child.base().matrix();
+                        bounds = bounds.union(&child.bounds_with_transform(&matrix, mode));
+                    }
+                }
 
-        bounds
+                bounds
+            },
+        )
     }
 
     /// Gets the **render bounds** of this object and all its children.
@@ -2095,24 +2204,35 @@ pub trait TDisplayObject<'gc>:
         include_own_filters: bool,
         view_matrix: &Matrix,
     ) -> Rectangle<Twips> {
-        let mut bounds = *matrix * self.self_bounds(BoundsMode::Engine);
+        let kind = snapshot::bounds::Kind::Render {
+            filters: include_own_filters,
+            scale: [view_matrix.a, view_matrix.d],
+        };
+        snapshot::bounds::measure(self.into(), *matrix, kind, || {
+            ruffle_render::profile::work(|w| w.render_bounds_nodes += 1);
+            let mut bounds = *matrix * self.self_bounds(BoundsMode::Engine);
 
-        if let Some(ctr) = self.as_container() {
-            for child in ctr.iter_render_list() {
-                let matrix = *matrix * child.base().matrix();
-                bounds =
-                    bounds.union(&child.render_bounds_with_transform(&matrix, true, view_matrix));
+            if let Some(ctr) = self.as_container() {
+                for child in ctr.iter_render_list() {
+                    snapshot::bounds::observe_child(child);
+                    let matrix = *matrix * child.base().matrix();
+                    bounds = bounds.union(&child.render_bounds_with_transform(
+                        &matrix,
+                        true,
+                        view_matrix,
+                    ));
+                }
             }
-        }
 
-        if include_own_filters {
-            for mut filter in self.filters().iter().cloned() {
-                filter.scale(view_matrix.a, view_matrix.d);
-                bounds = filter.calculate_dest_rect(bounds);
+            if include_own_filters {
+                for mut filter in self.filters().iter().cloned() {
+                    filter.scale(view_matrix.a, view_matrix.d);
+                    bounds = filter.calculate_dest_rect(bounds);
+                }
             }
-        }
 
-        bounds
+            bounds
+        })
     }
 
     #[no_dynamic]
@@ -2150,7 +2270,7 @@ pub trait TDisplayObject<'gc>:
         {
             // Self-transform changes are automatically handled,
             // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
     }
 
@@ -2158,21 +2278,24 @@ pub trait TDisplayObject<'gc>:
     /// without applying the translation of this object's own scroll rect.
     #[no_dynamic]
     fn local_to_global_matrix_without_own_scroll_rect(self) -> Matrix {
-        let mut node = self.parent();
-        let mut matrix = self.base().matrix();
-        while let Some(display_object) = node {
-            // We want to transform to Stage-local coordinates,
-            // so do *not* apply the Stage's matrix
-            if display_object.as_stage().is_some() {
-                break;
+        snapshot::bounds::world(self.into(), || {
+            ruffle_render::profile::work(|w| w.world_matrix_builds += 1);
+            let mut node = self.parent();
+            let mut matrix = self.base().matrix();
+            while let Some(display_object) = node {
+                // We want to transform to Stage-local coordinates,
+                // so do *not* apply the Stage's matrix
+                if display_object.as_stage().is_some() {
+                    break;
+                }
+                if let Some(rect) = display_object.scroll_rect() {
+                    matrix = Matrix::translate(-rect.x_min, -rect.y_min) * matrix;
+                }
+                matrix = display_object.base().matrix() * matrix;
+                node = display_object.parent();
             }
-            if let Some(rect) = display_object.scroll_rect() {
-                matrix = Matrix::translate(-rect.x_min, -rect.y_min) * matrix;
-            }
-            matrix = display_object.base().matrix() * matrix;
-            node = display_object.parent();
-        }
-        matrix
+            matrix
+        })
     }
 
     /// Returns the matrix for transforming from this object's local space to global stage space.
@@ -2259,7 +2382,7 @@ pub trait TDisplayObject<'gc>:
         {
             // Self-transform changes are automatically handled,
             // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
     }
 
@@ -2278,7 +2401,7 @@ pub trait TDisplayObject<'gc>:
         {
             // Self-transform changes are automatically handled,
             // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
     }
 
@@ -2287,7 +2410,7 @@ pub trait TDisplayObject<'gc>:
         if self.base().set_position(x, y)
             && let Some(parent) = self.parent()
         {
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
     }
 
@@ -2306,7 +2429,7 @@ pub trait TDisplayObject<'gc>:
         {
             // Self-transform changes are automatically handled,
             // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
     }
 
@@ -2329,7 +2452,7 @@ pub trait TDisplayObject<'gc>:
             if let Some(parent) = self.parent() {
                 // Self-transform changes are automatically handled,
                 // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-                parent.invalidate_cached_bitmap();
+                invalidate_raster(parent);
             }
         }
     }
@@ -2353,7 +2476,7 @@ pub trait TDisplayObject<'gc>:
             if let Some(parent) = self.parent() {
                 // Self-transform changes are automatically handled,
                 // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-                parent.invalidate_cached_bitmap();
+                invalidate_raster(parent);
             }
         }
     }
@@ -2377,7 +2500,7 @@ pub trait TDisplayObject<'gc>:
             if let Some(parent) = self.parent() {
                 // Self-transform changes are automatically handled,
                 // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
-                parent.invalidate_cached_bitmap();
+                invalidate_raster(parent);
             }
         }
     }
@@ -2509,7 +2632,7 @@ pub trait TDisplayObject<'gc>:
             && let Some(parent) = self.parent()
         {
             // Self-transform changes are automatically handled
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
     }
 
@@ -2794,7 +2917,7 @@ pub trait TDisplayObject<'gc>:
             && let Some(parent) = self.parent()
         {
             // We don't need to invalidate ourselves, we're just toggling if the bitmap is rendered.
-            parent.invalidate_cached_bitmap();
+            invalidate_raster(parent);
         }
 
         if !value && let Some(int) = self.as_interactive() {
@@ -3268,8 +3391,18 @@ pub trait TDisplayObject<'gc>:
         // Invisible children also participate in a parent's recorded block.
         this.snapshots.visited();
         this.clear_invalidate_flag();
-        this.scroll_rect
-            .set(this.has_scroll_rect().then(|| this.next_scroll_rect.get()));
+        let rect = this.has_scroll_rect().then(|| this.next_scroll_rect.get());
+        if this.scroll_rect.replace(rect) != rect {
+            // AS observes the previous scroll until pre_render commits the new one.
+            this.snapshots.changed(snapshot::Change::TRANSFORM);
+            let mut current: Option<DisplayObject<'gc>> = Some(self.into());
+            while let Some(object) = current {
+                if !object.base().snapshots.invalidate_bounds() {
+                    break;
+                }
+                current = object.parent();
+            }
+        }
     }
 
     fn render_self(self, _context: &mut RenderContext<'_, 'gc>) {}
@@ -3655,14 +3788,7 @@ pub trait TDisplayObject<'gc>:
     /// If this object or any ancestor is marked as cacheAsBitmap, it will invalidate that cache.
     #[no_dynamic]
     fn invalidate_cached_bitmap(self) {
-        self.base().invalidate_render();
-        let mut object: Option<DisplayObject<'gc>> = Some(self.into());
-        while let Some(current) = object {
-            if !current.base().invalidate_cached_bitmap() {
-                break;
-            }
-            object = current.parent();
-        }
+        invalidate_bitmap(self.into(), snapshot::Change::VISUAL);
     }
 
     /// Retrieve a named property from the AVM1 object.

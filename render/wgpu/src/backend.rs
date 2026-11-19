@@ -80,6 +80,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     surface: Surface,
     meshes: Vec<Mesh>,
     small_meshes: crate::mesh::SmallMeshCache,
+    definition_meshes: crate::mesh::DefinitionMeshes,
     pub(crate) preparation_generation: crate::prepare::PreparationGeneration,
     // This is currently unused - we just store it to report in
     // `get_viewport_dimensions`
@@ -285,6 +286,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             surface,
             meshes: Vec::new(),
             small_meshes: Default::default(),
+            definition_meshes: Default::default(),
             preparation_generation: crate::prepare::PreparationGeneration::default(),
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(budget.clone()),
@@ -458,13 +460,31 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
 
     fn prepare_commands(
         &mut self,
-        commands: &CommandList,
+        commands: CommandList,
         width: u32,
         height: u32,
         quality: StageQuality,
         format: wgpu::TextureFormat,
         load: crate::pass_graph::Load,
-    ) -> Result<crate::graph_encoder::GraphEncoder, crate::gpu_runtime::RenderFailure> {
+    ) -> Result<crate::graph_encoder::SurfaceCommands, crate::gpu_runtime::RenderFailure> {
+        let _preparation = ruffle_render::profile::native_time(
+            ruffle_render::profile::NativePhase::CommandPreparation,
+        );
+        use crate::graph_encoder::SurfaceCommands;
+        // Stage cache redraws have finished. Keep these handles only through this
+        // submission. Offscreen targets may alias their inputs and use the graph.
+        if matches!(load, crate::pass_graph::Load::Clear(_))
+            && matches!(
+                format,
+                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
+            )
+            && SurfaceCommands::pixel_aligned_caches(
+                &commands,
+                self.descriptors.runtime.generation(),
+            )
+        {
+            return Ok(SurfaceCommands::CachedBitmaps(commands));
+        }
         let samples = crate::utils::supported_sample_count(
             &self.descriptors.adapter,
             quality.sample_count(),
@@ -482,6 +502,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             samples,
             load,
         )
+        .map(SurfaceCommands::Graph)
     }
 
     fn validate_bitmap_size(
@@ -735,6 +756,34 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         })))
     }
 
+    fn register_swf_shape(
+        &mut self,
+        definition: &std::rc::Rc<swf::Shape>,
+        bitmap_source: &dyn BitmapSource,
+        scale: f32,
+    ) -> Result<ShapeHandle, crate::gpu_runtime::RenderFailure> {
+        self.descriptors.runtime.check_health()?;
+        if let Some(handle) = self.definition_meshes.get(definition, scale) {
+            return Ok(handle);
+        }
+        let shape = DistilledShape::from(definition.as_ref());
+        // A bitmap ID is scoped to its movie, even when that movie has no
+        // bitmap registered under the ID yet. Inspect uses before resolving it.
+        use ruffle_render::shape_utils::DrawPath;
+        let movie_independent = shape.paths.iter().all(|path| {
+            let fill = match path {
+                DrawPath::Fill { style, .. } => *style,
+                DrawPath::Stroke { style, .. } => style.fill_style(),
+            };
+            !matches!(fill, swf::FillStyle::Bitmap { .. })
+        });
+        let handle = self.register_shape_with_scale(shape, bitmap_source, scale)?;
+        if movie_independent {
+            self.definition_meshes.insert(definition, scale, &handle);
+        }
+        Ok(handle)
+    }
+
     #[instrument(level = "debug", skip_all)]
     fn submit_frame(
         &mut self,
@@ -898,7 +947,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         }
 
         let graph = self.prepare_commands(
-            &commands,
+            commands,
             self.target.width(),
             self.target.height(),
             self.surface.quality(),
@@ -1167,7 +1216,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             texture.texture.format(),
         )?;
         let graph = self.prepare_commands(
-            &commands,
+            commands,
             extent.width,
             extent.height,
             quality,

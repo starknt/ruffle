@@ -1,0 +1,18 @@
+num_frames = 5
+
+[image_comparisons.before]
+trigger = 2
+tolerance = 0
+
+[image_comparisons.after]
+trigger = 5
+tolerance = 0
+
+[player_options]
+with_renderer = { optional = false, quality = "low" }
+
+[[compilers]]
+type = "Asc"
+class = "Test"
+scripts = ["Test.as"]
+swf_version = 11

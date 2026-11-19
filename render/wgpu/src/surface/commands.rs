@@ -1,3 +1,4 @@
+use super::prepared_draws::{Group, Key as DrawKey, PreparedDraws};
 use crate::backend::RenderTargetMode;
 use crate::blend::BlendType;
 use crate::blend::TrivialBlend;
@@ -19,7 +20,7 @@ use ruffle_render::matrix::Matrix;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::region::RenderRect;
 use ruffle_render::transform::Transform;
-use std::{mem, sync::Arc};
+use std::{mem, rc::Rc, sync::Arc};
 use swf::{BlendMode, Color, ColorTransform, Twips};
 use wgpu::Backend;
 
@@ -128,6 +129,7 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     draw_encoder: &'encoder mut Scope<'global, crate::gpu_resources::CommandEncoder>,
     texture_pool: &'encoder mut TexturePool,
     emulate_lines: bool,
+    recording_block: bool,
 
     solid_inputs: Vec<(SolidInputKey, Arc<PoolOrArcTexture>)>,
     result: Vec<Chunk>,
@@ -175,6 +177,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             draw_encoder,
             texture_pool,
             emulate_lines,
+            recording_block: false,
 
             solid_inputs: vec![],
             result: vec![],
@@ -223,6 +226,52 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         }
 
         Ok(result)
+    }
+
+    fn finish_draw_group(&mut self) {
+        let next = ChunkBufferBuilder::new(self.chunk_buffers, &self.descriptors.limits);
+        if self.current.is_empty() {
+            self.chunk_buffer_builder = next;
+            return;
+        }
+        self.result.push(Chunk::Draw {
+            chunk: mem::take(&mut self.current),
+            needs_stencil: self.needs_stencil,
+            chunk_buffer_builder: mem::replace(&mut self.chunk_buffer_builder, next),
+        });
+    }
+
+    fn replay_window(&mut self, group: &Group, window: std::ops::Range<u32>) {
+        let stride = size_of::<crate::Transforms>();
+        let bytes = &group.instances[window.start as usize * stride..window.end as usize * stride];
+        let first = self
+            .chunk_buffer_builder
+            .append_instance_bytes(bytes)
+            .expect("window fits the current transform buffer");
+        for draw in &group.draws {
+            if let Some(command) = draw.in_window(&window, first) {
+                self.push_command(command);
+            }
+        }
+    }
+
+    fn replay_groups(&mut self, prepared: &PreparedDraws) {
+        for group in &prepared.groups {
+            let count = (group.instances.len() / size_of::<crate::Transforms>()) as u32;
+            let remaining = self
+                .chunk_buffer_builder
+                .remaining_instances(&self.descriptors.limits);
+            if count > remaining {
+                if remaining != 0 {
+                    self.replay_window(group, 0..remaining);
+                }
+                self.finish_draw_group();
+                self.replay_window(group, remaining..count);
+            } else {
+                self.replay_window(group, 0..count);
+            }
+        }
+        ruffle_render::profile::work(|w| w.prepared_draw_replays += 1);
     }
 
     fn push_command(&mut self, command: DrawCommand) {
@@ -294,6 +343,54 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 }
 
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
+    fn render_shared(&mut self, commands: Rc<CommandList>) {
+        let key = DrawKey {
+            device: self.descriptors.runtime.generation(),
+            origin: self.origin,
+            quality: self.quality,
+            mask_geometry: matches!(
+                self.mask_state.mode,
+                MaskMode::DrawMaskStencil | MaskMode::ClearMaskStencil
+            ),
+        };
+        if !self.recording_block
+            && let Some(prepared) = commands.prepared_draws::<PreparedDraws>()
+            && prepared.key == key
+        {
+            self.replay_groups(&prepared);
+            return;
+        }
+        if self.recording_block
+            || commands.iter().len() < 2
+            || !commands.may_prepare_draws(key.device)
+        {
+            commands.execute_ref(self);
+            return;
+        }
+        // Only certified immutable resident draws reach this builder. Capture
+        // their CPU-side instance bytes and merged material runs in isolation.
+        let outer_current = mem::take(&mut self.current);
+        let outer_result = mem::take(&mut self.result);
+        let fresh = ChunkBufferBuilder::new(self.chunk_buffers, &self.descriptors.limits);
+        let outer_buffers = mem::replace(&mut self.chunk_buffer_builder, fresh);
+        self.recording_block = true;
+        commands.execute_ref(self);
+        self.recording_block = false;
+        self.finish_draw_group();
+        let chunks = mem::replace(&mut self.result, outer_result);
+        self.current = outer_current;
+        self.chunk_buffer_builder = outer_buffers;
+        if let Some(prepared) = PreparedDraws::from_chunks(key, chunks) {
+            let bytes = prepared.bytes();
+            let prepared = Rc::new(prepared);
+            self.replay_groups(&prepared);
+            commands.store_draws(prepared, bytes);
+        } else {
+            commands.decline_draw_packet();
+            commands.execute_ref(self);
+        }
+    }
+
     fn blend(&mut self, _: CommandList, _: RenderBlendMode) {
         self.descriptors
             .runtime
@@ -816,24 +913,57 @@ impl WgpuCommandHandler<'_, '_> {
         }
         let result = (|| -> Result<(), crate::gpu_runtime::RenderFailure> {
             let direct = self.alpha_mask_bitmap_input(&maskee_commands, region)?;
-            let inputs = if direct.is_some() { 1 } else { 2 };
+            let scheduler = self.descriptors.runtime.scheduler();
+            let cache_input = match mask_commands.single_leaf() {
+                Some(Command::RenderBitmap {
+                    bitmap,
+                    transform,
+                    smoothing,
+                    pixel_snapping,
+                    region: source,
+                }) => (&*bitmap.0 as &dyn std::any::Any)
+                    .downcast_ref::<crate::bitmap_cache::CacheImage>()
+                    .map(|image| {
+                        (
+                            image.mask_raster(scheduler),
+                            crate::bitmap_cache::MaskKey {
+                                version: image.version(),
+                                output: region,
+                                quality: self.quality,
+                                transform: transform.clone(),
+                                source: *source,
+                                snapping: *pixel_snapping,
+                                smoothing: *smoothing,
+                            },
+                        )
+                    }),
+                _ => None,
+            };
+            let (cached, ticket) = cache_input
+                .as_ref()
+                .map_or((None, None), |(raster, key)| raster.lookup(key, scheduler));
+            let inputs = u64::from(direct.is_none()) + u64::from(cached.is_none());
             ruffle_render::profile::work(|w| {
                 w.offscreen_targets += inputs;
                 w.offscreen_pixels += inputs * u64::from(region.width) * u64::from(region.height);
             });
-            let surface = Surface::new(
-                self.descriptors,
-                self.quality,
-                region.width,
-                region.height,
-                wgpu::TextureFormat::Rgba8Unorm,
-            )?
-            .with_origin([region.x, region.y]);
+            let surface = (inputs != 0)
+                .then(|| {
+                    Surface::new(
+                        self.descriptors,
+                        self.quality,
+                        region.width,
+                        region.height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )
+                    .map(|surface| surface.with_origin([region.x, region.y]))
+                })
+                .transpose()?;
 
             let (maskee, vertices) = if let Some((texture, vertices)) = direct {
                 (texture, Some(vertices))
             } else {
-                let maskee = surface.draw_commands(
+                let maskee = surface.as_ref().expect("uncached content").draw_commands(
                     RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
                     self.descriptors,
                     self.meshes,
@@ -853,20 +983,30 @@ impl WgpuCommandHandler<'_, '_> {
                 ..Matrix::scale(region.width as f32, region.height as f32)
             };
 
-            let mask = surface.draw_commands(
-                RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
-                self.descriptors,
-                self.meshes,
-                mask_commands,
-                self.staging_belt,
-                self.chunk_buffers,
-                self.draw_encoder,
-                LayerRef::None,
-                self.texture_pool,
-            )?;
-            mask.ensure_cleared(self.draw_encoder);
-            let mask = mask.take_color_texture();
-
+            let mask = if let Some(texture) = cached {
+                PoolOrArcTexture::Manual(texture)
+            } else {
+                let mask = surface.as_ref().expect("uncached mask").draw_commands(
+                    RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
+                    self.descriptors,
+                    self.meshes,
+                    mask_commands,
+                    self.staging_belt,
+                    self.chunk_buffers,
+                    self.draw_encoder,
+                    LayerRef::None,
+                    self.texture_pool,
+                )?;
+                mask.ensure_cleared(self.draw_encoder);
+                match (mask.take_color_texture(), cache_input, ticket) {
+                    (PoolOrArcTexture::Pool(entry), Some((cache, key)), Some(ticket)) => {
+                        let texture = entry.into_owned();
+                        cache.store(&key, texture.clone(), ticket, scheduler);
+                        PoolOrArcTexture::Manual(texture)
+                    }
+                    (texture, _, _) => texture,
+                }
+            };
             let binds = self
                 .descriptors
                 .cached_bind_group(&wgpu::BindGroupDescriptor {

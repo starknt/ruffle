@@ -60,6 +60,16 @@ pub trait RenderBackend: Any {
         self.register_shape(shape, bitmap_source)
     }
 
+    /// Register an immutable timeline definition at its first-draw scale.
+    fn register_swf_shape(
+        &mut self,
+        shape: &Rc<swf::Shape>,
+        bitmap_source: &dyn BitmapSource,
+        scale: f32,
+    ) -> Result<ShapeHandle, RenderFailure> {
+        self.register_shape_with_scale(shape.as_ref().into(), bitmap_source, scale)
+    }
+
     fn render_offscreen(
         &mut self,
         handle: BitmapHandle,

@@ -29,7 +29,17 @@ pub struct BitmapRecipe {
     state: Mutex<State>,
     resident: OnceLock<Texture>,
 }
-impl BitmapHandleImpl for BitmapRecipe {}
+impl BitmapHandleImpl for BitmapRecipe {
+    fn retained_bytes(&self) -> Option<usize> {
+        // Include a resident RGBA texture, a full pending upload and coverage
+        // (one bit per pixel rounded up by row), even if currently unrealized.
+        let row = (self.width as usize)
+            .checked_mul(8)?
+            .checked_add((self.width as usize).div_ceil(64).checked_mul(8)?)?;
+        row.checked_mul(self.height as usize)?
+            .checked_add(size_of::<Self>() + 4096)
+    }
+}
 impl BitmapRecipe {
     pub fn new(pixels: Bitmap<'_>, device: &Device) -> Result<Arc<Self>, RenderFailure> {
         let owner = device.runtime().issue_owner(OwnerKind::BitmapData)?;

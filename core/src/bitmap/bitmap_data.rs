@@ -888,7 +888,9 @@ mod wrapper {
         }
 
         pub fn dispose(&self, mc: &Mutation<'gc>) {
-            self.0.borrow_mut(mc).dispose();
+            let mut data = self.0.borrow_mut(mc);
+            data.dispose();
+            data.inform_display_objects(mc);
         }
 
         pub fn init_object2(&self, mc: &Mutation<'gc>, object: BitmapDataObject<'gc>) {

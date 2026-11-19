@@ -3,6 +3,7 @@ pub mod buffers;
 mod chunk;
 mod commands;
 pub mod mask;
+mod prepared_draws;
 pub mod target;
 #[cfg(test)]
 mod tests;
@@ -32,7 +33,7 @@ use tracing::instrument;
 use crate::surface::mask::MaskState;
 use chunk::ChunkBlendMode;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Surface {
     size: wgpu::Extent3d,
     origin: [u32; 2],
@@ -92,15 +93,40 @@ impl Surface {
         chunk_buffers: &'global mut ChunkBuffers,
         draw_encoder: &'encoder mut Scope<'global, crate::gpu_resources::CommandEncoder>,
         meshes: &'global Vec<Mesh>,
-        graph: crate::graph_encoder::GraphEncoder,
+        plan: crate::graph_encoder::SurfaceCommands,
         layer: LayerRef<'encoder>,
         texture_pool: &'global mut TexturePool,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        use crate::graph_encoder::{PlannedList, SurfaceCommands};
+        let aligned_surface;
+        let (surface, direct_attachment, commands) = match plan {
+            SurfaceCommands::Graph(graph) => {
+                let direct = graph.graph.direct_attachment();
+                (self, direct, graph.into_commands()?)
+            }
+            SurfaceCommands::CachedBitmaps(list) => {
+                let bounds = ruffle_render::region::RenderRect {
+                    x: 0,
+                    y: 0,
+                    width: self.size.width,
+                    height: self.size.height,
+                };
+                // Each covered pixel contains all its samples. Filtering already
+                // happened when producing the cached image at the stage quality.
+                aligned_surface = Surface {
+                    sample_count: 1,
+                    pipelines: descriptors.pipelines(1, self.format)?,
+                    ..self.clone()
+                };
+                (
+                    &aligned_surface,
+                    true,
+                    PlannedList::from_cache_bitmaps(list, bounds),
+                )
+            }
+        };
         let direct = matches!(render_target_mode, RenderTargetMode::FreshWithColor(_))
-            && (graph.graph.direct_attachment() || {
-                // Complex compositing copies the destination before sampling it.
-                // Host texture targets can supply that copy directly; presentation
-                // surfaces with attachment-only usage still need the intermediate.
+            && (direct_attachment || {
                 let texture = frame_view.texture_handle()?;
                 texture.usage().contains(wgpu::TextureUsages::COPY_SRC)
                     && texture.format() == self.format
@@ -111,8 +137,7 @@ impl Surface {
             }
             mode => mode,
         };
-        let commands = graph.into_commands()?;
-        let target = self.draw_commands(
+        let target = surface.draw_commands(
             render_target_mode,
             descriptors,
             meshes,

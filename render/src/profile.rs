@@ -39,6 +39,15 @@ work_counters!(
     cache_hits,
     cache_redraws,
     tree_visits,
+    render_bounds_nodes,
+    world_matrix_builds,
+    child_slots_examined,
+    child_slots_copied,
+    render_instances_updated,
+    render_chunks_rebuilt,
+    prepared_chunk_hits,
+    prepared_draw_replays,
+    captured_command_leaves,
     snapshot_hits,
     snapshot_misses,
     snapshot_evictions,
@@ -75,9 +84,10 @@ pub enum NativePhase {
     Present,
     QueueThrottle,
     Preparation,
+    CommandPreparation,
 }
 impl NativePhase {
-    pub const NAMES: [&'static str; 7] = [
+    pub const NAMES: [&'static str; 8] = [
         "encoderFinish",
         "submitLock",
         "queueSubmit",
@@ -85,6 +95,7 @@ impl NativePhase {
         "present",
         "queueThrottle",
         "preparation",
+        "commandPreparation",
     ];
 }
 
@@ -240,7 +251,7 @@ pub struct PublishedCodeStats {
 #[derive(Debug, Default, Clone)]
 pub struct Counters {
     pub work: RenderWork,
-    pub native_timings: [Timing; 7],
+    pub native_timings: [Timing; NativePhase::NAMES.len()],
     pub native_resources: Option<NativeResources>,
     pub gpu_samples: Vec<GpuSample>,
     pub dropped_gpu_samples: u64,
