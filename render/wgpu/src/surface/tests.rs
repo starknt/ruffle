@@ -3332,3 +3332,36 @@ fn pixelbender_allocations_are_attributed_to_the_shader_until_drop() {
             .all(|r| baseline.contains(&r.id))
     );
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn shared_stage_chunk_replays_without_recapturing_its_leaves() {
+    use ruffle_render::commands::Command;
+    use ruffle_render::profile::{RenderMetrics, enter};
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (32, 24)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let mut block = CommandList::new();
+    rect(&mut block, 0., 0., 16., 24., Color::RED);
+    rect(&mut block, 16., 0., 16., 24., Color::BLACK);
+    let block = std::rc::Rc::new(block);
+    block.charge_storage(&std::rc::Rc::new(std::cell::Cell::new(0)), 1 << 20);
+    let metrics = RenderMetrics::default();
+    let _scope = enter(Some(&metrics));
+    for _ in 0..2 {
+        let mut frame = CommandList::new();
+        frame.push(Command::Shared(block.clone()));
+        renderer.submit_frame(Color::WHITE, frame, vec![]).unwrap();
+    }
+    let before = metrics.snapshot().work;
+    let mut frame = CommandList::new();
+    frame.push(Command::Shared(block));
+    renderer.submit_frame(Color::WHITE, frame, vec![]).unwrap();
+    let work = metrics.snapshot().work.delta(before);
+    assert_eq!(work.captured_command_leaves, 0);
+    assert!(work.prepared_chunk_hits > 0);
+    assert!(work.prepared_draw_replays > 0);
+    let image = renderer.capture_frame().unwrap().unwrap();
+    assert_eq!(image.get_pixel(2, 2).0, [255, 0, 0, 255]);
+    assert_eq!(image.get_pixel(24, 2).0, [0, 0, 0, 255]);
+}

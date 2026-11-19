@@ -86,7 +86,10 @@ impl GraphEncoder {
         samples: u32,
         load: Load,
     ) -> Result<Self, RenderFailure> {
-        let prepared = PreparedSnapshot::capture(commands)?;
+        let prepared = PreparedSnapshot::capture_for_device(
+            commands,
+            Some(backend.descriptors.runtime.generation()),
+        )?;
         Self::from_prepared(backend, prepared, bounds, samples, load)
     }
     pub fn from_prepared<T: crate::target::RenderTarget>(

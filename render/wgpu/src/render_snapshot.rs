@@ -16,7 +16,7 @@ use ruffle_render::{
     shape_utils::OwnedDistilledShape,
     transform::Transform,
 };
-use std::{any::Any, sync::Arc};
+use std::{any::Any, rc::Rc, sync::Arc};
 use swf::{BlendMode, Color};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -93,6 +93,8 @@ pub enum SnapshotCommand {
     },
     Mask(MaskCommand),
     Shared(Arc<[SnapshotNode]>),
+    /// Index into the player-thread immutable block table for this capture.
+    Retained(usize),
     Blend {
         children: Arc<[SnapshotNode]>,
         mode: SnapshotBlend,
@@ -191,14 +193,44 @@ pub struct PreparedSnapshot {
     pub snapshot: RenderSnapshot,
     resources: Vec<(ResourceVersion, Handle)>,
     resource_indices: HashMap<ResourceVersion, usize>,
+    retained: Vec<Rc<CommandList>>,
 }
 #[derive(Default)]
 struct Capture {
+    device: Option<u64>,
+    retained: Vec<Rc<CommandList>>,
     known: HashMap<ResourceVersion, usize>,
     resources: Vec<(ResourceVersion, Handle)>,
     recipes: Vec<ResourceRecipe>,
 }
 impl Capture {
+    fn immutable(commands: &CommandList, device: u64) -> bool {
+        commands.certify_immutable(device, || {
+            commands.iter().all(|cmd| match cmd {
+                Command::DrawRect { .. }
+                | Command::DrawLine { .. }
+                | Command::DrawLineRect { .. } => true,
+                Command::Shared(block) => Self::immutable(block, device),
+                Command::RenderShape { shape, .. } => {
+                    let handle = &*shape.0 as &dyn Any;
+                    if let Some(recipe) = handle.downcast_ref::<ShapeRecipe>() {
+                        recipe.device_generation == device
+                            && recipe.bitmaps.0.is_empty()
+                            && recipe
+                                .mesh
+                                .get()
+                                .is_some_and(|m| m.retained_bytes.is_some())
+                    } else if let Some(mesh) = handle.downcast_ref::<crate::mesh::Mesh>() {
+                        mesh.vertex_buffer.lease().id().device_generation() == device
+                            && mesh.retained_bytes.is_some()
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            })
+        })
+    }
     fn resource(&mut self, handle: Handle) -> Result<ResourceVersion, RenderFailure> {
         let resource = handle.version()?;
         // Register before dependencies to make cyclic references bounded.
@@ -256,6 +288,7 @@ impl Capture {
         Ok(resource)
     }
     fn commands(&mut self, commands: &CommandList) -> Result<Arc<[SnapshotNode]>, RenderFailure> {
+        let mut leaves = 0;
         let mut nodes = Vec::with_capacity(commands.iter().len());
         for command in commands.iter() {
             let region = command.region();
@@ -292,6 +325,14 @@ impl Capture {
                         rectangle: matches!(command, Command::DrawLineRect { .. }),
                     }
                 }
+                Command::Shared(children)
+                    if self.device.is_some_and(|d| Self::immutable(children, d)) =>
+                {
+                    let index = self.retained.len();
+                    self.retained.push(children.clone());
+                    ruffle_render::profile::work(|w| w.prepared_chunk_hits += 1);
+                    SnapshotCommand::Retained(index)
+                }
                 Command::Shared(children) => SnapshotCommand::Shared(self.commands(children)?),
                 Command::Blend(children, mode) => SnapshotCommand::Blend {
                     children: self.commands(children)?,
@@ -314,8 +355,16 @@ impl Capture {
                 Command::DeactivateMask => SnapshotCommand::Mask(MaskCommand::Deactivate),
                 Command::PopMask => SnapshotCommand::Mask(MaskCommand::Pop),
             };
+            leaves += u64::from(!matches!(
+                command,
+                SnapshotCommand::Retained(_)
+                    | SnapshotCommand::Shared(_)
+                    | SnapshotCommand::Blend { .. }
+                    | SnapshotCommand::AlphaMask { .. }
+            ));
             nodes.push(SnapshotNode { command, region });
         }
+        ruffle_render::profile::work(|w| w.captured_command_leaves += leaves);
         Ok(nodes.into())
     }
 }
@@ -342,6 +391,7 @@ impl PreparedSnapshot {
     }
     pub fn leaf(&self, node: &SnapshotNode) -> Result<Command, RenderFailure> {
         Ok(match &node.command {
+            SnapshotCommand::Retained(index) => Command::Shared(self.retained[*index].clone()),
             SnapshotCommand::Bitmap {
                 resource,
                 transform,
@@ -409,8 +459,17 @@ impl PreparedSnapshot {
     }
 
     pub fn capture(commands: &CommandList) -> Result<Self, RenderFailure> {
+        Self::capture_for_device(commands, None)
+    }
+
+    pub(super) fn capture_for_device(
+        commands: &CommandList,
+        device: Option<u64>,
+    ) -> Result<Self, RenderFailure> {
         let capacity = commands.iter().len().min(64);
         let mut capture = Capture {
+            device,
+            retained: Vec::new(),
             known: HashMap::with_capacity_and_hasher(capacity, Default::default()),
             resources: Vec::with_capacity(capacity),
             recipes: Vec::with_capacity(capacity),
@@ -423,6 +482,7 @@ impl PreparedSnapshot {
             },
             resource_indices: capture.known,
             resources: capture.resources,
+            retained: capture.retained,
         })
     }
     fn validate<T: crate::target::RenderTarget>(

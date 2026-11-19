@@ -4,7 +4,10 @@ use crate::matrix::Matrix;
 use crate::pixel_bender::PixelBenderShaderHandle;
 use crate::region::RenderRegion;
 use crate::transform::Transform;
-use std::rc::Rc;
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 use swf::{BlendMode, Color};
 
 pub trait CommandHandler {
@@ -44,9 +47,15 @@ pub enum RenderBlendMode {
     Shader(PixelBenderShaderHandle),
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct CommandList {
     commands: Vec<Command>,
+    has_commands: bool,
+    retained_size: std::cell::Cell<Option<usize>>,
+    prepared_device: Cell<Option<u64>>,
+    charge: RefCell<Option<StorageCharge>>,
+    prepared: RefCell<Option<Box<PreparedData>>>,
+    observed: Cell<bool>,
     region: RenderRegion,
     temporary_inputs: usize,
     samples_ancestor_layer: bool,
@@ -56,7 +65,85 @@ pub struct CommandList {
     maskers_in_progress: u32,
 }
 
+#[derive(Debug)]
+struct PreparedData {
+    value: Rc<dyn std::any::Any>,
+    _charge: StorageCharge,
+}
+
+#[derive(Debug)]
+struct StorageCharge {
+    limit: usize,
+    budget: Rc<Cell<usize>>,
+    bytes: usize,
+}
+impl Drop for StorageCharge {
+    fn drop(&mut self) {
+        self.budget.set(self.budget.get() - self.bytes);
+    }
+}
+
+impl Clone for CommandList {
+    fn clone(&self) -> Self {
+        Self {
+            commands: self.commands.clone(),
+            has_commands: self.has_commands,
+            region: self.region,
+            temporary_inputs: self.temporary_inputs,
+            samples_ancestor_layer: self.samples_ancestor_layer,
+            maskers_in_progress: self.maskers_in_progress,
+            ..Self::default()
+        }
+    }
+}
+
 impl CommandList {
+    /// A positive certificate covers only immutable resident draws on one device.
+    /// Mutation of the command list revokes it, including after Rc::make_mut.
+    pub fn certify_immutable(&self, device: u64, check: impl FnOnce() -> bool) -> bool {
+        if self.prepared_device.get() == Some(device) {
+            return true;
+        }
+        if !check() {
+            return false;
+        }
+        self.prepared_device.set(Some(device));
+        true
+    }
+    pub fn prepared_draws<T: std::any::Any>(&self) -> Option<Rc<T>> {
+        self.prepared
+            .borrow()
+            .as_ref()?
+            .value
+            .clone()
+            .downcast::<T>()
+            .ok()
+    }
+    pub fn may_prepare_draws(&self, device: u64) -> bool {
+        self.prepared_device.get() == Some(device)
+            && self.charge.borrow().is_some()
+            && self.observed.replace(true)
+    }
+    pub fn store_draws<T: std::any::Any>(&self, value: Rc<T>, bytes: usize) {
+        self.prepared.borrow_mut().take();
+        let charge = self.charge.borrow();
+        let Some(charge) = charge.as_ref() else {
+            return;
+        };
+        let bytes = bytes.saturating_add(size_of::<PreparedData>() + 64);
+        if bytes > charge.limit.saturating_sub(charge.budget.get()) {
+            return;
+        }
+        charge.budget.set(charge.budget.get() + bytes);
+        *self.prepared.borrow_mut() = Some(Box::new(PreparedData {
+            value,
+            _charge: StorageCharge {
+                budget: charge.budget.clone(),
+                bytes,
+                limit: charge.limit,
+            },
+        }));
+    }
     pub fn temporary_inputs(&self) -> usize {
         self.temporary_inputs
     }
@@ -64,23 +151,31 @@ impl CommandList {
         self.samples_ancestor_layer
     }
     pub fn append(&mut self, mut other: CommandList) {
+        self.prepared.get_mut().take();
+        self.observed.set(false);
+        self.charge.get_mut().take();
+        self.retained_size.set(None);
+        self.prepared_device.set(None);
         debug_assert_eq!(other.maskers_in_progress, 0);
         self.region = self.region.union(other.region);
         self.temporary_inputs = self.temporary_inputs.saturating_add(other.temporary_inputs);
         self.samples_ancestor_layer |= other.samples_ancestor_layer;
+        self.has_commands |= other.has_commands;
         self.commands.append(&mut other.commands);
     }
 
-    /// Counts command storage and all resources it can keep resident. Shared
-    /// resources are intentionally charged once per reference (an upper bound).
-    pub fn retained_bytes(&self) -> Option<usize> {
-        let mut bytes =
-            std::mem::size_of::<Self>() + self.commands.capacity() * std::mem::size_of::<Command>();
+    fn local_bytes(&self) -> Option<usize> {
+        let mut bytes = size_of::<Self>() + self.commands.capacity() * size_of::<Command>();
         for command in &self.commands {
             bytes = bytes.checked_add(match command {
                 Command::RenderShape { shape, .. } => shape.0.retained_bytes()?,
-                Command::Shared(commands) => commands.retained_bytes()?,
-                Command::DrawRect { .. }
+                Command::RenderBitmap { bitmap, .. } => bitmap.0.retained_bytes()?,
+                Command::PopMask
+                | Command::DeactivateMask
+                | Command::PushMask
+                | Command::ActivateMask
+                | Command::Shared(_)
+                | Command::DrawRect { .. }
                 | Command::DrawLine { .. }
                 | Command::DrawLineRect { .. } => 0,
                 _ => return None,
@@ -89,7 +184,57 @@ impl CommandList {
         Some(bytes)
     }
 
-    fn execute_ref(&self, handler: &mut (impl CommandHandler + ?Sized)) {
+    pub fn retained_bytes(&self) -> Option<usize> {
+        if let Some(bytes) = self.retained_size.get() {
+            return Some(bytes);
+        }
+        let mut bytes = self.local_bytes()?;
+        for cmd in &self.commands {
+            if let Command::Shared(child) = cmd {
+                bytes = bytes.checked_add(child.retained_bytes()?)?;
+            }
+        }
+        self.retained_size.set(Some(bytes));
+        Some(bytes)
+    }
+
+    /// Additional storage this player would retain. Already charged shared
+    /// blocks are constant-time stops, including blocks pinned by older frames.
+    pub fn additional_bytes(&self, budget: &Rc<Cell<usize>>) -> Option<usize> {
+        if let Some(charge) = self.charge.borrow().as_ref() {
+            return Rc::ptr_eq(&charge.budget, budget).then_some(0);
+        }
+        let mut bytes = self.local_bytes()?;
+        for command in &self.commands {
+            if let Command::Shared(child) = command {
+                bytes = bytes.checked_add(child.additional_bytes(budget)?)?;
+            }
+        }
+        Some(bytes)
+    }
+
+    /// Called after the complete graph and its size have been validated.
+    pub fn charge_storage(&self, budget: &Rc<Cell<usize>>, limit: usize) {
+        if self.charge.borrow().is_some() {
+            return;
+        }
+        let bytes = self
+            .local_bytes()
+            .expect("validated retained command block");
+        budget.set(budget.get() + bytes);
+        *self.charge.borrow_mut() = Some(StorageCharge {
+            budget: budget.clone(),
+            bytes,
+            limit,
+        });
+        for command in &self.commands {
+            if let Command::Shared(child) = command {
+                child.charge_storage(budget, limit);
+            }
+        }
+    }
+
+    pub fn execute_ref(&self, handler: &mut (impl CommandHandler + ?Sized)) {
         for command in &self.commands {
             // Do not materialize a cloned (large) Command enum on the stack.
             // Retained blocks contain only leaf draws or shared blocks.
@@ -116,6 +261,11 @@ impl CommandList {
         self.region
     }
     pub fn push(&mut self, command: Command) {
+        self.prepared.get_mut().take();
+        self.observed.set(false);
+        self.charge.get_mut().take();
+        self.retained_size.set(None);
+        self.prepared_device.set(None);
         self.region = self.region.union(command.region());
         self.temporary_inputs = self
             .temporary_inputs
@@ -132,6 +282,7 @@ impl CommandList {
             } => maskee_commands.samples_ancestor_layer || mask_commands.samples_ancestor_layer,
             _ => false,
         };
+        self.has_commands |= !matches!(&command, Command::Shared(children) if children.is_empty());
         self.commands.push(command);
     }
     #[inline]
@@ -141,13 +292,21 @@ impl CommandList {
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.commands.is_empty()
+        !self.has_commands
     }
 
     pub fn execute(self, handler: &mut (impl CommandHandler + ?Sized)) {
         for command in self.commands {
             command.execute(handler);
         }
+    }
+
+    /// Preserve Flash's nested-mask suppression while recording a stencil input.
+    pub fn stencil_recorder(&self) -> Option<Self> {
+        (self.maskers_in_progress == 1).then(|| Self {
+            maskers_in_progress: 1,
+            ..Default::default()
+        })
     }
 
     pub fn drawing_mask(&self) -> bool {

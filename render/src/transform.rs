@@ -12,6 +12,19 @@ pub struct Transform {
     pub perspective_projection: Option<PerspectiveProjection>,
 }
 
+impl Transform {
+    /// The stage stack and retained instance updates must perform the same
+    /// sequence of Twips and fixed-point color multiplications.
+    pub fn concat(&self, local: &Self) -> Self {
+        Self {
+            matrix: self.matrix * local.matrix,
+            color_transform: self.color_transform * local.color_transform,
+            tz: self.tz + local.tz,
+            perspective_projection: Default::default(),
+        }
+    }
+}
+
 pub struct TransformStack(Vec<Transform>);
 
 impl TransformStack {
@@ -20,17 +33,7 @@ impl TransformStack {
     }
 
     pub fn push(&mut self, transform: &Transform) {
-        let cur_transform = self.transform();
-        let matrix = cur_transform.matrix * transform.matrix;
-        let color_transform = cur_transform.color_transform * transform.color_transform;
-        let tz = cur_transform.tz + transform.tz;
-        self.0.push(Transform {
-            matrix,
-            color_transform,
-            // TODO: Merge perspective_projections from cur_transform and transform properly
-            perspective_projection: Default::default(),
-            tz,
-        });
+        self.0.push(self.0.last().unwrap().concat(transform));
     }
 
     pub fn pop(&mut self) {

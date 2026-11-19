@@ -1,5 +1,8 @@
 //! Stage command snapshots. No GC edges are retained; display objects own the
 //! entries and the player keeps only weak references for accounting/eviction.
+pub(super) mod bounds;
+pub(super) mod children;
+pub(super) mod stencil;
 use ruffle_render::{commands::CommandList, quality::StageQuality, transform::Transform};
 use std::{
     cell::{Cell, RefCell},
@@ -7,8 +10,39 @@ use std::{
 };
 use swf::{Rectangle, Twips};
 
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    pub(super) struct Change: u8 {
+        const TRANSFORM = 1;
+        const COLOR = 2;
+        const VISUAL = 4;
+        const MASK = 8;
+        const FILTER = 16;
+        const VISIBILITY = 32;
+        const CHILDREN = 64;
+    }
+}
+
+#[derive(Default)]
+struct RenderGeneration {
+    // Source stamps are allocated with an observed node. World transforms
+    // incorporate inherited stamps at use time.
+    revisions: Cell<[u64; 7]>,
+}
+impl RenderGeneration {
+    fn advance(&self, change: Change) {
+        let mut revisions = self.revisions.get();
+        for flag in change.iter() {
+            let revision = &mut revisions[flag.bits().trailing_zeros() as usize];
+            *revision = revision.wrapping_add(1);
+        }
+        self.revisions.set(revisions);
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct Key {
+    pub mask_geometry: bool,
     pub generation: u64,
     pub inherited: Transform,
     pub own: Transform,
@@ -24,6 +58,13 @@ pub struct Entry {
 
 #[derive(Default)]
 pub struct Node {
+    pub(super) bounds: Cell<Option<(bounds::Key, Rectangle<Twips>)>>,
+    pub(super) world: Cell<Option<bounds::World>>,
+    layout_revision: Cell<u64>,
+    revisions: RenderGeneration,
+    children: RefCell<Option<children::Children>>,
+    dense: Cell<bool>,
+    dirty_children: Cell<usize>,
     pub entry: RefCell<Option<Entry>>,
     pub used: Cell<u64>,
     pub observed: RefCell<Option<Key>>,
@@ -31,17 +72,24 @@ pub struct Node {
 }
 
 struct NodeCharge {
+    total: Rc<Cell<usize>>,
     used: Rc<Cell<usize>>,
     bytes: usize,
 }
 impl Drop for NodeCharge {
     fn drop(&mut self) {
         self.used.set(self.used.get() - self.bytes);
+        self.total.set(self.total.get() - self.bytes);
     }
 }
 
+thread_local! { static NEXT_ID: Cell<u64> = const { Cell::new(1) }; }
+
 #[derive(Default)]
 pub struct State {
+    id: Cell<u64>,
+    pub(super) transform_stamp: Cell<u64>,
+    pub(super) bounds_observed: Cell<bool>,
     pub generation: Cell<u64>,
     pub node: RefCell<Option<Rc<Node>>>,
     invalidated: Cell<bool>,
@@ -57,6 +105,63 @@ impl Clone for State {
 impl State {
     /// Coalesce until the next render traversal, not until the next frame.
     /// A second mutation after a render in the same logical frame propagates.
+    pub(super) fn id(&self) -> u64 {
+        let id = self.id.get();
+        if id != 0 {
+            return id;
+        }
+        let id = NEXT_ID.get();
+        NEXT_ID.set(
+            id.checked_add(1)
+                .expect("display object identity exhausted"),
+        );
+        self.id.set(id);
+        id
+    }
+    pub(super) fn observed_id(&self) -> u64 {
+        self.id.get()
+    }
+    pub(super) fn revision(&self, component: Change) -> u64 {
+        debug_assert_eq!(component.bits().count_ones(), 1);
+        self.node.borrow().as_ref().map_or(0, |node| {
+            node.revisions.revisions.get()[component.bits().trailing_zeros() as usize]
+        })
+    }
+    pub(super) fn changed(&self, change: Change) {
+        if change.contains(Change::TRANSFORM) {
+            self.transform_stamp.set(bounds::next_transform_stamp());
+        }
+        if let Some(node) = self.node.borrow().as_ref() {
+            node.revisions.advance(change);
+        }
+    }
+    pub(super) fn invalidate_bounds(&self) -> bool {
+        if !self.bounds_observed.replace(false) {
+            return false;
+        }
+        if let Some(node) = self.node.borrow().as_ref() {
+            node.bounds.set(None);
+        }
+        true
+    }
+    pub(super) fn mark_child(&self, id: u64, change: Change, first: bool) {
+        if let Some(node) = self.node.borrow().as_ref() {
+            if first && node.dense.get() {
+                node.dirty_children
+                    .set(node.dirty_children.get().saturating_add(1));
+            }
+            if let Some(children) = node.children.borrow_mut().as_mut() {
+                children.mark(id, change);
+            }
+        }
+    }
+    pub(super) fn invalidate_child_layout(&self) {
+        if let Some(node) = self.node.borrow().as_ref() {
+            node.layout_revision
+                .set(node.layout_revision.get().wrapping_add(1));
+        }
+    }
+
     pub fn invalidate(&self) -> bool {
         if self.invalidated.replace(true) {
             return false;
@@ -98,6 +203,7 @@ pub struct Cache {
     limit: usize,
     bytes: usize,
     node_bytes: Rc<Cell<usize>>,
+    used_bytes: Rc<Cell<usize>>,
     clock: u64,
 }
 
@@ -114,6 +220,7 @@ impl Cache {
             limit,
             bytes: 0,
             node_bytes: Rc::new(Cell::new(0)),
+            used_bytes: Rc::new(Cell::new(0)),
             clock: 0,
         }
     }
@@ -125,6 +232,7 @@ impl Cache {
         self.records.retain(|r| {
             if r.commands.strong_count() == 0 {
                 self.bytes -= r.bytes;
+                self.used_bytes.set(self.used_bytes.get() - r.bytes);
                 false
             } else {
                 true
@@ -136,18 +244,24 @@ impl Cache {
             self.records.shrink_to_fit();
         }
     }
-    fn new_node(&mut self) -> Option<Rc<Node>> {
-        // Includes Rc/allocator overhead; observation keys live inside Node.
-        let bytes = std::mem::size_of::<Node>() + 128;
+    fn charge(&mut self, bytes: usize) -> Option<NodeCharge> {
         if !self.make_room(bytes) {
             return None;
         }
         self.node_bytes.set(self.node_bytes.get() + bytes);
+        self.used_bytes.set(self.used_bytes.get() + bytes);
+        Some(NodeCharge {
+            total: self.used_bytes.clone(),
+            used: self.node_bytes.clone(),
+            bytes,
+        })
+    }
+    fn new_node(&mut self) -> Option<Rc<Node>> {
+        // Includes Rc/allocator overhead; observation keys live inside Node.
+        let bytes = std::mem::size_of::<Node>() + 128;
+        let charge = self.charge(bytes)?;
         Some(Rc::new(Node {
-            _charge: Some(NodeCharge {
-                used: self.node_bytes.clone(),
-                bytes,
-            }),
+            _charge: Some(charge),
             ..Default::default()
         }))
     }
@@ -155,8 +269,11 @@ impl Cache {
         if bytes > self.limit {
             return false;
         }
+        if self.used_bytes.get() + bytes <= self.limit {
+            return true;
+        }
         self.prune();
-        while self.bytes + self.node_bytes.get() + bytes > self.limit {
+        while self.used_bytes.get() + bytes > self.limit {
             let oldest = self
                 .records
                 .iter()
@@ -186,7 +303,7 @@ impl Cache {
         // as command/resource storage. Candidate Node has a separate lifetime.
         let Some(bytes) = entry
             .commands
-            .retained_bytes()
+            .additional_bytes(&self.used_bytes)
             .and_then(|b| b.checked_add(ENTRY_OVERHEAD))
         else {
             return false;
@@ -195,11 +312,13 @@ impl Cache {
             return false;
         }
         self.touch(node);
-        self.bytes += bytes;
+        entry.commands.charge_storage(&self.used_bytes, self.limit);
+        self.used_bytes.set(self.used_bytes.get() + ENTRY_OVERHEAD);
+        self.bytes += ENTRY_OVERHEAD;
         self.records.push(Record {
             node: Rc::downgrade(node),
             commands: Rc::downgrade(&entry.commands),
-            bytes,
+            bytes: ENTRY_OVERHEAD,
         });
         *node.entry.borrow_mut() = Some(entry);
         // Cumulative admitted bytes (not a live-size gauge); delta-safe.
@@ -214,6 +333,7 @@ mod tests {
     fn entry() -> Entry {
         Entry {
             key: Key {
+                mask_geometry: false,
                 generation: 0,
                 inherited: Transform::default(),
                 own: Transform::default(),
@@ -244,7 +364,7 @@ mod tests {
             + cache.records.capacity() * std::mem::size_of::<Record>()
             + frames.len() * (std::mem::size_of::<Node>() + 4 * std::mem::size_of::<usize>());
         assert!(
-            cache.bytes >= actual,
+            cache.used_bytes.get() >= actual,
             "{} charged for at least {actual} retained bytes",
             cache.bytes
         );
@@ -310,7 +430,7 @@ mod tests {
         let frame = first.commands.clone();
         assert!(cache.insert(&a, first));
         assert!(!cache.insert(&b, entry()));
-        assert_eq!(cache.bytes, cost);
+        assert_eq!(cache.used_bytes.get(), cost);
         drop(frame);
         assert!(cache.insert(&b, entry()));
         drop(b);

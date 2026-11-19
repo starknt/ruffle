@@ -140,6 +140,9 @@ impl BufferBuilder {
         Ok(())
     }
 
+    pub fn into_storage(mut self) -> Box<[u8]> {
+        std::mem::take(&mut self.inner).into_boxed_slice()
+    }
     pub fn len(&self) -> usize {
         self.inner.len()
     }

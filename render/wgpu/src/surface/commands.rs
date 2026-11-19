@@ -1,3 +1,4 @@
+use super::prepared_draws::{Key as DrawKey, PreparedDraws};
 use crate::backend::RenderTargetMode;
 use crate::blend::BlendType;
 use crate::blend::TrivialBlend;
@@ -19,7 +20,7 @@ use ruffle_render::matrix::Matrix;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::region::RenderRect;
 use ruffle_render::transform::Transform;
-use std::{mem, sync::Arc};
+use std::{mem, rc::Rc, sync::Arc};
 use swf::{BlendMode, Color, ColorTransform, Twips};
 use wgpu::Backend;
 
@@ -128,6 +129,7 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     draw_encoder: &'encoder mut Scope<'global, crate::gpu_resources::CommandEncoder>,
     texture_pool: &'encoder mut TexturePool,
     emulate_lines: bool,
+    recording_block: bool,
 
     solid_inputs: Vec<(SolidInputKey, Arc<PoolOrArcTexture>)>,
     result: Vec<Chunk>,
@@ -175,6 +177,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             draw_encoder,
             texture_pool,
             emulate_lines,
+            recording_block: false,
 
             solid_inputs: vec![],
             result: vec![],
@@ -223,6 +226,40 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         }
 
         Ok(result)
+    }
+
+    fn finish_draw_group(&mut self) {
+        let next = ChunkBufferBuilder::new(self.chunk_buffers, &self.descriptors.limits);
+        if self.current.is_empty() {
+            self.chunk_buffer_builder = next;
+            return;
+        }
+        self.result.push(Chunk::Draw {
+            chunk: mem::take(&mut self.current),
+            needs_stencil: self.needs_stencil,
+            chunk_buffer_builder: mem::replace(&mut self.chunk_buffer_builder, next),
+        });
+    }
+
+    fn replay_groups(&mut self, prepared: &PreparedDraws) {
+        for group in &prepared.groups {
+            let first = match self
+                .chunk_buffer_builder
+                .append_instance_bytes(&group.instances)
+            {
+                Ok(first) => first,
+                Err(_) => {
+                    self.finish_draw_group();
+                    self.chunk_buffer_builder
+                        .append_instance_bytes(&group.instances)
+                        .expect("prepared group fits its originating device uniform window")
+                }
+            };
+            for draw in &group.draws {
+                self.push_command(draw.at(first));
+            }
+        }
+        ruffle_render::profile::work(|w| w.prepared_draw_replays += 1);
     }
 
     fn push_command(&mut self, command: DrawCommand) {
@@ -294,6 +331,53 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 }
 
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
+    fn render_shared(&mut self, commands: Rc<CommandList>) {
+        let key = DrawKey {
+            device: self.descriptors.runtime.generation(),
+            origin: self.origin,
+            quality: self.quality,
+            mask_geometry: matches!(
+                self.mask_state.mode,
+                MaskMode::DrawMaskStencil | MaskMode::ClearMaskStencil
+            ),
+        };
+        if !self.recording_block
+            && let Some(prepared) = commands.prepared_draws::<PreparedDraws>()
+            && prepared.key == key
+        {
+            self.replay_groups(&prepared);
+            return;
+        }
+        if self.recording_block
+            || commands.iter().len() < 2
+            || !commands.may_prepare_draws(key.device)
+        {
+            commands.execute_ref(self);
+            return;
+        }
+        // Only certified immutable resident draws reach this builder. Capture
+        // their CPU-side instance bytes and merged material runs in isolation.
+        let outer_current = mem::take(&mut self.current);
+        let outer_result = mem::take(&mut self.result);
+        let fresh = ChunkBufferBuilder::new(self.chunk_buffers, &self.descriptors.limits);
+        let outer_buffers = mem::replace(&mut self.chunk_buffer_builder, fresh);
+        self.recording_block = true;
+        commands.execute_ref(self);
+        self.recording_block = false;
+        self.finish_draw_group();
+        let chunks = mem::replace(&mut self.result, outer_result);
+        self.current = outer_current;
+        self.chunk_buffer_builder = outer_buffers;
+        if let Some(prepared) = PreparedDraws::from_chunks(key, chunks) {
+            let bytes = prepared.bytes();
+            let prepared = Rc::new(prepared);
+            self.replay_groups(&prepared);
+            commands.store_draws(prepared, bytes);
+        } else {
+            commands.execute_ref(self);
+        }
+    }
+
     fn blend(&mut self, _: CommandList, _: RenderBlendMode) {
         self.descriptors
             .runtime

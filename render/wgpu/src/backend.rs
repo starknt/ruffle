@@ -465,6 +465,9 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         format: wgpu::TextureFormat,
         load: crate::pass_graph::Load,
     ) -> Result<crate::graph_encoder::GraphEncoder, crate::gpu_runtime::RenderFailure> {
+        let _preparation = ruffle_render::profile::native_time(
+            ruffle_render::profile::NativePhase::CommandPreparation,
+        );
         let samples = crate::utils::supported_sample_count(
             &self.descriptors.adapter,
             quality.sample_count(),

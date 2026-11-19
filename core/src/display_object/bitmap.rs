@@ -217,7 +217,9 @@ impl<'gc> Bitmap<'gc> {
     }
 
     pub fn set_pixel_snapping(self, value: PixelSnapping) {
-        self.0.pixel_snapping.set(value);
+        if self.0.pixel_snapping.replace(value) != value {
+            self.invalidate_cached_bitmap();
+        }
     }
 
     pub fn bitmap_data(self) -> BitmapData<'gc> {
@@ -283,7 +285,9 @@ impl<'gc> Bitmap<'gc> {
     }
 
     pub fn set_smoothing(self, smoothing: bool) {
-        self.0.smoothing.set(smoothing);
+        if self.0.smoothing.replace(smoothing) != smoothing {
+            self.invalidate_cached_bitmap();
+        }
     }
 
     pub fn downgrade(self) -> BitmapWeak<'gc> {

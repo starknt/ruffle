@@ -19,7 +19,8 @@ use ruffle_macros::{enum_trait_object, istr};
 use ruffle_render::commands::CommandHandler;
 use std::cell::{Cell, OnceCell};
 use std::cell::{Ref, RefMut};
-use std::cmp::Ordering;
+mod order;
+use order::Order;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -508,6 +509,7 @@ pub trait TDisplayObjectContainer<'gc>:
             None => LifecycleIter::Direct(RenderIter {
                 neg_i: src.len(),
                 src,
+                cursor: Default::default(),
                 i: 0,
             }),
             Some(indices) => LifecycleIter::Projected {
@@ -578,44 +580,8 @@ pub trait TDisplayObjectContainer<'gc>:
     /// Renders the children of this container in render list order.
     #[no_dynamic]
     fn render_children(self, context: &mut RenderContext<'_, 'gc>) {
-        let mut clip_depth = 0;
-        let mut clip_depth_stack: Vec<(Depth, DisplayObject<'_>)> = vec![];
-        for child in self.iter_render_list() {
-            let depth = child.depth();
-
-            child.pre_render(context);
-
-            // Check if we need to pop off a mask.
-            // This must be a while loop because multiple masks can be popped
-            // at the same depth.
-            while clip_depth > 0 && depth > clip_depth {
-                // Clear the mask stencil and pop the mask.
-                let (prev_clip_depth, clip_child) = clip_depth_stack.pop().unwrap();
-                clip_depth = prev_clip_depth;
-                context.commands.deactivate_mask();
-                clip_child.render(context);
-                context.commands.pop_mask();
-            }
-            if child.clip_depth() > 0 && child.allow_as_mask() {
-                // Push and render the mask.
-                clip_depth_stack.push((clip_depth, child));
-                clip_depth = child.clip_depth();
-                context.commands.push_mask();
-                child.render(context);
-                context.commands.activate_mask();
-            } else if child.visible() || context.commands.drawing_mask() {
-                // Either a normal visible child, or a descendant of a mask object
-                // that we're drawing. The 'visible' flag is ignored for all descendants
-                // of a mask.
-                child.render(context);
-            }
-        }
-
-        // Pop any remaining masks.
-        for (_, clip_child) in clip_depth_stack.into_iter().rev() {
-            context.commands.deactivate_mask();
-            clip_child.render(context);
-            context.commands.pop_mask();
+        if !super::snapshot::children::render(self.into(), context) {
+            render_order(self.iter_render_list(), context);
         }
     }
 
@@ -630,6 +596,54 @@ pub trait TDisplayObjectContainer<'gc>:
             child.display_render_tree(depth);
         }
     }
+}
+
+pub(super) fn render_order<'gc>(
+    children: impl Iterator<Item = DisplayObject<'gc>>,
+    context: &mut RenderContext<'_, 'gc>,
+) {
+    let mut clip_depth = 0;
+    let mut clip_depth_stack: Vec<(Depth, DisplayObject<'_>)> = vec![];
+    let mut examined = 0;
+    for child in children {
+        examined += 1;
+        let depth = child.depth();
+
+        child.pre_render(context);
+
+        // Check if we need to pop off a mask.
+        // This must be a while loop because multiple masks can be popped
+        // at the same depth.
+        while clip_depth > 0 && depth > clip_depth {
+            // Clear the mask stencil and pop the mask.
+            let (prev_clip_depth, clip_child) = clip_depth_stack.pop().unwrap();
+            clip_depth = prev_clip_depth;
+            context.commands.deactivate_mask();
+            clip_child.render(context);
+            context.commands.pop_mask();
+        }
+        if child.clip_depth() > 0 && child.allow_as_mask() {
+            // Push and render the mask.
+            clip_depth_stack.push((clip_depth, child));
+            clip_depth = child.clip_depth();
+            context.commands.push_mask();
+            child.render(context);
+            context.commands.activate_mask();
+        } else if child.visible() || context.commands.drawing_mask() {
+            // Either a normal visible child, or a descendant of a mask object
+            // that we're drawing. The 'visible' flag is ignored for all descendants
+            // of a mask.
+            child.render(context);
+        }
+    }
+
+    // Pop any remaining masks.
+    for (_, clip_child) in clip_depth_stack.into_iter().rev() {
+        context.commands.deactivate_mask();
+        clip_child.render(context);
+        context.commands.pop_mask();
+    }
+    ruffle_render::profile::work(|w| w.child_slots_examined += examined);
 }
 
 impl<'gc> From<DisplayObjectContainer<'gc>> for DisplayObject<'gc> {
@@ -664,18 +678,9 @@ pub struct ChildContainer<'gc> {
     /// exclusively with the depth list. However, AS3 instead references clips
     /// by render list indexes and does not manipulate the depth list.
     ///
-    /// We store an `Rc` to support iterating over the render list
-    /// when modifications may occur during iteration.
-    /// Whenever we modify the render list, we call `Rc::make_mut`.
-    /// Normally, there will only be one strong reference to this `Rc`,
-    /// so we will end up modifying the list in place. However, if
-    /// any `RenderIter`s exist (which hold a strong reference to the `Rc`),
-    /// modifying the `ChildContainer` will cause `Rc::make_mut` to clone
-    /// the underlying data, and store a new `Rc` allocation. This will
-    /// cause the `RenderIter` to continue iterating over the old list,
-    /// while consumers of the `ChildContainer` will immediately see the
-    /// updated list.
-    render_list: Rc<Vec<DisplayObject<'gc>>>,
+    /// Iterators retain the old root across reentrant structural mutations.
+    render_list: Order<'gc>,
+    children_epoch: u64,
 
     // Indices only: no extra GC roots, and old iterators retain the matching
     // COW render-list snapshot. Every structural edit invalidates this cache.
@@ -716,9 +721,14 @@ pub struct ChildContainer<'gc> {
 }
 
 impl<'gc> ChildContainer<'gc> {
+    pub(super) fn children_epoch(&self) -> u64 {
+        self.children_epoch
+    }
+
     pub fn new(movie: &SwfMovieData) -> Self {
         Self {
-            render_list: Rc::new(Vec::new()),
+            render_list: Order::new(),
+            children_epoch: 0,
             lifecycle_indices: OnceCell::new(),
             last_name_hit: Cell::new(None),
             depth_list: BTreeMap::new(),
@@ -771,10 +781,7 @@ impl<'gc> ChildContainer<'gc> {
     ) -> bool {
         let mut this = container.raw_container_mut(context.gc());
 
-        let render_list_position = this
-            .render_list
-            .iter()
-            .position(|x| DisplayObject::ptr_eq(*x, child));
+        let render_list_position = this.render_list.position(child);
         if let Some(position) = render_list_position {
             this.render_list_mut().remove(position);
             drop(this);
@@ -852,11 +859,7 @@ impl<'gc> ChildContainer<'gc> {
     ) -> Option<DisplayObject<'gc>> {
         let prev_child = self.insert_child_into_depth_list(depth, child);
         if let Some(prev_child) = prev_child {
-            if let Some(position) = self
-                .render_list
-                .iter()
-                .position(|x| DisplayObject::ptr_eq(*x, prev_child))
-            {
+            if let Some(position) = self.render_list.position(prev_child) {
                 if !prev_child.placed_by_avm2_script() {
                     self.replace_id(position, child);
                     Some(prev_child)
@@ -879,11 +882,7 @@ impl<'gc> ChildContainer<'gc> {
                 .next();
 
             if let Some(above_child) = above {
-                if let Some(position) = self
-                    .render_list
-                    .iter()
-                    .position(|x| DisplayObject::ptr_eq(*x, above_child))
-                {
+                if let Some(position) = self.render_list.position(above_child) {
                     self.insert_id(position, child);
                 } else {
                     self.push_id(child);
@@ -964,7 +963,7 @@ impl<'gc> ChildContainer<'gc> {
     /// Replace a child in the render list with another child in the same
     /// position.
     fn replace_id(&mut self, id: usize, child: DisplayObject<'gc>) {
-        self.render_list_mut()[id] = child;
+        self.render_list_mut().replace(id, child);
     }
 
     /// Insert a child into the render list at a particular position.
@@ -1012,21 +1011,9 @@ impl<'gc> ChildContainer<'gc> {
     /// All children at or after the given ID will be shifted down in the
     /// render list. The child will *not* be put onto the depth list.
     fn insert_at_id(&mut self, child: DisplayObject<'gc>, id: usize) {
-        if let Some(old_id) = self
-            .render_list
-            .iter()
-            .position(|x| DisplayObject::ptr_eq(*x, child))
-        {
-            match old_id.cmp(&id) {
-                Ordering::Less if id < self.render_list.len() => {
-                    self.render_list_mut()[old_id..=id].rotate_left(1)
-                }
-                Ordering::Less => self.render_list_mut()[old_id..id].rotate_left(1),
-                Ordering::Greater if old_id < self.render_list.len() => {
-                    self.render_list_mut()[id..=old_id].rotate_right(1)
-                }
-                Ordering::Greater => self.render_list_mut()[id..old_id].rotate_right(1),
-                Ordering::Equal => {}
+        if let Some(old_id) = self.render_list.position(child) {
+            if old_id != id.min(self.render_list.len() - 1) {
+                self.render_list_mut().move_to(old_id, id);
             }
         } else {
             self.render_list_mut().insert(id, child);
@@ -1068,14 +1055,8 @@ impl<'gc> ChildContainer<'gc> {
             prev_child.set_transformed_by_script(true);
             self.depth_list.insert(prev_depth, prev_child);
 
-            let prev_position = self
-                .render_list
-                .iter()
-                .position(|x| DisplayObject::ptr_eq(*x, prev_child));
-            let next_position = self
-                .render_list
-                .iter()
-                .position(|x| DisplayObject::ptr_eq(*x, child));
+            let prev_position = self.render_list.position(prev_child);
+            let next_position = self.render_list.position(child);
 
             match (prev_position, next_position) {
                 (Some(prev_position), Some(next_position)) => {
@@ -1090,11 +1071,7 @@ impl<'gc> ChildContainer<'gc> {
         } else {
             self.depth_list.remove(&prev_depth);
 
-            if let Some(old_position) = self
-                .render_list
-                .iter()
-                .position(|x| DisplayObject::ptr_eq(*x, child))
-            {
+            if let Some(old_position) = self.render_list.position(child) {
                 self.render_list_mut().remove(old_position);
             }
 
@@ -1186,19 +1163,18 @@ impl<'gc> ChildContainer<'gc> {
         }
     }
 
-    fn render_list_mut(&mut self) -> &mut Vec<DisplayObject<'gc>> {
+    fn render_list_mut(&mut self) -> &mut Order<'gc> {
         self.lifecycle_indices.take();
         self.last_name_hit.set(None);
-        Rc::make_mut(&mut self.render_list)
+        self.children_epoch = self.children_epoch.wrapping_add(1);
+        &mut self.render_list
     }
 }
 
 pub struct RenderIter<'gc> {
-    // We store an `Rc` cloned from the original `DisplayObjectContainer`.
-    // Any modifications to the render list will call `Rc::make_mut` on
-    // the `Rc` field stored by `ChildContainer`, which will leave this
-    // `Rc` unaffected.
-    src: Rc<Vec<DisplayObject<'gc>>>,
+    // A new logical order shares untouched pages with existing iterators.
+    src: Order<'gc>,
+    cursor: order::Cursor<'gc>,
     i: usize,
     neg_i: usize,
 }
@@ -1207,7 +1183,12 @@ impl<'gc> RenderIter<'gc> {
     fn from_container(src: DisplayObjectContainer<'gc>) -> Self {
         let src = src.raw_container().render_list.clone();
         let neg_i = src.len();
-        Self { src, i: 0, neg_i }
+        Self {
+            src,
+            cursor: Default::default(),
+            i: 0,
+            neg_i,
+        }
     }
 }
 
@@ -1219,7 +1200,7 @@ impl<'gc> Iterator for RenderIter<'gc> {
             return None;
         }
 
-        let this = self.src.get(self.i).copied();
+        let this = Some(self.cursor.at(&self.src, self.i));
 
         self.i += 1;
 
@@ -1238,7 +1219,7 @@ impl<'gc> DoubleEndedIterator for RenderIter<'gc> {
             return None;
         }
 
-        let this = self.src.get(self.neg_i - 1).copied();
+        let this = Some(self.cursor.at(&self.src, self.neg_i - 1));
 
         self.neg_i -= 1;
 
@@ -1249,10 +1230,11 @@ impl<'gc> DoubleEndedIterator for RenderIter<'gc> {
 impl ExactSizeIterator for RenderIter<'_> {}
 
 /// Lifecycle projection tied to one immutable render-list snapshot.
+#[allow(private_interfaces)]
 pub enum LifecycleIter<'gc> {
     Direct(RenderIter<'gc>),
     Projected {
-        src: Rc<Vec<DisplayObject<'gc>>>,
+        src: Order<'gc>,
         indices: Rc<Vec<usize>>,
         range: std::ops::Range<usize>,
     },

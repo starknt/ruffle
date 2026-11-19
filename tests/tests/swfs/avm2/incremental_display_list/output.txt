@@ -1,0 +1,4 @@
+removing 14 true 1
+reordered true 2 ff0000
+removed 13 true ff0000
+added 14 0 2 ff0000

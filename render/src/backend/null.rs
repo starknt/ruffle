@@ -50,7 +50,12 @@ impl BitmapHandleImpl for NullBitmapHandle {}
 
 #[derive(Clone, Debug)]
 struct NullShapeHandle;
-impl ShapeHandleImpl for NullShapeHandle {}
+impl ShapeHandleImpl for NullShapeHandle {
+    fn retained_bytes(&self) -> Option<usize> {
+        // The empty handle owns only its Arc control block.
+        Some(2 * std::mem::size_of::<usize>())
+    }
+}
 
 impl RenderBackend for NullRenderer {
     fn health(&self) -> &crate::error::RendererHealth {

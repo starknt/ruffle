@@ -2392,10 +2392,8 @@ impl Player {
             let mut render_context = RenderContext {
                 render_epoch: this.render_epoch,
                 snapshots: Some(&mut this.snapshots),
-                snapshot_allowed: stage
-                    .stage3ds()
-                    .iter()
-                    .all(|s| !s.visible() || s.context3d().is_none()),
+                // Stage3D draws below the independent 2D display list.
+                snapshot_allowed: true,
                 snapshot_barriers: 0,
                 snapshot_recording: false,
                 renderer: this.renderer.deref_mut(),
