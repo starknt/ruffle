@@ -18,7 +18,7 @@ use gc_arena::barrier::unlock;
 use gc_arena::lock::{Lock, RefLock};
 use gc_arena::{Collect, Gc, GcWeak, Mutation};
 use ruffle_common::utils::HasPrefixField;
-use std::cell::{Ref, RefMut};
+use std::cell::{Cell, Ref, RefMut};
 
 use super::interactive::Avm2MousePick;
 
@@ -40,6 +40,7 @@ impl fmt::Debug for LoaderDisplay<'_> {
 pub struct LoaderDisplayData<'gc> {
     base: InteractiveObjectBase<'gc>,
     container: RefLock<ChildContainer<'gc>>,
+    drawn_children_epoch: Cell<u64>,
     avm2_object: Lock<Option<Avm2StageObject<'gc>>>,
     movie: SwfMovie<'gc>,
 }
@@ -51,6 +52,7 @@ impl<'gc> LoaderDisplay<'gc> {
             LoaderDisplayData {
                 base: Default::default(),
                 container: RefLock::new(ChildContainer::new(&movie)),
+                drawn_children_epoch: Cell::new(0),
                 avm2_object: Lock::new(None),
                 movie,
             },
@@ -76,6 +78,18 @@ impl<'gc> TDisplayObject<'gc> for LoaderDisplay<'gc> {
     }
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
+        if context.snapshot_allowed && !context.is_offscreen && !context.commands.drawing_mask() {
+            let epoch = self.raw_container().children_epoch();
+            if self.0.drawn_children_epoch.replace(epoch) != epoch && self.num_children() != 0 {
+                // Submit newly loaded geometry once so the renderer can create its
+                // resident handles before the stage tries to retain its draws.
+                context.snapshot_barriers += 1;
+                context.snapshot_allowed = false;
+                self.render_children(context);
+                context.snapshot_allowed = true;
+                return;
+            }
+        }
         self.render_children(context);
     }
 

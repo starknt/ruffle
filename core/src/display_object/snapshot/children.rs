@@ -18,10 +18,8 @@ type Block = Rc<CommandList>;
 
 struct Instance {
     shape: std::sync::Weak<dyn ShapeHandleImpl>,
-    local: Transform,
     basis: [f32; 4],
     graphic: bool,
-    visible: bool,
 }
 impl Instance {
     fn from_draw<'gc>(
@@ -43,14 +41,12 @@ impl Instance {
         let m = transform.matrix;
         Some(Self {
             shape: std::sync::Arc::downgrade(&shape.0),
-            local,
             basis: [m.a, m.b, m.c, m.d],
             graphic,
-            visible: child.visible(),
         })
     }
     fn update<'gc>(
-        &mut self,
+        &self,
         child: DisplayObject<'gc>,
         reason: Change,
         context: &mut RenderContext<'_, 'gc>,
@@ -61,20 +57,19 @@ impl Instance {
         }
         if !reason.is_empty() {
             child.pre_render(context);
-            self.local = child.base().transform(true);
-            self.visible = child.visible();
         }
-        let world = context.transform_stack.transform().concat(&self.local);
+        let local = child.base().transform(true);
+        let world = context.transform_stack.transform().concat(&local);
         let m = world.matrix;
         // Timeline shapes choose their tessellation using the linear matrix.
         // Script graphics use the Drawing's existing, scale-independent handle.
         if world.tz != 0.
-            || self.local.perspective_projection.is_some()
+            || local.perspective_projection.is_some()
             || self.graphic && self.basis != [m.a, m.b, m.c, m.d]
         {
             return None;
         }
-        let command = if self.visible
+        let command = if child.visible()
             && (!self.graphic
                 || child
                     .world_bounds(super::super::BoundsMode::Engine)
@@ -363,7 +358,7 @@ pub(in crate::display_object) fn render<'gc>(
             let reason = std::mem::take(&mut index.reasons[slot]);
             let child = container.child_by_index(scope.start).unwrap();
             let instance = index.instances[slot]
-                .as_mut()
+                .as_ref()
                 .and_then(|i| i.update(child, reason, context, &empty));
             let (block, stable) = if let Some(block) = instance {
                 (block, true)

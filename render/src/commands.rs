@@ -360,10 +360,9 @@ impl CommandList {
             }
             Command::Blend(children, _) => children.samples_ancestor_layer,
             Command::Shared(children) => children.samples_ancestor_layer,
-            Command::RenderAlphaMask {
-                maskee_commands,
-                mask_commands,
-            } => maskee_commands.samples_ancestor_layer || mask_commands.samples_ancestor_layer,
+            Command::RenderAlphaMask(inputs) => {
+                inputs.maskee.samples_ancestor_layer || inputs.mask.samples_ancestor_layer
+            }
             _ => false,
         };
         self.has_commands |= !matches!(&command, Command::Shared(children) if children.is_empty());
@@ -427,7 +426,7 @@ impl Command {
     pub fn temporary_inputs(&self) -> usize {
         match self {
             Self::Blend(..) => 1,
-            Self::RenderAlphaMask { .. } => 2,
+            Self::RenderAlphaMask(_) => 2,
             Self::Shared(commands) => commands.temporary_inputs,
             _ => 0,
         }
@@ -454,10 +453,9 @@ impl Command {
             Command::DeactivateMask => handler.deactivate_mask(),
             Command::PopMask => handler.pop_mask(),
             Command::Blend(commands, blend_mode) => handler.blend(commands, blend_mode),
-            Command::RenderAlphaMask {
-                maskee_commands,
-                mask_commands,
-            } => handler.render_alpha_mask(maskee_commands, mask_commands),
+            Command::RenderAlphaMask(inputs) => {
+                handler.render_alpha_mask(inputs.maskee, inputs.mask)
+            }
         }
     }
 }
@@ -499,10 +497,10 @@ impl CommandHandler for CommandList {
 
     fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList) {
         if self.maskers_in_progress <= 1 {
-            self.push(Command::RenderAlphaMask {
-                maskee_commands,
-                mask_commands,
-            });
+            self.push(Command::RenderAlphaMask(Box::new(AlphaMaskInputs {
+                maskee: maskee_commands,
+                mask: mask_commands,
+            })));
         }
     }
 
@@ -567,6 +565,14 @@ impl CommandHandler for CommandList {
     }
 }
 
+// Store the pair together. Ordinary draw slots only carry the size of their
+// largest leaf or blend operand, including in short-lived and retained pages.
+#[derive(Debug, Clone)]
+pub struct AlphaMaskInputs {
+    pub maskee: CommandList,
+    pub mask: CommandList,
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
     Shared(Rc<CommandList>),
@@ -585,10 +591,7 @@ pub enum Command {
         shape: ShapeHandle,
         transform: Transform,
     },
-    RenderAlphaMask {
-        maskee_commands: CommandList,
-        mask_commands: CommandList,
-    },
+    RenderAlphaMask(Box<AlphaMaskInputs>),
     DrawRect {
         color: Color,
         matrix: Matrix,
@@ -649,10 +652,7 @@ impl Command {
             Self::Blend(commands, _) => commands.region(),
             // A union is deliberately conservative, and propagates dependencies
             // even when one input is empty or disjoint.
-            Self::RenderAlphaMask {
-                maskee_commands,
-                mask_commands,
-            } => maskee_commands.region().union(mask_commands.region()),
+            Self::RenderAlphaMask(inputs) => inputs.maskee.region().union(inputs.mask.region()),
             Self::PushMask | Self::ActivateMask | Self::DeactivateMask | Self::PopMask => {
                 RenderRegion::Empty
             }
@@ -663,6 +663,15 @@ impl Command {
 #[cfg(test)]
 mod prepared_budget_tests {
     use super::*;
+
+    #[test]
+    fn draw_slots_do_not_reserve_space_for_two_effect_lists() {
+        assert!(
+            size_of::<Command>() < size_of::<[CommandList; 2]>(),
+            "draw slot occupies {} bytes",
+            size_of::<Command>()
+        );
+    }
 
     #[test]
     fn exhausted_packet_budget_retries_only_when_space_is_available() {

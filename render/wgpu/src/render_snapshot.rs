@@ -359,12 +359,9 @@ impl Capture {
                         }
                     },
                 },
-                Command::RenderAlphaMask {
-                    maskee_commands,
-                    mask_commands,
-                } => SnapshotCommand::AlphaMask {
-                    maskee: self.commands(maskee_commands)?,
-                    mask: self.commands(mask_commands)?,
+                Command::RenderAlphaMask(inputs) => SnapshotCommand::AlphaMask {
+                    maskee: self.commands(&inputs.maskee)?,
+                    mask: self.commands(&inputs.mask)?,
                 },
                 Command::PushMask => SnapshotCommand::Mask(MaskCommand::Push),
                 Command::ActivateMask => SnapshotCommand::Mask(MaskCommand::Activate),

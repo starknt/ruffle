@@ -26,6 +26,47 @@ fn static_swf_containers_are_admitted_to_snapshot_lookup() {
 }
 
 #[test]
+fn freshly_loaded_children_stream_once_before_snapshot_admission() {
+    let player = PlayerBuilder::new()
+        .with_viewport_dimensions(128, 128, 1.0)
+        .with_scale_mode(StageScaleMode::NoScale, true)
+        .build();
+    let mut player = player.lock().unwrap();
+    player.mutate_with_update_context(|ctx| {
+        let movie = ctx.stage.movie();
+        let loader = LoaderDisplay::empty(&mut crate::avm2::Activation::from_nothing(ctx), movie);
+        ctx.stage.replace_at_depth(ctx, loader.into(), 1);
+    });
+    let metrics = RenderMetrics::default();
+    let _scope = enter(Some(&metrics));
+    for _ in 0..2 {
+        player.mutate_with_update_context(|ctx| {
+            let loader = ctx.stage.child_by_depth(1).unwrap().as_container().unwrap();
+            let content = MovieClip::new(ctx.stage.movie(), ctx.gc());
+            for depth in 1..=40 {
+                let child = Graphic::empty(ctx);
+                content.replace_at_depth(ctx, child.into(), depth);
+            }
+            loader.replace_at_depth(ctx, content.into(), 0);
+            assert_eq!(loader.num_children(), 1);
+        });
+        let before = metrics.snapshot().work;
+        player.render().unwrap();
+        let cold = metrics.snapshot().work.delta(before);
+        assert!(
+            cold.child_slots_examined < 50,
+            "cold slot visits {}",
+            cold.child_slots_examined
+        );
+        player.render().unwrap();
+        let before = metrics.snapshot().work;
+        player.render().unwrap();
+        let warm = metrics.snapshot().work.delta(before);
+        assert!(warm.tree_visits < 8 && warm.snapshot_hits > 0);
+    }
+}
+
+#[test]
 fn retained_stage_subtree_reuses_and_immediately_invalidates_after_render() {
     let player = PlayerBuilder::new()
         .with_viewport_dimensions(64, 64, 1.0)
