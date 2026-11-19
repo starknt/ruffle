@@ -138,6 +138,10 @@ impl ChunkBufferBuilder {
     pub(super) fn into_instance_bytes(self) -> Option<Box<[u8]>> {
         (self.vertices.len() == 0).then(|| self.transforms.into_storage())
     }
+    pub(super) fn remaining_instances(&self, limits: &wgpu::Limits) -> u32 {
+        transforms_per_draw(limits) as u32
+            - (self.transforms.len() / size_of::<Transforms>()) as u32
+    }
     pub(super) fn append_instance_bytes(&mut self, bytes: &[u8]) -> Result<u32, BufferFull> {
         let range = self.transforms.add(bytes)?;
         Ok((range.start / size_of::<Transforms>() as u64) as u32)

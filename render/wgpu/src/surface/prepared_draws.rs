@@ -6,6 +6,7 @@ use super::{
 };
 use crate::gpu_resources::BindGroup;
 use ruffle_render::quality::StageQuality;
+use std::ops::Range;
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct Key {
@@ -37,10 +38,16 @@ impl Draw {
         };
         Some(Self { material, offsets })
     }
-    pub fn at(&self, first: u32) -> DrawCommand {
+    pub fn in_window(&self, window: &Range<u32>, first: u32) -> Option<DrawCommand> {
+        let range = &self.offsets.instances;
+        let start = range.start.max(window.start);
+        let end = range.end.min(window.end);
+        if start >= end {
+            return None;
+        }
         let mut offsets = self.offsets.clone();
-        offsets.instances = (first + offsets.instances.start)..(first + offsets.instances.end);
-        match &self.material {
+        offsets.instances = (first + (start - window.start))..(first + (end - window.start));
+        Some(match &self.material {
             Material::Color => DrawCommand::DrawColor {
                 draw_offsets: offsets,
             },
@@ -51,7 +58,7 @@ impl Draw {
                 bind_group: bind_group.clone(),
                 draw_offsets: offsets,
             },
-        }
+        })
     }
 }
 
@@ -80,6 +87,17 @@ impl PreparedDraws {
                 .into_iter()
                 .map(Draw::from_command)
                 .collect::<Option<Box<[_]>>>()?;
+            // Replaying two adjacent uniform windows must preserve painter order.
+            // Consecutive mesh draws can share their boundary instance.
+            let mut last = 0;
+            let count = instances.len() / size_of::<crate::Transforms>();
+            for draw in &draws {
+                let range = &draw.offsets.instances;
+                if range.is_empty() || range.start < last || range.end as usize > count {
+                    return None;
+                }
+                last = range.end - 1;
+            }
             groups.push(Group { instances, draws });
         }
         Some(Self { key, groups })

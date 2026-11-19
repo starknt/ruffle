@@ -1,4 +1,4 @@
-use super::prepared_draws::{Key as DrawKey, PreparedDraws};
+use super::prepared_draws::{Group, Key as DrawKey, PreparedDraws};
 use crate::backend::RenderTargetMode;
 use crate::blend::BlendType;
 use crate::blend::TrivialBlend;
@@ -241,22 +241,34 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         });
     }
 
+    fn replay_window(&mut self, group: &Group, window: std::ops::Range<u32>) {
+        let stride = size_of::<crate::Transforms>();
+        let bytes = &group.instances[window.start as usize * stride..window.end as usize * stride];
+        let first = self
+            .chunk_buffer_builder
+            .append_instance_bytes(bytes)
+            .expect("window fits the current transform buffer");
+        for draw in &group.draws {
+            if let Some(command) = draw.in_window(&window, first) {
+                self.push_command(command);
+            }
+        }
+    }
+
     fn replay_groups(&mut self, prepared: &PreparedDraws) {
         for group in &prepared.groups {
-            let first = match self
+            let count = (group.instances.len() / size_of::<crate::Transforms>()) as u32;
+            let remaining = self
                 .chunk_buffer_builder
-                .append_instance_bytes(&group.instances)
-            {
-                Ok(first) => first,
-                Err(_) => {
-                    self.finish_draw_group();
-                    self.chunk_buffer_builder
-                        .append_instance_bytes(&group.instances)
-                        .expect("prepared group fits its originating device uniform window")
+                .remaining_instances(&self.descriptors.limits);
+            if count > remaining {
+                if remaining != 0 {
+                    self.replay_window(group, 0..remaining);
                 }
-            };
-            for draw in &group.draws {
-                self.push_command(draw.at(first));
+                self.finish_draw_group();
+                self.replay_window(group, remaining..count);
+            } else {
+                self.replay_window(group, 0..count);
             }
         }
         ruffle_render::profile::work(|w| w.prepared_draw_replays += 1);

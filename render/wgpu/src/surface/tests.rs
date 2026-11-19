@@ -3365,3 +3365,54 @@ fn shared_stage_chunk_replays_without_recapturing_its_leaves() {
     assert_eq!(image.get_pixel(2, 2).0, [255, 0, 0, 255]);
     assert_eq!(image.get_pixel(24, 2).0, [0, 0, 0, 255]);
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn prepared_groups_fill_the_same_uniform_windows_as_flat_draws() {
+    use ruffle_render::commands::Command;
+    use ruffle_render::profile::{RenderMetrics, enter};
+    use std::{cell::Cell, rc::Rc};
+    let descriptors = gpu();
+    let window = super::buffers::transforms_per_draw(&descriptors.limits) as usize;
+    let target = TextureTarget::new(&descriptors.device, (4, 4)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let mut block = CommandList::new();
+    for i in 0..window / 2 + 1 {
+        let color = if i == window / 2 {
+            Color::BLACK
+        } else {
+            Color::RED
+        };
+        rect(&mut block, 0., 0., 4., 4., color);
+    }
+    let block = Rc::new(block);
+    block.charge_storage(&Rc::new(Cell::new(0)), 4 << 20);
+    let metrics = RenderMetrics::default();
+    let _scope = enter(Some(&metrics));
+    let mut flat = CommandList::new();
+    for _ in 0..3 {
+        flat.append((*block).clone());
+    }
+    let before = metrics.snapshot().work;
+    renderer.submit_frame(Color::WHITE, flat, vec![]).unwrap();
+    let reference = metrics.snapshot().work.delta(before);
+    for _ in 0..2 {
+        let mut frame = CommandList::new();
+        for _ in 0..3 {
+            frame.push(Command::Shared(block.clone()));
+        }
+        let before = metrics.snapshot().work;
+        renderer.submit_frame(Color::WHITE, frame, vec![]).unwrap();
+        let work = metrics.snapshot().work.delta(before);
+        if work.prepared_draw_replays == 3 {
+            assert_eq!(work.render_passes, reference.render_passes);
+            assert_eq!(work.draw_calls, reference.draw_calls);
+            assert_eq!(
+                renderer.capture_frame().unwrap().unwrap().get_pixel(1, 1).0,
+                [0, 0, 0, 255]
+            );
+            return;
+        }
+    }
+    panic!("expected three warm replays");
+}
