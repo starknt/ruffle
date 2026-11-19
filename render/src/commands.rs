@@ -65,6 +65,7 @@ pub struct CommandList {
 // Allocate this state only when observing a retained block.
 #[derive(Default, Debug)]
 struct Retention {
+    regions: OnceCell<Box<[RenderRegion]>>,
     total_bytes: Cell<Option<usize>>,
     local_bytes: Cell<Option<usize>>,
     device: Cell<Option<u64>>,
@@ -204,7 +205,12 @@ impl CommandList {
         let mut bytes = size_of::<Self>()
             + size_of::<Retention>()
             + 32
-            + self.commands.capacity() * size_of::<Command>();
+            + self.commands.capacity() * size_of::<Command>()
+            + self
+                .retention
+                .get()
+                .and_then(|s| s.regions.get())
+                .map_or(0, |regions| size_of_val(&**regions));
         for command in &self.commands {
             bytes = bytes.checked_add(command.pinned_bytes()?)?;
         }
@@ -310,9 +316,41 @@ impl CommandList {
     pub fn region(&self) -> RenderRegion {
         self.region
     }
+    /// A retained leaf page remembers exact per-slot coverage. Directory
+    /// children already carry their aggregate region on the shared block.
+    pub fn from_render_page(
+        items: impl ExactSizeIterator<Item = (Command, RenderRegion)>,
+        leaf: bool,
+    ) -> Self {
+        let mut list = Self::with_capacity(items.len());
+        let mut regions = leaf.then(|| Vec::with_capacity(items.len()));
+        for (command, region) in items {
+            if let Some(regions) = &mut regions {
+                regions.push(region);
+            }
+            list.push_with_region(command, region);
+        }
+        if let Some(regions) = regions {
+            let _ = list.retention().regions.set(regions.into_boxed_slice());
+        }
+        list
+    }
+
+    pub fn command_region(&self, index: usize) -> RenderRegion {
+        self.retention
+            .get()
+            .and_then(|s| s.regions.get())
+            .map_or_else(|| self.commands[index].region(), |regions| regions[index])
+    }
+
     pub fn push(&mut self, command: Command) {
         self.retention.take();
-        self.region = self.region.union(command.region());
+        let region = command.region();
+        self.push_with_region(command, region);
+    }
+
+    fn push_with_region(&mut self, command: Command, region: RenderRegion) {
+        self.region = self.region.union(region);
         self.temporary_inputs = self
             .temporary_inputs
             .saturating_add(command.temporary_inputs());

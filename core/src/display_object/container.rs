@@ -582,7 +582,10 @@ pub trait TDisplayObjectContainer<'gc>:
     /// Renders the children of this container in render list order.
     #[no_dynamic]
     fn render_children(self, context: &mut RenderContext<'_, 'gc>) {
-        if !super::snapshot::children::render(self.into(), context) {
+        let count = self.num_children();
+        if count != 0
+            && (count == 1 || !super::snapshot::children::render(self.into(), count, context))
+        {
             render_order(self.iter_render_list(), context);
         }
     }

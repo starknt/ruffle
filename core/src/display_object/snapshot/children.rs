@@ -145,12 +145,12 @@ fn slot_command(block: Block) -> Command {
     }
 }
 
-fn chunk(items: impl ExactSizeIterator<Item = Command>) -> Block {
-    let mut list = CommandList::with_capacity(items.len());
-    for item in items {
-        list.push(item);
-    }
-    Rc::new(list)
+fn chunk(items: impl ExactSizeIterator<Item = Command>, stride: usize) -> Block {
+    let slots = items.map(|command| {
+        let region = command.region();
+        (command, region)
+    });
+    Rc::new(CommandList::from_render_page(slots, stride == 1))
 }
 
 fn pack(mut level: Vec<Command>) -> (Block, usize) {
@@ -159,12 +159,12 @@ fn pack(mut level: Vec<Command>) -> (Block, usize) {
         let mut items = level.into_iter();
         let mut next = Vec::with_capacity(items.len().div_ceil(WIDTH));
         while items.len() != 0 {
-            next.push(Command::Shared(chunk((&mut items).take(WIDTH))));
+            next.push(Command::Shared(chunk((&mut items).take(WIDTH), stride)));
         }
         level = next;
         stride *= WIDTH;
     }
-    (chunk(level.into_iter()), stride)
+    (chunk(level.into_iter(), stride), stride)
 }
 
 // Stable siblings keep their pages. Only pages intersecting a patch are copied.
@@ -175,22 +175,26 @@ fn patch(root: &Block, stride: usize, changes: Vec<(usize, Command)>) -> Block {
         if changes.peek().is_none_or(|(slot, _)| *slot >= end) {
             return root.clone();
         }
-        chunk(root.iter().enumerate().map(|(i, command)| {
+        let slots = root.iter().enumerate().map(|(i, command)| {
             let start = offset + i * stride;
             if changes
                 .peek()
                 .is_none_or(|(slot, _)| *slot >= start + stride)
             {
-                return command.clone();
+                return (command.clone(), root.command_region(i));
             }
-            if stride == 1 {
-                return changes.next().unwrap().1;
-            }
-            let Command::Shared(child) = command else {
-                unreachable!("invalid chunk directory")
+            let command = if stride == 1 {
+                changes.next().unwrap().1
+            } else {
+                let Command::Shared(child) = command else {
+                    unreachable!("invalid chunk directory")
+                };
+                Command::Shared(update(child, stride / WIDTH, start, changes))
             };
-            Command::Shared(update(child, stride / WIDTH, start, changes))
-        }))
+            let region = command.region();
+            (command, region)
+        });
+        Rc::new(CommandList::from_render_page(slots, stride == 1))
     }
     update(root, stride, 0, &mut changes.into_iter().peekable())
 }
@@ -264,14 +268,10 @@ fn capture<'gc>(
 
 pub(in crate::display_object) fn render<'gc>(
     container: DisplayObjectContainer<'gc>,
+    count: usize,
     context: &mut RenderContext<'_, 'gc>,
 ) -> bool {
-    let count = container.num_children();
-    if count < 2
-        || !context.snapshot_allowed
-        || context.is_offscreen
-        || context.commands.drawing_mask()
-    {
+    if !context.snapshot_allowed || context.is_offscreen || context.commands.drawing_mask() {
         return false;
     }
     let Some(cache) = context.snapshots.as_deref_mut() else {
@@ -282,6 +282,10 @@ pub(in crate::display_object) fn render<'gc>(
     let Some(node) = base.snapshots.node(cache) else {
         return false;
     };
+    if node.live_until.get() > context.render_epoch {
+        context.snapshot_barriers += 1;
+        return false;
+    }
     if node.dense.get() && node.dirty_children.replace(0) > count / 2 {
         return false;
     }
@@ -461,6 +465,13 @@ pub(in crate::display_object) fn render<'gc>(
         let output = patch(&root, stride, live);
         (index, Some(root), output)
     };
+    // A fully live painter order has no reusable geometry to hide its
+    // recording cost. Stream it directly until an edit or a periodic probe.
+    if !index.live.is_empty() && stable_root.as_ref().is_some_and(|root| root.is_empty()) {
+        node.live_until.set(context.render_epoch.saturating_add(64));
+        context.commands.push(Command::Shared(output));
+        return true;
+    }
     let cache = context.snapshots.as_deref_mut().unwrap();
     let stored = if let Some(commands) = stable_root {
         index.owner.entry.borrow_mut().take();
@@ -482,6 +493,59 @@ mod tests {
     use super::*;
     use crate::display_object::{Graphic, MovieClip, StageScaleMode, Video};
     use crate::player::PlayerBuilder;
+
+    #[test]
+    fn patching_one_draw_does_not_measure_its_stable_siblings() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Debug, Default)]
+        struct Shape(AtomicUsize);
+        impl ShapeHandleImpl for Shape {
+            fn bounds(&self) -> Option<[f64; 4]> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Some([0., 0., 1., 1.])
+            }
+        }
+        let shape = Arc::new(Shape::default());
+        let command = Command::RenderShape {
+            shape: ShapeHandle(shape.clone()),
+            transform: Default::default(),
+        };
+        let (root, stride) = pack(vec![command; 66]);
+        shape.0.store(0, Ordering::Relaxed);
+        let replacement = Command::DrawRect {
+            color: swf::Color::WHITE,
+            matrix: Default::default(),
+        };
+        let updated = patch(&root, stride, vec![(1, replacement)]);
+        assert_eq!(root.region(), updated.region());
+        assert_eq!(shape.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn wholly_live_video_children_are_examined_once_per_draw() {
+        use ruffle_render::profile::{RenderMetrics, enter};
+        let player = PlayerBuilder::new()
+            .with_viewport_dimensions(128, 128, 1.)
+            .build();
+        let mut player = player.lock().unwrap();
+        player.mutate_with_update_context(|ctx| {
+            let root = MovieClip::new(ctx.stage.movie(), ctx.gc());
+            for depth in 1..=16 {
+                let video = Video::new(ctx.gc(), ctx.stage.movie(), 32, 32, None);
+                root.replace_at_depth(ctx, video.into(), depth);
+            }
+            ctx.stage.replace_at_depth(ctx, root.into(), 1);
+        });
+        player.render().unwrap();
+        let metrics = RenderMetrics::default();
+        let _scope = enter(Some(&metrics));
+        player.render().unwrap();
+        let slots = metrics.snapshot().work.child_slots_examined;
+        assert!(slots <= 18, "examined {slots} slots for 16 live children");
+    }
 
     #[test]
     fn simple_draws_share_one_allocation_per_leaf_page() {
@@ -547,7 +611,14 @@ mod tests {
         player.mutate_with_update_context(|ctx| {
             let root = ctx.stage.child_by_depth(1).unwrap();
             let node = root.base().snapshots.node.borrow().clone().unwrap();
-            assert!(node.children.borrow().as_ref().unwrap().live.contains(&0));
+            assert!(
+                node.live_until.get() > 0
+                    || node
+                        .children
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|index| index.live.contains(&0))
+            );
         });
     }
 

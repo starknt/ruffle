@@ -299,8 +299,8 @@ impl Capture {
         nodes: &mut Vec<SnapshotNode>,
     ) -> Result<(), RenderFailure> {
         let mut leaves = 0;
-        for command in commands.iter() {
-            let region = command.region();
+        for (index, command) in commands.iter().enumerate() {
+            let region = commands.command_region(index);
             let command = match command {
                 Command::RenderBitmap {
                     bitmap,

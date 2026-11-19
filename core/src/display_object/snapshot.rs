@@ -60,6 +60,7 @@ pub struct Node {
     revisions: RenderGeneration,
     children: RefCell<Option<children::Children>>,
     dense: Cell<bool>,
+    live_until: Cell<u64>,
     dirty_children: Cell<usize>,
     pub entry: RefCell<Option<Entry>>,
     pub used: Cell<u64>,
@@ -130,6 +131,9 @@ impl State {
         }
         if let Some(node) = self.node.borrow().as_ref() {
             node.revisions.advance(change);
+            if change.contains(Change::CHILDREN) {
+                node.live_until.set(0);
+            }
         }
     }
     pub(super) fn invalidate_bounds(&self) -> bool {
@@ -143,6 +147,11 @@ impl State {
     }
     pub(super) fn mark_child(&self, id: u64, change: Change, first: bool) {
         if let Some(node) = self.node.borrow().as_ref() {
+            if node.live_until.get() != 0
+                && !(change - (Change::TRANSFORM | Change::COLOR)).is_empty()
+            {
+                node.live_until.set(0);
+            }
             if first && node.dense.get() {
                 node.dirty_children
                     .set(node.dirty_children.get().saturating_add(1));
