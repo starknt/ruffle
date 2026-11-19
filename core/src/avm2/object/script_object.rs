@@ -68,7 +68,7 @@ pub struct ScriptObjectData<'gc> {
     slots: Box<[Lock<Value<'gc>>]>,
 
     /// Methods stored on this object.
-    bound_methods: RefLock<MethodCache<FunctionObject<'gc>>>,
+    bound_methods: RefLock<Option<Box<MethodCache<FunctionObject<'gc>>>>>,
 
     /// Implicit prototype of this script object.
     proto: Lock<Option<Object<'gc>>>,
@@ -166,7 +166,7 @@ impl<'gc> ScriptObjectData<'gc> {
         ScriptObjectData {
             values: RefLock::new(Default::default()),
             slots,
-            bound_methods: RefLock::new(MethodCache::new(true)),
+            bound_methods: RefLock::new(None),
             proto: Lock::new(proto),
             instance_class,
             vtable: Lock::new(vtable),
@@ -188,17 +188,6 @@ impl<'gc> ScriptObjectWrapper<'gc> {
         mc: &Mutation<'gc>,
     ) -> RefMut<'_, DynamicMap<DynamicKey<'gc>, Value<'gc>>> {
         unlock!(Gc::write(mc, self.0), ScriptObjectData, values).borrow_mut()
-    }
-
-    fn bound_methods(&self) -> Ref<'_, MethodCache<FunctionObject<'gc>>> {
-        self.0.bound_methods.borrow()
-    }
-
-    fn bound_methods_mut(
-        &self,
-        mc: &Mutation<'gc>,
-    ) -> RefMut<'_, MethodCache<FunctionObject<'gc>>> {
-        unlock!(Gc::write(mc, self.0), ScriptObjectData, bound_methods).borrow_mut()
     }
 
     pub fn get_property_local(
@@ -299,7 +288,7 @@ impl<'gc> ScriptObjectWrapper<'gc> {
 
     /// Retrieve a bound method from the method table.
     pub fn get_bound_method(self, id: usize) -> Option<FunctionObject<'gc>> {
-        self.bound_methods().get_copied(id)
+        self.0.bound_methods.borrow().as_ref()?.get_copied(id)
     }
 
     pub fn has_own_dynamic_property(self, name: &Multiname<'gc>) -> bool {
@@ -361,7 +350,10 @@ impl<'gc> ScriptObjectWrapper<'gc> {
         disp_id: usize,
         function: FunctionObject<'gc>,
     ) {
-        self.bound_methods_mut(mc).insert(disp_id, function);
+        unlock!(Gc::write(mc, self.0), ScriptObjectData, bound_methods)
+            .borrow_mut()
+            .get_or_insert_with(|| Box::new(MethodCache::new(true)))
+            .insert(disp_id, function);
     }
 
     /// Get the `Class` for this object.

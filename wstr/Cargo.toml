@@ -7,5 +7,8 @@ license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[dependencies]
+memchr = { workspace = true }
+
 [lints]
 workspace = true

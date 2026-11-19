@@ -322,14 +322,10 @@ impl<'gc> Avm1Function<'gc> {
             // * Allocate a new scope using the given base clip. No previous scope is closed over.
             let swf_version = base_clip.swf_version().max(5);
             let base_clip_obj = base_clip.object1().unwrap();
-            // TODO: It would be nice to avoid these extra Scope allocs.
-            let scope = Gc::new(
+            let scope = activation.context.avm1.target_scope(
+                activation.swf_version(),
+                base_clip_obj,
                 activation.gc(),
-                Scope::new(
-                    activation.global_scope(),
-                    super::scope::ScopeClass::Target,
-                    base_clip_obj,
-                ),
             );
             (swf_version, scope)
         };

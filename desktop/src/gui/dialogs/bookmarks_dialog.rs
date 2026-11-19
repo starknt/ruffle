@@ -38,7 +38,7 @@ impl BookmarkAddDialog {
     }
 
     fn is_valid(&self) -> bool {
-        self.url.result().is_some() && !self.name.is_empty()
+        self.url.is_valid() && !self.name.is_empty()
     }
 
     pub fn show(&mut self, locale: &LanguageIdentifier, egui_ctx: &egui::Context) -> bool {
@@ -280,15 +280,9 @@ impl BookmarksDialog {
                     }
                     ui.end_row();
 
-                    // TODO Do not ignore root content directory.
-                    let previous_desc = bookmark.url.result();
-
                     ui.label(text(locale, "bookmarks-dialog-location"));
-                    let current_desc = bookmark.url.ui(locale, ui).result();
-
-                    // TODO: Change the UrlOrPathField widget to return a response instead, so we can update when we lose the focus, removes the need to clone every redraw.
-                    if previous_desc != current_desc
-                        && let Some(content_descriptor) = current_desc
+                    if bookmark.url.ui(locale, ui)
+                        && let Some(content_descriptor) = bookmark.url.result()
                         && let Err(e) = self.preferences.write_bookmarks(|writer| {
                             writer.set_content_descriptor(bookmark.index, content_descriptor);
                         })

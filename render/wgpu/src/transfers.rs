@@ -76,7 +76,7 @@ pub fn copy(
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::RENDER_ATTACHMENT,
-            wgpu::TextureFormat::Rgba8Unorm,
+            source_texture.texture.format(),
             1,
         )?);
     } else {

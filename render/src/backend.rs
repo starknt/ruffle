@@ -1,7 +1,8 @@
 pub mod null;
 
 use crate::bitmap::{
-    Bitmap, BitmapHandle, BitmapInfo, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
+    Bitmap, BitmapBufRead, BitmapFormat, BitmapHandle, BitmapInfo, BitmapSource, PixelRegion,
+    RgbaBufRead, SyncHandle,
 };
 use crate::commands::CommandList;
 use crate::error::{Error, RenderFailure, RendererHealth};
@@ -210,6 +211,31 @@ pub trait RenderBackend: Any {
         _with_rgba: RgbaBufRead,
     ) -> Result<Option<()>, Error> {
         Ok(None)
+    }
+
+    /// Backends with a native BGRA transfer path can deliver its bytes directly.
+    fn read_bitmap_region_native(
+        &mut self,
+        handle: &BitmapHandle,
+        region: PixelRegion,
+        read: BitmapBufRead,
+    ) -> Result<Option<()>, Error> {
+        self.read_bitmap_region(
+            handle,
+            region,
+            Box::new(|bytes, stride| read(bytes, stride, BitmapFormat::Rgba)),
+        )
+    }
+
+    fn resolve_sync_handle_native(
+        &mut self,
+        handle: Box<dyn SyncHandle>,
+        read: BitmapBufRead,
+    ) -> Result<(), Error> {
+        self.resolve_sync_handle(
+            handle,
+            Box::new(|bytes, stride| read(bytes, stride, BitmapFormat::Rgba)),
+        )
     }
 
     fn resolve_sync_handle(
@@ -723,6 +749,8 @@ pub enum Context3DCommand<'a> {
     },
     CopyBitmapToTexture {
         source: &'a [u8],
+        /// BitmapData stores BGRA pixels. Encoded texture payloads already use the destination layout.
+        source_is_bgra: bool,
         source_width: u32,
         source_height: u32,
         dest: Rc<dyn Texture>,

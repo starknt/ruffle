@@ -9,15 +9,30 @@ use bitflags::bitflags;
 use gc_arena::Gc;
 use gc_arena::{Collect, Mutation};
 use ruffle_macros::istr;
-use std::fmt::Debug;
+use std::fmt;
 use std::ops::Deref;
 use swf::avm2::types::{Index, Multiname as AbcMultiname, NamespaceSet as AbcNamespaceSet};
 
-#[derive(Clone, Copy, Debug, Collect)]
+#[derive(Clone, Copy, Collect)]
 #[collect(no_drop)]
 pub enum NamespaceSet<'gc> {
-    Multiple(Gc<'gc, Vec<Namespace<'gc>>>),
+    Multiple {
+        namespaces: Gc<'gc, Vec<Namespace<'gc>>>,
+        contains_public: bool,
+    },
     Single(Namespace<'gc>),
+}
+
+impl fmt::Debug for NamespaceSet<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Multinames appear in error messages. Only print the namespaces themselves.
+        match self {
+            Self::Multiple { namespaces, .. } => {
+                f.debug_tuple("Multiple").field(namespaces).finish()
+            }
+            Self::Single(namespace) => f.debug_tuple("Single").field(namespace).finish(),
+        }
+    }
 }
 
 impl<'gc> NamespaceSet<'gc> {
@@ -30,20 +45,25 @@ impl<'gc> NamespaceSet<'gc> {
     }
 
     pub fn multiple(set: Vec<Namespace<'gc>>, mc: &Mutation<'gc>) -> Self {
-        Self::Multiple(Gc::new(mc, set))
+        // Immutable sets from ABC are shared by every use of a multiname.
+        let contains_public = set.iter().any(|ns| ns.is_public());
+        Self::Multiple {
+            namespaces: Gc::new(mc, set),
+            contains_public,
+        }
     }
     pub fn single(ns: Namespace<'gc>) -> Self {
         Self::Single(ns)
     }
     pub fn len(&self) -> usize {
         match self {
-            Self::Multiple(ns) => ns.len(),
+            Self::Multiple { namespaces, .. } => namespaces.len(),
             Self::Single(_) => 1,
         }
     }
     pub fn get(&self, index: usize) -> Option<Namespace<'gc>> {
         match self {
-            Self::Multiple(ns) => ns.get(index).copied(),
+            Self::Multiple { namespaces, .. } => namespaces.get(index).copied(),
             Self::Single(ns) => {
                 if index == 0 {
                     Some(*ns)
@@ -378,7 +398,7 @@ impl<'gc> Multiname<'gc> {
     pub fn namespace_set(&self) -> &[Namespace<'gc>] {
         match &self.ns {
             NamespaceSet::Single(ns) => std::slice::from_ref(ns),
-            NamespaceSet::Multiple(ns) => ns,
+            NamespaceSet::Multiple { namespaces, .. } => namespaces,
         }
     }
 
@@ -389,21 +409,23 @@ impl<'gc> Multiname<'gc> {
     pub fn contains_public_namespace(&self) -> bool {
         match self.ns {
             NamespaceSet::Single(ns) => ns.is_public(),
-            NamespaceSet::Multiple(ns) => ns.iter().any(|ns| ns.is_public()),
+            NamespaceSet::Multiple {
+                contains_public, ..
+            } => contains_public,
         }
     }
 
     pub fn has_explicit_namespace(&self) -> bool {
         match self.ns {
             NamespaceSet::Single(ns) => ns.is_namespace() && !ns.is_public(),
-            NamespaceSet::Multiple(_) => false,
+            NamespaceSet::Multiple { .. } => false,
         }
     }
 
     pub fn has_nonempty_namespace(&self) -> bool {
         match self.ns {
             NamespaceSet::Single(ns) => !ns.is_public(),
-            NamespaceSet::Multiple(_) => true,
+            NamespaceSet::Multiple { .. } => true,
         }
     }
 
@@ -425,7 +447,7 @@ impl<'gc> Multiname<'gc> {
             NamespaceSet::Single(ns) => ns.is_any(),
 
             // NamespaceSet::Multiple should not have any Any namespaces in it
-            NamespaceSet::Multiple(_) => false,
+            NamespaceSet::Multiple { .. } => false,
         }
     }
 
@@ -541,5 +563,45 @@ impl<'gc> From<QName<'gc>> for Multiname<'gc> {
             param: None,
             flags: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::avm2::api_version::ApiVersion;
+    use crate::string::AvmStringInterner;
+    use gc_arena::{Arena, Rootable};
+
+    #[test]
+    fn dynamic_names_follow_the_current_namespace_set() {
+        let mut arena =
+            Arena::<Rootable![AvmStringInterner<'_>]>::new(|mc| AvmStringInterner::new(mc));
+        arena.mutate_root(|mc, interner| {
+            let mut strings = StringContext::from_parts(mc, interner);
+            let public = Namespace::package(strings.empty(), ApiVersion::AllVersions, &mut strings);
+            let internal = Namespace::internal(strings.empty(), &mut strings);
+            let mut name = Multiname::new(public, strings.empty());
+            for (namespaces, expected) in [
+                (vec![], false),
+                (vec![public], true),
+                (vec![internal], false),
+                (vec![internal, internal], false),
+                (vec![public, internal, internal], true),
+                (vec![internal, public, internal], true),
+                (vec![internal, internal, public], true),
+            ] {
+                name.set_ns(NamespaceSet::new(namespaces.clone(), mc));
+                assert_eq!(name.namespace_set(), namespaces);
+                assert_eq!(name.valid_dynamic_name(), expected);
+                let mut attribute = name.clone();
+                attribute.set_is_attribute(true);
+                assert_eq!(attribute.contains_public_namespace(), expected);
+                assert!(!attribute.valid_dynamic_name());
+            }
+            name.set_single_namespace(Namespace::any());
+            assert!(name.is_any_namespace());
+            assert!(!name.contains_public_namespace());
+        });
     }
 }

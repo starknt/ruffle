@@ -181,7 +181,7 @@ impl<'gc> Bitmap<'gc> {
         let width = bitmap.width();
         let height = bitmap.height();
         let transparency = match bitmap.format() {
-            BitmapFormat::Rgba => true,
+            BitmapFormat::Rgba | BitmapFormat::Bgra => true,
             BitmapFormat::Rgb => false,
             _ => unreachable!(
                 "Bitmap objects can only be constructed from RGB or RGBA source bitmaps"

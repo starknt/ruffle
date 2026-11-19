@@ -10,6 +10,7 @@ use url::Url;
 struct PathOrUrlFieldValue {
     content_descriptor: Option<ContentDescriptor>,
     representation: String,
+    changed: bool,
 }
 
 impl PathOrUrlFieldValue {
@@ -24,6 +25,7 @@ impl PathOrUrlFieldValue {
                 url.to_string()
             },
             content_descriptor: Some(value),
+            changed: false,
         }
     }
 
@@ -31,6 +33,7 @@ impl PathOrUrlFieldValue {
         Self {
             representation: Self::path_to_representation(&path),
             content_descriptor: ContentDescriptor::new_local(&path, None),
+            changed: false,
         }
     }
 
@@ -42,6 +45,7 @@ impl PathOrUrlFieldValue {
             Self {
                 content_descriptor: Url::parse(&string).map(ContentDescriptor::new_remote).ok(),
                 representation: string,
+                changed: false,
             }
         }
     }
@@ -52,7 +56,13 @@ impl PathOrUrlFieldValue {
         Self {
             representation: Self::path_to_representation(&directory),
             content_descriptor: ContentDescriptor::new_local(&content, Some(directory)),
+            changed: false,
         }
+    }
+
+    fn replace(&mut self, mut next: Self) {
+        next.changed = self.changed || self.content_descriptor != next.content_descriptor;
+        *self = next;
     }
 
     fn path_to_representation(path: &Path) -> String {
@@ -91,32 +101,37 @@ impl PathOrUrlField {
         value.lock().expect("Non-poisoned value")
     }
 
-    pub fn ui(&mut self, locale: &LanguageIdentifier, ui: &mut Ui) -> &mut Self {
+    pub fn ui(&mut self, locale: &LanguageIdentifier, ui: &mut Ui) -> bool {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let dir = Self::lock_value(&self.value)
-                .content_descriptor
-                .as_ref()
-                .map(|desc| &desc.url)
-                .filter(|url| url.scheme() == "file")
-                .and_then(|url| url.to_file_path().ok())
-                .map(|mut path| {
-                    path.pop();
-                    path
-                });
+            let directory = || {
+                Self::lock_value(&self.value)
+                    .content_descriptor
+                    .as_ref()
+                    .map(|desc| &desc.url)
+                    .filter(|url| url.scheme() == "file")
+                    .and_then(|url| url.to_file_path().ok())
+                    .map(|mut path| {
+                        path.pop();
+                        path
+                    })
+            };
 
             if ui
                 .button(text(locale, "path-or-url-field-open-directory"))
                 .clicked()
             {
-                let dir = dir.clone();
+                let dir = directory();
+                let ctx = ui.ctx().clone();
                 let value = self.value.clone();
                 let picker = self.picker.clone();
                 tokio::spawn(async move {
                     if let Some((directory, content)) =
                         picker.pick_ruffle_directory_and_content(dir).await
                     {
-                        *Self::lock_value(&value) =
-                            PathOrUrlFieldValue::from_picked_directory(directory, content);
+                        Self::lock_value(&value).replace(
+                            PathOrUrlFieldValue::from_picked_directory(directory, content),
+                        );
+                        ctx.request_repaint();
                     }
                 });
             }
@@ -125,37 +140,70 @@ impl PathOrUrlField {
                 .button(text(locale, "path-or-url-field-open-file"))
                 .clicked()
             {
+                let dir = directory();
+                let ctx = ui.ctx().clone();
                 let value = self.value.clone();
                 let picker = self.picker.clone();
                 tokio::spawn(async move {
                     if let Some(path) = picker.pick_ruffle_file(dir).await {
-                        *Self::lock_value(&value) = PathOrUrlFieldValue::from_path(path);
+                        Self::lock_value(&value).replace(PathOrUrlFieldValue::from_path(path));
+                        ctx.request_repaint();
                     }
                 });
             }
 
             let mut value = Self::lock_value(&self.value);
-            let old_representation = value.representation.clone();
-            let mut new_representation = old_representation.clone();
-            ui.add_sized(
+            let color = value
+                .content_descriptor
+                .is_none()
+                .then(|| ui.style().visuals.error_fg_color);
+            let response = ui.add_sized(
                 ui.available_size(),
-                TextEdit::singleline(&mut new_representation)
+                TextEdit::singleline(&mut value.representation)
                     .hint_text(self.hint.localize(locale))
-                    .text_color_opt(if value.content_descriptor.is_none() {
-                        Some(ui.style().visuals.error_fg_color)
-                    } else {
-                        None
-                    }),
+                    .text_color_opt(color),
             );
-            if new_representation != old_representation {
-                *value = PathOrUrlFieldValue::from_string(new_representation);
+            if response.changed() {
+                let typed = std::mem::take(&mut value.representation);
+                value.replace(PathOrUrlFieldValue::from_string(typed));
             }
-        });
+            std::mem::take(&mut value.changed)
+        })
+        .inner
+    }
 
-        self
+    pub fn is_valid(&self) -> bool {
+        Self::lock_value(&self.value).content_descriptor.is_some()
     }
 
     pub fn result(&self) -> Option<ContentDescriptor> {
         Self::lock_value(&self.value).content_descriptor.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picked_location_is_delivered_once_and_preserves_the_directory() {
+        let mut field = PathOrUrlFieldValue::from_string("https://example.org/first.swf".into());
+        let directory = std::env::temp_dir().join("bookmark");
+        let content = directory.join("second.swf");
+        assert!(!field.changed);
+        field.replace(PathOrUrlFieldValue::from_picked_directory(
+            directory.clone(),
+            content.clone(),
+        ));
+        field.replace(PathOrUrlFieldValue::from_picked_directory(
+            directory.clone(),
+            content.clone(),
+        ));
+        assert!(std::mem::take(&mut field.changed));
+        assert!(!field.changed);
+        let expected = ContentDescriptor::new_local(&content, Some(directory));
+        assert_eq!(field.content_descriptor, expected);
+        field.replace(PathOrUrlFieldValue::new(expected.unwrap()));
+        assert!(!field.changed);
     }
 }

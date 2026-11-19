@@ -336,7 +336,8 @@ impl OpenDialog {
                         .num_columns(1)
                         .striped(true)
                         .show(ui, |ui| {
-                            is_valid &= self.path.ui(locale, ui).result().is_some();
+                            self.path.ui(locale, ui);
+                            is_valid &= self.path.is_valid();
                             ui.end_row();
                         });
                 });

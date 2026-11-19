@@ -1715,10 +1715,6 @@ impl<'gc> MovieClip<'gc> {
         //    the goto frame, so we should instead aggregate the deltas into a final list
         //    of commands, and THEN modify the children as necessary.
 
-        // This map will maintain a map of depth -> placement commands.
-        // TODO: Move this to UpdateContext to avoid allocations.
-        let mut goto_commands: Vec<GotoPlaceObject<'_>> = vec![];
-
         self.0.stop_audio_stream(context);
 
         let is_rewind = if frame <= self.current_frame() {
@@ -1747,7 +1743,10 @@ impl<'gc> MovieClip<'gc> {
         }
 
         // Step through the intermediate frames, and aggregate the deltas of each frame.
-        let data = self.0.shared.get().swf_data.clone();
+        let shared = self.0.shared.get();
+        let data = &shared.swf_data;
+        // Script callbacks can issue another goto while this one is being assembled.
+        let mut goto_commands = GotoCommands::default();
         let tag_stream_start = data.as_ref().as_ptr() as u64;
         let mut frame_pos = self.0.tag_stream_pos.get();
         let mut index = 0;
@@ -1788,6 +1787,7 @@ impl<'gc> MovieClip<'gc> {
                             &mut goto_commands,
                             is_rewind,
                             index,
+                            tag_stream_start,
                         )
                     }
                     Action::Remove(version) => self.goto_remove_object(
@@ -1821,12 +1821,9 @@ impl<'gc> MovieClip<'gc> {
             // but BTreeMap::retain does not exist.
             // TODO: Should AS3 children ignore GOTOs?
 
-            let final_placements: HashMap<Depth, &GotoPlaceObject<'_>> =
-                goto_commands.iter().map(|cmd| (cmd.depth(), cmd)).collect();
-
             let children: SmallVec<[_; 16]> = self
                 .iter_render_list()
-                .filter(|child| !self.survives_rewind(*child, &final_placements, frame))
+                .filter(|child| !self.survives_rewind(*child, &goto_commands, frame))
                 .collect();
 
             for child in children {
@@ -1904,7 +1901,8 @@ impl<'gc> MovieClip<'gc> {
         // First, sort the goto commands in the order of execution.
         // (Maybe it'd be better to keeps this list sorted as we create it?
         // Currently `swap_remove` calls futz with the order; but we could use `remove`).
-        goto_commands.sort_by_key(|params| params.index);
+        let mut goto_commands = goto_commands.commands;
+        goto_commands.sort_unstable_by_key(|params| params.index);
 
         // Then, run frames for children that were created before this frame.
         goto_commands
@@ -1955,7 +1953,7 @@ impl<'gc> MovieClip<'gc> {
     fn survives_rewind(
         self,
         old_object: DisplayObject<'_>,
-        final_placements: &HashMap<Depth, &GotoPlaceObject<'_>>,
+        final_placements: &GotoCommands<'_>,
         frame: FrameNumber,
     ) -> bool {
         // TODO [KJ] This logic is not 100% tested. It's possible it's a bit
@@ -1970,7 +1968,7 @@ impl<'gc> MovieClip<'gc> {
         if !is_candidate_for_removal && old_object.as_morph_shape().is_none() {
             return true;
         }
-        let Some(final_placement) = final_placements.get(&old_object.depth()) else {
+        let Some(final_placement) = final_placements.get(old_object.depth()) else {
             return false;
         };
 
@@ -2226,7 +2224,7 @@ impl<'gc> MovieClip<'gc> {
         reader: &mut SwfStream<'a>,
         version: u8,
         context: &mut UpdateContext<'gc>,
-        goto_commands: &mut Vec<GotoPlaceObject<'a>>,
+        goto_commands: &mut GotoCommands<'a>,
         is_rewind: bool,
         from_frame: FrameNumber,
         removed_frame_scripts: &mut Vec<DisplayObject<'gc>>,
@@ -2237,9 +2235,7 @@ impl<'gc> MovieClip<'gc> {
             reader.read_remove_object_2()
         }?;
         let depth: Depth = remove_object.depth.into();
-        if let Some(i) = goto_commands.iter().position(|o| o.depth() == depth) {
-            goto_commands.swap_remove(i);
-        }
+        goto_commands.remove(depth);
         if !is_rewind {
             // For fast-forwards, if this tag were to remove an object
             // that existed before the goto, then we can remove that child right away.
@@ -3679,31 +3675,24 @@ impl<'gc> MovieClipData<'gc> {
         &self,
         reader: &mut SwfStream<'a>,
         version: u8,
-        goto_commands: &mut Vec<GotoPlaceObject<'a>>,
+        goto_commands: &mut GotoCommands<'a>,
         is_rewind: bool,
         index: usize,
+        tag_stream_start: u64,
     ) -> Result<(), Error> {
-        let swf_ptr = self.shared.get().swf_data.as_ref().as_ptr();
         let tag_ptr = reader.get_ref().as_ptr();
-        let tag_start = (tag_ptr.addr() - swf_ptr.addr()) as u64;
+        let tag_start = tag_ptr as u64 - tag_stream_start;
         let place_object = read_place_object(reader, version)?;
 
         // We merge the deltas from this PlaceObject with the previous command.
-        let depth: Depth = place_object.depth.into();
-        let mut goto_place = GotoPlaceObject::new(
+        goto_commands.place(GotoPlaceObject::new(
             self.current_frame(),
             place_object,
             is_rewind,
             index,
             tag_start,
             version,
-        );
-        if let Some(i) = goto_commands.iter().position(|o| o.depth() == depth) {
-            goto_commands[i].merge(&mut goto_place);
-        } else {
-            goto_commands.push(goto_place);
-        }
-
+        ));
         Ok(())
     }
 
@@ -5102,6 +5091,98 @@ impl<'gc> MovieClipShared<'gc> {
             write.eager_tags = HashMap::new();
         }
         tags
+    }
+}
+
+/// Small timelines can search their inline commands directly. Once the list
+/// spills, index the active depths for both placement and rewind lookups.
+#[derive(Default)]
+struct GotoCommands<'a> {
+    commands: SmallVec<[GotoPlaceObject<'a>; 2]>,
+    positions: HashMap<Depth, usize>,
+}
+
+impl<'a> GotoCommands<'a> {
+    fn position(&self, depth: Depth) -> Option<usize> {
+        if self.commands.spilled() {
+            self.positions.get(&depth).copied()
+        } else {
+            self.commands.iter().position(|cmd| cmd.depth() == depth)
+        }
+    }
+
+    fn get(&self, depth: Depth) -> Option<&GotoPlaceObject<'a>> {
+        self.position(depth).map(|i| &self.commands[i])
+    }
+
+    fn place(&mut self, mut command: GotoPlaceObject<'a>) {
+        let depth = command.depth();
+        if let Some(i) = self.position(depth) {
+            self.commands[i].merge(&mut command);
+            return;
+        }
+        let index = self.commands.len();
+        if !self.commands.spilled() && index == self.commands.inline_size() {
+            self.positions.extend(
+                self.commands
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.depth(), i)),
+            );
+        }
+        self.commands.push(command);
+        if self.commands.spilled() {
+            self.positions.insert(depth, index);
+        }
+    }
+
+    fn remove(&mut self, depth: Depth) {
+        if let Some(index) = self.position(depth) {
+            self.commands.swap_remove(index);
+            if self.commands.spilled() {
+                self.positions.remove(&depth);
+                if let Some(moved) = self.commands.get(index) {
+                    self.positions.insert(moved.depth(), index);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod goto_tests {
+    use super::*;
+
+    #[test]
+    fn spilled_goto_commands_reindex_moved_depths_and_keep_merge_order() {
+        fn place(depth: u16, index: usize) -> GotoPlaceObject<'static> {
+            let mut placement = swf::read::Reader::new(&[1, 0, 1, 0, 0], 8)
+                .read_place_object()
+                .unwrap();
+            placement.depth = depth;
+            GotoPlaceObject::new(1, placement, false, index, 0, 1)
+        }
+        let mut commands = GotoCommands::default();
+        commands.place(place(2, 0));
+        commands.place(place(8, 1));
+        assert!(!commands.commands.spilled());
+        commands.place(place(4, 2));
+        commands.place(place(6, 3));
+        commands.remove(8);
+        assert!(commands.get(8).is_none());
+        assert_eq!(commands.get(6).unwrap().depth(), 6);
+        commands.place(place(6, 4));
+        commands.remove(2);
+        commands.place(place(8, 5));
+        let mut remaining = commands.commands;
+        remaining.sort_unstable_by_key(|command| command.index);
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|c| (c.depth(), c.index))
+                .collect::<Vec<_>>(),
+            [(4, 2), (6, 3), (8, 5)]
+        );
     }
 }
 

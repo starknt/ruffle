@@ -40,26 +40,6 @@ package flash.text.engine {
             newElements:Vector.<ContentElement>
         ):Vector.<ContentElement>;
 
-        // TODO: This method should probably be implemented in native code
-        public function splitTextElement(elementIndex:int, splitIndex:int):TextElement {
-            var element:ContentElement = this.getElementAt(elementIndex);
-            if (!(element instanceof TextElement)) {
-                throw new ArgumentError("Error #2004: One of the parameters is invalid.", 2004);
-            }
-
-            var text:String = element.text;
-            if (splitIndex < 0 || splitIndex >= text.length) {
-                throw new RangeError("Error #2006: The supplied index is out of bounds.", 2006);
-            }
-            element.text = text.slice(0, splitIndex);
-
-            var newTextElement:ContentElement = new TextElement(text.slice(splitIndex));
-            this.replaceElements(
-                elementIndex + 1,
-                elementIndex + 1,
-                Vector.<ContentElement>([newTextElement])
-            );
-            return newTextElement;
-        }
+        public native function splitTextElement(elementIndex:int, splitIndex:int):TextElement;
     }
 }

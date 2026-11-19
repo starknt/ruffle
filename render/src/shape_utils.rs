@@ -1009,6 +1009,26 @@ fn hit_test_stroke(
     dist <= stroke_width_sq
 }
 
+/// Test one axis before solving the cubic for the closest point. Only points
+/// between an endpoint and an exterior control point need the exact extremum.
+fn outside_quadratic_stroke(p: f64, start: f64, control: f64, end: f64, radius: f64) -> bool {
+    let low = start.min(end) - radius;
+    let high = start.max(end) + radius;
+    if (low..=high).contains(&p) {
+        return false;
+    }
+    if p < low.min(control - radius) || p > high.max(control + radius) {
+        return true;
+    }
+    // At this point the control is strictly outside the endpoints. Evaluate
+    // the interior extremum in Bernstein form, as in the distance calculation.
+    let t = (start - control) / ((start - control) + (end - control));
+    let u = 1.0 - t;
+    let extreme = u * u * start + 2.0 * u * t * control + t * t * end;
+    // Round outward by one twip, including cancellation at large coordinates.
+    p < low.min(extreme - radius - 1.0) || p > high.max(extreme + radius + 1.0)
+}
+
 /// Returns whether the given point is inside the stroked bezier curve.
 /// `width_sq` should be the squared width of the stroke.
 fn hit_test_stroke_curve(
@@ -1027,18 +1047,9 @@ fn hit_test_stroke_curve(
     let x2 = anchor.x.get() as f64;
     let y2 = anchor.y.get() as f64;
 
-    // Early exit: out of bounds
-    // TODO: Since this involves an expensive cubic, probably wortwhile to calculate the tight bounds for the curve:
-    // https://www.iquilezles.org/www/articles/bezierbbox/bezierbbox.htm
-    let x_min = x0.min(x1).min(x2);
-    let x_max = x0.max(x1).max(x2);
-    if px < x_min - stroke_width || px > x_max + stroke_width {
-        return false;
-    }
-
-    let y_min = y0.min(y1).min(y2);
-    let y_max = y0.max(y1).max(y2);
-    if py < y_min - stroke_width || py > y_max + stroke_width {
+    if outside_quadratic_stroke(px, x0, x1, x2, stroke_width)
+        || outside_quadratic_stroke(py, y0, y1, y2, stroke_width)
+    {
         return false;
     }
 
@@ -1462,6 +1473,15 @@ pub fn cubic_curve_bounds(
 mod tests {
     use super::*;
     use swf::PointDelta;
+
+    #[test]
+    fn quadratic_bounds_keep_stroke_edges_and_reject_control_hull_misses() {
+        assert!(outside_quadratic_stroke(170.0, 0.0, 200.0, 0.0, 3.0));
+        assert!(!outside_quadratic_stroke(103.0, 0.0, 200.0, 0.0, 3.0));
+        assert!(!outside_quadratic_stroke(-103.0, 0.0, -200.0, 0.0, 3.0));
+        assert!(!outside_quadratic_stroke(7.0, 4.0, 4.0, 4.0, 3.0));
+        assert!(!outside_quadratic_stroke(203.0, -100.0, 50.0, 200.0, 3.0));
+    }
 
     const FILL_STYLES: [FillStyle; 1] = [FillStyle::Color(swf::Color {
         r: 255,

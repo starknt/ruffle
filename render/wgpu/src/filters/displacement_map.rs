@@ -1,3 +1,4 @@
+use super::FilterPipelines;
 use crate::as_texture;
 use crate::backend::RenderTargetMode;
 use crate::buffer_pool::TexturePool;
@@ -5,12 +6,10 @@ use crate::descriptors::Descriptors;
 use crate::filters::{FilterSource, FilterVertex, VERTEX_BUFFERS_DESCRIPTION_FILTERS};
 use crate::gpu_resources::StagingBelt;
 use crate::surface::target::CommandTarget;
-use crate::utils::SampleCountMap;
 use bytemuck::{Pod, Zeroable};
 use ruffle_render::filters::{
     DisplacementMapFilter as DisplacementMapFilterArgs, DisplacementMapFilterMode,
 };
-use std::sync::OnceLock;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq)]
@@ -37,7 +36,7 @@ pub struct DisplacementMapFilter {
     uniform_buffer: crate::gpu_resources::Buffer,
     vertices_size: wgpu::BufferSize,
     uniform_size: wgpu::BufferSize,
-    pipelines: SampleCountMap<OnceLock<crate::gpu_resources::RenderPipeline>>,
+    pipelines: FilterPipelines,
 }
 
 impl DisplacementMapFilter {
@@ -130,8 +129,9 @@ impl DisplacementMapFilter {
         &self,
         descriptors: &Descriptors,
         msaa_sample_count: u32,
+        format: wgpu::TextureFormat,
     ) -> Result<&crate::gpu_resources::RenderPipeline, crate::gpu_runtime::RenderFailure> {
-        self.pipelines.get_or_init(msaa_sample_count, || {
+        self.pipelines.get_or_init(format, msaa_sample_count, || {
             let label = create_debug_label!("Displacement Map Filter ({} msaa)", msaa_sample_count);
             descriptors
                 .persistent_device
@@ -162,7 +162,7 @@ impl DisplacementMapFilter {
                     fragment: Some(wgpu::FragmentState {
                         module: &descriptors.shaders.displacement_map_filter,
                         entry_point: Some("main_fragment"),
-                        targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+                        targets: &[Some(format.into())],
                         compilation_options: Default::default(),
                     }),
                     multiview_mask: None,
@@ -180,9 +180,12 @@ impl DisplacementMapFilter {
         source: &FilterSource,
         filter: &DisplacementMapFilterArgs,
     ) -> Result<Option<CommandTarget>, crate::gpu_runtime::RenderFailure> {
+        let Some(map_handle) = filter.map_bitmap.clone() else {
+            return Ok(None);
+        };
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
-        let pipeline = self.pipeline(descriptors, sample_count)?;
+        let pipeline = self.pipeline(descriptors, sample_count, format)?;
 
         let target = CommandTarget::new(
             descriptors,
@@ -198,9 +201,6 @@ impl DisplacementMapFilter {
             draw_encoder,
         )?;
         let source_view = source.texture.create_view(&Default::default())?;
-        let Some(map_handle) = filter.map_bitmap.clone() else {
-            return Ok(None);
-        };
         let map_texture = as_texture(&map_handle, &descriptors.device)?;
         let map_view = map_texture.texture.create_view(&Default::default())?;
         staging_belt

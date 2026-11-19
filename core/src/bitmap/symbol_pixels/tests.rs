@@ -127,6 +127,7 @@ impl RenderBackend for TestRenderer {
             .into());
         }
         self.uploads.push(region);
+        let bitmap = bitmap.to_rgba();
         let target = test_handle(handle);
         let mut pixels = target.pixels.borrow_mut();
         for y in region.y_min..region.y_max {
@@ -791,4 +792,11 @@ fn bitmap_validity_alpha_copy_reads_aliased_source_regions_before_borrowing() {
             );
             assert!(!source.can_read(PixelRegion::for_pixel(3, 0)));
         });
+}
+
+#[test]
+fn actionscript_pixel_words_have_native_bgra_byte_order() {
+    let color = crate::bitmap::bitmap_data::Color::bgra_u32(0x80563412);
+    assert_eq!(bytemuck::bytes_of(&color), &[0x12, 0x34, 0x56, 0x80]);
+    assert_eq!(color.to_bgra_u32(), 0x80563412);
 }

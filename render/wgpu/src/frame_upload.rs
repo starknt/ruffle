@@ -455,6 +455,7 @@ impl FrameUploadArena {
         encoder: &mut CommandEncoder,
         destination: wgpu::TexelCopyTextureInfo<'_>,
         source: &[u8],
+        source_is_bgra: bool,
         size: wgpu::Extent3d,
     ) -> Result<(), RenderFailure> {
         let invalid =
@@ -470,7 +471,7 @@ impl FrameUploadArena {
         let row_bytes = u64::from(size.width.div_ceil(block_width)) * u64::from(block_bytes);
         let rows = size.height.div_ceil(block_height);
         let needed = row_bytes.checked_mul(u64::from(rows)).ok_or_else(invalid)?;
-        if needed != source.len() as u64 {
+        if needed != source.len() as u64 || (source_is_bgra && !row_bytes.is_multiple_of(4)) {
             return Err(invalid());
         }
         let padded = row_bytes.next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
@@ -539,7 +540,14 @@ impl FrameUploadArena {
                 let target = (u64::from(row) * padded) as usize;
                 let mapped_row = view.slice(target..target + padded as usize);
                 let (mut pixels, mut padding) = mapped_row.split_at(row_bytes as usize);
-                pixels.copy_from_slice(&source[start..start + row_bytes as usize]);
+                let row = &source[start..start + row_bytes as usize];
+                if source_is_bgra {
+                    let (bgra, _) = row.as_chunks::<4>();
+                    let (rgba, _) = pixels.into_chunks::<4>();
+                    rgba.write_iter(bgra.iter().map(|&[b, g, r, a]| [r, g, b, a]));
+                } else {
+                    pixels.copy_from_slice(row);
+                }
                 padding.fill(0);
             }
             drop(view);

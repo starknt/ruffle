@@ -1,10 +1,11 @@
 use crate::avm2::activation::Activation;
 use crate::avm2::error::{Error, Error2004Type, Error2006Type, make_error_2004, make_error_2006};
 use crate::avm2::function::FunctionArgs;
-use crate::avm2::object::{ContentElementObject, ElementData, Object, VectorObject};
+use crate::avm2::object::{ContentElementObject, ElementData, Object, TObject, VectorObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
 use crate::avm2::vector::VectorStorage;
+use ruffle_macros::istr;
 
 pub fn init<'gc>(
     activation: &mut Activation<'_, 'gc>,
@@ -71,6 +72,64 @@ pub fn get_element_at<'gc>(
         .ok_or_else(|| make_error_2006(activation, Error2006Type::RangeError))?;
 
     Ok(element.into())
+}
+
+pub fn split_text_element<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let group = this
+        .as_object()
+        .unwrap()
+        .as_content_element_object()
+        .unwrap();
+    let index = usize::try_from(args.get_i32(0))
+        .map_err(|_| make_error_2006(activation, Error2006Type::RangeError))?;
+    let element = {
+        let data = group.element_data();
+        let ElementData::Group { elements } = &*data else {
+            unreachable!()
+        };
+        elements
+            .get(index)
+            .copied()
+            .ok_or_else(|| make_error_2006(activation, Error2006Type::RangeError))?
+    };
+    let text = match *element.element_data() {
+        ElementData::Text { text } => text,
+        _ => return Err(make_error_2004(activation, Error2004Type::ArgumentError)),
+    };
+    let split = usize::try_from(args.get_i32(1))
+        .map_err(|_| make_error_2006(activation, Error2006Type::RangeError))?;
+    let text = text.ok_or_else(|| {
+        let name =
+            crate::avm2::Multiname::new(activation.avm2().find_public_namespace(), istr!("length"));
+        crate::avm2::error::make_null_or_undefined_error(activation, Value::Null, Some(&name))
+    })?;
+    if split >= text.len() {
+        return Err(make_error_2006(activation, Error2006Type::RangeError));
+    }
+    let prefix = activation.strings().substring(text, 0..split);
+    let suffix = activation.strings().substring(text, split..text.len());
+    *element.element_data_mut(activation.gc()) = ElementData::Text { text: Some(prefix) };
+    // TextElement is final. Use its original class and run its constructor.
+    let class = element
+        .instance_class()
+        .class_object()
+        .expect("TextElement class object");
+    let created = class.construct(activation, &[suffix.into()])?;
+    let child = created
+        .as_object()
+        .unwrap()
+        .as_content_element_object()
+        .unwrap();
+    let mut data = group.element_data_mut(activation.gc());
+    let ElementData::Group { elements } = &mut *data else {
+        unreachable!()
+    };
+    elements.insert(index + 1, child);
+    Ok(created)
 }
 
 pub fn set_elements<'gc>(

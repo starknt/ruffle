@@ -52,7 +52,7 @@ pub fn start<'gc>(
         let id = activation.context.timers.add_for_clock(
             TimerCallback::Avm2Callback {
                 closure: Some(on_update),
-                params: vec![],
+                params: [].as_slice().into(),
             },
             delay,
             false,

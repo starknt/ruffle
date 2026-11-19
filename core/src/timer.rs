@@ -73,7 +73,7 @@ impl<'gc> Timers<'gc> {
                 break;
             }
 
-            // TODO: Can we avoid these clones?
+            // Keep the immutable payload alive while the callback may remove its own timer.
             let callback = timer.callback.clone();
             let expected_id = timer.id;
 
@@ -489,6 +489,37 @@ impl Ord for Timer<'_> {
     }
 }
 
+/// Timer parameters survive a callback removing its own registration. Empty
+/// timers use no backing allocation, and repeats share the registered slice.
+#[derive(Clone, Collect)]
+#[collect(no_drop)]
+pub struct TimerParams<T>(Option<std::rc::Rc<[T]>>);
+
+impl<T: Clone> From<&[T]> for TimerParams<T> {
+    fn from(values: &[T]) -> Self {
+        Self((!values.is_empty()).then(|| values.into()))
+    }
+}
+
+impl<'gc> From<FunctionArgs<'_, 'gc>> for TimerParams<Avm2Value<'gc>> {
+    fn from(args: FunctionArgs<'_, 'gc>) -> Self {
+        match args {
+            FunctionArgs::AsArgs(values) => values.into(),
+            FunctionArgs::AsCellArgs(values) => Self(
+                (!values.is_empty()).then(|| values.iter().map(std::cell::Cell::get).collect()),
+            ),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for TimerParams<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        self.0.as_deref().unwrap_or_default()
+    }
+}
+
 /// A callback fired by a `setInterval`/`setTimeout` timer.
 #[derive(Clone, Collect)]
 #[collect(no_drop)]
@@ -496,17 +527,39 @@ pub enum TimerCallback<'gc> {
     Avm1Function {
         func: Avm1Object<'gc>,
         /// The parameters to pass to the callback function.
-        params: Vec<Avm1Value<'gc>>,
+        params: TimerParams<Avm1Value<'gc>>,
     },
 
     Avm1Method {
         this: Avm1Object<'gc>,
         method_name: AvmString<'gc>,
-        params: Vec<Avm1Value<'gc>>,
+        params: TimerParams<Avm1Value<'gc>>,
     },
 
     Avm2Callback {
         closure: Option<Avm2FunctionObject<'gc>>,
-        params: Vec<Avm2Value<'gc>>,
+        params: TimerParams<Avm2Value<'gc>>,
     },
+}
+
+#[cfg(test)]
+mod callback_tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_keeps_the_registered_argument_storage() {
+        let callback = TimerCallback::Avm2Callback {
+            closure: None,
+            params: [Avm2Value::Integer(17), Avm2Value::Integer(23)]
+                .as_slice()
+                .into(),
+        };
+        let TimerCallback::Avm2Callback { params: first, .. } = &callback else {
+            unreachable!()
+        };
+        let TimerCallback::Avm2Callback { params: next, .. } = callback.clone() else {
+            unreachable!()
+        };
+        assert_eq!(first.as_ptr(), next.as_ptr());
+    }
 }

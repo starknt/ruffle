@@ -13,7 +13,7 @@ use crate::frame_lifecycle::FramePhase;
 use crate::string::{AvmString, StringContext};
 use crate::tag_utils::SwfSlice;
 use crate::{avm_debug, avm1};
-use gc_arena::{Collect, Gc, Mutation};
+use gc_arena::{Collect, Gc, GcWeak, Mutation};
 use std::borrow::Cow;
 use swf::avm1::read::Reader;
 use tracing::instrument;
@@ -28,6 +28,7 @@ use tracing::instrument;
 struct GlobalEnv<'gc> {
     /// The global scope (pre-allocated so that it can be reused by fresh `Activation`s).
     global_scope: Gc<'gc, Scope<'gc>>,
+    recent_target_scope: Option<GcWeak<'gc, Scope<'gc>>>,
 
     /// System built-ins that we use internally to construct new objects.
     prototypes: avm1::globals::SystemPrototypes<'gc>,
@@ -42,6 +43,7 @@ impl<'gc> GlobalEnv<'gc> {
         let (prototypes, globals) = create_globals(context);
         Self {
             global_scope: Gc::new(context.gc(), Scope::from_global_object(globals)),
+            recent_target_scope: None,
             prototypes,
             constructor_registry: PropertyMap::new(),
         }
@@ -397,6 +399,32 @@ impl<'gc> Avm1<'gc> {
         } else {
             self.env_case_insensitive.global_scope
         }
+    }
+
+    /// SWF5 calls start at the target clip. Only the outer target is shared;
+    /// every invocation still creates its own local scope.
+    pub fn target_scope(
+        &mut self,
+        version: u8,
+        clip: Object<'gc>,
+        mc: &Mutation<'gc>,
+    ) -> Gc<'gc, Scope<'gc>> {
+        let env = if Self::is_case_sensitive(version) {
+            &mut self.env_case_sensitive
+        } else {
+            &mut self.env_case_insensitive
+        };
+        if let Some(cached) = env.recent_target_scope.and_then(|weak| weak.upgrade(mc))
+            && Object::ptr_eq(cached.locals_cell(), clip)
+        {
+            return cached;
+        }
+        let target = Gc::new(
+            mc,
+            Scope::new(env.global_scope, scope::ScopeClass::Target, clip),
+        );
+        env.recent_target_scope = Some(Gc::downgrade(target));
+        target
     }
 
     /// Obtain system built-in prototypes for this instance.

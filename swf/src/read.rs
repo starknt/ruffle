@@ -95,31 +95,29 @@ pub fn decompress_swf<'a, R: Read + 'a>(mut input: R) -> Result<SwfBuf> {
         .checked_sub(8)
         .ok_or_else(|| Error::invalid_data("Malformed SWF length"))?;
 
-    // Now the SWF switches to a compressed stream.
-    let decompress_stream: Box<dyn Read> = match compression {
-        Compression::None => Box::new(input),
-        Compression::Zlib => {
-            if version < 6 {
-                log::warn!("zlib compressed SWF is version {version} but minimum version is 6");
-            }
-            make_zlib_reader(input)?
-        }
+    // Flash caps the body at the declared size, even if the compressed stream
+    // contains more bytes. Keep partial Zlib reads for historical compatibility.
+    let mut data = Vec::with_capacity(body_len.min(MAX_DATA_CAPACITY) as usize);
+    match compression {
         Compression::Lzma => {
             if version < 13 {
                 log::warn!("LZMA compressed SWF is version {version} but minimum version is 13");
             }
-            make_lzma_reader(input, body_len)?
+            read_lzma_body(input, &mut data, body_len)?;
         }
-    };
-
-    // Flash Player allocates a fixed buffer based on the header length and
-    // never accesses data beyond it. Match that behavior by capping reads here.
-    let mut data = Vec::with_capacity(body_len.min(MAX_DATA_CAPACITY) as usize);
-    if let Err(e) = decompress_stream
-        .take(body_len as u64)
-        .read_to_end(&mut data)
-    {
-        log::error!("Error decompressing SWF: {e}");
+        compression => {
+            let reader: Box<dyn Read> = if compression == Compression::Zlib {
+                if version < 6 {
+                    log::warn!("zlib compressed SWF is version {version} but minimum version is 6");
+                }
+                make_zlib_reader(input)?
+            } else {
+                Box::new(input)
+            };
+            if let Err(e) = reader.take(u64::from(body_len)).read_to_end(&mut data) {
+                log::error!("Error decompressing SWF: {e}");
+            }
+        }
     }
 
     // Some SWF streams may not be compressed correctly,
@@ -199,10 +197,7 @@ fn make_zlib_reader<'a, R: Read + 'a>(_input: R) -> Result<Box<dyn Read + 'a>> {
 }
 
 #[cfg(feature = "lzma")]
-fn make_lzma_reader<'a, R: Read + 'a>(
-    mut input: R,
-    unpacked_size: u32,
-) -> Result<Box<dyn Read + 'a>> {
+fn read_lzma_body<R: Read>(mut input: R, output: &mut Vec<u8>, unpacked_size: u32) -> Result<()> {
     use lzma_rs::{
         decompress::{Options, UnpackedSize},
         lzma_decompress_with_options,
@@ -225,11 +220,29 @@ fn make_lzma_reader<'a, R: Read + 'a>(
     // Read compressed length (ignored)
     input.read_exact(&mut [0; 4])?;
 
-    // TODO: Switch to lzma-rs streaming API when stable.
-    let mut output = Vec::with_capacity(unpacked_size.min(MAX_DATA_CAPACITY) as usize);
+    // Consume the full stream so that end-marker and decoder errors retain
+    // their normal meaning, while writing at most the declared body length.
+    struct BodyWriter<'a> {
+        bytes: &'a mut Vec<u8>,
+        limit: usize,
+    }
+    impl io::Write for BodyWriter<'_> {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            let keep = input.len().min(self.limit - self.bytes.len());
+            self.bytes.extend_from_slice(&input[..keep]);
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
     lzma_decompress_with_options(
         &mut io::BufReader::new(input),
-        &mut output,
+        &mut BodyWriter {
+            bytes: output,
+            limit: unpacked_size as usize,
+        },
         &Options {
             // [KJ] Note: according to my tests Flash doesn't work without
             // the end-of-payload marker, so we don't have to worry about it.
@@ -240,14 +253,11 @@ fn make_lzma_reader<'a, R: Read + 'a>(
     )
     .map_err(|e| Error::invalid_data(format!("Unable to decompress LZMA SWF: {e}")))?;
 
-    Ok(Box::new(io::Cursor::new(output)))
+    Ok(())
 }
 
 #[cfg(not(feature = "lzma"))]
-fn make_lzma_reader<'a, R: Read + 'a>(
-    _input: R,
-    _unpacked_size: u32,
-) -> Result<Box<dyn Read + 'a>> {
+fn read_lzma_body<R: Read>(_input: R, _output: &mut Vec<u8>, _unpacked_size: u32) -> Result<()> {
     Err(Error::unsupported(
         "Support for LZMA compressed SWFs is not enabled.",
     ))

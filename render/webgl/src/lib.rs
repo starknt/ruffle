@@ -1057,10 +1057,7 @@ impl RenderBackend for WebGlRenderBackend {
         shape: DistilledShape,
         bitmap_source: &dyn BitmapSource,
     ) -> Result<ShapeHandle, ruffle_render::error::RenderFailure> {
-        self.health.check()?;
-        let output = (|| self.register_shape_with_scale(shape, bitmap_source, 1.0))();
-        self.health.check()?;
-        Ok(output)
+        self.register_shape_with_scale(shape, bitmap_source, 1.0)
     }
 
     fn register_shape_with_scale(
@@ -1114,7 +1111,9 @@ impl RenderBackend for WebGlRenderBackend {
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, BitmapError> {
         let (format, bitmap) = match bitmap.format() {
             BitmapFormat::Rgb | BitmapFormat::Yuv420p => (Gl::RGB, bitmap.to_rgb()),
-            BitmapFormat::Rgba | BitmapFormat::Yuva420p => (Gl::RGBA, bitmap.to_rgba()),
+            BitmapFormat::Rgba | BitmapFormat::Bgra | BitmapFormat::Yuva420p => {
+                (Gl::RGBA, bitmap.to_rgba())
+            }
         };
 
         let texture = self
@@ -1167,7 +1166,9 @@ impl RenderBackend for WebGlRenderBackend {
 
         let (format, bitmap) = match bitmap.format() {
             BitmapFormat::Rgb | BitmapFormat::Yuv420p => (Gl::RGB, bitmap.to_rgb()),
-            BitmapFormat::Rgba | BitmapFormat::Yuva420p => (Gl::RGBA, bitmap.to_rgba()),
+            BitmapFormat::Rgba | BitmapFormat::Bgra | BitmapFormat::Yuva420p => {
+                (Gl::RGBA, bitmap.to_rgba())
+            }
         };
 
         self.gl

@@ -747,16 +747,13 @@ impl FormatSpans {
             ),
         };
 
-        // Helper function to decode a byte sequence returned by quick_xml into a WString.
-        // TODO: use Cow<'_, WStr>?
-        let decode_to_wstr = |raw: &[u8]| -> WString {
-            if is_raw_latin1 {
-                WString::from_buf(raw.to_vec())
+        fn decode_to_wstr(raw: &[u8], latin1: bool) -> Cow<'_, WStr> {
+            if latin1 {
+                Cow::Borrowed(WStr::from_units(raw))
             } else {
-                let utf8 = std::str::from_utf8(raw).expect("raw should be valid utf8");
-                WString::from_utf8(utf8)
+                ruffle_wstr::from_utf8(std::str::from_utf8(raw).expect("raw should be valid utf8"))
             }
-        };
+        }
 
         // Flash ignores mismatched end tags (i.e. end tags with a missing/different corresponding
         // start tag). `quick-xml` checks end tag mismatches by default, but it cannot recover after
@@ -815,13 +812,14 @@ impl FormatSpans {
                             };
                         }
                     };
+                    let attributes = &attributes;
                     let attribute = move |name| {
                         attributes.iter().rev().find_map(|attribute| {
                             attribute
                                 .key
                                 .into_inner()
                                 .eq_ignore_ascii_case(name)
-                                .then(|| decode_to_wstr(&attribute.value))
+                                .then(|| decode_to_wstr(&attribute.value, is_raw_latin1))
                         })
                     };
                     let mut format = format_stack.last().unwrap().clone();
@@ -869,11 +867,11 @@ impl FormatSpans {
                         }
                         tag @ b"a" => {
                             if let Some(href) = attribute(b"href") {
-                                format.url = Some(href);
+                                format.url = Some(href.into_owned());
                             }
 
                             if let Some(target) = attribute(b"target") {
-                                format.target = Some(target);
+                                format.target = Some(target.into_owned());
                             }
 
                             // TODO Docs claim that a:link, a:hover, a:active, should work.
@@ -886,7 +884,7 @@ impl FormatSpans {
                         }
                         b"font" => {
                             if let Some(face) = attribute(b"face") {
-                                format.font = Some(face);
+                                format.font = Some(face.into_owned());
                             }
 
                             if let Some(size) = attribute(b"size") {
@@ -943,10 +941,10 @@ impl FormatSpans {
                             }
 
                             if let Some(kerning) = attribute(b"kerning") {
-                                if kerning == WStr::from_units(b"1") && swf_version >= 8 {
+                                if kerning.as_ref() == WStr::from_units(b"1") && swf_version >= 8 {
                                     // Enabling kerning works only for SWF >=8
                                     format.kerning = Some(true);
-                                } else if kerning == WStr::from_units(b"0") {
+                                } else if kerning.as_ref() == WStr::from_units(b"0") {
                                     format.kerning = Some(false);
                                 }
                             }
@@ -1014,8 +1012,10 @@ impl FormatSpans {
                             }
 
                             let image_attribute = |name| {
-                                attribute(name)
-                                    .map(|value| process_html_entity(&value).unwrap_or(value))
+                                attribute(name).map(|value| {
+                                    process_html_entity(&value)
+                                        .unwrap_or_else(|| value.into_owned())
+                                })
                             };
 
                             if let Some(src) = image_attribute(b"src") {
@@ -1083,8 +1083,9 @@ impl FormatSpans {
                     format_stack.push(format);
                 }
                 Ok(Event::Text(e)) if !e.is_empty() => 'text: {
-                    let e = decode_to_wstr(&e.into_inner());
-                    let e = process_html_entity(&e).unwrap_or(e);
+                    let bytes = e.into_inner();
+                    let e = decode_to_wstr(&bytes, is_raw_latin1);
+                    let e = process_html_entity(&e).map(Cow::Owned).unwrap_or(e);
                     let format = format_stack.last().unwrap().clone();
                     if let Some(TextDisplay::None) = format.display {
                         break 'text;
@@ -1097,7 +1098,7 @@ impl FormatSpans {
                         break 'text;
                     }
                     let e = if condense_white {
-                        Self::condense_white_in_text(e)
+                        Self::condense_white_in_text(&e)
                     } else {
                         e.replace(swf_is_newline, WStr::from_units(&[HTML_NEWLINE]))
                     };
@@ -1195,7 +1196,7 @@ impl FormatSpans {
         ret
     }
 
-    fn condense_white_in_text(string: WString) -> WString {
+    fn condense_white_in_text(string: &WStr) -> WString {
         let mut result = WString::with_capacity(string.len(), string.is_wide());
         let mut last_white = false;
         for ch in string.iter() {

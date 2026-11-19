@@ -816,15 +816,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_x(&self, x: Twips) -> bool {
-        let mut matrix = self.matrix.get();
-        let changed = matrix.tx != x;
-        matrix.tx = x;
-        if self.matrix.get() != matrix {
-            self.invalidate_render();
-        }
-        self.matrix.set(matrix);
-        self.set_transformed_by_script(true);
-        changed
+        self.set_position(x, self.y())
     }
 
     fn y(&self) -> Twips {
@@ -832,8 +824,13 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_y(&self, y: Twips) -> bool {
+        self.set_position(self.x(), y)
+    }
+
+    fn set_position(&self, x: Twips, y: Twips) -> bool {
         let mut matrix = self.matrix.get();
-        let changed = matrix.ty != y;
+        let changed = matrix.tx != x || matrix.ty != y;
+        matrix.tx = x;
         matrix.ty = y;
         if self.matrix.get() != matrix {
             self.invalidate_render();
@@ -1019,6 +1016,9 @@ impl<'gc> DisplayObjectBase<'gc> {
     }
 
     fn set_name(this: &Write<Self>, name: AvmString<'gc>) {
+        if this.name() != Some(name) {
+            container::invalidate_child_names();
+        }
         unlock!(this, Self, name).set(Some(name));
     }
 
@@ -2278,6 +2278,15 @@ pub trait TDisplayObject<'gc>:
         {
             // Self-transform changes are automatically handled,
             // we only want to inform ancestors to avoid unnecessary invalidations for tx/ty
+            parent.invalidate_cached_bitmap();
+        }
+    }
+
+    /// Update both translation axes with one cache invalidation.
+    fn set_position(self, x: Twips, y: Twips) {
+        if self.base().set_position(x, y)
+            && let Some(parent) = self.parent()
+        {
             parent.invalidate_cached_bitmap();
         }
     }

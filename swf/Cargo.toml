@@ -12,6 +12,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+memchr = { workspace = true }
 bitflags = { workspace = true }
 bitstream-io = { workspace = true }
 encoding_rs = { workspace = true }

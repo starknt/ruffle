@@ -1,12 +1,57 @@
 import json
+import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from native_perf import summarize, compare
+from native_perf import summarize, compare, main
 
 
 class NativePerfTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux driver disk caches')
+    def test_each_measured_process_starts_with_private_empty_shader_caches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shared = root / 'user-cache'
+            shared.mkdir()
+            (shared / 'existing').touch()
+            binary = root / 'probe'
+            binary.write_text(
+                '#!' + sys.executable + '\n'
+                'import json, os, sys\n'
+                'from pathlib import Path\n'
+                'keys = ("__GL_SHADER_DISK_CACHE_PATH", "MESA_SHADER_CACHE_DIR")\n'
+                'caches = [Path(os.environ[k]) for k in keys]\n'
+                'cold = all(not any(path.iterdir()) for path in caches)\n'
+                'for path in caches: (path / "compiled").touch()\n'
+                'out = Path(sys.argv[sys.argv.index("--output") + 1])\n'
+                'out.write_text(json.dumps([cold, os.environ["XDG_CACHE_HOME"], str(caches[0])]))\n'
+            )
+            binary.chmod(0o700)
+            manifest = root / 'manifest.toml'
+            manifest.write_text('[[case]]\nname = "probe"\n')
+            output = root / 'runs'
+            env = dict.fromkeys(
+                ('XDG_CACHE_HOME', '__GL_SHADER_DISK_CACHE_PATH', 'MESA_SHADER_CACHE_DIR'),
+                str(shared),
+            )
+            args = ['native_perf', '--baseline', str(binary), '--candidate', str(binary),
+                    '--manifest', str(manifest), '--output', str(output)]
+            with (
+                patch.dict(os.environ, env),
+                patch.object(sys, 'argv', args),
+                patch('native_perf.summarize', side_effect=lambda p: json.loads(p.read_text())),
+                patch('native_perf.compare', return_value={}),
+            ):
+                main()
+            runs = json.loads((output / 'summary.json').read_text())['probe']['runs']
+            samples = runs['baseline'] + runs['candidate']
+            self.assertEqual([sample[:2] for sample in samples], [[True, str(shared)]] * 10)
+            self.assertEqual(len({sample[2] for sample in samples}), 10)
+            self.assertEqual(sorted(p.name for p in shared.iterdir()), ['existing'])
+
     def test_instrumentation_modes_must_match(self):
         run = {'completedFrameMs': 10, 'cpuP95Ms': 10, 'cpuP99Ms': 10,
                'peakRssBytes': 100, 'phaseP95Ms': {'logic': 8}, 'profilingEnabled': True}
