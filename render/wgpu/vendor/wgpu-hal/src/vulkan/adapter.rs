@@ -4,7 +4,7 @@ use core::{ffi::CStr, marker::PhantomData};
 use ash::{ext, google, khr, vk};
 use parking_lot::Mutex;
 
-use crate::{vulkan::semaphore_list::SemaphoreList, AllocationSizes};
+use crate::{AllocationSizes, vulkan::semaphore_list::SemaphoreList};
 
 use super::semaphore_list::SemaphoreListMode;
 
@@ -2922,6 +2922,9 @@ impl super::Adapter {
             },
             pipeline_cache_validation_key,
             vendor_id: self.phd_capabilities.properties.vendor_id,
+            pool_trim: super::pool_trim::Trimmer::from_env(
+                self.phd_capabilities.properties.vendor_id,
+            ),
             timestamp_period: self.phd_capabilities.properties.limits.timestamp_period,
             private_caps: self.private_caps.clone(),
             features,

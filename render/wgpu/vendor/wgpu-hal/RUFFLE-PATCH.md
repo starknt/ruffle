@@ -1,9 +1,9 @@
-# Ruffle native GL patch
+# Ruffle native GPU patches
 
 Vendored from the crates.io `wgpu-hal` 30.0.1 package (upstream commit
 `40f4a34ebaf56f9a046231f54125ad046239d3f3`). Keep its MIT/Apache-2.0 licenses and version.
 
-The sole engine change is in `src/gles/adapter.rs`: derive
+`src/gles/adapter.rs` derives
 `SHADER_BINDING_LAYOUT` from Naga's `Version::supports_explicit_locations()`.
 A desktop GL 3.3 driver may advertise compute extensions while Naga emits GLSL
 330 without explicit bindings. Using compute support to skip program remapping
@@ -14,3 +14,18 @@ in `render/wgpu/src/surface/tests.rs`, explicitly run with `--ignored` on native
 The original crate fails exact red/blue pixels; this patch must pass without
 changing shader arithmetic, pixel tolerances or GPU backends. Remove this vendor
 patch when an adopted upstream version includes the same capability correction.
+
+On Linux NVIDIA Vulkan, `RUFFLE_VK_POOL_TRIM=reset` requests a release reset
+after the device has retired high-use command pools and returned to lighter
+work. `buffers` also frees excess command buffers in batches. The `pool`
+experiment reserves 512 primary command buffers in a new pool for the same
+queue family before destroying the fully retired pool. If either allocation
+fails the encoder keeps the old pool and its buffers. Other settings
+use the upstream pool reuse policy. The device tracks retired encoders weakly.
+Recording, retirement and destruction take exclusive ownership of the buffer
+list before accessing the pool. The runtime reports successful release resets
+as well as explicitly freed handles, whole-pool replacements and newly reserved handles.
+
+The ignored real-device test
+`retired_vulkan_pool_can_be_reclaimed_and_reused_while_another_encoder_is_active`
+exercises submissions, reuse, cancellation and destruction under Vulkan validation.

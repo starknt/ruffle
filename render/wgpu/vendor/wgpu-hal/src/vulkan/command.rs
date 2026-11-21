@@ -121,6 +121,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
     unsafe fn begin_encoding(&mut self, label: crate::Label) -> Result<(), crate::DeviceError> {
         if self.free.is_empty() {
+            if let Some(slot) = &mut self.trim_slot {
+                slot.checkout(&mut self.raw, &mut self.free);
+            }
+        }
+        if self.free.is_empty() {
             let vk_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(self.raw)
                 .command_buffer_count(ALLOCATION_GRANULARITY);
@@ -178,6 +183,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
         I: Iterator<Item = super::CommandBuffer>,
     {
         self.temp.clear();
+        if let Some(slot) = &mut self.trim_slot {
+            slot.checkout(&mut self.raw, &mut self.free);
+        }
+        let available = self.free.len();
         self.free
             .extend(cmd_bufs.into_iter().map(|cmd_buf| cmd_buf.raw));
         self.free.append(&mut self.discarded);
@@ -185,11 +194,17 @@ impl crate::CommandEncoder for super::CommandEncoder {
         for (_, framebuffer) in self.framebuffers.drain() {
             unsafe { self.device.raw.destroy_framebuffer(framebuffer, None) };
         }
-        let _ = unsafe {
+        let reset = unsafe {
             self.device
                 .raw
                 .reset_command_pool(self.raw, vk::CommandPoolResetFlags::default())
         };
+        if reset.is_ok() {
+            if let (Some(slot), Some(trim)) = (&mut self.trim_slot, &self.device.pool_trim) {
+                let used = self.free.len() - available;
+                trim.retired(slot, &mut self.free, used, &self.device.raw);
+            }
+        }
     }
 
     unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)
@@ -1076,7 +1091,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
             && (first_instance as u64 + instance_count as u64 - 1)
                 > self.device.private_caps.multiview_instance_index_limit as u64
         {
-            panic!("This vulkan device is affected by [#8333](https://github.com/gfx-rs/wgpu/issues/8333)");
+            panic!(
+                "This vulkan device is affected by [#8333](https://github.com/gfx-rs/wgpu/issues/8333)"
+            );
         }
         unsafe {
             self.device.raw.cmd_draw(
@@ -1100,7 +1117,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
             && (first_instance as u64 + instance_count as u64 - 1)
                 > self.device.private_caps.multiview_instance_index_limit as u64
         {
-            panic!("This vulkan device is affected by [#8333](https://github.com/gfx-rs/wgpu/issues/8333)");
+            panic!(
+                "This vulkan device is affected by [#8333](https://github.com/gfx-rs/wgpu/issues/8333)"
+            );
         }
         unsafe {
             self.device.raw.cmd_draw_indexed(

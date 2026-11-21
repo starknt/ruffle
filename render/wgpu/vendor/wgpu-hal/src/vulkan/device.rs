@@ -12,7 +12,7 @@ use ash::{ext, vk};
 use hashbrown::hash_map::Entry;
 use parking_lot::{Mutex, RwLock};
 
-use super::{conv, descriptor::DescriptorCounts, RawTlasInstance};
+use super::{RawTlasInstance, conv, descriptor::DescriptorCounts};
 use crate::TlasInstance;
 
 impl super::DeviceShared {
@@ -1393,6 +1393,11 @@ impl crate::Device for super::Device {
             bind_point: vk::PipelineBindPoint::default(),
             temp: super::Temp::default(),
             free: Vec::new(),
+            trim_slot: self
+                .shared
+                .pool_trim
+                .as_ref()
+                .map(|trim| trim.register(raw, desc.queue.family_index)),
             discarded: Vec::new(),
             rpass_debug_marker_active: false,
             end_of_pass_timer_query: None,

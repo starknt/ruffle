@@ -10,6 +10,155 @@ use ruffle_render::quality::StageQuality;
 use std::sync::Arc;
 use swf::{BlendMode, Color, Twips};
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires NVIDIA Vulkan; run with the validation layer and each pool trim mode"]
+fn retired_vulkan_pool_can_be_reclaimed_and_reused_while_another_encoder_is_active() {
+    use std::time::{Duration, Instant};
+    use wgpu::hal::{CommandEncoder as _, Device as _, Queue as _, api::Vulkan};
+
+    let descriptors = gpu();
+    assert_eq!(descriptors.adapter.get_info().vendor, 0x10de);
+    let mode = std::env::var("RUFFLE_VK_POOL_TRIM").unwrap_or_default();
+    // The encoders and fence belong to this private queue/device. Every submitted
+    // command buffer stays alive until the fence has signalled its submission.
+    unsafe {
+        let device = descriptors.device.as_hal::<Vulkan>().unwrap();
+        let queue = descriptors.queue.as_hal::<Vulkan>().unwrap();
+        let desc = wgpu::hal::CommandEncoderDescriptor {
+            label: None,
+            queue: &*queue,
+        };
+        let mut heavy = device.create_command_encoder(&desc).unwrap();
+        let mut light = device.create_command_encoder(&desc).unwrap();
+        let fence = device.create_fence().unwrap();
+        let mut value = 0;
+        for cycle in 1..=31 {
+            let mut commands = Vec::with_capacity(800);
+            let start = Instant::now();
+            for _ in 0..800 {
+                heavy.begin_encoding(None).unwrap();
+                commands.push(heavy.end_encoding().unwrap());
+            }
+            let rebuild = start.elapsed();
+            value += 1;
+            queue
+                .submit(&commands.iter().collect::<Vec<_>>(), &[], (&fence, value))
+                .unwrap();
+            light.begin_encoding(None).unwrap();
+            assert!(
+                device
+                    .wait(&fence, value, Some(Duration::from_secs(5)))
+                    .unwrap()
+            );
+            heavy.reset_all(commands.into_iter());
+            let before = device.command_pool_trim_counts();
+            std::thread::sleep(Duration::from_millis(4050));
+            // This pool is not retired until its discarded recording is reset.
+            light.discard_encoding();
+            light.reset_all(std::iter::empty());
+            let after = device.command_pool_trim_counts();
+            match mode.as_str() {
+                "pool" => {
+                    let old = before.unwrap();
+                    let new = after.unwrap();
+                    assert_eq!(new[2] - old[2], 1);
+                    assert_eq!(new[3] - old[3], 512);
+                }
+                "buffers" | "reset" => {
+                    let [resets, freed, _, _] = before.unwrap();
+                    let [new_resets, new_freed, _, _] = after.unwrap();
+                    assert!(new_resets > resets, "cycle {cycle}");
+                    assert_eq!(new_freed - freed, if mode == "buffers" { 288 } else { 0 });
+                }
+                _ => assert_eq!(after, None),
+            }
+            eprintln!(
+                "cycle={cycle} encode_us={} before={before:?} after={after:?}",
+                rebuild.as_micros()
+            );
+        }
+        // Recheck a parked pool after its last trim, also covering destruction in
+        // the checked-out and parked states on this driver.
+        light.begin_encoding(None).unwrap();
+        light.discard_encoding();
+        light.reset_all(std::iter::empty());
+        drop(heavy);
+        drop(light);
+        device.destroy_fence(fence);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires Linux NVIDIA Vulkan and RUFFLE_VK_POOL_TRIM=pool"]
+fn concurrent_vulkan_submissions_can_retire_or_destroy_their_parked_pools() {
+    use std::sync::{Barrier, Mutex};
+    use std::time::Duration;
+    use wgpu::hal::{CommandEncoder as _, Device as _, Queue as _, api::Vulkan};
+
+    let descriptors = gpu();
+    let barrier = Barrier::new(2);
+    let submit = Mutex::new(());
+    // Each worker owns its encoder and fence. Queue access is serialized, and
+    // both submissions are enqueued before either worker recycles its buffers.
+    unsafe {
+        let device_guard = descriptors.device.as_hal::<Vulkan>().unwrap();
+        let queue_guard = descriptors.queue.as_hal::<Vulkan>().unwrap();
+        let device = &*device_guard;
+        let queue = &*queue_guard;
+        let desc = wgpu::hal::CommandEncoderDescriptor { label: None, queue };
+        let before = device.command_pool_trim_counts().unwrap();
+        std::thread::scope(|scope| {
+            for worker in 0..2 {
+                let (desc, barrier, submit) = (&desc, &barrier, &submit);
+                scope.spawn(move || {
+                    let mut heavy = device.create_command_encoder(desc).unwrap();
+                    let mut light = device.create_command_encoder(desc).unwrap();
+                    let mut buffers = Vec::new();
+                    for _ in 0..800 {
+                        heavy.begin_encoding(None).unwrap();
+                        buffers.push(heavy.end_encoding().unwrap());
+                    }
+                    let fence = device.create_fence().unwrap();
+                    {
+                        let _lock = submit.lock().unwrap();
+                        queue
+                            .submit(&buffers.iter().collect::<Vec<_>>(), &[], (&fence, 1))
+                            .unwrap();
+                    }
+                    barrier.wait();
+                    assert!(
+                        device
+                            .wait(&fence, 1, Some(Duration::from_secs(5)))
+                            .unwrap()
+                    );
+                    heavy.reset_all(buffers.into_iter());
+                    light.begin_encoding(None).unwrap();
+                    barrier.wait();
+                    std::thread::sleep(Duration::from_millis(4050));
+                    barrier.wait();
+                    if worker == 0 {
+                        drop(heavy);
+                    } else {
+                        light.discard_encoding();
+                        light.reset_all(std::iter::empty());
+                        heavy.begin_encoding(None).unwrap();
+                        heavy.discard_encoding();
+                        heavy.reset_all(std::iter::empty());
+                    }
+                    if worker == 0 {
+                        light.discard_encoding();
+                        light.reset_all(std::iter::empty());
+                    }
+                    device.destroy_fence(fence);
+                });
+            }
+        });
+        assert!(device.command_pool_trim_counts().unwrap()[2] > before[2]);
+    }
+}
+
 #[test]
 #[ignore = "requires a Vulkan adapter"]
 fn measurement_target_never_allocates_a_readback_buffer_even_after_resize() {

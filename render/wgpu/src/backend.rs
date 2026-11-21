@@ -82,6 +82,8 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     small_meshes: crate::mesh::SmallMeshCache,
     definition_meshes: crate::mesh::DefinitionMeshes,
     filtered_tiles: Option<crate::filtered_tiles::FilteredTiles>,
+    #[cfg(target_os = "linux")]
+    pool_trim_counts: Option<[u64; 4]>,
     pub(crate) preparation_generation: crate::prepare::PreparationGeneration,
     // This is currently unused - we just store it to report in
     // `get_viewport_dimensions`
@@ -292,6 +294,8 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             small_meshes: Default::default(),
             definition_meshes: Default::default(),
             filtered_tiles,
+            #[cfg(target_os = "linux")]
+            pool_trim_counts: std::env::var_os("RUFFLE_VK_POOL_TRIM").map(|_| [0; 4]),
             preparation_generation: crate::prepare::PreparationGeneration::default(),
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(budget.clone()),
@@ -540,6 +544,21 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
     /// Collect completed timestamp queries without blocking or inventing missing samples.
     pub fn collect_gpu_samples(&mut self) {
         if ruffle_render::profile::enabled() {
+            #[cfg(target_os = "linux")]
+            if let Some(previous) = &mut self.pool_trim_counts {
+                // Read only atomic counters while the device guard is live.
+                let stats = unsafe { self.descriptors.device.as_hal::<wgpu::hal::api::Vulkan>() }
+                    .and_then(|device| device.command_pool_trim_counts());
+                if let Some(current) = stats {
+                    ruffle_render::profile::work(|w| {
+                        w.vulkan_pool_release_resets += current[0].saturating_sub(previous[0]);
+                        w.vulkan_pool_freed_buffers += current[1].saturating_sub(previous[1]);
+                        w.vulkan_pool_replacements += current[2].saturating_sub(previous[2]);
+                        w.vulkan_pool_reserved_buffers += current[3].saturating_sub(previous[3]);
+                    });
+                    *previous = current;
+                }
+            }
             ruffle_render::profile::record_native_resources(
                 self.descriptors.runtime.diagnostic_snapshot(),
             );

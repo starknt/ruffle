@@ -31,6 +31,7 @@ mod descriptor;
 mod device;
 mod drm;
 mod instance;
+mod pool_trim;
 mod sampler;
 mod semaphore_list;
 mod swapchain;
@@ -512,6 +513,7 @@ struct DeviceShared {
     enabled_extensions: Vec<&'static CStr>,
     extension_fns: DeviceExtensionFunctions,
     vendor_id: u32,
+    pool_trim: Option<pool_trim::Trimmer>,
     pipeline_cache_validation_key: [u8; 16],
     timestamp_period: f32,
     private_caps: PrivateCapabilities,
@@ -1066,6 +1068,7 @@ pub struct CommandEncoder {
     ///
     /// These are all in the Vulkan "initial" state.
     free: Vec<vk::CommandBuffer>,
+    trim_slot: Option<pool_trim::Slot>,
 
     /// A pool of discarded command buffers.
     ///
@@ -1090,6 +1093,9 @@ pub struct CommandEncoder {
 
 impl Drop for CommandEncoder {
     fn drop(&mut self) {
+        if let Some(slot) = &mut self.trim_slot {
+            slot.checkout(&mut self.raw, &mut self.free);
+        }
         // SAFETY:
         //
         // VUID-vkDestroyCommandPool-commandPool-00041: wgpu_hal requires that a
