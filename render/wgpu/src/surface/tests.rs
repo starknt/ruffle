@@ -20,6 +20,7 @@ fn retired_vulkan_pool_can_be_reclaimed_and_reused_while_another_encoder_is_acti
     let descriptors = gpu();
     assert_eq!(descriptors.adapter.get_info().vendor, 0x10de);
     let mode = std::env::var("RUFFLE_VK_POOL_TRIM").unwrap_or_default();
+    let heavy_count = if mode == "split" { 1536 } else { 800 };
     // The encoders and fence belong to this private queue/device. Every submitted
     // command buffer stays alive until the fence has signalled its submission.
     unsafe {
@@ -32,13 +33,27 @@ fn retired_vulkan_pool_can_be_reclaimed_and_reused_while_another_encoder_is_acti
         let mut heavy = device.create_command_encoder(&desc).unwrap();
         let mut light = device.create_command_encoder(&desc).unwrap();
         let fence = device.create_fence().unwrap();
+        let mut original_primary = std::collections::HashSet::new();
         let mut value = 0;
         for cycle in 1..=31 {
-            let mut commands = Vec::with_capacity(800);
+            let mut commands = Vec::with_capacity(heavy_count);
             let start = Instant::now();
-            for _ in 0..800 {
+            for index in 0..heavy_count {
                 heavy.begin_encoding(None).unwrap();
-                commands.push(heavy.end_encoding().unwrap());
+                if mode == "split" && index < 1280 {
+                    let handle = heavy.raw_handle();
+                    if cycle == 1 {
+                        assert!(original_primary.insert(handle));
+                    } else {
+                        assert!(original_primary.contains(&handle));
+                    }
+                }
+                if mode == "split" && index + 1 == heavy_count {
+                    // Return an abandoned recording from the overflow pool too.
+                    heavy.discard_encoding();
+                } else {
+                    commands.push(heavy.end_encoding().unwrap());
+                }
             }
             let rebuild = start.elapsed();
             value += 1;
@@ -59,11 +74,11 @@ fn retired_vulkan_pool_can_be_reclaimed_and_reused_while_another_encoder_is_acti
             light.reset_all(std::iter::empty());
             let after = device.command_pool_trim_counts();
             match mode.as_str() {
-                "pool" => {
+                "pool" | "split" => {
                     let old = before.unwrap();
                     let new = after.unwrap();
                     assert_eq!(new[2] - old[2], 1);
-                    assert_eq!(new[3] - old[3], 512);
+                    assert_eq!(new[3] - old[3], if mode == "split" { 1280 } else { 512 });
                 }
                 "buffers" | "reset" => {
                     let [resets, freed, _, _] = before.unwrap();
@@ -78,6 +93,18 @@ fn retired_vulkan_pool_can_be_reclaimed_and_reused_while_another_encoder_is_acti
                 rebuild.as_micros()
             );
         }
+        if mode == "split" {
+            let before = device.command_pool_trim_counts();
+            for _ in 0..original_primary.len() {
+                heavy.begin_encoding(None).unwrap();
+                assert!(original_primary.contains(&heavy.raw_handle()));
+                heavy.discard_encoding();
+            }
+            heavy.reset_all(std::iter::empty());
+            std::thread::sleep(Duration::from_millis(4050));
+            light.reset_all(std::iter::empty());
+            assert_eq!(device.command_pool_trim_counts(), before);
+        }
         // Recheck a parked pool after its last trim, also covering destruction in
         // the checked-out and parked states on this driver.
         light.begin_encoding(None).unwrap();
@@ -91,7 +118,7 @@ fn retired_vulkan_pool_can_be_reclaimed_and_reused_while_another_encoder_is_acti
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires Linux NVIDIA Vulkan and RUFFLE_VK_POOL_TRIM=pool"]
+#[ignore = "requires Linux NVIDIA Vulkan and RUFFLE_VK_POOL_TRIM=pool or split"]
 fn concurrent_vulkan_submissions_can_retire_or_destroy_their_parked_pools() {
     use std::sync::{Barrier, Mutex};
     use std::time::Duration;
@@ -100,6 +127,11 @@ fn concurrent_vulkan_submissions_can_retire_or_destroy_their_parked_pools() {
     let descriptors = gpu();
     let barrier = Barrier::new(2);
     let submit = Mutex::new(());
+    let count = if std::env::var("RUFFLE_VK_POOL_TRIM").as_deref() == Ok("split") {
+        1536
+    } else {
+        800
+    };
     // Each worker owns its encoder and fence. Queue access is serialized, and
     // both submissions are enqueued before either worker recycles its buffers.
     unsafe {
@@ -116,7 +148,7 @@ fn concurrent_vulkan_submissions_can_retire_or_destroy_their_parked_pools() {
                     let mut heavy = device.create_command_encoder(desc).unwrap();
                     let mut light = device.create_command_encoder(desc).unwrap();
                     let mut buffers = Vec::new();
-                    for _ in 0..800 {
+                    for _ in 0..count {
                         heavy.begin_encoding(None).unwrap();
                         buffers.push(heavy.end_encoding().unwrap());
                     }

@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 
 const BUSY: usize = 768;
 const KEEP: usize = 512;
+// Normal room traffic uses about 300 buffers per encoder. Preserve a larger
+// set of already recorded buffers for the first frame when a portrait reopens.
+const PRIMARY_BUFFERS: usize = 1280;
 const BATCH: usize = 1024;
 const QUIET: Duration = Duration::from_secs(4);
 const INTERVAL: Duration = Duration::from_millis(150);
@@ -23,13 +26,64 @@ enum Mode {
     Reset,
     Buffers,
     Pool,
+    Split,
+}
+
+/// The encoder owns both pools while recording. The registry can access them
+/// only after reset_all has returned every buffer and parked this partition.
+#[derive(Debug)]
+pub(super) struct Partition {
+    family: u32,
+    primary: Vec<vk::CommandBuffer>,
+    overflow: Option<vk::CommandPool>,
+}
+
+impl Partition {
+    pub fn allocate(
+        &mut self,
+        device: &ash::Device,
+        mut info: vk::CommandBufferAllocateInfo<'_>,
+    ) -> Result<Vec<vk::CommandBuffer>, vk::Result> {
+        let remaining = PRIMARY_BUFFERS - self.primary.len();
+        if remaining != 0 {
+            info.command_buffer_count = info.command_buffer_count.min(remaining as u32);
+            let buffers = unsafe { device.allocate_command_buffers(&info) }?;
+            self.primary.extend_from_slice(&buffers);
+            return Ok(buffers);
+        }
+        if let Some(pool) = self.overflow {
+            info.command_pool = pool;
+            return unsafe { device.allocate_command_buffers(&info) };
+        }
+        let desc = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(self.family)
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+        let pool = unsafe { device.create_command_pool(&desc, None) }?;
+        info.command_pool = pool;
+        match unsafe { device.allocate_command_buffers(&info) } {
+            Ok(buffers) => {
+                self.overflow = Some(pool);
+                Ok(buffers)
+            }
+            Err(error) => {
+                unsafe { device.destroy_command_pool(pool, None) };
+                Err(error)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Parked {
+    buffers: Vec<vk::CommandBuffer>,
+    partition: Option<Partition>,
 }
 
 #[derive(Debug)]
 struct Retired {
     raw: vk::CommandPool,
     family: u32,
-    free: Option<Vec<vk::CommandBuffer>>,
+    free: Option<Parked>,
     armed: bool,
 }
 
@@ -37,16 +91,23 @@ struct Retired {
 pub(super) struct Slot {
     state: Arc<Mutex<Retired>>,
     parked: bool,
+    pub(super) partition: Option<Partition>,
 }
 impl Slot {
+    pub fn overflow_pool(&self) -> Option<vk::CommandPool> {
+        self.partition.as_ref()?.overflow
+    }
+
     pub fn checkout(&mut self, raw: &mut vk::CommandPool, free: &mut Vec<vk::CommandBuffer>) {
         if self.parked {
             let mut state = self.state.lock();
             *raw = state.raw;
-            *free = state
+            let owned = state
                 .free
                 .take()
                 .expect("parked encoder owns its buffer list");
+            *free = owned.buffers;
+            self.partition = owned.partition;
             self.parked = false;
         }
     }
@@ -77,6 +138,7 @@ impl Trimmer {
             Ok("reset") => Mode::Reset,
             Ok("buffers") => Mode::Buffers,
             Ok("pool") => Mode::Pool,
+            Ok("split") => Mode::Split,
             _ => return None,
         };
         Some(Self {
@@ -105,6 +167,11 @@ impl Trimmer {
         Slot {
             state,
             parked: false,
+            partition: (self.mode == Mode::Split).then(|| Partition {
+                family,
+                primary: Vec::new(),
+                overflow: None,
+            }),
         }
     }
 
@@ -116,10 +183,17 @@ impl Trimmer {
         device: &ash::Device,
     ) {
         let now = Instant::now();
-        if free.len() > KEEP {
+        let excess = slot
+            .partition
+            .as_ref()
+            .map_or(free.len() > KEEP, |p| p.overflow.is_some());
+        if excess {
             let mut state = slot.state.lock();
             state.armed |= used >= BUSY;
-            state.free = Some(mem::take(free));
+            state.free = Some(Parked {
+                buffers: mem::take(free),
+                partition: slot.partition.take(),
+            });
             slot.parked = true;
         }
         let mut registry = self.registry.lock();
@@ -145,12 +219,28 @@ impl Trimmer {
             }
             let raw = state.raw;
             let family = state.family;
-            let Some(buffers) = &mut state.free else {
+            let Some(parked) = &mut state.free else {
                 continue;
             };
+            let buffers = &mut parked.buffers;
             // reset_all returned every outstanding command buffer, and both
             // begin_encoding and destruction take this list under the same
             // mutex before either may touch the Vulkan pool.
+            if let Some(partition) = &mut parked.partition {
+                let Some(overflow) = partition.overflow.take() else {
+                    continue;
+                };
+                // All the primary handles are still valid in their original
+                // pool. A future burst creates another overflow pool on demand.
+                unsafe { device.destroy_command_pool(overflow, None) };
+                buffers.clear();
+                buffers.extend_from_slice(&partition.primary);
+                self.reserved
+                    .fetch_add(buffers.len() as u64, Ordering::Relaxed);
+                self.replaced.fetch_add(1, Ordering::Relaxed);
+                state.armed = false;
+                break;
+            }
             if self.mode == Mode::Pool {
                 let desc = vk::CommandPoolCreateInfo::default()
                     .queue_family_index(family)
@@ -204,8 +294,8 @@ impl Trimmer {
 }
 
 impl super::Device {
-    /// Totals for release resets, freed handles, replaced pools, and handles
-    /// reserved in the replacement pools before the encoders become busy again.
+    /// Totals for release resets, freed handles, reclaimed whole pools, and
+    /// buffers immediately reusable by the corresponding encoders after reclaim.
     pub fn command_pool_trim_counts(&self) -> Option<[u64; 4]> {
         let trim = self.shared.pool_trim.as_ref()?;
         Some([

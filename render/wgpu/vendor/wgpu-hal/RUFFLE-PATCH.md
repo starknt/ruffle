@@ -20,11 +20,15 @@ after the device has retired high-use command pools and returned to lighter
 work. `buffers` also frees excess command buffers in batches. The `pool`
 experiment reserves 512 primary command buffers in a new pool for the same
 queue family before destroying the fully retired pool. If either allocation
-fails the encoder keeps the old pool and its buffers. Other settings
-use the upstream pool reuse policy. The device tracks retired encoders weakly.
+fails the encoder keeps the old pool and its buffers. The `split` experiment
+keeps the first 1280 buffers in their original pool and allocates the rest
+from a second pool for the same queue family. A quiet period reclaims that
+second pool. The next burst can immediately record into the original buffers.
+Other settings use the upstream pool reuse policy. The device tracks retired encoders weakly.
 Recording, retirement and destruction take exclusive ownership of the buffer
 list before accessing the pool. The runtime reports successful release resets
-as well as explicitly freed handles, whole-pool replacements and newly reserved handles.
+as well as explicitly freed handles, whole pools reclaimed and the number of
+buffers available for immediate reuse after each such reclamation.
 
 The ignored real-device test
 `retired_vulkan_pool_can_be_reclaimed_and_reused_while_another_encoder_is_active`

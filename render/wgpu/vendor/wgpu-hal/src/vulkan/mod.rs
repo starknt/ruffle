@@ -1110,6 +1110,13 @@ impl Drop for CommandEncoder {
             // from that pool, so there's no need to explicitly call
             // `vkFreeCommandBuffers` on `cmd_encoder`'s `free` and `discarded`
             // fields.
+            if let Some(overflow) = self
+                .trim_slot
+                .as_ref()
+                .and_then(|slot| slot.overflow_pool())
+            {
+                self.device.raw.destroy_command_pool(overflow, None);
+            }
             self.device.raw.destroy_command_pool(self.raw, None);
         }
 

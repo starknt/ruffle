@@ -129,12 +129,15 @@ impl crate::CommandEncoder for super::CommandEncoder {
             let vk_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(self.raw)
                 .command_buffer_count(ALLOCATION_GRANULARITY);
-            let cmd_buf_vec = unsafe {
-                self.device
-                    .raw
-                    .allocate_command_buffers(&vk_info)
-                    .map_err(super::map_host_device_oom_err)?
-            };
+            let partition = self
+                .trim_slot
+                .as_mut()
+                .and_then(|slot| slot.partition.as_mut());
+            let cmd_buf_vec = match partition {
+                Some(partition) => partition.allocate(&self.device.raw, vk_info),
+                None => unsafe { self.device.raw.allocate_command_buffers(&vk_info) },
+            }
+            .map_err(super::map_host_device_oom_err)?;
             self.free.extend(cmd_buf_vec);
         }
         let raw = self.free.pop().unwrap();
@@ -194,11 +197,23 @@ impl crate::CommandEncoder for super::CommandEncoder {
         for (_, framebuffer) in self.framebuffers.drain() {
             unsafe { self.device.raw.destroy_framebuffer(framebuffer, None) };
         }
-        let reset = unsafe {
+        let mut reset = unsafe {
             self.device
                 .raw
                 .reset_command_pool(self.raw, vk::CommandPoolResetFlags::default())
         };
+        if let Some(overflow) = self
+            .trim_slot
+            .as_ref()
+            .and_then(|slot| slot.overflow_pool())
+        {
+            let other = unsafe {
+                self.device
+                    .raw
+                    .reset_command_pool(overflow, vk::CommandPoolResetFlags::default())
+            };
+            reset = reset.and(other);
+        }
         if reset.is_ok() {
             if let (Some(slot), Some(trim)) = (&mut self.trim_slot, &self.device.pool_trim) {
                 let used = self.free.len() - available;
