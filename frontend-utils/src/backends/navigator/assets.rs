@@ -1,5 +1,6 @@
 //! Session-local scheduling for explicitly buffered, public HTTP resources.
 use super::fetch::{Response, ResponseBody};
+use futures::channel::oneshot;
 use futures::future::{FutureExt, LocalBoxFuture, WeakShared};
 use reqwest::{Client, cookie::CookieStore, header};
 use ruffle_core::backend::navigator::{
@@ -42,6 +43,16 @@ const PER_ORIGIN: usize = 12;
 const MAX_LOGICAL: usize = 256;
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const MAX_SHARED: usize = 32 * 1024 * 1024;
+const MAX_PRELOADS: usize = 24;
+const MAX_ACTIVE_PRELOADS: usize = 4;
+const PRELOAD_LIFETIME: Duration = Duration::from_secs(20);
+
+struct Preload {
+    cookies: (bool, u64),
+    started: Instant,
+    claimed: Rc<Cell<bool>>,
+    ready: oneshot::Receiver<Option<(Response, Reservation)>>,
+}
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct AssetStats {
@@ -56,6 +67,7 @@ pub struct AssetStats {
     pub cache_bytes: u64,
     pub transfers: u64,
     pub joined: u64,
+    pub preloaded: u64,
     pub cancelled: u64,
     pub peak_active: usize,
     pub peak_shared_bytes: usize,
@@ -90,6 +102,8 @@ struct State {
 #[derive(Clone)]
 pub struct AssetScheduler {
     inner: Rc<RefCell<State>>,
+    preloads: Rc<RefCell<HashMap<Url, Preload>>>,
+    preload_slots: Arc<tokio::sync::Semaphore>,
     admissions: Arc<tokio::sync::Semaphore>,
     disk_reads: Arc<tokio::sync::Semaphore>,
     allow: fn(&Url) -> bool,
@@ -104,6 +118,8 @@ impl AssetScheduler {
     pub(super) fn new(allow: fn(&Url) -> bool) -> Self {
         Self {
             inner: Rc::default(),
+            preloads: Rc::default(),
+            preload_slots: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_PRELOADS)),
             admissions: Arc::new(tokio::sync::Semaphore::new(MAX_LOGICAL)),
             disk_reads: Arc::new(tokio::sync::Semaphore::new(1)),
             allow,
@@ -138,6 +154,9 @@ impl AssetScheduler {
     }
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.set(enabled);
+        if !enabled {
+            self.clear_preloads();
+        }
     }
     /// Prefer an existing disk entry even after its HTTP freshness window.
     /// Public game URLs are versioned by the Aola allow-list, so this avoids
@@ -148,8 +167,64 @@ impl AssetScheduler {
     pub fn stats(&self) -> AssetStats {
         self.inner.borrow().stats
     }
+    /// Release any unclaimed hints when the loading phase ends.
+    pub fn clear_preloads(&self) {
+        self.preloads.borrow_mut().clear();
+    }
     pub(super) fn allows(&self, url: &Url) -> bool {
         (self.enabled() || self.cache_enabled()) && (self.allow)(url)
+    }
+
+    /// Prepare one ordinary buffered GET. Only cache-admissible responses can
+    /// be handed to a loader, once, in the identical session cookie context.
+    pub(super) fn preload(
+        &self,
+        client: Client,
+        jar: Arc<super::SessionCookies>,
+        url: Url,
+    ) -> Option<OwnedFuture<(), Error>> {
+        if !self.cache_enabled() || !self.enabled() || !self.allows(&url) {
+            return None;
+        }
+        let mut tickets = self.preloads.borrow_mut();
+        tickets.retain(|_, ticket| ticket.started.elapsed() < PRELOAD_LIFETIME);
+        if tickets.contains_key(&url) || tickets.len() >= MAX_PRELOADS {
+            return None;
+        }
+        let (mut send, ready) = oneshot::channel();
+        let cookies = jar.snapshot(&url);
+        let claimed = Rc::new(Cell::new(false));
+        tickets.insert(
+            url.clone(),
+            Preload {
+                cookies,
+                started: Instant::now(),
+                ready,
+                claimed: claimed.clone(),
+            },
+        );
+        let transfer = self.download(client, jar, url, false, false);
+        let state = self.inner.clone();
+        let slots = self.preload_slots.clone();
+        Some(Box::pin(async move {
+            let expire_unused = async {
+                tokio::time::sleep(PRELOAD_LIFETIME).await;
+                if claimed.get() {
+                    // A foreground request now owns this download, including on a slow link.
+                    futures::future::pending::<()>().await;
+                }
+            };
+            let prepare = async {
+                let _slot = slots.acquire().await.ok()?;
+                transfer.await.into_preload(&state).await
+            };
+            tokio::select! {
+                result = prepare => { let _ = send.send(result); }
+                _ = send.cancellation() => {}
+                _ = expire_unused => {}
+            }
+            Ok(())
+        }))
     }
 
     pub(super) fn fetch(
@@ -161,6 +236,24 @@ impl AssetScheduler {
     ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
         let this = self.clone();
         Box::pin(async move {
+            let preload = {
+                let mut tickets = this.preloads.borrow_mut();
+                tickets.retain(|_, ticket| ticket.started.elapsed() < PRELOAD_LIFETIME);
+                tickets.remove(&url)
+            };
+            if let Some(ticket) = preload
+                && ticket.cookies == jar.snapshot(&url)
+            {
+                ticket.claimed.set(true);
+                if let Ok(Some((response, _reservation))) = ticket.ready.await
+                    && ticket.cookies == jar.snapshot(&url)
+                {
+                    let mut state = this.inner.borrow_mut();
+                    state.stats.preloaded += 1;
+                    state.stats.requested += 1;
+                    return Ok(Box::new(response) as Box<dyn SuccessResponse>);
+                }
+            }
             let _slot = this
                 .admissions
                 .acquire()
@@ -859,6 +952,27 @@ enum Outcome {
     BodyError(Meta, String),
 }
 impl Outcome {
+    async fn into_preload(self, state: &Rc<RefCell<State>>) -> Option<(Response, Reservation)> {
+        let mut response = match self {
+            Self::Disk { response, .. } => response.into_inner()?,
+            Self::Single(response) => response.into_inner()?,
+            _ => return None,
+        };
+        let size = usize::try_from(response.expected_length().ok()??).ok()?;
+        let reservation = Reservation::new(state, size)?;
+        let data = match response.response_body {
+            ResponseBody::File(Ok(data)) => data,
+            // A DiskWrite exists only after checking origin, HTTP policy and cookies.
+            ResponseBody::Scheduled(Some(body)) if body.disk.is_some() => body.read().await.ok()?,
+            _ => return None,
+        };
+        if data.len() != size {
+            return None;
+        }
+        response.response_body = ResponseBody::File(Ok(data));
+        Some((response, reservation))
+    }
+
     fn for_reader(&self, leader: bool) -> Option<Result<Box<dyn SuccessResponse>, ErrorResponse>> {
         match self {
             Self::Shared(meta, body) => {

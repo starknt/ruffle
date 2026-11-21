@@ -107,6 +107,39 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
         scheduler
     }
 
+    /// Reqwest exposes its connection pool through requests. A bodyless HEAD
+    /// makes DNS and TLS overlap renderer startup, including on a hot disk cache.
+    pub fn warm_connection(
+        &self,
+        public_asset: &Url,
+    ) -> impl Future<Output = ()> + Send + use<F, I> {
+        let head = self.client.as_ref().map(|client| {
+            client
+                .head(public_asset.clone())
+                .timeout(Duration::from_secs(2))
+        });
+        async move {
+            if let Some(head) = head {
+                let _ = head.send().await;
+            }
+        }
+    }
+
+    /// Warm an allow-listed static asset on the same HTTP pool used by the movie.
+    pub fn preload(&self, url: &Url) {
+        if matches!(url.scheme(), "https" | "http")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && let (Some(scheduler), Some(client)) = (&self.assets, &self.client)
+            && let Some(future) =
+                scheduler.preload(client.as_ref().clone(), self.cookies.clone(), url.clone())
+        {
+            self.future_spawner.spawn(future);
+        }
+    }
+
     /// Construct a navigator backend with fetch and async capability.
     #[expect(clippy::too_many_arguments)]
     pub fn new(
