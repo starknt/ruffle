@@ -248,6 +248,7 @@ impl GlowFilter {
         ruffle_render::profile::work(|w| {
             w.render_passes += 1;
             w.filter_passes += 1;
+            w.filter_kind_glow_shadow += 1;
             w.draw_calls += 1;
             w.pipeline_changes += 1;
             w.material_binds += 1;

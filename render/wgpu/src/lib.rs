@@ -39,6 +39,7 @@ mod bitmap_recipe;
 mod bitmap_residency;
 mod bitmaps;
 mod context3d;
+mod filtered_tiles;
 mod frame_upload;
 mod globals;
 mod gpu_metrics;
@@ -60,6 +61,7 @@ mod idle_pool;
 
 pub mod backend;
 mod blend;
+mod blend_inputs;
 mod buffer_builder;
 mod buffer_pool;
 #[cfg(feature = "clap")]

@@ -309,6 +309,212 @@ fn bitmap_batch_bindings_reuse_only_while_every_source_image_is_alive() {
 }
 
 #[test]
+#[ignore = "requires a Vulkan adapter"]
+fn aligned_single_bitmap_blends_preserve_pixels_without_an_isolation_target() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    let mut descriptors = gpu();
+    Arc::get_mut(&mut descriptors).unwrap().direct_bitmap_blends = true;
+    for quality in [StageQuality::Low, StageQuality::High] {
+        for mode in [
+            BlendMode::Layer,
+            BlendMode::Add,
+            BlendMode::Subtract,
+            BlendMode::Screen,
+        ] {
+            let mut images = Vec::new();
+            for general in [true, false] {
+                let target = TextureTarget::new(&descriptors.device, (32, 24)).unwrap();
+                let mut renderer =
+                    WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+                renderer.set_quality(quality).unwrap();
+                let pixels: Vec<u8> = (0..48)
+                    .flat_map(|i| {
+                        let a = [0, 1, 57, 127, 239, 255][i % 6];
+                        [a / 2, a / 3, a, a]
+                    })
+                    .collect();
+                let bitmap = renderer
+                    .register_bitmap(Bitmap::new(8, 6, BitmapFormat::Rgba, pixels))
+                    .unwrap();
+                let mut content = CommandList::new();
+                if general {
+                    rect(&mut content, 7., 4., 8., 6., Color::TRANSPARENT);
+                }
+                content.render_bitmap(
+                    bitmap,
+                    Transform {
+                        matrix: Matrix::translate(
+                            Twips::from_pixels_i32(7),
+                            Twips::from_pixels_i32(4),
+                        ),
+                        ..Default::default()
+                    },
+                    true,
+                    PixelSnapping::Always,
+                    PixelRegion::for_whole_size(8, 6),
+                );
+                let mut stage = CommandList::new();
+                stage.blend(content, RenderBlendMode::Builtin(mode));
+                let metrics = ruffle_render::profile::RenderMetrics::default();
+                let _scope = ruffle_render::profile::enter(Some(&metrics));
+                renderer
+                    .submit_frame(Color::from_rgb(0x305280, 255), stage, vec![])
+                    .unwrap();
+                images.push(renderer.capture_frame().unwrap().unwrap().into_raw());
+                assert_eq!(
+                    metrics.snapshot().work.offscreen_targets,
+                    u64::from(general)
+                );
+            }
+            assert_eq!(images[0], images[1], "{mode:?} {quality:?}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn single_nested_add_on_a_clear_isolation_preserves_msaa_edges() {
+    let mut images = Vec::new();
+    let mut work = Vec::new();
+    for direct in [false, true] {
+        let mut descriptors = gpu();
+        Arc::get_mut(&mut descriptors).unwrap().direct_bitmap_blends = direct;
+        let target = TextureTarget::new(&descriptors.device, (48, 40)).unwrap();
+        let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+        renderer.set_quality(StageQuality::High).unwrap();
+        let mut child = CommandList::new();
+        rect(
+            &mut child,
+            3.2,
+            4.7,
+            13.5,
+            9.25,
+            Color::from_rgb(0x30dca1, 90),
+        );
+        rect(
+            &mut child,
+            7.2,
+            5.3,
+            18.5,
+            11.7,
+            Color::from_rgb(0xed823e, 143),
+        );
+        let mut parent = CommandList::new();
+        parent.blend(child, RenderBlendMode::Builtin(BlendMode::Add));
+        let mut stage = CommandList::new();
+        rect(
+            &mut stage,
+            4.85,
+            0.25,
+            10.5,
+            34.75,
+            Color::from_rgb(0xfc2259, 180),
+        );
+        stage.blend(parent, RenderBlendMode::Builtin(BlendMode::Screen));
+        let metrics = ruffle_render::profile::RenderMetrics::default();
+        let _scope = ruffle_render::profile::enter(Some(&metrics));
+        renderer
+            .submit_frame(Color::from_rgb(0x307080, 128), stage, vec![])
+            .unwrap();
+        images.push(renderer.capture_frame().unwrap().unwrap().into_raw());
+        work.push(metrics.snapshot().work.offscreen_targets);
+    }
+    assert_eq!(images[0], images[1]);
+    assert_eq!(work, [2, 1]);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn animated_blend_inputs_reuse_only_identical_pixels_when_the_backdrop_changes() {
+    use crate::resource_scheduler::ResourceScheduler;
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    let mut reference = Vec::new();
+    // First draw normally. Then exercise both refused and successful cache admission.
+    for cache_budget in [None, Some(0), Some(1024 * 1024)] {
+        let mut descriptors = gpu();
+        let desc = Arc::get_mut(&mut descriptors).unwrap();
+        let scheduler = cache_budget.map(|bytes| ResourceScheduler::new(0, bytes));
+        desc.blend_inputs = scheduler
+            .as_ref()
+            .map(crate::blend_inputs::BlendInputs::new);
+        let target = TextureTarget::new(&descriptors.device, (40, 32)).unwrap();
+        let mut renderer =
+            WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+        renderer.set_quality(StageQuality::High).unwrap();
+        let bitmap = renderer
+            .register_bitmap(Bitmap::new(2, 2, BitmapFormat::Rgba, vec![100; 16]))
+            .unwrap();
+        for frame in 0..14 {
+            if frame == 6 {
+                renderer
+                    .update_texture(
+                        &bitmap,
+                        Bitmap::new(2, 2, BitmapFormat::Rgba, vec![224; 16]),
+                        PixelRegion::for_whole_size(2, 2),
+                    )
+                    .unwrap();
+            }
+            if frame == 8 {
+                for _ in 0..120 {
+                    renderer
+                        .submit_frame(Color::BLACK, CommandList::new(), vec![])
+                        .unwrap();
+                }
+            }
+            if frame == 12
+                && let Some(scheduler) = &scheduler
+            {
+                scheduler.reclaim();
+            }
+            let mut overlay = CommandList::new();
+            overlay.render_bitmap(
+                bitmap.clone(),
+                Transform {
+                    matrix: Matrix::create_box(
+                        5.0,
+                        5.0,
+                        Twips::from_pixels(7.25),
+                        Twips::from_pixels(5.75),
+                    ),
+                    ..Default::default()
+                },
+                true,
+                PixelSnapping::Never,
+                PixelRegion::for_whole_size(2, 2),
+            );
+            rect(
+                &mut overlay,
+                6.75,
+                3.25,
+                10.0 + (frame % 2) as f32,
+                12.75,
+                Color::from_rgb(0x42e3f0, 123),
+            );
+            let mut commands = CommandList::new();
+            commands.blend(overlay, RenderBlendMode::Builtin(BlendMode::Lighten));
+            let metrics = ruffle_render::profile::RenderMetrics::default();
+            let _scope = ruffle_render::profile::enter(Some(&metrics));
+            renderer
+                .submit_frame(Color::from_rgb(0x336010 + frame * 7, 255), commands, vec![])
+                .unwrap();
+            let pixels = renderer.capture_frame().unwrap().unwrap().into_raw();
+            if let Some(budget) = cache_budget {
+                assert!(reference[frame as usize] == pixels, "frame {frame}");
+                assert_eq!(
+                    metrics.snapshot().work.offscreen_targets,
+                    u64::from(budget == 0 || matches!(frame, 0 | 1 | 6..=9 | 12 | 13)),
+                    "frame {frame}"
+                );
+            } else {
+                reference.push(pixels);
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires a real native adapter"]
 fn alpha_mask_samples_aligned_bitmap_content_without_an_intermediate_copy() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
@@ -2362,12 +2568,123 @@ fn render_filter_chain_test(
                 .submit_frame(Color::TRANSPARENT, draw(source), vec![])
                 .unwrap();
         }
+        let work = metrics.snapshot().work;
+        assert_eq!(
+            work.entries()
+                .filter(|(name, _)| name.starts_with("filter_kind_"))
+                .map(|(_, count)| count)
+                .sum::<u64>(),
+            work.filter_passes,
+            "each encoded filter pass must be attributed to its shader"
+        );
         results.push((
             renderer.capture_frame().unwrap().unwrap().into_raw(),
-            metrics.snapshot().work.filter_passes,
+            work.filter_passes,
         ));
     }
     results
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn repeated_small_filtered_draws_match_fresh_pixels_after_edits_and_idle() {
+    use ruffle_render::{
+        backend::BitmapCacheEntry,
+        bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping},
+        filters::Filter,
+        transform::Transform,
+    };
+    let descriptors = gpu();
+    let mut reference = Vec::new();
+    for reuse in [false, true] {
+        let target = TextureTarget::new(&descriptors.device, (96, 24)).unwrap();
+        let mut renderer =
+            WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+        renderer.set_filtered_tiles(reuse);
+        renderer.set_quality(StageQuality::High).unwrap();
+        let pixels = |rgba: [u8; 4]| Bitmap::new(4, 4, BitmapFormat::Rgba, rgba.repeat(16));
+        let source = renderer.register_bitmap(pixels([255, 0, 40, 255])).unwrap();
+        let metrics = ruffle_render::profile::RenderMetrics::default();
+        let _scope = ruffle_render::profile::enter(Some(&metrics));
+        for frame in 0..7 {
+            if frame == 2 {
+                renderer
+                    .update_texture(
+                        &source,
+                        pixels([0, 180, 250, 255]),
+                        PixelRegion::for_whole_size(4, 4),
+                    )
+                    .unwrap();
+            }
+            if frame == 5 {
+                for _ in 0..121 {
+                    renderer
+                        .submit_frame(Color::BLACK, CommandList::new(), vec![])
+                        .unwrap();
+                }
+            }
+            let before = metrics.snapshot().work;
+            let mut entries = Vec::new();
+            let mut stage = CommandList::new();
+            for i in 0..8 {
+                let handle = renderer
+                    .create_bitmap_cache(12.try_into().unwrap(), 16.try_into().unwrap())
+                    .unwrap();
+                let mut content = CommandList::new();
+                content.render_bitmap(
+                    source.clone(),
+                    Transform {
+                        matrix: Matrix::translate(
+                            Twips::from_pixels(3.0 + f64::from(i) / 8.0),
+                            Twips::from_pixels(5.0),
+                        ),
+                        ..Default::default()
+                    },
+                    true,
+                    PixelSnapping::Never,
+                    PixelRegion::for_whole_size(4, 4),
+                );
+                let radius = if frame == 3 { 5.0 } else { 3.0 };
+                entries.push(BitmapCacheEntry {
+                    handle: handle.clone(),
+                    commands: content,
+                    clear: Color::TRANSPARENT,
+                    filters: vec![Filter::BlurFilter(swf::BlurFilter {
+                        blur_x: swf::Fixed16::from_f32(radius),
+                        blur_y: swf::Fixed16::from_f32(radius),
+                        flags: swf::BlurFilterFlags::from_passes(1),
+                    })],
+                });
+                stage.render_bitmap(
+                    handle,
+                    Transform {
+                        matrix: Matrix::translate(Twips::from_pixels_i32(i * 12), Twips::ZERO),
+                        ..Default::default()
+                    },
+                    false,
+                    PixelSnapping::Never,
+                    PixelRegion::for_whole_size(12, 16),
+                );
+            }
+            renderer.submit_frame(Color::BLACK, stage, entries).unwrap();
+            let image = renderer.capture_frame().unwrap().unwrap().into_raw();
+            let work = metrics.snapshot().work.delta(before);
+            if reuse {
+                assert_eq!(image, reference[frame], "frame {frame}");
+                if matches!(frame, 2 | 3 | 4 | 5) {
+                    assert_eq!(work.filtered_tile_hits, 0, "frame {frame}");
+                }
+                if frame == 6 {
+                    assert!(work.filtered_tile_hits > 0);
+                }
+            } else {
+                if matches!(frame, 2 | 3) {
+                    assert_ne!(reference[frame - 1], image);
+                }
+                reference.push(image);
+            }
+        }
+    }
 }
 
 #[test]

@@ -668,6 +668,7 @@ pub(super) fn run_pixelbender_shader_impl(
     ruffle_render::profile::work(|w| {
         w.render_passes += 1;
         w.filter_passes += 1;
+        w.filter_kind_pixel_bender += 1;
         w.draw_calls += 1;
         w.pipeline_changes += 1;
         w.material_binds += 1;

@@ -29,6 +29,8 @@ pub struct Descriptors {
     pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), Arc<Pipelines>>>,
     pub filters: Filters,
     pub(crate) bitmap_batches: crate::bitmap_batch::BitmapBatchCache,
+    pub(crate) direct_bitmap_blends: bool,
+    pub(crate) blend_inputs: Option<Arc<crate::blend_inputs::BlendInputs>>,
     pub materials: crate::material_cache::MaterialCache,
 }
 
@@ -91,6 +93,11 @@ impl Descriptors {
         let bitmap_batches = crate::bitmap_batch::BitmapBatchCache::new(&runtime);
         Ok(Self {
             bitmap_batches,
+            direct_bitmap_blends: std::env::var_os("RUFFLE_DIRECT_BITMAP_BLENDS").as_deref()
+                == Some(std::ffi::OsStr::new("1")),
+            blend_inputs: (std::env::var_os("RUFFLE_BLEND_RASTERS").as_deref()
+                == Some("1".as_ref()))
+            .then(|| crate::blend_inputs::BlendInputs::new(runtime.scheduler())),
             materials,
             runtime,
             wgpu_instance: instance,

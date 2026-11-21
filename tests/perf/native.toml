@@ -11,6 +11,10 @@ name = "filter_cache"
 path = "../tests/swfs/native_perf/filter_cache"
 
 [[case]]
+name = "portrait_particles"
+path = "../tests/swfs/native_perf/portrait_particles"
+
+[[case]]
 name = "static_tree"
 path = "../tests/swfs/native_perf/static_tree"
 

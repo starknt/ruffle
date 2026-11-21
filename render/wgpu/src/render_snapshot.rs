@@ -382,6 +382,32 @@ impl Capture {
     }
 }
 impl PreparedSnapshot {
+    /// A filtered tile can be replayed only if this version describes every
+    /// pixel input. Textured meshes may refer to mutable BitmapData.
+    pub(super) fn single_tile_draw(&self) -> Option<&SnapshotCommand> {
+        let [node] = &*self.snapshot.commands else {
+            return None;
+        };
+        let [(_, handle)] = self.resources.as_slice() else {
+            return None;
+        };
+        match (&node.command, handle) {
+            (SnapshotCommand::Shape { .. }, Handle::Shape(shape)) => {
+                let raw = &*shape.0 as &dyn Any;
+                let immutable = raw
+                    .downcast_ref::<ShapeRecipe>()
+                    .is_some_and(|r| r.bitmaps.0.is_empty());
+                immutable.then_some(&node.command)
+            }
+            (SnapshotCommand::Bitmap { .. }, Handle::Bitmap(bitmap))
+                if (&*bitmap.0 as &dyn Any).is::<BitmapRecipe>() =>
+            {
+                Some(&node.command)
+            }
+            _ => None,
+        }
+    }
+
     fn handle(&self, resource: ResourceVersion) -> Result<&Handle, RenderFailure> {
         self.resource_indices
             .get(&resource)

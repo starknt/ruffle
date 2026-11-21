@@ -75,6 +75,9 @@ impl PlannedList {
     pub fn into_commands(self) -> Vec<PlannedCommand> {
         self.commands
     }
+    pub(super) fn commands(&self) -> &[PlannedCommand] {
+        &self.commands
+    }
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
@@ -88,6 +91,26 @@ impl PlannedList {
             ] => Some(command),
             _ => None,
         }
+    }
+
+    /// A single additive child drawn on a clear, equally bounded RGBA8 layer
+    /// reproduces the resolved child texture. Keep the outer blend with the
+    /// destination, and leave any ancestor-layer reads on their original path.
+    pub fn remove_redundant_add_layers(mut self, output: RenderRect) -> Self {
+        use ruffle_render::commands::RenderBlendMode;
+        while matches!(
+            self.commands.as_slice(),
+            [PlannedCommand {
+                op: PlannedOp::Blend(child, RenderBlendMode::Builtin(swf::BlendMode::Add), bounds),
+                ..
+            }] if !child.samples_ancestor_layer() && *bounds == output
+        ) {
+            let PlannedOp::Blend(child, _, _) = self.commands.pop().unwrap().op else {
+                unreachable!()
+            };
+            self = child;
+        }
+        self
     }
 }
 

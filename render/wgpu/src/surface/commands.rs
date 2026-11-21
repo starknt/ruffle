@@ -703,6 +703,45 @@ impl WgpuCommandHandler<'_, '_> {
             };
             let blend_type = BlendType::from(blend_mode);
             let clear_color = blend_type.default_color();
+            let commands = if self.descriptors.direct_bitmap_blends
+                && matches!(blend_type, BlendType::Trivial(_))
+            {
+                commands.remove_redundant_add_layers(region)
+            } else {
+                commands
+            };
+            let direct = if self.descriptors.direct_bitmap_blends
+                && matches!(blend_type, BlendType::Trivial(_))
+                && matches!(
+                    self.mask_state.mode,
+                    MaskMode::NoMask | MaskMode::DrawMaskedContent
+                )
+                && let Some((texture, matrix)) = self.aligned_bitmap(&commands)?
+            {
+                // Transparent AA padding has no effect for these four blends.
+                // Keep clipped inputs on the general path so their UVs stay exact.
+                let x = matrix.tx.to_pixels();
+                let y = matrix.ty.to_pixels();
+                let width = texture.texture.width();
+                let height = texture.texture.height();
+                (x >= f64::from(region.x)
+                    && y >= f64::from(region.y)
+                    && x + f64::from(width) <= f64::from(region.x + region.width)
+                    && y + f64::from(height) <= f64::from(region.y + region.height))
+                .then(|| {
+                    (
+                        PoolOrArcTexture::Manual((texture.texture.clone(), texture.view.clone())),
+                        RenderRect {
+                            x: x as u32,
+                            y: y as u32,
+                            width,
+                            height,
+                        },
+                    )
+                })
+            } else {
+                None
+            };
             let key = if matches!(blend_type, BlendType::Shader(_)) {
                 None
             } else {
@@ -714,8 +753,31 @@ impl WgpuCommandHandler<'_, '_> {
                     .find(|(candidate, _)| candidate == key)
                     .map(|(_, texture)| texture.clone())
             });
-            let texture = if let Some(texture) = reused {
+            let raster_key = self.descriptors.blend_inputs.as_ref().and_then(|cache| {
+                if direct.is_some()
+                    || reused.is_some()
+                    || matches!(blend_type, BlendType::Shader(_))
+                {
+                    return None;
+                }
+                Some((
+                    cache,
+                    crate::blend_inputs::Key::capture(&commands, region, self.quality)?,
+                ))
+            });
+            let mut region = region;
+            let texture = if let Some((texture, bounds)) = direct {
+                region = bounds;
+                ruffle_render::profile::work(|w| w.direct_bitmap_blends += 1);
+                texture
+            } else if let Some(texture) = reused {
                 PoolOrArcTexture::Shared(texture)
+            } else if let Some(texture) = raster_key
+                .as_ref()
+                .and_then(|(cache, key)| cache.lookup(key))
+            {
+                ruffle_render::profile::work(|w| w.blend_raster_hits += 1);
+                PoolOrArcTexture::Manual(texture)
             } else {
                 ruffle_render::profile::work(|w| {
                     w.offscreen_targets += 1;
@@ -741,7 +803,16 @@ impl WgpuCommandHandler<'_, '_> {
                     self.texture_pool,
                 )?;
                 target.ensure_cleared(self.draw_encoder);
-                let texture = target.take_color_texture();
+                let admitted =
+                    raster_key.and_then(|(cache, key)| Some((cache, cache.admit(&key)?, key)));
+                let texture = match (target.take_color_texture(), admitted) {
+                    (PoolOrArcTexture::Pool(entry), Some((cache, ticket, key))) => {
+                        let raster = entry.into_owned();
+                        cache.store(key, raster.clone(), ticket);
+                        PoolOrArcTexture::Manual(raster)
+                    }
+                    (texture, _) => texture,
+                };
                 if let Some(key) = key
                     && self.solid_inputs.len() < 64
                 {
@@ -841,12 +912,10 @@ impl WgpuCommandHandler<'_, '_> {
         }
     }
 
-    fn alpha_mask_bitmap_input(
+    fn aligned_bitmap<'a>(
         &self,
-        commands: &PlannedList,
-        output: RenderRect,
-    ) -> Result<Option<(PoolOrArcTexture, [PosUvVertex; 4])>, crate::gpu_runtime::RenderFailure>
-    {
+        commands: &'a PlannedList,
+    ) -> Result<Option<(&'a crate::Texture, Matrix)>, crate::gpu_runtime::RenderFailure> {
         let Some(Command::RenderBitmap {
             bitmap,
             transform,
@@ -880,6 +949,18 @@ impl WgpuCommandHandler<'_, '_> {
         {
             return Ok(None);
         }
+        Ok(Some((texture, matrix)))
+    }
+
+    fn alpha_mask_bitmap_input(
+        &self,
+        commands: &PlannedList,
+        output: RenderRect,
+    ) -> Result<Option<(PoolOrArcTexture, [PosUvVertex; 4])>, crate::gpu_runtime::RenderFailure>
+    {
+        let Some((texture, matrix)) = self.aligned_bitmap(commands)? else {
+            return Ok(None);
+        };
         // Integer, one-to-one RGBA8 rasterization would reproduce these exact texels.
         // Keep the parent target's bounded quad and map its UVs into the original image;
         // the shader supplies transparent pixels beyond the image's coverage.

@@ -81,6 +81,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     meshes: Vec<Mesh>,
     small_meshes: crate::mesh::SmallMeshCache,
     definition_meshes: crate::mesh::DefinitionMeshes,
+    filtered_tiles: Option<crate::filtered_tiles::FilteredTiles>,
     pub(crate) preparation_generation: crate::prepare::PreparationGeneration,
     // This is currently unused - we just store it to report in
     // `get_viewport_dimensions`
@@ -278,6 +279,9 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             &descriptors.runtime,
             descriptors.runtime.config().cache_limit,
         );
+        let filtered_tiles = (std::env::var_os("RUFFLE_FILTERED_TILES").as_deref()
+            == Some(std::ffi::OsStr::new("1")))
+        .then(|| crate::filtered_tiles::FilteredTiles::new(descriptors.runtime.scheduler()));
         descriptors.runtime.check_health()?;
         Ok(Self {
             budget: budget.clone(),
@@ -287,6 +291,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             meshes: Vec::new(),
             small_meshes: Default::default(),
             definition_meshes: Default::default(),
+            filtered_tiles,
             preparation_generation: crate::prepare::PreparationGeneration::default(),
             viewport_scale_factor: 1.0,
             texture_pool: TexturePool::new(budget.clone()),
@@ -309,6 +314,13 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                 &self.descriptors.runtime,
                 limit,
             ))
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_filtered_tiles(&mut self, enabled: bool) {
+        self.filtered_tiles = enabled.then(|| {
+            crate::filtered_tiles::FilteredTiles::new(self.descriptors.runtime.scheduler())
         });
     }
 
@@ -810,6 +822,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             return Ok(());
         };
 
+        if let Some(tiles) = &mut self.filtered_tiles {
+            tiles.begin_frame();
+        }
+        if let Some(inputs) = &self.descriptors.blend_inputs {
+            inputs.begin_frame();
+        }
         for entry in cache_entries {
             let prepared = crate::render_snapshot::PreparedSnapshot::capture(&entry.commands)?;
             let cache =
@@ -838,6 +856,38 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 }
                 continue;
             };
+            let tile = if self.filtered_tiles.is_some() && cache.is_some() {
+                crate::filtered_tiles::Input::capture(
+                    &prepared,
+                    &entry.filters,
+                    entry.clear,
+                    self.surface.quality(),
+                    self.surface.sample_count(),
+                    valid.width,
+                    valid.height,
+                )
+            } else {
+                None
+            };
+            if let (Some(tiles), Some(input)) = (&mut self.filtered_tiles, &tile) {
+                if let Some(id) = tiles.replay(
+                    input,
+                    &texture.texture,
+                    self.active_frame.command_encoder.record(),
+                ) {
+                    ruffle_render::profile::work(|w| w.filtered_tile_hits += 1);
+                    crate::record_bitmap_write(&entry.handle)?;
+                    if let Some(cache) = cache {
+                        cache
+                            .tile_id
+                            .store(id, std::sync::atomic::Ordering::Relaxed);
+                        cache.finish_redraw(history);
+                    }
+                    self.active_frame.maybe_flush(&self.descriptors)?;
+                    continue;
+                }
+                ruffle_render::profile::work(|w| w.filtered_tile_misses += 1);
+            }
             let (input, output) = crate::bitmap_cache::filter_regions(dirty, valid, &entry.filters);
             let partial = input != valid;
             let surface = Surface::new(
@@ -940,6 +990,19 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             }
             drop(scope);
             crate::record_bitmap_write(&entry.handle)?;
+            if let (Some(tiles), Some(input), Some(cache)) = (&mut self.filtered_tiles, tile, cache)
+            {
+                if let Some(id) = tiles.store(
+                    input,
+                    &texture.texture,
+                    &self.descriptors.device,
+                    self.active_frame.command_encoder.record(),
+                )? {
+                    cache
+                        .tile_id
+                        .store(id, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             if let Some(cache) = cache {
                 cache.finish_redraw(history);
             }

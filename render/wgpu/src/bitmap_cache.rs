@@ -32,6 +32,8 @@ pub struct CacheImage {
     height: u32,
     weak_self: Weak<Self>,
     version: AtomicU64,
+    /// Identical post-filter pixels can have different per-instance owners.
+    pub(super) tile_id: AtomicU64,
     resident: OnceLock<Texture>,
     history: Mutex<Option<History>>,
     mask: OnceLock<Arc<MaskRaster>>,
@@ -58,6 +60,7 @@ impl CacheImage {
             height,
             weak_self: weak.clone(),
             version: AtomicU64::new(1),
+            tile_id: AtomicU64::new(0),
             resident: OnceLock::new(),
             history: Mutex::new(None),
             mask: OnceLock::new(),
@@ -124,6 +127,7 @@ impl CacheImage {
             .clone()
     }
     pub fn written(&self) -> Result<(), RenderFailure> {
+        self.tile_id.store(0, Ordering::Relaxed);
         if let Some(mask) = self.mask.get() {
             mask.evict_oldest();
         }
@@ -324,12 +328,24 @@ impl Reclaim for Retained {
 const MAX_HISTORY_NODES: usize = 4096;
 const HISTORY_BYTES: u64 = 2 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq)]
-enum FilterKey {
+pub(super) enum FilterKey {
     Matrix(swf::ColorMatrixFilter),
     Blur(swf::BlurFilter),
     Glow(swf::GlowFilter),
     Shadow(swf::DropShadowFilter),
     Bevel(swf::BevelFilter),
+}
+impl FilterKey {
+    pub(super) fn capture(filter: &Filter) -> Option<Self> {
+        Some(match filter {
+            Filter::ColorMatrixFilter(f) => Self::Matrix(f.clone()),
+            Filter::BlurFilter(f) => Self::Blur(f.clone()),
+            Filter::GlowFilter(f) => Self::Glow(f.clone()),
+            Filter::DropShadowFilter(f) => Self::Shadow(f.clone()),
+            Filter::BevelFilter(f) => Self::Bevel(f.clone()),
+            _ => return None,
+        })
+    }
 }
 #[derive(Debug)]
 pub struct History {
@@ -369,16 +385,7 @@ impl History {
         flatten(&snapshot.commands, &mut nodes)?;
         let filters = filters
             .iter()
-            .map(|filter| {
-                Some(match filter {
-                    Filter::ColorMatrixFilter(f) => FilterKey::Matrix(f.clone()),
-                    Filter::BlurFilter(f) => FilterKey::Blur(f.clone()),
-                    Filter::GlowFilter(f) => FilterKey::Glow(f.clone()),
-                    Filter::DropShadowFilter(f) => FilterKey::Shadow(f.clone()),
-                    Filter::BevelFilter(f) => FilterKey::Bevel(f.clone()),
-                    _ => return None,
-                })
-            })
+            .map(FilterKey::capture)
             .collect::<Option<Vec<_>>>()?;
         let dependencies: HashMap<_, _> = snapshot
             .recipes
