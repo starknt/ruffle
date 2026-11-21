@@ -67,6 +67,17 @@ impl ResourceScheduler {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .bytes[class as usize]
     }
+    #[cfg(test)]
+    pub(crate) fn live_reclaimers(&self, class: ReclaimClass) -> usize {
+        self.0
+            .state
+            .lock()
+            .unwrap()
+            .hooks
+            .iter()
+            .filter(|(c, hook)| *c == class && hook.strong_count() != 0)
+            .count()
+    }
     pub fn register(&self, class: ReclaimClass, hook: Arc<dyn Reclaim>) {
         let mut state = self
             .0

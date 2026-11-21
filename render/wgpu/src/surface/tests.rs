@@ -3492,6 +3492,80 @@ fn bitmap_cache_partial_redraw_clears_old_pixels_and_replays_all_translucent_con
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn retained_bitmaps_share_one_reclaimer_and_keep_exact_lru_order() {
+    use crate::resource_scheduler::ReclaimClass;
+
+    let descriptors = gpu();
+    let mut renderer = WgpuRenderBackend::with_options(
+        descriptors.clone(),
+        TextureTarget::new(&descriptors.device, (32, 32)).unwrap(),
+        false,
+    )
+    .unwrap();
+    renderer.enable_indexed_bitmap_leases();
+    let scheduler = descriptors.runtime.scheduler();
+    scheduler.reclaim();
+    let before = scheduler.live_reclaimers(ReclaimClass::Cache);
+    let mut leases = Vec::new();
+    for _ in 0..512 {
+        let bitmap = renderer
+            .create_bitmap_cache(8.try_into().unwrap(), 8.try_into().unwrap())
+            .unwrap();
+        leases.push(renderer.retain_bitmap_cache(&bitmap).unwrap());
+    }
+    assert!(
+        scheduler.live_reclaimers(ReclaimClass::Cache) <= before + 1,
+        "per-bitmap registrations make every eviction scan the entire display list"
+    );
+    assert_eq!(scheduler.bytes(ReclaimClass::Cache), 512 * 8 * 8 * 4);
+    assert!(leases[0].bitmap().is_some());
+    assert!(scheduler.evict_one(ReclaimClass::Cache));
+    assert!(leases[1].bitmap().is_none());
+    assert!(leases[0].bitmap().is_some());
+    drop(leases);
+    assert_eq!(scheduler.bytes(ReclaimClass::Cache), 0);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn bitmap_lease_budget_preserves_separate_owners_and_global_recency() {
+    use crate::bitmap_cache::{CacheImage, RetainedBitmaps};
+    use crate::resource_scheduler::{ReclaimClass, ResourceScheduler};
+
+    let descriptors = gpu();
+    for indexed in [false, true] {
+        let bytes = 4 * 4 * 4;
+        let scheduler = ResourceScheduler::new(0, 3 * bytes);
+        let left = indexed.then(|| RetainedBitmaps::new(&scheduler));
+        let right = indexed.then(|| RetainedBitmaps::new(&scheduler));
+        let a = CacheImage::new(4, 4, &descriptors.device).unwrap();
+        let b = CacheImage::new(4, 4, &descriptors.device).unwrap();
+        let weak = Arc::downgrade(&a);
+        let first = a.retain(&scheduler, left.as_ref());
+        let other = b.retain(&scheduler, right.as_ref());
+        let second = a.retain(&scheduler, left.as_ref());
+        drop(a);
+        assert!(first.bitmap().is_some());
+        let newest = b.retain(&scheduler, right.as_ref());
+        assert!(other.bitmap().is_none(), "oldest image across providers");
+        assert_eq!(scheduler.bytes(ReclaimClass::Cache), 3 * bytes);
+        drop(first);
+        assert!(second.bitmap().is_some());
+        drop(second);
+        assert!(weak.upgrade().is_none(), "last display owner unloaded");
+        let oversize = CacheImage::new(16, 16, &descriptors.device).unwrap();
+        let denied = oversize.retain(&scheduler, left.as_ref());
+        let weak = Arc::downgrade(&oversize);
+        drop(oversize);
+        assert!(denied.bitmap().is_none() && weak.upgrade().is_none());
+        assert!(newest.bitmap().is_some());
+        drop(newest);
+        assert_eq!(scheduler.bytes(ReclaimClass::Cache), 0);
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn bitmap_cache_retention_is_reclaimable_without_invalidating_recorded_commands() {
     use ruffle_render::bitmap::{PixelRegion, PixelSnapping};
     let descriptors = gpu();

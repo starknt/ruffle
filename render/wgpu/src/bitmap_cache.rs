@@ -141,13 +141,24 @@ impl CacheImage {
                 )
             })
     }
-    pub fn retain(&self, scheduler: &ResourceScheduler) -> Arc<dyn BitmapCacheLease> {
+    pub fn retain(
+        &self,
+        scheduler: &ResourceScheduler,
+        index: Option<&Arc<RetainedBitmaps>>,
+    ) -> Arc<dyn BitmapCacheLease> {
         let bytes = u64::from(self.width) * u64::from(self.height) * 4;
         let entry = scheduler
             .admit(ReclaimClass::Cache, bytes)
-            .and_then(|ticket| Some((self.weak_self.upgrade()?, ticket, scheduler.tick())));
+            .and_then(|ticket| Some((self.weak_self.upgrade()?, ticket)));
+        if let Some(index) = index {
+            return index.lease(entry);
+        }
         let lease = Arc::new(Retained {
-            entry: Mutex::new(entry),
+            entry: Mutex::new(entry.map(|(image, ticket)| RetainedImage {
+                image,
+                _ticket: ticket,
+                last_use: scheduler.tick(),
+            })),
             scheduler: scheduler.clone(),
         });
         scheduler.register(ReclaimClass::Cache, lease.clone());
@@ -288,8 +299,25 @@ impl Reclaim for MaskRaster {
 }
 
 #[derive(Debug)]
+struct RetainedImage {
+    image: Arc<CacheImage>,
+    _ticket: CacheTicket,
+    last_use: u64,
+}
+impl RetainedImage {
+    fn bitmap(&mut self, scheduler: &ResourceScheduler) -> BitmapInfo {
+        self.last_use = scheduler.tick();
+        BitmapInfo {
+            width: self.image.width,
+            height: self.image.height,
+            handle: BitmapHandle(self.image.clone()),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Retained {
-    entry: Mutex<Option<(Arc<CacheImage>, CacheTicket, u64)>>,
+    entry: Mutex<Option<RetainedImage>>,
     scheduler: ResourceScheduler,
 }
 impl BitmapCacheLease for Retained {
@@ -298,13 +326,7 @@ impl BitmapCacheLease for Retained {
             .entry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (image, _, age) = entry.as_mut()?;
-        *age = self.scheduler.tick();
-        Some(BitmapInfo {
-            width: image.width,
-            height: image.height,
-            handle: BitmapHandle(image.clone()),
-        })
+        Some(entry.as_mut()?.bitmap(&self.scheduler))
     }
 }
 impl Reclaim for Retained {
@@ -313,7 +335,7 @@ impl Reclaim for Retained {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .map(|e| e.2)
+            .map(|e| e.last_use)
     }
     fn evict_oldest(&self) -> bool {
         let entry = self
@@ -322,6 +344,83 @@ impl Reclaim for Retained {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         entry.is_some()
+    }
+}
+
+/// All display leases in this renderer expose their oldest image through a
+/// single budget hook. Dropping a lease still releases its image immediately.
+#[derive(Debug)]
+pub(super) struct RetainedBitmaps {
+    entries: parking_lot::Mutex<lru::LruCache<u64, RetainedImage>>,
+    scheduler: ResourceScheduler,
+}
+impl RetainedBitmaps {
+    pub fn new(scheduler: &ResourceScheduler) -> Arc<Self> {
+        let cache = Arc::new(Self {
+            entries: parking_lot::Mutex::new(lru::LruCache::unbounded()),
+            scheduler: scheduler.clone(),
+        });
+        scheduler.register(ReclaimClass::Cache, cache.clone());
+        cache
+    }
+
+    fn lease(
+        self: &Arc<Self>,
+        entry: Option<(Arc<CacheImage>, CacheTicket)>,
+    ) -> Arc<dyn BitmapCacheLease> {
+        let mut entries = self.entries.lock();
+        let id = self.scheduler.tick();
+        if let Some((image, ticket)) = entry {
+            entries.put(
+                id,
+                RetainedImage {
+                    image,
+                    _ticket: ticket,
+                    last_use: id,
+                },
+            );
+        }
+        Arc::new(IndexedLease {
+            cache: self.clone(),
+            id,
+        })
+    }
+}
+impl Reclaim for RetainedBitmaps {
+    fn oldest(&self) -> Option<u64> {
+        self.entries
+            .lock()
+            .peek_lru()
+            .map(|(_, image)| image.last_use)
+    }
+
+    fn evict_oldest(&self) -> bool {
+        let removed = self.entries.lock().pop_lru();
+        removed.is_some()
+    }
+}
+
+#[derive(Debug)]
+struct IndexedLease {
+    cache: Arc<RetainedBitmaps>,
+    id: u64,
+}
+impl BitmapCacheLease for IndexedLease {
+    fn bitmap(&self) -> Option<BitmapInfo> {
+        Some(
+            self.cache
+                .entries
+                .lock()
+                .get_mut(&self.id)?
+                .bitmap(&self.cache.scheduler),
+        )
+    }
+}
+impl Drop for IndexedLease {
+    fn drop(&mut self) {
+        // Resource destruction may enter the scheduler. Release the index lock first.
+        let removed = self.cache.entries.lock().pop(&self.id);
+        drop(removed);
     }
 }
 

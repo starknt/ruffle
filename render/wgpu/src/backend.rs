@@ -82,6 +82,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     small_meshes: crate::mesh::SmallMeshCache,
     definition_meshes: crate::mesh::DefinitionMeshes,
     filtered_tiles: Option<crate::filtered_tiles::FilteredTiles>,
+    retained_bitmaps: Option<Arc<crate::bitmap_cache::RetainedBitmaps>>,
     #[cfg(target_os = "linux")]
     pool_trim_counts: Option<[u64; 4]>,
     pub(crate) preparation_generation: crate::prepare::PreparationGeneration,
@@ -284,6 +285,9 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         let filtered_tiles = (std::env::var_os("RUFFLE_FILTERED_TILES").as_deref()
             == Some(std::ffi::OsStr::new("1")))
         .then(|| crate::filtered_tiles::FilteredTiles::new(descriptors.runtime.scheduler()));
+        let retained_bitmaps = (std::env::var_os("RUFFLE_INDEXED_BITMAP_LEASES").as_deref()
+            == Some(std::ffi::OsStr::new("1")))
+        .then(|| crate::bitmap_cache::RetainedBitmaps::new(descriptors.runtime.scheduler()));
         descriptors.runtime.check_health()?;
         Ok(Self {
             budget: budget.clone(),
@@ -294,6 +298,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             small_meshes: Default::default(),
             definition_meshes: Default::default(),
             filtered_tiles,
+            retained_bitmaps,
             #[cfg(target_os = "linux")]
             pool_trim_counts: std::env::var_os("RUFFLE_VK_POOL_TRIM").map(|_| [0; 4]),
             preparation_generation: crate::prepare::PreparationGeneration::default(),
@@ -318,6 +323,13 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                 &self.descriptors.runtime,
                 limit,
             ))
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_indexed_bitmap_leases(&mut self) {
+        self.retained_bitmaps.get_or_insert_with(|| {
+            crate::bitmap_cache::RetainedBitmaps::new(self.descriptors.runtime.scheduler())
         });
     }
 
@@ -1772,7 +1784,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         handle: &BitmapHandle,
     ) -> Option<Arc<dyn ruffle_render::backend::BitmapCacheLease>> {
         let cache = (&*handle.0 as &dyn Any).downcast_ref::<crate::bitmap_cache::CacheImage>()?;
-        Some(cache.retain(self.descriptors.runtime.scheduler()))
+        Some(cache.retain(
+            self.descriptors.runtime.scheduler(),
+            self.retained_bitmaps.as_ref(),
+        ))
     }
 
     fn create_empty_texture(
