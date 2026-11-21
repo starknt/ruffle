@@ -398,6 +398,8 @@ impl<'gc> MovieClip<'gc> {
             "Called replace_movie on a clip with LoaderInfo set"
         );
 
+        write.movie().record_lifetime("replace-out");
+        movie.record_lifetime("replace-in");
         write.base.base.reset_for_movie_load();
         write.base.base.set_is_root(is_root);
 

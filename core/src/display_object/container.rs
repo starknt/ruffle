@@ -790,6 +790,9 @@ impl<'gc> ChildContainer<'gc> {
         if let Some(position) = render_list_position {
             this.render_list_mut().remove(position);
             drop(this);
+            if child.is_root() {
+                child.movie().record_lifetime("remove-root");
+            }
             children_changed(container);
 
             // Only set the parent's field to 'null' if the child was not placed/modified

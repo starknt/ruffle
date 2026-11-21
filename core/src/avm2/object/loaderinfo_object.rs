@@ -298,6 +298,7 @@ impl<'gc> LoaderInfoObject<'gc> {
         let content = loader.child_by_index(0);
 
         if let Some(content) = content {
+            content.movie().record_lifetime("loader-unload");
             context.load_manager.invalidate_target_loads(content);
         }
 

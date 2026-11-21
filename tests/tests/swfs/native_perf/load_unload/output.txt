@@ -1,0 +1,4 @@
+first child retained
+second child unloaded
+retained child accessible: true
+last external reference released

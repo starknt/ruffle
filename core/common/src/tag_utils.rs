@@ -11,6 +11,8 @@ use url::Url;
 
 pub type SwfStream<'a> = swf::read::Reader<'a>;
 
+mod lifetime;
+
 /// A shared pointer to a `SwfMovieData`.
 #[derive(Clone, Collect, Copy, Debug)]
 #[collect(no_drop)]
@@ -20,6 +22,7 @@ pub struct SwfMovie<'gc>(Gc<'gc, MovieData<'gc>>);
 #[collect(no_drop)]
 struct MovieData<'gc> {
     data: SwfMovieData,
+    lifetime: lifetime::MovieLifetime,
     // The core crate defines the library type. An erased GC edge still traces
     // the allocation's original type, including cycles back to this movie.
     library: Lock<Option<Gc<'gc, ()>>>,
@@ -30,6 +33,7 @@ impl<'gc> SwfMovie<'gc> {
         SwfMovie(Gc::new(
             mc,
             MovieData {
+                lifetime: lifetime::MovieLifetime::new(&data),
                 data,
                 library: Lock::new(None),
             },
@@ -51,6 +55,10 @@ impl<'gc> SwfMovie<'gc> {
 
     pub fn as_ptr(self) -> *const SwfMovieData {
         &self.0.data
+    }
+
+    pub fn record_lifetime(self, action: &'static str) {
+        self.0.lifetime.record(action);
     }
 
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {

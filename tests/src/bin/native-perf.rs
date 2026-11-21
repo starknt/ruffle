@@ -492,7 +492,13 @@ fn main() -> Result<()> {
             for sample in metrics.take_gpu_samples() {
                 write_gpu_record(&mut output, &sample)?;
             }
-            let gc_after = runner.player().lock().unwrap().gc_object_count();
+            let (gc_after, movies_after) = {
+                let mut player = runner.player().lock().unwrap();
+                (
+                    player.gc_object_count(),
+                    player.mutate_with_update_context(|ctx| ctx.library.movie_count()),
+                )
+            };
             environment
                 .descriptors
                 .runtime
@@ -504,6 +510,8 @@ fn main() -> Result<()> {
                 json!({
                     "event":"reclaim", "measuredFrame":frame - opt.warmup + 1,
                     "gcBefore":gc_before, "gcAfter":gc_after,
+                    "moviesAfter":movies_after,
+                    "unixUs":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_micros() as u64,
                     "resources":environment.descriptors.runtime.diagnostic_snapshot(),
                     "allocator":allocator_stats(&environment.descriptors.device),
                     "rssBytes":resident_memory().map(|r| r.0),
