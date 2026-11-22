@@ -80,7 +80,8 @@ impl<'gc> BitmapCharacter<'gc> {
             return Ok(handle.clone());
         }
         let decoded = self.compressed.data.decode()?;
-        let new_handle = backend.register_bitmap(decoded)?;
+        let new_handle = backend
+            .register_bitmap_with_usage(decoded, ruffle_render::backend::BitmapUsage::Symbol)?;
         // FIXME - do we ever want to release this handle, to avoid taking up GPU memory?
         self.handle.set(new_handle.clone()).unwrap();
         Ok(new_handle)

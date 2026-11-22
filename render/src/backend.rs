@@ -34,7 +34,25 @@ pub trait BitmapCacheLease: Debug {
     fn bitmap(&self) -> Option<BitmapInfo>;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitmapUsage {
+    Mutable,
+    Symbol,
+    Excluded,
+}
+
 pub trait RenderBackend: Any {
+    fn display_sampling_revision(&self) -> u64 {
+        0
+    }
+    fn register_bitmap_with_usage(
+        &mut self,
+        bitmap: Bitmap<'_>,
+        _usage: BitmapUsage,
+    ) -> Result<BitmapHandle, Error> {
+        self.register_bitmap(bitmap)
+    }
+
     fn health(&self) -> &RendererHealth;
 
     fn viewport_dimensions(&self) -> ViewportDimensions;

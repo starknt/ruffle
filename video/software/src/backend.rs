@@ -98,7 +98,10 @@ impl VideoBackend for SoftwareVideoBackend {
                 )?;
                 bitmap
             } else {
-                renderer.register_bitmap(frame)?
+                renderer.register_bitmap_with_usage(
+                    frame,
+                    ruffle_render::backend::BitmapUsage::Excluded,
+                )?
             };
             stream.bitmap = Some(handle.clone());
 

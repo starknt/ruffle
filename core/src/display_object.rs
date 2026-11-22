@@ -113,6 +113,7 @@ use self::loader_display::LoaderDisplayWeak;
 ///
 #[derive(Debug, Default)]
 pub struct BitmapCache {
+    display_sampling_revision: u64,
     /// The `Matrix.a` value that was last used with this cache
     matrix_a: f32,
     /// The `Matrix.b` value that was last used with this cache
@@ -1713,6 +1714,12 @@ fn render_base_inner<'gc>(
             ..
         } = &mut *storage;
         if let Some(cache) = cache {
+            let revision = context.renderer.display_sampling_revision();
+            if revision != cache.display_sampling_revision {
+                cache.clear();
+                cache.make_dirty();
+                cache.display_sampling_revision = revision;
+            }
             let width = bounds.width().to_pixels().ceil().max(0.0);
             let height = bounds.height().to_pixels().ceil().max(0.0);
             if width <= u16::MAX as f64 && height <= u16::MAX as f64 {

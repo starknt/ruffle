@@ -35,6 +35,7 @@ use chunk::ChunkBlendMode;
 
 #[derive(Clone, Debug)]
 pub struct Surface {
+    pub(crate) display: Option<Arc<dyn crate::display_bitmap::DisplayBitmapEnhancer>>,
     size: wgpu::Extent3d,
     origin: [u32; 2],
     quality: StageQuality,
@@ -44,6 +45,13 @@ pub struct Surface {
 }
 
 impl Surface {
+    pub fn with_display(
+        mut self,
+        display: Option<Arc<dyn crate::display_bitmap::DisplayBitmapEnhancer>>,
+    ) -> Self {
+        self.display = display;
+        self
+    }
     pub fn with_origin(mut self, origin: [u32; 2]) -> Self {
         self.origin = origin;
         self
@@ -73,6 +81,7 @@ impl Surface {
         }
         let pipelines = descriptors.pipelines(sample_count, frame_buffer_format)?;
         Ok(Self {
+            display: None,
             origin: [0, 0],
             size,
             quality,
@@ -202,6 +211,7 @@ impl Surface {
             CommandBatches::new(commands, descriptors.runtime.config().transient_watermark)
         {
             let chunks = chunk_blends(
+                self.display.as_ref(),
                 commands,
                 descriptors,
                 staging_belt,

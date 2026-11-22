@@ -67,6 +67,7 @@ mod buffer_pool;
 #[cfg(feature = "clap")]
 pub mod clap;
 pub mod descriptors;
+pub mod display_bitmap;
 mod filters;
 mod layouts;
 mod material_cache;

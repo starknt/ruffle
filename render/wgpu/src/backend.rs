@@ -77,6 +77,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     pub(crate) descriptors: Arc<Descriptors>,
     budget: crate::idle_pool::Budget,
     target: T,
+    display_enhancer: Option<Arc<dyn crate::display_bitmap::DisplayBitmapEnhancer>>,
     surface: Surface,
     meshes: Vec<Mesh>,
     small_meshes: crate::mesh::SmallMeshCache,
@@ -294,6 +295,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             descriptors,
             target,
             surface,
+            display_enhancer: None,
             meshes: Vec::new(),
             small_meshes: Default::default(),
             definition_meshes: Default::default(),
@@ -317,6 +319,13 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
     /// Limit retained, reconstructible symbol uploads. In-flight commands and
     /// writable bitmaps are separate owners and are not constrained by this cache.
     /// A zero or absent limit disables the cache for focused renderer tests.
+    pub fn set_display_bitmap_enhancer(
+        &mut self,
+        enhancer: Arc<dyn crate::display_bitmap::DisplayBitmapEnhancer>,
+    ) {
+        self.display_enhancer = Some(enhancer);
+    }
+
     pub fn set_immutable_bitmap_cache_limit(&mut self, limit: Option<u64>) {
         self.bitmap_residency = limit.filter(|limit| *limit > 0).map(|limit| {
             Arc::new(crate::bitmap_residency::BitmapResidency::with_runtime(
@@ -859,6 +868,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         if let Some(inputs) = &self.descriptors.blend_inputs {
             inputs.begin_frame();
         }
+        let display = self
+            .display_enhancer
+            .as_ref()
+            .filter(|e| e.enabled())
+            .cloned();
+        self.surface.display = display.clone();
         for entry in cache_entries {
             let prepared = crate::render_snapshot::PreparedSnapshot::capture(&entry.commands)?;
             let cache =
@@ -887,7 +902,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 }
                 continue;
             };
-            let tile = if self.filtered_tiles.is_some() && cache.is_some() {
+            let tile = if display.is_none() && self.filtered_tiles.is_some() && cache.is_some() {
                 crate::filtered_tiles::Input::capture(
                     &prepared,
                     &entry.filters,
@@ -928,7 +943,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 input.height,
                 texture.texture.format(),
             )?
-            .with_origin([input.x, input.y]);
+            .with_origin([input.x, input.y])
+            .with_display(display.clone());
             let graph = crate::graph_encoder::GraphEncoder::from_prepared(
                 self,
                 prepared,
@@ -1070,6 +1086,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             LayerRef::None,
             &mut self.texture_pool,
         )?;
+        if let Some(e) = &display {
+            e.finish_frame(self.active_frame.command_encoder.record())?;
+        }
         self.profiler
             .resolve_queries(self.active_frame.command_encoder.record());
         self.active_frame.staging_belt.finish();
@@ -1079,6 +1098,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             &self.target,
             frame_output,
         )?);
+        if let Some(e) = &display {
+            e.submitted(self.descriptors.queue.raw());
+        }
         let (idle, peak, combined) = self.budget.stats();
         ruffle_render::profile::pool(idle, peak, combined);
         self.texture_pool.end_frame();
@@ -1094,7 +1116,17 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     }
 
     #[instrument(level = "debug", skip_all)]
+    fn display_sampling_revision(&self) -> u64 {
+        self.display_enhancer.as_ref().map_or(0, |e| e.revision())
+    }
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, BitmapError> {
+        self.register_bitmap_with_usage(bitmap, ruffle_render::backend::BitmapUsage::Mutable)
+    }
+    fn register_bitmap_with_usage(
+        &mut self,
+        bitmap: Bitmap<'_>,
+        usage: ruffle_render::backend::BitmapUsage,
+    ) -> Result<BitmapHandle, BitmapError> {
         self.descriptors.runtime.check_health()?;
         let bitmap = if bitmap.format() == BitmapFormat::Bgra
             && self
@@ -1113,10 +1145,40 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             bitmap.to_rgba()
         };
         self.validate_bitmap_size(&bitmap)?;
-        Ok(BitmapHandle(crate::bitmap_recipe::BitmapRecipe::new(
-            bitmap,
-            &self.descriptors.device,
-        )?))
+        let detail = self
+            .display_enhancer
+            .as_ref()
+            .filter(|e| e.enabled() && usage != ruffle_render::backend::BitmapUsage::Excluded)
+            .map(|_| {
+                let pixels = bitmap.data().chunks_exact(4);
+                let mut count = 0u32;
+                let mut transparent = 0;
+                let mut edges = 0;
+                let mut last = None;
+                for px in pixels
+                    .clone()
+                    .step_by((pixels.len() / 128).max(1))
+                    .take(128)
+                {
+                    count += 1;
+                    transparent += u32::from(px[3] < 255);
+                    let value = u16::from(px[1]) + u16::from(px[0]) / 2 + u16::from(px[2]) / 2;
+                    edges += u32::from(last.is_some_and(|v: u16| v.abs_diff(value) > 40));
+                    last = Some(value);
+                }
+                crate::display_bitmap::BitmapDetail {
+                    transparent: (transparent * 255 / count.max(1)) as u8,
+                    edges: (edges * 255 / count.max(1)) as u8,
+                }
+            });
+        Ok(BitmapHandle(
+            crate::bitmap_recipe::BitmapRecipe::with_usage(
+                bitmap,
+                &self.descriptors.device,
+                usage,
+                detail,
+            )?,
+        ))
     }
 
     fn cache_immutable_bitmap(&mut self, bitmap: &BitmapHandle) -> bool {

@@ -35,6 +35,7 @@ pub enum LayerRef<'a> {
 /// Every complex blend will be its own item, but every other draw will be chunked together
 #[expect(clippy::too_many_arguments)]
 pub fn chunk_blends<'encoder, 'global: 'encoder>(
+    display: Option<&'encoder Arc<dyn crate::display_bitmap::DisplayBitmapEnhancer>>,
     commands: PlannedList,
     descriptors: &'encoder Descriptors,
     staging_belt: &'encoder mut crate::gpu_resources::StagingBelt,
@@ -51,6 +52,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     mask_state: MaskState,
 ) -> Result<Vec<Chunk>, crate::gpu_runtime::RenderFailure> {
     Ok(WgpuCommandHandler::new(
+        display,
         descriptors,
         staging_belt,
         chunk_buffers,
@@ -116,6 +118,7 @@ impl SolidInputKey {
 }
 
 struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
+    display: Option<&'encoder Arc<dyn crate::display_bitmap::DisplayBitmapEnhancer>>,
     descriptors: &'encoder Descriptors,
     quality: StageQuality,
     width: u32,
@@ -142,6 +145,7 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
 impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
     #[expect(clippy::too_many_arguments)]
     fn new(
+        display: Option<&'encoder Arc<dyn crate::display_bitmap::DisplayBitmapEnhancer>>,
         descriptors: &'encoder Descriptors,
         staging_belt: &'encoder mut crate::gpu_resources::StagingBelt,
         chunk_buffers: &'encoder mut ChunkBuffers,
@@ -164,6 +168,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         let emulate_lines = descriptors.backend == Backend::Dx12;
 
         Self {
+            display,
             descriptors,
             quality,
             width,
@@ -344,6 +349,12 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
     fn render_shared(&mut self, commands: Rc<CommandList>) {
+        // Prepared materials retain the view that was resident during recording.
+        // A display-derived bitmap can change at GPU completion or eviction.
+        if self.display.is_some() {
+            commands.execute_ref(self);
+            return;
+        }
         let key = DrawKey {
             device: self.descriptors.runtime.generation(),
             origin: self.origin,
@@ -412,7 +423,23 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             return;
         }
         let result = (|| -> Result<(), crate::gpu_runtime::RenderFailure> {
-            let texture = as_texture(&bitmap, &self.descriptors.device)?;
+            let original = as_texture(&bitmap, &self.descriptors.device)?;
+            let derived = if smoothing
+                && let Some(enhancer) = self.display
+                && let Some(source) = crate::display_bitmap::Source::for_handle(&bitmap)
+            {
+                let m = &transform.matrix;
+                enhancer.sample(
+                    source,
+                    m.a.hypot(m.b).max(m.c.hypot(m.d)),
+                    crate::display_bitmap::Sampling::Direct,
+                    self.draw_encoder,
+                )?
+            } else {
+                None
+            };
+            let texture = derived.as_ref().map_or(original, |d| d.texture.as_ref());
+            let uv = derived.as_ref().map_or([0., 0., 1., 1.], |d| d.uv);
 
             pixel_snapping.apply(&mut transform.matrix);
             transform.matrix *= Matrix::scale(region.width() as f32, region.height() as f32);
@@ -446,10 +473,11 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                 render_stage3d: false,
             };
 
-            let texture_width = texture.texture.width();
-            let texture_height = texture.texture.height();
+            let texture_width = original.texture.width();
+            let texture_height = original.texture.height();
 
-            if region.x_min == 0
+            if uv == [0., 0., 1., 1.]
+                && region.x_min == 0
                 && region.y_min == 0
                 && region.width() == texture_width
                 && region.height() == texture_height
@@ -463,10 +491,10 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                 );
             } else {
                 let (u0, u1, v0, v1) = (
-                    region.x_min as f32 / texture_width as f32,
-                    region.x_max as f32 / texture_width as f32,
-                    region.y_min as f32 / texture_height as f32,
-                    region.y_max as f32 / texture_height as f32,
+                    uv[0] + region.x_min as f32 / texture_width as f32 * (uv[2] - uv[0]),
+                    uv[0] + region.x_max as f32 / texture_width as f32 * (uv[2] - uv[0]),
+                    uv[1] + region.y_min as f32 / texture_height as f32 * (uv[3] - uv[1]),
+                    uv[1] + region.y_max as f32 / texture_height as f32 * (uv[3] - uv[1]),
                 );
                 let vertices = &[
                     PosUvVertex::new(0.0, 0.0, u0, v0, 1.0),
@@ -577,12 +605,53 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                         }
                     });
                 }
-                DrawType::Bitmap { binds } => {
+                DrawType::Bitmap { binds, display } => {
+                    let mut binds = binds.bind_group.clone();
+                    if let (Some(enhancer), Some(fill)) = (self.display, display)
+                        && let Some(source) = fill.source.refresh()
+                    {
+                        let sampling = if fill.repeating {
+                            crate::display_bitmap::Sampling::RepeatingFill
+                        } else {
+                            crate::display_bitmap::Sampling::ClampedFill
+                        };
+                        let result = enhancer
+                            .sample(
+                                source,
+                                fill.magnification(&transform),
+                                sampling,
+                                self.draw_encoder,
+                            )
+                            .and_then(|sample| {
+                                sample
+                                    .map(|s| {
+                                        s.texture
+                                            .bind_group(
+                                                fill.repeating,
+                                                true,
+                                                &self.descriptors.device,
+                                                &self.descriptors.bind_layouts.bitmap,
+                                                BitmapHandle(s.texture.clone()),
+                                                &self.descriptors.bitmap_samplers,
+                                            )
+                                            .map(|b| b.bind_group.clone())
+                                    })
+                                    .transpose()
+                            });
+                        match result {
+                            Ok(Some(enhanced)) => binds = enhanced,
+                            Ok(None) => {}
+                            Err(error) => {
+                                self.descriptors.runtime.fail(error);
+                                return;
+                            }
+                        }
+                    }
                     self.add_to_current(&transform, &mut instance, vertices, |draw_offsets| {
                         DrawCommand::RenderTexture {
                             _texture: None,
                             batch_sampler: None,
-                            binds: binds.bind_group.clone(),
+                            binds: binds.clone(),
                             blend_mode: TrivialBlend::Normal,
                             render_stage3d: false,
                             draw_offsets,
@@ -703,14 +772,16 @@ impl WgpuCommandHandler<'_, '_> {
             };
             let blend_type = BlendType::from(blend_mode);
             let clear_color = blend_type.default_color();
-            let commands = if self.descriptors.direct_bitmap_blends
+            let commands = if self.display.is_none()
+                && self.descriptors.direct_bitmap_blends
                 && matches!(blend_type, BlendType::Trivial(_))
             {
                 commands.remove_redundant_add_layers(region)
             } else {
                 commands
             };
-            let direct = if self.descriptors.direct_bitmap_blends
+            let direct = if self.display.is_none()
+                && self.descriptors.direct_bitmap_blends
                 && matches!(blend_type, BlendType::Trivial(_))
                 && matches!(
                     self.mask_state.mode,
@@ -754,7 +825,8 @@ impl WgpuCommandHandler<'_, '_> {
                     .map(|(_, texture)| texture.clone())
             });
             let raster_key = self.descriptors.blend_inputs.as_ref().and_then(|cache| {
-                if direct.is_some()
+                if self.display.is_some()
+                    || direct.is_some()
                     || reused.is_some()
                     || matches!(blend_type, BlendType::Shader(_))
                 {
@@ -790,7 +862,8 @@ impl WgpuCommandHandler<'_, '_> {
                     region.height,
                     wgpu::TextureFormat::Rgba8Unorm,
                 )?
-                .with_origin([region.x, region.y]);
+                .with_origin([region.x, region.y])
+                .with_display(self.display.cloned());
                 let target = surface.draw_commands(
                     RenderTargetMode::FreshWithColor(clear_color),
                     self.descriptors,
@@ -1037,7 +1110,11 @@ impl WgpuCommandHandler<'_, '_> {
                         region.height,
                         wgpu::TextureFormat::Rgba8Unorm,
                     )
-                    .map(|surface| surface.with_origin([region.x, region.y]))
+                    .map(|surface| {
+                        surface
+                            .with_origin([region.x, region.y])
+                            .with_display(self.display.cloned())
+                    })
                 })
                 .transpose()?;
 

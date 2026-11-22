@@ -133,6 +133,16 @@ impl CommandEncoder {
         Uses::new(self.device.clone(), &self.uses).retain(buffer);
         self.raw.clear_buffer(buffer, offset, size);
     }
+    /// Schedule a read only if this encoder's commands reach the queue.
+    pub fn map_read_on_submit(
+        &self,
+        buffer: &Buffer,
+        size: u64,
+        callback: impl FnOnce(Result<(), wgpu::BufferAsyncError>) + Send + 'static,
+    ) {
+        self.raw
+            .map_buffer_on_submit(buffer, wgpu::MapMode::Read, ..size, callback);
+    }
     pub fn resolve_query_set(
         &mut self,
         queries: &wgpu::QuerySet,
@@ -341,6 +351,20 @@ pub struct ComputePass<'a> {
     uses: Uses<'a>,
 }
 impl ComputePass<'_> {
+    /// Record a single-group image compute pass and its exact resource dependencies.
+    pub fn dispatch(
+        &mut self,
+        pipeline: &wgpu::ComputePipeline,
+        bindings: &wgpu::BindGroup,
+        groups: [u32; 2],
+    ) {
+        self.uses.retain(pipeline);
+        self.uses.retain(bindings);
+        self.raw.set_pipeline(pipeline);
+        self.raw.set_bind_group(0, bindings, &[]);
+        self.raw.dispatch_workgroups(groups[0], groups[1], 1);
+    }
+
     pub fn write_timestamp(&mut self, queries: &wgpu::QuerySet, index: u32) {
         self.uses.retain(queries);
         self.raw.write_timestamp(queries, index);

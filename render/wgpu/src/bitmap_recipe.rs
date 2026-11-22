@@ -25,7 +25,9 @@ pub struct BitmapRecipe {
     format: BitmapFormat,
     pub width: u32,
     pub height: u32,
-    weak_self: Weak<Self>,
+    pub(crate) weak_self: Weak<Self>,
+    pub(crate) usage: ruffle_render::backend::BitmapUsage,
+    pub(crate) detail: Option<crate::display_bitmap::BitmapDetail>,
     state: Mutex<State>,
     resident: OnceLock<Texture>,
 }
@@ -41,7 +43,21 @@ impl BitmapHandleImpl for BitmapRecipe {
     }
 }
 impl BitmapRecipe {
+    #[cfg(test)]
     pub fn new(pixels: Bitmap<'_>, device: &Device) -> Result<Arc<Self>, RenderFailure> {
+        Self::with_usage(
+            pixels,
+            device,
+            ruffle_render::backend::BitmapUsage::Mutable,
+            None,
+        )
+    }
+    pub fn with_usage(
+        pixels: Bitmap<'_>,
+        device: &Device,
+        usage: ruffle_render::backend::BitmapUsage,
+        detail: Option<crate::display_bitmap::BitmapDetail>,
+    ) -> Result<Arc<Self>, RenderFailure> {
         let owner = device.runtime().issue_owner(OwnerKind::BitmapData)?;
         let (width, height) = (pixels.width(), pixels.height());
         Ok(Arc::new_cyclic(|weak_self| Self {
@@ -50,6 +66,8 @@ impl BitmapRecipe {
             format: pixels.format(),
             width,
             height,
+            usage,
+            detail,
             weak_self: weak_self.clone(),
             resident: OnceLock::new(),
             state: Mutex::new(State {

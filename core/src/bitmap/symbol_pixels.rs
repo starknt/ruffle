@@ -38,7 +38,10 @@ impl SymbolImage {
         if let Some(h) = self.view.borrow().as_ref().and_then(Weak::upgrade) {
             return Ok(BitmapHandle(h));
         }
-        let h = renderer.register_bitmap(self.data.decode()?)?;
+        let h = renderer.register_bitmap_with_usage(
+            self.data.decode()?,
+            ruffle_render::backend::BitmapUsage::Symbol,
+        )?;
         *self.view.borrow_mut() = Some(std::sync::Arc::downgrade(&h.0));
         Ok(h)
     }

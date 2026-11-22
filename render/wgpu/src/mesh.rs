@@ -1,6 +1,7 @@
 use crate::backend::WgpuRenderBackend;
 use crate::target::RenderTarget;
 use crate::{Descriptors, GradientUniforms, as_texture};
+use ruffle_render::bitmap::BitmapHandle;
 use std::any::Any;
 use std::ops::Range;
 
@@ -282,6 +283,41 @@ impl PendingDraw {
 }
 
 #[derive(Debug)]
+pub struct BitmapFillSource {
+    pub source: crate::display_bitmap::Source,
+    pub repeating: bool,
+    // Logical shape pixels per source texel.
+    basis: [f32; 4],
+}
+impl BitmapFillSource {
+    fn new(handle: &BitmapHandle, bitmap: &Bitmap) -> Option<Self> {
+        if !bitmap.is_smoothed {
+            return None;
+        }
+        let source = crate::display_bitmap::Source::for_handle(handle)?;
+        let [[a, b, _], [c, d, _], _] = bitmap.matrix;
+        let [w, h] = source.size.map(|v| v as f32);
+        let (a, b, c, d) = (a * w, b * h, c * w, d * h);
+        let det = a * d - b * c;
+        if !det.is_finite() || det.abs() <= f32::EPSILON {
+            return None;
+        }
+        Some(Self {
+            source,
+            repeating: bitmap.is_repeating,
+            basis: [d / det, -b / det, -c / det, a / det],
+        })
+    }
+    pub fn magnification(&self, transform: &ruffle_render::transform::Transform) -> f32 {
+        let m = &transform.matrix;
+        let [a, b, c, d] = self.basis;
+        (m.a * a + m.c * b)
+            .hypot(m.b * a + m.d * b)
+            .max((m.a * c + m.c * d).hypot(m.b * c + m.d * d))
+    }
+}
+
+#[derive(Debug)]
 pub enum PendingDrawType {
     Color,
     Gradient {
@@ -290,6 +326,7 @@ pub enum PendingDrawType {
     },
     Bitmap {
         binds: BitmapBinds,
+        display: Option<BitmapFillSource>,
     },
 }
 
@@ -340,6 +377,7 @@ impl PendingDrawType {
 
         Ok(Some(PendingDrawType::Bitmap {
             binds: binds.clone(),
+            display: BitmapFillSource::new(&handle, &bitmap),
         }))
     }
 
@@ -391,7 +429,7 @@ impl PendingDrawType {
                         })?;
                 DrawType::Gradient { bind_group }
             }
-            PendingDrawType::Bitmap { binds } => DrawType::Bitmap { binds },
+            PendingDrawType::Bitmap { binds, display } => DrawType::Bitmap { binds, display },
         })
     }
 }
@@ -404,6 +442,7 @@ pub enum DrawType {
     },
     Bitmap {
         binds: BitmapBinds,
+        display: Option<BitmapFillSource>,
     },
 }
 

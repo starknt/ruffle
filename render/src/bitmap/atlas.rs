@@ -74,7 +74,10 @@ impl BitmapAtlas {
         let handle = if let Some(handle) = data.handle.get() {
             handle.clone()
         } else {
-            match renderer.register_bitmap(data.bitmap.reborrow()) {
+            match renderer.register_bitmap_with_usage(
+                data.bitmap.reborrow(),
+                crate::backend::BitmapUsage::Excluded,
+            ) {
                 Ok(handle) => {
                     data.dirty = None;
                     let _ = data.handle.set(Some(handle.clone()));

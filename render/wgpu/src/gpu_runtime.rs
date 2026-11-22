@@ -324,7 +324,7 @@ impl GpuRuntime {
         })))
     }
 
-    pub(crate) fn scheduler(&self) -> &crate::resource_scheduler::ResourceScheduler {
+    pub fn scheduler(&self) -> &crate::resource_scheduler::ResourceScheduler {
         &self.0.scheduler
     }
 
