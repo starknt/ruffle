@@ -2429,6 +2429,7 @@ impl Player {
             }
         });
 
+        ruffle_render::profile::logical_frame();
         if self.playback.sample_time.is_some() {
             // Script-visible redraws follow the movie even when the host exports
             // fewer (or more) images than there are authored frames.
@@ -3781,9 +3782,22 @@ pub enum PlayerMode {
 }
 
 #[cfg(test)]
-mod render_failure_tests {
+mod tests {
     use super::*;
     use ruffle_render::error::{RenderFailure, RenderFailureKind};
+
+    #[test]
+    fn logical_frame_count_advances_without_rendering() {
+        let player = PlayerBuilder::new().build();
+        let mut player = player.lock().unwrap();
+        let metrics = ruffle_render::profile::RenderMetrics::default();
+        let _scope = ruffle_render::profile::enter(Some(&metrics));
+        player.run_frame();
+        player.run_frame();
+        assert_eq!(metrics.logical_frames(), 2);
+        player.render().unwrap();
+        assert_eq!(metrics.snapshot().logical_frames, 2);
+    }
 
     #[test]
     fn fatal_renderer_failure_stops_tick_and_frame_publication() {

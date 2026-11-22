@@ -379,6 +379,11 @@ impl Drop for Scope {
     }
 }
 impl RenderMetrics {
+    /// Completed movie frames since profiling started, including frames with no stage submission.
+    pub fn logical_frames(&self) -> u64 {
+        self.0.borrow().logical_frames
+    }
+
     pub fn take_gc_samples(&self) -> (Vec<GcSample>, u64) {
         let mut counters = self.0.borrow_mut();
         (
