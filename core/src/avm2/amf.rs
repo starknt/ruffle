@@ -112,9 +112,6 @@ pub fn serialize_value<'gc>(
             } else if let Some(bytearray) = o.as_bytearray() {
                 AmfValue::ByteArray(bytearray.bytes().to_vec())
             } else if let Some(dictionary) = o.as_dictionary_object() {
-                // FIXME change this once weak keys are implemented
-                let has_weak_keys = false;
-
                 let mut dictionary_body = Vec::new();
 
                 let mut last_index = dictionary.get_next_enumerant(0, activation).unwrap();
@@ -137,7 +134,11 @@ pub fn serialize_value<'gc>(
                         .unwrap();
                 }
 
-                AmfValue::Dictionary(ObjectId::INVALID, dictionary_body, has_weak_keys)
+                AmfValue::Dictionary(
+                    ObjectId::INVALID,
+                    dictionary_body,
+                    dictionary.has_weak_keys(),
+                )
             } else {
                 let class = o.instance_class();
                 let name = class_to_alias(activation, class);

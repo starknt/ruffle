@@ -134,6 +134,13 @@ impl<'gc> ScriptObject<'gc> {
 }
 
 impl<'gc> ScriptObjectData<'gc> {
+    pub(super) fn prune_dropped_weak_keys(&self) {
+        // SAFETY: Only removes entries. No new GC pointer can enter the object.
+        unsafe { self.values.as_ref_cell() }
+            .borrow_mut()
+            .prune_dropped_weak_keys();
+    }
+
     /// Create new object data of a given class.
     /// This is a low-level function used to implement things like object allocators.
     pub fn new(instance_of: ClassObject<'gc>) -> Self {
@@ -320,12 +327,8 @@ impl<'gc> ScriptObjectWrapper<'gc> {
             .unwrap_or(0)
     }
 
-    pub fn get_enumerant_name(self, index: u32) -> Option<Value<'gc>> {
-        self.values().key_at(index as usize).map(|key| match key {
-            DynamicKey::String(name) => Value::String(*name),
-            DynamicKey::Object(obj) => Value::Object(*obj),
-            DynamicKey::Uint(val) => Value::Number(*val as f64),
-        })
+    pub fn get_enumerant_name(self, index: u32, mc: &Mutation<'gc>) -> Option<Value<'gc>> {
+        self.values().key_at(index as usize)?.as_value(mc)
     }
 
     pub fn property_is_enumerable(self, name: AvmString<'gc>) -> bool {

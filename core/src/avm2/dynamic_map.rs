@@ -1,7 +1,8 @@
-use crate::avm2::object::Object;
+use crate::avm2::object::{Object, WeakObject};
+use crate::avm2::value::Value;
 use crate::string::AvmString;
 use fnv::FnvBuildHasher;
-use gc_arena::Collect;
+use gc_arena::{Collect, Mutation};
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use std::cell::Cell;
@@ -24,6 +25,18 @@ pub enum DynamicKey<'gc> {
     // can be `number`
     Uint(u32),
     Object(Object<'gc>),
+    WeakObject(WeakObject<'gc>),
+}
+
+impl<'gc> DynamicKey<'gc> {
+    pub fn as_value(self, mc: &Mutation<'gc>) -> Option<Value<'gc>> {
+        Some(match self {
+            Self::String(name) => Value::String(name),
+            Self::Uint(index) => Value::Number(index as f64),
+            Self::Object(object) => Value::Object(object),
+            Self::WeakObject(key) => Value::Object(key.upgrade(mc)?),
+        })
+    }
 }
 
 /// Computes a map hash without repeating work that is already cached by the
@@ -40,6 +53,7 @@ impl<'gc> DynamicMapKey for DynamicKey<'gc> {
             DynamicKey::String(name) => name.fnv_hash(),
             DynamicKey::Uint(value) => hasher.hash_one(value),
             DynamicKey::Object(object) => hasher.hash_one(object),
+            DynamicKey::WeakObject(key) => hasher.hash_one(key),
         }
     }
 }
@@ -67,6 +81,13 @@ pub struct DynamicMap<K, V> {
     // The actual bucket index that represents where an item is in the table
     #[collect(require_static)]
     real_index: Cell<usize>,
+}
+
+impl<V> DynamicMap<DynamicKey<'_>, V> {
+    pub fn prune_dropped_weak_keys(&mut self) {
+        self.table
+            .retain(|(key, _)| !matches!(key, DynamicKey::WeakObject(w) if w.is_dropped()));
+    }
 }
 
 impl<K: DynamicMapKey, V> Default for DynamicMap<K, V> {

@@ -234,6 +234,16 @@ impl TestRunner {
         }
         self.preloaded = true;
 
+        if self.options.gc_at.contains(&(self.current_iteration + 1)) {
+            self.player
+                .lock()
+                .unwrap()
+                .mutate_with_update_context(|context| {
+                    let metrics = context.gc().metrics();
+                    metrics.adjust_debt(metrics.total_gc_count() as f64 * 4.0 + 1024.0);
+                });
+        }
+
         if self.options.num_ticks.is_some() {
             self.player.lock().unwrap().tick(self.frame_time)?;
         } else {

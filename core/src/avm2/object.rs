@@ -550,11 +550,13 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     fn get_enumerant_name(
         self,
         index: u32,
-        _activation: &mut Activation<'_, 'gc>,
+        activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
         let base = self.base();
 
-        Ok(base.get_enumerant_name(index).unwrap_or(Value::Null))
+        Ok(base
+            .get_enumerant_name(index, activation.gc())
+            .unwrap_or(Value::Null))
     }
 
     /// Retrieve a given enumerable value by index.
@@ -959,6 +961,12 @@ macro_rules! define_weak_enum {
                 }
             }
 
+            $vis fn is_dropped(self) -> bool {
+                match self {
+                    $( Self::$variant(o) => o.0.is_dropped(), )*
+                }
+            }
+
             $vis fn upgrade(self, mc: &Mutation<'gc>) -> Option<$strong_enum<'gc>> {
                 match self {
                     $( Self::$variant(o) => $strong_enum::$variant($variant(o.0.upgrade(mc)?)).into(), )*
@@ -973,6 +981,20 @@ macro_rules! define_weak_enum {
                 }
             }
         }
+    }
+}
+
+impl PartialEq for WeakObject<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ptr() == other.as_ptr()
+    }
+}
+
+impl Eq for WeakObject<'_> {}
+
+impl Hash for WeakObject<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_ptr().hash(state);
     }
 }
 

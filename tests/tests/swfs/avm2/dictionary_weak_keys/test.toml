@@ -1,2 +1,3 @@
 num_frames = 25
-known_failure = true
+# The movie releases three keys on frame 2. Allow GC before it counts again.
+gc_at = [4, 5]

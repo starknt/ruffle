@@ -1,0 +1,6 @@
+AMF3 weak flags 1 0
+deleted false undefined
+values retained for dead keys 0
+live entries live,self,string
+external key true live
+strong entry strong

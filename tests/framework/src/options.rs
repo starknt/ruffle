@@ -102,6 +102,8 @@ pub struct TestOptions {
 
     pub num_frames: Option<u32>,
     pub num_ticks: Option<u32>,
+    /// Wake the incremental collector before these one-based test iterations.
+    pub gc_at: Vec<u32>,
     pub tick_rate: Option<f64>,
     pub output_path: String,
     pub sleep_to_meet_frame_rate: bool,
@@ -128,6 +130,7 @@ impl Default for TestOptions {
             subtest_name: None,
             num_frames: None,
             num_ticks: None,
+            gc_at: Vec::new(),
             tick_rate: None,
             output_path: "output.txt".to_string(),
             sleep_to_meet_frame_rate: false,

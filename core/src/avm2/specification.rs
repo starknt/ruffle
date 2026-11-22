@@ -1,4 +1,3 @@
-use crate::avm2::dynamic_map::DynamicKey;
 use crate::avm2::function::BoundMethod;
 use crate::avm2::method::{Method, ParamConfig};
 use crate::avm2::object::TObject as _;
@@ -294,13 +293,10 @@ impl Definition {
         let prototype_base = prototype.base();
         let prototype_values = prototype_base.values();
         for (key, value) in prototype_values.iter() {
-            let name = match key {
-                DynamicKey::String(name) => *name,
-                DynamicKey::Uint(key) => AvmString::new_utf8(activation.gc(), key.to_string()),
-                DynamicKey::Object(object) => {
-                    Value::Object(*object).coerce_to_string(activation).unwrap()
-                }
+            let Some(key) = key.as_value(activation.gc()) else {
+                continue;
             };
+            let name = key.coerce_to_string(activation).unwrap();
             if &name != b"constructor" {
                 Self::add_prototype_value(name, value.value, &mut definition.prototype, activation);
             }

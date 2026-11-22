@@ -26,6 +26,9 @@ num_ticks = 1
 # By default this uses the SWF frame rate.
 tick_rate = 16.666
 
+# Request a collection at these one-based iterations for weak-reference tests.
+gc_at = [4, 5]
+
 # If true, sleep in between ticks to run at realtime speed.
 # Necessary for some timer tests.
 sleep_to_meet_frame_rate = false
