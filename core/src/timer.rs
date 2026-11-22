@@ -38,13 +38,32 @@ pub struct Timers<'gc> {
 }
 
 impl<'gc> Timers<'gc> {
+    /// Both script clocks share the host's absolute time during fixed sampling.
+    /// Set it before running any actions that can create or reschedule a timer.
+    pub(crate) fn set_sample_time(&mut self, elapsed: std::time::Duration) {
+        self.cur_time = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.other_time = self.cur_time;
+    }
+
+    pub(crate) fn next_sample_deadline(&self) -> Option<std::time::Duration> {
+        self.timers
+            .peek()
+            .into_iter()
+            .chain(self.other_timers.peek())
+            .map(|timer| std::time::Duration::from_micros(timer.tick_time))
+            .min()
+    }
+
     /// Ticks all timers and runs necessary callbacks.
     pub fn update_timers(context: &mut UpdateContext<'gc>, dt: FloatDuration) -> Option<f64> {
         context.timers.apply_clock_changes();
-        context.timers.cur_time = context
-            .timers
-            .cur_time
-            .wrapping_add((dt.as_millis() * Self::TIMER_SCALE) as u64);
+        let sampled = context.playback.sample_time.is_some();
+        if !sampled {
+            context.timers.cur_time = context
+                .timers
+                .cur_time
+                .wrapping_add((dt.as_millis() * Self::TIMER_SCALE) as u64);
+        }
 
         if context.timers.is_empty() {
             return None;
@@ -56,18 +75,15 @@ impl<'gc> Timers<'gc> {
 
         // We have to be careful because the timer list can be mutated while updating;
         // a timer callback could add more timers, clear timers (including itself), etc.
-        while context
-            .timers
-            .peek()
-            .map(|timer| timer.tick_time)
-            .unwrap_or(context.timers.cur_time)
-            < context.timers.cur_time
-        {
-            let timer = context.timers.peek().unwrap();
+        while let Some(timer) = context.timers.peek() {
+            let now = context.timers.cur_time;
+            if timer.tick_time > now || (!sampled && timer.tick_time == now) {
+                break;
+            }
 
             tick_count += 1;
             // SANITY: Only allow so many ticks per update.
-            if tick_count > Self::MAX_TICKS {
+            if !sampled && tick_count > Self::MAX_TICKS {
                 // Reset our time to a little bit before the nearest timer.
                 context.timers.cur_time = timer.tick_time.wrapping_sub(100);
                 break;

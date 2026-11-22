@@ -49,7 +49,8 @@ impl AvmRng {
         // In avmplus, RNG is initialized on first use.
         if self.u_value == 0 {
             let seed = get_seed(locale);
-            self.init_with_seed(seed);
+            // Zero is both the uninitialized marker and a fixed point of the LFSR.
+            self.init_with_seed(seed.max(1));
         }
 
         let mut a_num = self.random_fast_next();

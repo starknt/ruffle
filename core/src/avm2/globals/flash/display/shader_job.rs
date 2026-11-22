@@ -118,104 +118,81 @@ pub fn process_post_frame(context: &mut crate::context::UpdateContext<'_>) {
         context.shader_job_queue.pending.clear();
         return;
     }
-    let mut jobs = std::mem::take(context.active_shader_jobs);
-    let jobs_this_frame = jobs.len();
-    for _ in 0..jobs_this_frame {
-        if context.renderer.health().check().is_err() {
+    for mut job in std::mem::take(context.active_shader_jobs) {
+        let health = context.renderer.health().clone();
+        if health.check().is_err() {
             context.pending_shader_jobs.clear();
             context.active_shader_jobs.clear();
             return;
         }
-        let Some(mut job) = jobs.pop_front() else {
-            break;
+        let started = Instant::now();
+        let phase = if job.pending.is_some() {
+            "readback"
+        } else {
+            "submit"
         };
-        if let Some(mut pending) = job.pending.take() {
-            let polled_at = Instant::now();
-            let health = context.renderer.health().clone();
-            match shader_operation(&health, || {
-                context.renderer.poll_pixelbender_shader(&mut pending)
-            }) {
-                Ok(Some(output)) => {
-                    if context.renderer.health().check().is_err() {
-                        context.pending_shader_jobs.clear();
-                        context.active_shader_jobs.clear();
-                        return;
-                    }
-                    job.phase = AsyncShaderJobPhase::Ready;
-                    ruffle_render::profile::async_event(
-                        "shaderJobCompleted",
-                        job.id,
-                        context.active_shader_jobs.len(),
-                        polled_at.elapsed().as_nanos() as u64,
-                        pixel_bender_output_bytes(&job.pixel_bender_target),
-                        None,
-                    );
-                    if let Err(error) = finish_shader_job(context, job.job, job.target, output) {
-                        tracing::error!(
-                            job_id = job.id,
-                            ?error,
-                            "Asynchronous ShaderJob result failed"
-                        );
-                    }
-                }
-                Ok(None) => {
-                    job.phase = AsyncShaderJobPhase::WaitingReadback;
-                    job.pending = Some(pending);
-                    context.active_shader_jobs.push_back(job);
-                }
-                Err(error) => {
+        let result = shader_operation(&health, || {
+            if let Some(pending) = &mut job.pending {
+                context.renderer.poll_pixelbender_shader(pending)
+            } else if context.playback.sample_time.is_some() {
+                // begin_frame admitted this job from a previous logical frame.
+                // The host clock stays here until its observable result is ready.
+                context
+                    .renderer
+                    .run_pixelbender_shader(
+                        job.shader_handle.clone(),
+                        &job.arguments,
+                        &job.pixel_bender_target,
+                    )
+                    .map(Some)
+            } else {
+                job.pending = Some(context.renderer.submit_pixelbender_shader(
+                    job.shader_handle.clone(),
+                    &job.arguments,
+                    &job.pixel_bender_target,
+                )?);
+                Ok(None)
+            }
+        });
+        match result {
+            Ok(Some(output)) => {
+                job.phase = AsyncShaderJobPhase::Ready;
+                ruffle_render::profile::async_event(
+                    "shaderJobCompleted",
+                    job.id,
+                    context.active_shader_jobs.len(),
+                    started.elapsed().as_nanos() as u64,
+                    pixel_bender_output_bytes(&job.pixel_bender_target),
+                    None,
+                );
+                if let Err(error) = finish_shader_job(context, job.job, job.target, output) {
                     tracing::error!(
                         job_id = job.id,
                         ?error,
-                        "Asynchronous ShaderJob readback failed"
+                        "Asynchronous ShaderJob result failed"
                     );
-                    ruffle_render::profile::async_event(
-                        "shaderJobCanceled",
-                        job.id,
-                        context.active_shader_jobs.len(),
-                        0,
-                        pixel_bender_output_bytes(&job.pixel_bender_target),
-                        Some("readback"),
-                    );
-                    job.phase = AsyncShaderJobPhase::Canceled;
-                    context.pending_shader_jobs.clear();
-                    context.active_shader_jobs.clear();
-                    context.shader_job_queue.pending.clear();
-                    return;
                 }
             }
-            continue;
-        }
-
-        let submitted_at = Instant::now();
-        let health = context.renderer.health().clone();
-        match shader_operation(&health, || {
-            context.renderer.submit_pixelbender_shader(
-                job.shader_handle.clone(),
-                &job.arguments,
-                &job.pixel_bender_target,
-            )
-        }) {
-            Ok(pending) => {
+            Ok(None) => {
                 job.phase = AsyncShaderJobPhase::WaitingReadback;
-                job.pending = Some(pending);
                 context.active_shader_jobs.push_back(job);
             }
             Err(error) => {
+                job.phase = AsyncShaderJobPhase::Canceled;
                 tracing::error!(
                     job_id = job.id,
+                    phase,
                     ?error,
-                    "Asynchronous ShaderJob submission failed"
+                    "Asynchronous ShaderJob failed"
                 );
                 ruffle_render::profile::async_event(
                     "shaderJobCanceled",
                     job.id,
                     context.active_shader_jobs.len(),
-                    submitted_at.elapsed().as_nanos() as u64,
+                    started.elapsed().as_nanos() as u64,
                     pixel_bender_output_bytes(&job.pixel_bender_target),
-                    Some("submit"),
+                    Some(phase),
                 );
-                job.phase = AsyncShaderJobPhase::Canceled;
                 context.pending_shader_jobs.clear();
                 context.active_shader_jobs.clear();
                 context.shader_job_queue.pending.clear();

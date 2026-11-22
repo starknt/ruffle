@@ -1454,13 +1454,21 @@ pub fn load_root_movie<'gc>(
             .map(|u| u.to_string())
             .unwrap_or(swf_url);
 
-        let (parsed_body, movie) = if use_inline_movie_parse(&spoofed_or_swf_url) {
+        let parsed = if use_inline_movie_parse(&spoofed_or_swf_url) {
             prepare_swf_movie_inline(body, spoofed_or_swf_url, None, None)
         } else {
             prepare_swf_movie(body, spoofed_or_swf_url, None, None).await
-        }
-        .map_err(|error| Error::FetchError(format!("Could not parse root SWF: {error}")))?;
-        let mut movie = require_swf_movie(movie, &parsed_body)?;
+        };
+        let mut movie = parsed
+            .map_err(|error| Error::FetchError(format!("Could not parse root SWF: {error}")))
+            .and_then(|(body, movie)| require_swf_movie(movie, &body))
+            .inspect_err(|error| {
+                player
+                    .lock()
+                    .unwrap()
+                    .ui()
+                    .display_root_movie_download_failed_message(true, error.to_string());
+            })?;
         on_metadata(movie.header());
         movie.append_parameters(parameters);
         player.lock().unwrap().mutate_with_update_context(|uc| {

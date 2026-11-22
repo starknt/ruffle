@@ -36,7 +36,9 @@ use crate::display_object::{
 };
 use crate::events::GamepadButton;
 use crate::events::PlayerNotification;
-use crate::events::{ButtonKeyCode, ClipEvent, ClipEventResult, KeyCode, MouseButton, PlayerEvent};
+use crate::events::{
+    ButtonKeyCode, ClipEvent, ClipEventResult, ImeCursorArea, KeyCode, MouseButton, PlayerEvent,
+};
 use crate::external::{ExternalInterface, ExternalInterfaceProvider, NullFsCommandProvider};
 use crate::external::{FsCommandProvider, Value as ExternalValue};
 use crate::focus_tracker::NavigationDirection;
@@ -597,6 +599,28 @@ impl Player {
     /// while executing an action. Timeline advancement still uses `tick`.
     pub fn set_sample_time(&mut self, elapsed: Duration) {
         self.playback.sample_time = Some(elapsed);
+        self.enter_arena_mut(|_, root, _| root.timers.set_sample_time(elapsed));
+    }
+
+    /// Shorten a host sample interval to the next authored frame or live timer.
+    /// Returns the supplied interval for players using the realtime clock.
+    pub fn next_sample_step(&self, remaining: Duration) -> Duration {
+        let Some(now) = self.playback.sample_time else {
+            return remaining;
+        };
+        if !self.is_playing() {
+            return remaining;
+        }
+        let mut step = remaining;
+        let frame = self.frame_duration();
+        if frame > FloatDuration::ZERO {
+            step = step.min((frame - self.frame_accumulator).to_std());
+        }
+        if let Some(deadline) = self.enter_arena(|_, root, _| root.timers.next_sample_deadline()) {
+            step = step.min(deadline.saturating_sub(now));
+        }
+        // A deadline can already be due, or round to zero at nanosecond precision.
+        step.max(Duration::from_nanos(1)).min(remaining)
     }
 
     pub fn set_playback_rate(&mut self, rate: crate::playback::PlaybackRate) {
@@ -736,10 +760,26 @@ impl Player {
         self.frame_accumulator += dt;
         let frame_duration = self.frame_duration();
 
-        let max_frames_per_tick = self.max_frames_per_tick();
+        let sampled = self.playback.sample_time.is_some();
+        // The host clock rounds each deadline to the nearest nanosecond. Keep
+        // the fractional debt when subtracting the actual authored duration.
+        let tolerance = if sampled {
+            FloatDuration::from_millis(0.5e-6)
+        } else {
+            FloatDuration::ZERO
+        };
+        let max_frames_per_tick = if sampled {
+            if frame_duration > FloatDuration::ZERO {
+                u32::MAX
+            } else {
+                0
+            }
+        } else {
+            self.max_frames_per_tick()
+        };
         let mut frame = 0;
 
-        while frame < max_frames_per_tick && self.frame_accumulator >= frame_duration {
+        while frame < max_frames_per_tick && self.frame_accumulator + tolerance >= frame_duration {
             let timer = Instant::now();
             self.run_frame();
             self.playback.wall_frame_due = false;
@@ -785,7 +825,7 @@ impl Player {
         }
 
         // Adjust playback speed for next frame to stay in sync with timeline audio tracks ("stream" sounds).
-        if let Some(wall_dt) = wall_dt {
+        if wall_dt.is_some() && !sampled {
             let cur_frame_offset = self.frame_accumulator.as_millis();
             let audio_skew = {
                 let _audio_skew =
@@ -797,7 +837,9 @@ impl Player {
                 })
             };
             self.frame_accumulator += FloatDuration::from_secs(audio_skew);
+        }
 
+        if let Some(wall_dt) = wall_dt {
             {
                 let _socket = ruffle_render::profile::time(ruffle_render::profile::Phase::Socket);
                 self.update_sockets();
@@ -1215,6 +1257,24 @@ impl Player {
 
     pub fn viewport_dimensions(&mut self) -> ViewportDimensions {
         self.mutate_with_update_context(|context| context.renderer.viewport_dimensions())
+    }
+
+    /// Project the stage-space rectangle from an IME notification into physical
+    /// viewport pixels using the movie's current scale mode and alignment.
+    pub fn ime_area_in_viewport(&self, area: &ImeCursorArea) -> ImeCursorArea {
+        let bounds = Rectangle {
+            x_min: Twips::from_pixels(area.x),
+            y_min: Twips::from_pixels(area.y),
+            x_max: Twips::from_pixels(area.x + area.width),
+            y_max: Twips::from_pixels(area.y + area.height),
+        };
+        let bounds = self.enter_arena(|_, root, _| root.stage.view_matrix() * bounds);
+        ImeCursorArea {
+            x: bounds.x_min.to_pixels(),
+            y: bounds.y_min.to_pixels(),
+            width: bounds.width().to_pixels(),
+            height: bounds.height().to_pixels(),
+        }
     }
 
     pub fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions) {
@@ -2369,6 +2429,11 @@ impl Player {
             }
         });
 
+        if self.playback.sample_time.is_some() {
+            // Script-visible redraws follow the movie even when the host exports
+            // fewer (or more) images than there are authored frames.
+            self.broadcast_render_if_invalidated();
+        }
         self.needs_render = true;
     }
 
@@ -2382,7 +2447,7 @@ impl Player {
         self.check_render_health()
     }
 
-    fn render_inner(&mut self) -> Result<(), ruffle_render::error::RenderFailure> {
+    fn broadcast_render_if_invalidated(&mut self) {
         let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
 
         if invalidated {
@@ -2390,6 +2455,12 @@ impl Player {
                 let stage = context.stage;
                 stage.broadcast_render(context);
             });
+        }
+    }
+
+    fn render_inner(&mut self) -> Result<(), ruffle_render::error::RenderFailure> {
+        if self.playback.sample_time.is_none() {
+            self.broadcast_render_if_invalidated();
         }
 
         self.render_epoch = self.render_epoch.wrapping_add(1);
