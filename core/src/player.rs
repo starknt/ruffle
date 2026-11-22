@@ -1832,18 +1832,17 @@ impl Player {
 
             let mut new_over_object_updated = false;
             if let Some(hovered) = context.mouse_data.hovered {
+                let display = hovered.as_displayobject();
                 // Cancel hover if an object is removed from the stage.
-                if !hovered.as_displayobject().movie().is_action_script_3()
-                    && hovered.as_displayobject().avm1_removed()
-                {
+                if !display.movie().is_action_script_3() && display.avm1_removed() {
                     context.mouse_data.hovered = None;
                     if let Some(new_object) = new_over_object
                         && Self::check_display_object_equality(
                             new_object.as_displayobject(),
-                            hovered.as_displayobject(),
+                            display,
                         )
                     {
-                        if let Some(state) = hovered.as_displayobject().state() {
+                        if let Some(state) = display.state() {
                             new_object.as_displayobject().set_state(context, state);
                         }
                         context.mouse_data.hovered = Some(new_object);
@@ -1851,9 +1850,16 @@ impl Player {
                     }
                 }
 
-                // Ensure that hover is canceled when an object disappears,
-                // even if the mouse was idle.
-                if !hovered.as_displayobject().visible() {
+                // Removing an AVM2 panel leaves its children visible inside the
+                // detached tree. Repick after button release so an idle pointer
+                // doesn't keep that tree alive. A tab hover still on stage wins.
+                if !display.visible()
+                    || (skip_mouse_hover
+                        && !InteractiveObject::option_ptr_eq(Some(hovered), new_over_object)
+                        && display.movie().is_action_script_3()
+                        && display.avm2_stage(context).is_none()
+                        && context.input.get_mouse_down_buttons().is_empty())
+                {
                     skip_mouse_hover = false;
                 }
             }

@@ -1,0 +1,10 @@
+mouseOver first
+on stage 1
+idle after removal 0
+after motion 0
+mouseOver second
+mouseDown second
+button still pressed 1
+mouseOut second
+releaseOutside second
+after release 0
