@@ -349,12 +349,8 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
     fn render_shared(&mut self, commands: Rc<CommandList>) {
-        // Prepared materials retain the view that was resident during recording.
-        // A display-derived bitmap can change at GPU completion or eviction.
-        if self.display.is_some() {
-            commands.execute_ref(self);
-            return;
-        }
+        // Only certified immutable vector blocks can store prepared materials.
+        // Bitmap draws and textured meshes still resolve their views on replay.
         let key = DrawKey {
             device: self.descriptors.runtime.generation(),
             origin: self.origin,
