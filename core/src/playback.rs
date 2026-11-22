@@ -40,6 +40,7 @@ struct ModuleCheck {
 #[derive(Default)]
 pub struct PlaybackClock {
     modules: Option<ModuleCheck>,
+    pub(crate) sample_time: Option<std::time::Duration>,
     pub(crate) rate: PlaybackRate,
     pub(crate) elapsed: Option<f64>,
     pub(crate) credit: f64,
@@ -104,6 +105,9 @@ impl PlaybackClock {
         self.executing_since = Some(Instant::now());
     }
     pub(crate) fn read(&self, start: Instant) -> f64 {
+        if let Some(time) = self.sample_time {
+            return time.as_secs_f64() * 1000.0;
+        }
         let Some(elapsed) = self.elapsed else {
             return start.elapsed().as_secs_f64() * 1000.0;
         };
@@ -118,5 +122,23 @@ impl PlaybackClock {
         let now = now.max(self.last_read.get());
         self.last_read.set(now);
         now
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn host_sample_time_is_independent_of_wall_and_action_time() {
+        let mut clock = PlaybackClock::default();
+        let start = Instant::now() - Duration::from_secs(8);
+        assert!(clock.read(start) >= 8_000.0);
+        clock.sample_time = Some(Duration::ZERO);
+        clock.begin_action();
+        assert_eq!(clock.read(start), 0.0);
+        clock.sample_time = Some(Duration::from_micros(16_500));
+        assert_eq!(clock.read(start), 16.5);
     }
 }

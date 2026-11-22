@@ -592,6 +592,13 @@ impl Player {
         self.playback.read(self.start_time)
     }
 
+    /// Selects a host-driven simulation clock for this player. Scripts observe
+    /// this elapsed time until the frontend sets the next sample, including
+    /// while executing an action. Timeline advancement still uses `tick`.
+    pub fn set_sample_time(&mut self, elapsed: Duration) {
+        self.playback.sample_time = Some(elapsed);
+    }
+
     pub fn set_playback_rate(&mut self, rate: crate::playback::PlaybackRate) {
         if rate != crate::playback::PlaybackRate::Normal
             && (self.unverified_module().is_some() || self.has_mixed_protocol_timer())
