@@ -529,6 +529,54 @@ fn retryable_creation_reclaims_before_exactly_one_retry() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn configure_retries_with_the_queue_unlocked_during_reclamation() {
+    use crate::resource_scheduler::{Reclaim, ReclaimClass};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Probe(Arc<Mutex<()>>, AtomicBool);
+    impl Reclaim for Probe {
+        fn oldest(&self) -> Option<u64> {
+            self.1.store(self.0.try_lock().is_ok(), Ordering::Relaxed);
+            None
+        }
+        fn evict_oldest(&self) -> bool {
+            unreachable!()
+        }
+    }
+
+    let device = device(4096);
+    let gate = Arc::new(Mutex::new(()));
+    let probe = Arc::new(Probe(gate.clone(), AtomicBool::new(false)));
+    device
+        .runtime()
+        .scheduler()
+        .register(ReclaimClass::Idle, probe.clone());
+    let mut attempts = 0;
+    device
+        .configure_with(Some(&gate), |_| {
+            assert!(
+                gate.try_lock().is_err(),
+                "raw configuration must exclude submissions"
+            );
+            attempts += 1;
+            if attempts == 1 {
+                return Err(RenderFailure::new(
+                    RenderFailureKind::OutOfMemory,
+                    "injected surface failure",
+                ));
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(attempts, 2);
+    assert!(
+        probe.1.load(Ordering::Relaxed),
+        "reclamation must permit queue progress"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn native_submissions_never_exceed_two_in_flight() {
     let device = device(4096);
     for _ in 0..16 {

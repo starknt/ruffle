@@ -509,10 +509,37 @@ impl Device {
         surface: &wgpu::Surface<'_>,
         config: &wgpu::SurfaceConfiguration,
     ) -> Result<(), RenderFailure> {
+        self.configure_surface_with_lock(surface, config, None)
+    }
+
+    /// Serializes raw configuration attempts with an embedding frontend's
+    /// queue submissions. Error-scope polling and retries run outside the lock.
+    pub fn configure_surface_with_lock(
+        &self,
+        surface: &wgpu::Surface<'_>,
+        config: &wgpu::SurfaceConfiguration,
+        submission_lock: Option<&Mutex<()>>,
+    ) -> Result<(), RenderFailure> {
+        self.configure_with(submission_lock, |device| {
+            surface.configure(device, config);
+            Ok(())
+        })
+    }
+
+    fn configure_with(
+        &self,
+        submission_lock: Option<&Mutex<()>>,
+        mut configure: impl FnMut(&wgpu::Device) -> Result<(), RenderFailure>,
+    ) -> Result<(), RenderFailure> {
         self.recover(|| {
             self.scoped(|device| {
-                surface.configure(device, config);
-                Ok(())
+                // Exclude concurrent submits only while wgpu needs the queue
+                // idle. Error-scope polling and OOM recovery may run callbacks.
+                let _guard = submission_lock.map(|lock| {
+                    lock.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                });
+                configure(device)
             })
         })
     }
