@@ -19,6 +19,9 @@ pub enum Error {
 
     #[error("FreeType error: {0}")]
     FreetypeError(#[from] freetype::Error),
+
+    #[error("Unsupported FreeType glyph pixel mode: {0:?}")]
+    UnsupportedPixelMode(PixelMode),
 }
 
 pub struct FreetypeFontRenderer {
@@ -78,8 +81,12 @@ impl FreetypeFontRenderer {
             .get_char_index(character as usize)
             .ok_or(Error::MissingGlyph(character))?;
 
-        self.face
-            .load_glyph(index, LoadFlag::NO_BITMAP | LoadFlag::RENDER)?;
+        // These atlas glyphs are scaled again at display time. Auto-hinting
+        // to the atlas pixel grid can shift an unhinted outline by a row.
+        self.face.load_glyph(
+            index,
+            LoadFlag::NO_BITMAP | LoadFlag::NO_AUTOHINT | LoadFlag::RENDER,
+        )?;
         let glyph = self.face.glyph();
         let bitmap = glyph.bitmap();
         let advance = convert_26_6_to_twips(glyph.advance().x);
@@ -183,23 +190,112 @@ fn convert_26_6_to_twips(value_26_6: impl Into<i64>) -> Twips {
 }
 
 fn convert_bitmap(bitmap: &freetype::Bitmap) -> Result<Vec<u8>, Error> {
-    let pixel_mode = bitmap.pixel_mode()?;
+    let mode = bitmap.pixel_mode()?;
+    let bits = match mode {
+        PixelMode::Mono => 1,
+        PixelMode::Gray2 => 2,
+        PixelMode::Gray4 => 4,
+        PixelMode::Gray => 8,
+        _ => return Err(Error::UnsupportedPixelMode(mode)),
+    };
+    let mask = (1u16 << bits) - 1;
+    let max_coverage = match (mode, bitmap.raw().num_grays) {
+        (PixelMode::Gray, levels @ 2..=256) => (levels - 1) as u16,
+        _ => mask,
+    };
+    let width = bitmap.width() as usize;
+    let height = bitmap.rows() as usize;
+    let stride = bitmap.pitch().unsigned_abs() as usize;
     let buffer = bitmap.buffer();
-
-    match pixel_mode {
-        PixelMode::Gray => {
-            let mut result = Vec::with_capacity(buffer.len() * 4);
-
-            // TODO Add support for num_grays.
-            for &pixel in buffer {
-                result.push(pixel);
-                result.push(pixel);
-                result.push(pixel);
-                result.push(pixel);
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        let row_index = if bitmap.pitch() < 0 {
+            height - 1 - y
+        } else {
+            y
+        };
+        let row = &buffer[row_index * stride..(row_index + 1) * stride];
+        if bits == 8 && max_coverage == 255 {
+            for &alpha in &row[..width] {
+                rgba.extend_from_slice(&[alpha; 4]);
             }
-
-            Ok(result)
+        } else {
+            for x in 0..width {
+                let bit = x * bits;
+                let sample = (u16::from(row[bit / 8]) >> (8 - bits - bit % 8)) & mask;
+                let alpha = (sample * 255 / max_coverage).min(255) as u8;
+                rgba.extend_from_slice(&[alpha; 4]);
+            }
         }
-        m => panic!("FreeType pixel mode unsupported: {m:?}"),
+    }
+    Ok(rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glyph_rows_respect_coverage_depth_pitch_and_flow() {
+        use freetype::ffi::{
+            FT_PIXEL_MODE_GRAY, FT_PIXEL_MODE_GRAY2, FT_PIXEL_MODE_GRAY4, FT_PIXEL_MODE_MONO,
+        };
+
+        fn check(mode: u32, pitch: i32, levels: i16, bytes: &mut [u8], expected: &[u8]) {
+            let raw = freetype::ffi::FT_Bitmap {
+                rows: 2,
+                width: 3,
+                pitch,
+                buffer: bytes.as_mut_ptr(),
+                num_grays: levels,
+                pixel_mode: mode as _,
+                palette_mode: 0,
+                palette: std::ptr::null_mut(),
+            };
+            assert_eq!(bytes.len(), 2 * pitch.unsigned_abs() as usize);
+            // Both the descriptor and its backing rows live through conversion.
+            let bitmap = unsafe { freetype::Bitmap::from_raw(&raw) };
+            let rgba = convert_bitmap(&bitmap).unwrap();
+            assert_eq!(
+                rgba,
+                expected.iter().flat_map(|&a| [a; 4]).collect::<Vec<_>>()
+            );
+        }
+
+        check(
+            FT_PIXEL_MODE_GRAY,
+            4,
+            256,
+            &mut [1, 2, 3, 0, 4, 5, 6, 0],
+            &[1, 2, 3, 4, 5, 6],
+        );
+        check(
+            FT_PIXEL_MODE_GRAY,
+            3,
+            4,
+            &mut [0, 1, 2, 3, 2, 1],
+            &[0, 85, 170, 255, 170, 85],
+        );
+        check(
+            FT_PIXEL_MODE_MONO,
+            -2,
+            2,
+            &mut [0x40, 0, 0xa0, 0],
+            &[255, 0, 255, 0, 255, 0],
+        );
+        check(
+            FT_PIXEL_MODE_GRAY2,
+            1,
+            4,
+            &mut [0x18, 0xe4],
+            &[0, 85, 170, 255, 170, 85],
+        );
+        check(
+            FT_PIXEL_MODE_GRAY4,
+            2,
+            16,
+            &mut [0x05, 0xa0, 0xfa, 0x50],
+            &[0, 85, 170, 255, 170, 85],
+        );
     }
 }
