@@ -143,6 +143,9 @@ impl CommandEncoder {
         self.raw
             .map_buffer_on_submit(buffer, wgpu::MapMode::Read, ..size, callback);
     }
+    pub fn on_submitted_work_done(&self, callback: impl FnOnce() + Send + 'static) {
+        self.raw.on_submitted_work_done(callback);
+    }
     pub fn resolve_query_set(
         &mut self,
         queries: &wgpu::QuerySet,

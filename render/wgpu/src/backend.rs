@@ -2019,39 +2019,37 @@ impl ActiveFrame {
     pub(crate) fn encoder(&mut self) -> &mut crate::gpu_resources::CommandEncoder {
         self.command_encoder.record()
     }
+    fn take_encoder(
+        &mut self,
+        descriptors: &Descriptors,
+    ) -> Result<crate::gpu_resources::CommandEncoder, crate::gpu_runtime::RenderFailure> {
+        descriptors.runtime.check_health()?;
+        let next = descriptors
+            .device
+            .create_command_encoder(&Default::default())?;
+        self.staging_belt.finish();
+        self.command_encoder.dirty = false;
+        self.budget.retire_with(&self.command_encoder.raw);
+        descriptors.runtime.check_health()?;
+        Ok(std::mem::replace(&mut self.command_encoder.raw, next))
+    }
+
     pub fn submit_for_target<T: RenderTarget>(
         &mut self,
         descriptors: &Descriptors,
         target: &T,
         frame: T::Frame,
     ) -> Result<SubmissionIndex, crate::gpu_runtime::RenderFailure> {
-        descriptors.runtime.check_health()?;
-        self.staging_belt.finish();
-        let draw_encoder = std::mem::replace(
-            &mut self.command_encoder.raw,
-            descriptors
-                .device
-                .create_command_encoder(&Default::default())?,
-        );
-        let index = {
-            let _submit = ruffle_render::profile::time(ruffle_render::profile::Phase::RenderSubmit);
-            let command_buffer = {
-                let _timer = ruffle_render::profile::native_time(
-                    ruffle_render::profile::NativePhase::EncoderFinish,
-                );
-                draw_encoder.finish()?
-            };
-            target.submit(
-                &descriptors.device,
-                &descriptors.queue,
-                descriptors.runtime.health(),
-                Some(command_buffer),
-                frame,
-            )?
-        };
+        let encoder = self.take_encoder(descriptors)?;
+        let _submit = ruffle_render::profile::time(ruffle_render::profile::Phase::RenderSubmit);
+        let index = target.submit_encoder(
+            &descriptors.device,
+            &descriptors.queue,
+            descriptors.runtime.health(),
+            encoder,
+            frame,
+        )?;
         self.staging_belt.recall();
-        self.command_encoder.dirty = false;
-        self.budget.submitted(&descriptors.queue);
         descriptors.runtime.check_health()?;
         Ok(index)
     }
@@ -2060,14 +2058,7 @@ impl ActiveFrame {
         &mut self,
         descriptors: &Descriptors,
     ) -> Result<SubmissionIndex, crate::gpu_runtime::RenderFailure> {
-        descriptors.runtime.check_health()?;
-        self.staging_belt.finish();
-        let draw_encoder = std::mem::replace(
-            &mut self.command_encoder.raw,
-            descriptors
-                .device
-                .create_command_encoder(&Default::default())?,
-        );
+        let draw_encoder = self.take_encoder(descriptors)?;
         let index = {
             let _submit = ruffle_render::profile::time(ruffle_render::profile::Phase::RenderSubmit);
             let command_buffer = {
@@ -2082,8 +2073,6 @@ impl ActiveFrame {
             descriptors.queue.submit(Some(command_buffer))?
         };
         self.staging_belt.recall();
-        self.command_encoder.dirty = false;
-        self.budget.submitted(&descriptors.queue);
         descriptors.runtime.check_health()?;
         Ok(index)
     }

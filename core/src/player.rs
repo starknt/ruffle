@@ -68,7 +68,9 @@ use gc_arena::lock::GcRefLock;
 use gc_arena::{Collect, DynamicRootSet, Mutation, Rootable};
 use ruffle_common::duration::FloatDuration;
 use ruffle_macros::istr;
-use ruffle_render::backend::{RenderBackend, ViewportDimensions, null::NullRenderer};
+use ruffle_render::backend::{
+    BitmapCacheEntry, RenderBackend, ViewportDimensions, null::NullRenderer,
+};
 use ruffle_render::commands::CommandList;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::TransformStack;
@@ -2478,8 +2480,27 @@ impl Player {
     pub fn render_stage(
         &mut self,
     ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
+        self.extract_stage(|renderer, clear, commands, caches| {
+            renderer.submit_prepared_frame(clear, commands, caches)
+        })
+        .map(|submission| {
+            submission.map_or(ruffle_render::backend::FrameOutcome::Deferred, Into::into)
+        })
+    }
+
+    /// Extract one reserved picture on the VM owner. The consumer can capture an
+    /// owned packet or submit immediately. A missing output leaves the stage dirty.
+    pub fn extract_stage<R>(
+        &mut self,
+        consume: impl FnOnce(
+            &mut dyn RenderBackend,
+            Color,
+            CommandList,
+            Vec<BitmapCacheEntry>,
+        ) -> Result<R, ruffle_render::error::RenderFailure>,
+    ) -> Result<Option<R>, ruffle_render::error::RenderFailure> {
         self.check_render_health()?;
-        let result = self.render_inner();
+        let result = self.extract_stage_inner(consume);
         if let Err(error) = &result {
             self.renderer.health().fail(error.clone());
         }
@@ -2499,12 +2520,18 @@ impl Player {
         }
     }
 
-    fn render_inner(
+    fn extract_stage_inner<R>(
         &mut self,
-    ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
+        consume: impl FnOnce(
+            &mut dyn RenderBackend,
+            Color,
+            CommandList,
+            Vec<BitmapCacheEntry>,
+        ) -> Result<R, ruffle_render::error::RenderFailure>,
+    ) -> Result<Option<R>, ruffle_render::error::RenderFailure> {
         if !self.renderer.prepare_frame()? {
             self.needs_render = true;
-            return Ok(ruffle_render::backend::FrameOutcome::Deferred);
+            return Ok(None);
         }
 
         self.render_epoch = self.render_epoch.wrapping_add(1);
@@ -2555,12 +2582,15 @@ impl Player {
         });
 
         self.check_render_health()?;
-        let outcome =
-            self.renderer
-                .submit_prepared_frame(background_color, commands, cache_draws)?;
+        let picture = consume(
+            self.renderer.as_mut(),
+            background_color,
+            commands,
+            cache_draws,
+        )?;
         self.check_render_health()?;
         self.needs_render = false;
-        Ok(outcome.into())
+        Ok(Some(picture))
     }
 
     /// The current frame of the main timeline, if available.

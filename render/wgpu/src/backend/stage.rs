@@ -23,6 +23,12 @@ enum StageContent {
     Failed(RenderFailure),
 }
 
+fn stage_label() -> String {
+    ruffle_render::profile::next_frame()
+        .map(|n| format!("Stage {n}"))
+        .unwrap_or_else(|| "Frame commands".into())
+}
+
 impl PendingStage {
     pub(super) fn cancelled(&self) -> bool {
         self.draw.strong_count() == 0
@@ -135,6 +141,22 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         &mut self,
         packet: FramePacket,
     ) -> Result<ruffle_render::backend::FrameSubmission, RenderFailure> {
+        let frame = self.packet_output(&packet)?;
+        self.submit_packet_to(frame, packet)
+    }
+
+    /// Transfer the final native encoding work to a host executor. The host
+    /// retains queue order and confirms the actual submission on the VM owner.
+    pub fn encode_stage_packet(
+        &mut self,
+        packet: FramePacket,
+    ) -> Result<(crate::gpu_resources::CommandEncoder, T::Frame), RenderFailure> {
+        let frame = self.packet_output(&packet)?;
+        self.draw_packet(&frame, packet)?;
+        Ok((self.take_stage_encoder()?, frame))
+    }
+
+    fn packet_output(&mut self, packet: &FramePacket) -> Result<T::Frame, RenderFailure> {
         self.descriptors.runtime.check_health()?;
         if self.pending_stage.as_ref().map(|p| p.key) != Some(packet.key)
             || self.target.frame_reservation() != packet.key.reservation
@@ -144,8 +166,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                 "obsolete stage packet",
             ));
         }
-        let frame = self.take_stage_output()?;
-        self.submit_packet_to(frame, packet)
+        self.take_stage_output()
     }
 
     fn submit_packet_to(
@@ -153,6 +174,11 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         frame: T::Frame,
         packet: FramePacket,
     ) -> Result<ruffle_render::backend::FrameSubmission, RenderFailure> {
+        self.draw_packet(&frame, packet)?;
+        self.finish_stage(frame)
+    }
+
+    fn draw_packet(&mut self, frame: &T::Frame, packet: FramePacket) -> Result<(), RenderFailure> {
         let mut payload = packet.payload;
         if let Some(ticket) = &mut payload {
             ticket.begin_encoding();
@@ -164,7 +190,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                 let draw = Arc::unwrap_or_clone(packet.draw);
                 let clear = draw.clear;
                 let commands = self.plan_stage_packet(draw, bindings)?;
-                self.encode_stage_draw(frame.view(), clear, commands)?;
+                self.encode_stage_draw(frame.view(), clear, commands, stage_label())?;
             }
             StageContent::Encoded(saved) => {
                 run_copy_pipeline(
@@ -173,11 +199,13 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                     frame.view(),
                     &saved.1,
                     1,
-                    self.active_frame.encoder(),
+                    &mut self
+                        .profiler
+                        .scope(stage_label(), self.active_frame.encoder()),
                 )?;
             }
         }
-        self.finish_stage(frame)
+        Ok(())
     }
 
     fn plan_stage_packet(
@@ -266,7 +294,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                 self.target.format(),
                 1,
             )?;
-            self.encode_stage_draw(&saved.1, clear, commands)?;
+            self.encode_stage_draw(&saved.1, clear, commands, "Preserve stage pixels".into())?;
             if submit_before_return {
                 self.active_frame.submit_direct(&self.descriptors)?;
             }
@@ -498,6 +526,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         view: &crate::gpu_resources::TextureView,
         clear: Color,
         graph: crate::graph_encoder::SurfaceCommands,
+        label: String,
     ) -> Result<(), RenderFailure> {
         self.surface.draw_graph_and_copy_to(
             view,
@@ -510,12 +539,9 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             &self.descriptors,
             &mut self.active_frame.staging_belt,
             &mut self.chunk_buffers,
-            &mut self.profiler.scope(
-                ruffle_render::profile::next_frame()
-                    .map(|n| format!("Stage {n}"))
-                    .unwrap_or_else(|| "Frame commands".into()),
-                self.active_frame.command_encoder.record(),
-            ),
+            &mut self
+                .profiler
+                .scope(label, self.active_frame.command_encoder.record()),
             &self.meshes,
             graph,
             LayerRef::None,
@@ -528,33 +554,49 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         &mut self,
         frame_output: T::Frame,
     ) -> Result<ruffle_render::backend::FrameSubmission, RenderFailure> {
+        let encoder = self.take_stage_encoder()?;
+        let index = {
+            let _submit = ruffle_render::profile::time(ruffle_render::profile::Phase::RenderSubmit);
+            self.target.submit_encoder(
+                &self.descriptors.device,
+                &self.descriptors.queue,
+                self.descriptors.runtime.health(),
+                encoder,
+                frame_output,
+            )?
+        };
+        self.confirm_stage_submission(index)?;
+        Ok(ruffle_render::backend::FrameSubmission::Submitted)
+    }
+
+    fn take_stage_encoder(
+        &mut self,
+    ) -> Result<crate::gpu_resources::CommandEncoder, RenderFailure> {
         if let Some(e) = &self.surface.display {
             e.finish_frame(self.active_frame.command_encoder.record())?;
         }
         self.profiler
             .resolve_queries(self.active_frame.command_encoder.record());
-        self.active_frame.staging_belt.finish();
-
-        self.last_submission = Some(self.active_frame.submit_for_target(
-            &self.descriptors,
-            &self.target,
-            frame_output,
-        )?);
-        if let Some(e) = &self.surface.display {
-            e.submitted(self.descriptors.queue.raw());
-        }
+        self.profiler
+            .end_frame(&self.active_frame.command_encoder.raw)
+            .map_err(|error| self.descriptors.runtime.health().record(error.into()))?;
         let (idle, peak, combined) = self.budget.stats();
         ruffle_render::profile::pool(idle, peak, combined);
         self.texture_pool.end_frame();
         self.offscreen_texture_pool.end_frame();
-        self.profiler
-            .end_frame()
-            .map_err(|error| self.descriptors.runtime.health().record(error.into()))?;
+        self.active_frame.take_encoder(&self.descriptors)
+    }
+
+    pub fn confirm_stage_submission(
+        &mut self,
+        index: wgpu::SubmissionIndex,
+    ) -> Result<(), RenderFailure> {
+        self.last_submission = Some(index);
+        self.active_frame.staging_belt.recall();
         ruffle_render::profile::submitted();
         self.collect_gpu_samples();
 
-        self.descriptors.runtime.check_health()?;
-        Ok(ruffle_render::backend::FrameSubmission::Submitted)
+        self.descriptors.runtime.check_health()
     }
 
     pub(super) fn submit_inline_frame(
@@ -594,7 +636,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                 crate::pass_graph::Load::Clear(clear),
             )?
         };
-        self.encode_stage_draw(frame_output.view(), clear, graph)?;
+        self.encode_stage_draw(frame_output.view(), clear, graph, stage_label())?;
         self.finish_stage(frame_output)
     }
 }

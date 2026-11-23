@@ -394,10 +394,13 @@ impl GpuProfiler {
 
     /// Marks the end of a frame.
     ///
-    /// Needs to be called **after** submitting any encoder used in the current profiler frame.
+    /// Attach mappings to the final encoder after resolving this frame's queries.
     ///
     /// Fails if there are still open queries or unresolved queries.
-    pub fn end_frame(&mut self) -> Result<(), EndFrameError> {
+    pub fn end_frame(
+        &mut self,
+        encoder: &crate::gpu_resources::CommandEncoder,
+    ) -> Result<(), EndFrameError> {
         self.device.runtime().check_health()?;
         let started = std::time::Instant::now();
         while self.pending_frames.len() >= self.settings.max_num_pending_frames {
@@ -482,22 +485,21 @@ impl GpuProfiler {
         for pool in new_pending_frame.query_pools.iter_mut() {
             let mapped_buffers = new_pending_frame.mapped_buffers.clone();
             let health = self.device.runtime().health().clone();
-            pool.read_buffer
-                .slice(0..(pool.num_used_queries.load(Ordering::Relaxed) * wgpu::QUERY_SIZE) as u64)
-                .map_async(
-                    wgpu::MapMode::Read,
-                    move |mapping_result| match mapping_result {
-                        Err(error) => {
-                            health.fail(crate::gpu_runtime::RenderFailure::new(
-                                crate::gpu_runtime::RenderFailureKind::MapFailed,
-                                error.to_string(),
-                            ));
-                        }
-                        Ok(()) => {
-                            mapped_buffers.fetch_add(1, std::sync::atomic::Ordering::Release);
-                        }
-                    },
-                );
+            encoder.map_read_on_submit(
+                &pool.read_buffer,
+                u64::from(pool.num_used_queries.load(Ordering::Relaxed) * wgpu::QUERY_SIZE),
+                move |mapping_result| match mapping_result {
+                    Err(error) => {
+                        health.fail(crate::gpu_runtime::RenderFailure::new(
+                            crate::gpu_runtime::RenderFailureKind::MapFailed,
+                            error.to_string(),
+                        ));
+                    }
+                    Ok(()) => {
+                        mapped_buffers.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    }
+                },
+            );
         }
 
         // Enqueue

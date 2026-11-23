@@ -5,6 +5,7 @@
 //! Encoders retain only resources referenced by actual commands and their
 //! dependency leases. Submission completion releases those exact use sets.
 mod encoding;
+mod submission_order;
 use crate::gpu_runtime::{
     GpuRuntime, RenderFailure, RenderFailureKind, ResourceId, ResourceKind, ResourceLease,
     ResourceOwner, texture_storage_bytes,
@@ -21,6 +22,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+pub use submission_order::ReservedSubmission;
 
 pub type Buffer = Resource<wgpu::Buffer>;
 pub type Texture = Resource<wgpu::Texture>;
@@ -151,6 +153,7 @@ struct DeviceInner {
     pending_writes: Mutex<UseSet>,
     upload_sealers: Mutex<Vec<Weak<dyn crate::frame_upload::SealUploads>>>,
     submission_gate: Mutex<()>,
+    submission_order: submission_order::SubmissionOrder,
     external_submission_lock: Mutex<Option<Arc<Mutex<()>>>>,
     pending_submissions: Mutex<
         std::collections::VecDeque<(crate::gpu_runtime::SubmissionSerial, wgpu::SubmissionIndex)>,
@@ -234,6 +237,7 @@ impl Device {
                 pending_writes: Default::default(),
                 upload_sealers: Default::default(),
                 submission_gate: Default::default(),
+                submission_order: Default::default(),
                 external_submission_lock: Default::default(),
                 pending_submissions: Default::default(),
             }),
@@ -905,6 +909,13 @@ impl Deref for Queue {
     }
 }
 impl Queue {
+    fn order(&self) -> &submission_order::SubmissionOrder {
+        &self.0.0.inner().submission_order
+    }
+    pub fn reserve_submission(&self) -> Result<ReservedSubmission, RenderFailure> {
+        self.order().reserve(self)
+    }
+
     pub fn pending_upload_bytes(&self) -> u64 {
         self.0
             .0
@@ -950,6 +961,7 @@ impl Queue {
         destination: ResourceLease,
         write: impl FnOnce(&wgpu::Queue),
     ) -> Result<(), RenderFailure> {
+        self.order().wait_pending(self)?;
         self.prepare_upload(bytes)?;
         let staging = self
             .0
@@ -1120,6 +1132,7 @@ impl Queue {
         commands: impl IntoIterator<Item = wgpu::CommandBuffer>,
         resources: &[ResourceLease],
     ) -> Result<wgpu::SubmissionIndex, RenderFailure> {
+        self.order().wait_pending(self)?;
         self.0
             .scoped(|_| {
                 let _gate = self
@@ -1151,6 +1164,14 @@ impl Queue {
             .map_err(|error| self.0.runtime().health().record(error))
     }
     pub fn submit(
+        &self,
+        commands: impl IntoIterator<Item = CommandBuffer>,
+    ) -> Result<wgpu::SubmissionIndex, RenderFailure> {
+        self.order().wait_pending(self)?;
+        self.submit_ordered(commands)
+    }
+
+    fn submit_ordered(
         &self,
         commands: impl IntoIterator<Item = CommandBuffer>,
     ) -> Result<wgpu::SubmissionIndex, RenderFailure> {

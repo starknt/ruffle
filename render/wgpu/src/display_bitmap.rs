@@ -120,5 +120,4 @@ pub trait DisplayBitmapEnhancer: std::fmt::Debug + Send + Sync {
         &self,
         encoder: &mut gpu_resources::CommandEncoder,
     ) -> Result<(), RenderFailure>;
-    fn submitted(&self, queue: &wgpu::Queue);
 }

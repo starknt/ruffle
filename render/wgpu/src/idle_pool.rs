@@ -104,7 +104,7 @@ impl Budget {
         s.next += 1;
         s.next
     }
-    pub fn submitted(&self, queue: &crate::gpu_resources::Queue) {
+    pub fn retire_with(&self, encoder: &crate::gpu_resources::CommandEncoder) {
         let mut s = self
             .0
             .lock()
@@ -115,7 +115,7 @@ impl Budget {
         let epoch = s.epoch;
         s.epoch += 1;
         let complete = s.completed.clone();
-        queue.on_submitted_work_done(move || {
+        encoder.on_submitted_work_done(move || {
             complete.fetch_max(epoch, Ordering::Release);
         });
     }

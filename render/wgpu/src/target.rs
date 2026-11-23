@@ -49,6 +49,25 @@ pub trait RenderTarget: Debug + 'static {
     /// may attempt to recreate the swap chain via [`RenderTarget::resize`].
     fn get_next_texture(&mut self) -> Result<Option<Self::Frame>, Error>;
 
+    /// A native target may transfer the unfinished encoder to its submission
+    /// thread. The returned index always identifies an actual queue submission.
+    fn submit_encoder(
+        &self,
+        device: &crate::gpu_resources::Device,
+        queue: &crate::gpu_resources::Queue,
+        health: &RendererHealth,
+        encoder: crate::gpu_resources::CommandEncoder,
+        frame: Self::Frame,
+    ) -> Result<wgpu::SubmissionIndex, Error> {
+        let commands = {
+            let _timer = ruffle_render::profile::native_time(
+                ruffle_render::profile::NativePhase::EncoderFinish,
+            );
+            encoder.finish()?
+        };
+        self.submit(device, queue, health, [commands], frame)
+    }
+
     fn submit<I: IntoIterator<Item = crate::gpu_resources::CommandBuffer>>(
         &self,
         device: &crate::gpu_resources::Device,
@@ -407,6 +426,41 @@ impl TextureTarget {
         }
     }
 
+    /// Record the requested capture after the stage draw in the same ordering domain.
+    pub fn encode_readback(&self, encoder: &mut crate::gpu_resources::CommandEncoder) {
+        if let Some(TextureBufferInfo { buffer, copy_area }) = &self.buffer {
+            let (buffer, dimensions) = buffer.inner();
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: copy_area.x_min,
+                        y: copy_area.y_min,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(dimensions.padded_bytes_per_row),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: copy_area.width(),
+                    height: copy_area.height(),
+                    depth_or_array_layers: 1,
+                },
+            );
+            ruffle_render::profile::work(|w| {
+                w.copy_bytes += u64::from(copy_area.width()) * u64::from(copy_area.height()) * 4
+            });
+        }
+    }
+
     pub fn new(device: &crate::gpu_resources::Device, size: (u32, u32)) -> Result<Self, Error> {
         Self::with_readback(device, size, true)
     }
@@ -544,41 +598,13 @@ impl RenderTarget for TextureTarget {
         _frame: Self::Frame,
     ) -> Result<wgpu::SubmissionIndex, Error> {
         health.check()?;
-        let index = if let Some(TextureBufferInfo { buffer, copy_area }) = &self.buffer {
+        let index = if self.buffer.is_some() {
             let label = create_debug_label!("Render target transfer encoder");
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: label.as_deref(),
             })?;
-            let (buffer, dimensions) = buffer.inner();
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: copy_area.x_min,
-                        y: copy_area.y_min,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(dimensions.padded_bytes_per_row),
-                        rows_per_image: None,
-                    },
-                },
-                wgpu::Extent3d {
-                    width: copy_area.width(),
-                    height: copy_area.height(),
-                    depth_or_array_layers: 1,
-                },
-            );
+            self.encode_readback(&mut encoder);
             let buffer = encoder.finish()?;
-            ruffle_render::profile::work(|w| {
-                w.copy_bytes += u64::from(copy_area.width()) * u64::from(copy_area.height()) * 4
-            });
             let _timer = ruffle_render::profile::native_time(
                 ruffle_render::profile::NativePhase::QueueSubmit,
             );

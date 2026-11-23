@@ -3832,9 +3832,15 @@ fn a_replacement_packet_draws_cache_work_from_a_discarded_picture() {
 #[ignore = "requires a Vulkan adapter"]
 fn pending_stage_uses_the_bitmap_version_seen_at_capture() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    let metrics = ruffle_render::profile::RenderMetrics::default();
+    let _scope = ruffle_render::profile::enter(Some(&metrics));
     let descriptors = gpu();
+    let timestamps = descriptors
+        .device
+        .features()
+        .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
     let target = TextureTarget::new(&descriptors.device, (2, 1)).unwrap();
-    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, true).unwrap();
     let pixels = |color: [u8; 4]| Bitmap::new(2, 1, BitmapFormat::Rgba, color.repeat(2));
     let handle = renderer.register_bitmap(pixels([255, 0, 0, 255])).unwrap();
     let region = PixelRegion::for_whole_size(2, 1);
@@ -3862,6 +3868,18 @@ fn pending_stage_uses_the_bitmap_version_seen_at_capture() {
         renderer.capture_frame().unwrap().unwrap().into_raw(),
         [255, 0, 0, 255].repeat(2)
     );
+    if timestamps {
+        renderer.collect_gpu_samples();
+        let samples = metrics.take_gpu_samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].frame, Some(1));
+        for name in ["Preserve stage pixels", "Stage"] {
+            assert!(
+                samples[0].phases.iter().any(|(phase, _)| phase == name),
+                "missing {name}"
+            );
+        }
+    }
     let after = renderer
         .capture_stage_packet(Color::BLACK, commands(), vec![])
         .unwrap();

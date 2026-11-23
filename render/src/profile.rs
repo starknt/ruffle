@@ -122,6 +122,30 @@ pub fn work(f: impl FnOnce(&mut RenderWork)) {
     });
 }
 
+/// Attribute a completed packet's worker counters to its caller's active frame.
+pub fn include_worker(work: RenderWork, timings: &[Timing; NativePhase::NAMES.len()]) {
+    CURRENT.with_borrow(|current| {
+        if let Some(metrics) = current {
+            metrics.0.borrow_mut().include_worker(work, timings);
+        }
+    });
+}
+
+impl Counters {
+    pub fn include_worker(
+        &mut self,
+        work: RenderWork,
+        timings: &[Timing; NativePhase::NAMES.len()],
+    ) {
+        self.work.add(work);
+        for (total, worker) in self.native_timings.iter_mut().zip(timings) {
+            total.samples += worker.samples;
+            total.nanos += worker.nanos;
+            total.max_nanos = total.max_nanos.max(worker.max_nanos);
+        }
+    }
+}
+
 pub struct NativeTimer(Option<(RenderMetrics, NativePhase, Instant)>);
 pub fn native_time(phase: NativePhase) -> NativeTimer {
     NativeTimer(CURRENT.with_borrow(|m| m.clone().map(|m| (m, phase, Instant::now()))))
