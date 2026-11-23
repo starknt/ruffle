@@ -88,14 +88,14 @@ impl RenderBackend for TestRenderer {
         Ok(output)
     }
 
-    fn submit_frame(
+    fn submit_prepared_frame(
         &mut self,
         _clear: Color,
         _commands: CommandList,
         _cache_entries: Vec<BitmapCacheEntry>,
-    ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
+    ) -> Result<ruffle_render::backend::FrameSubmission, ruffle_render::error::RenderFailure> {
         self.health.check()?;
-        Ok(ruffle_render::backend::FrameOutcome::NoOutput)
+        Ok(ruffle_render::backend::FrameSubmission::NoOutput)
     }
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, Error> {
         self.registrations += 1;

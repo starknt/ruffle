@@ -47,7 +47,7 @@ toml_edit = { workspace = true, features = ["parse"] }
 gilrs = "0.11"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
 
-tracing-tracy = { version = "0.11.3", optional = true, features = ["demangle"] }
+tracing-tracy = { version = "0.11.3", optional = true }
 rand = { workspace = true, default-features = true }
 thiserror.workspace = true
 async-channel.workspace = true
@@ -89,7 +89,7 @@ avm_debug = ["ruffle_core/avm_debug"]
 lzma = ["ruffle_core/lzma"]
 software_video = ["ruffle_video_software"]
 external_video = ["ruffle_video_external"]
-tracy = ["tracing-tracy", "ruffle_render_wgpu/profile-with-tracy"]
+tracy = ["tracing-tracy", "ruffle_render/tracy_demangle", "ruffle_render_wgpu/profile-with-tracy"]
 tracy_images = ["tracy", "ruffle_render_wgpu/tracy_images"]
 tracy_avm = ["tracy", "ruffle_core/tracy_avm"]
 fontconfig = ["dep:fontconfig"]

@@ -5,7 +5,7 @@ mod parse_tests;
 
 mod movie;
 pub(crate) mod resource;
-use movie::{PreparedContent, prepare_swf_movie_for_url, use_inline_movie_parse};
+use movie::{Preparation, PreparedContent, use_inline_movie_parse};
 #[cfg(test)]
 use movie::{prepare_swf_movie, prepare_swf_movie_data};
 
@@ -224,7 +224,7 @@ pub struct LoadManager<'gc> {
     active_reads: Vec<ActiveRead<'gc>>,
     next_read: u64,
     #[collect(require_static)]
-    root_read: Option<futures::future::AbortHandle>,
+    root_read: Option<(futures::future::AbortHandle, Option<LoaderHandle>)>,
 }
 
 #[derive(Collect)]
@@ -250,9 +250,26 @@ impl<'gc> LoadManager<'gc> {
     }
 
     pub(crate) fn cancel_root_read(&mut self) {
-        if let Some(read) = self.root_read.take() {
+        if let Some((read, handle)) = self.root_read.take() {
             read.abort();
+            if let Some(loader) = handle.and_then(|handle| self.get_loader_mut(handle)) {
+                invalidate_generation(&mut loader.generation);
+                loader.loader_status = LoaderStatus::Failed;
+            }
         }
+    }
+
+    fn start_root_read(
+        &mut self,
+        loader: Option<LoaderHandle>,
+    ) -> (
+        futures::future::AbortHandle,
+        futures::future::AbortRegistration,
+    ) {
+        self.cancel_root_read();
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        self.root_read = Some((abort.clone(), loader));
+        (abort, registration)
     }
 
     fn read_id(&self, owner: Avm2Object<'gc>) -> Option<u64> {
@@ -335,10 +352,30 @@ impl<'gc> LoadManager<'gc> {
     /// Invalidate parses that target the same display object. The old future
     /// may finish naturally, but its generation check prevents installation or
     /// loader events after a replacement or unload.
-    pub fn invalidate_target_loads(&mut self, target_clip: DisplayObject<'gc>) {
+    pub fn invalidate_target_loads(
+        &mut self,
+        target_clip: DisplayObject<'gc>,
+        reason: TargetLoadChange,
+    ) {
         for loader in self.movies.values_mut() {
             if DisplayObject::ptr_eq(loader.target_clip, target_clip) {
                 invalidate_generation(&mut loader.generation);
+                loader.loader_status = match (reason, loader.loader_status, loader.vm_data) {
+                    (
+                        TargetLoadChange::Unload,
+                        LoaderStatus::BeforeStart | LoaderStatus::UnloadedBeforeStart,
+                        MovieLoaderVMData::Avm1 {
+                            broadcaster: Some(_),
+                            ..
+                        },
+                    ) => LoaderStatus::UnloadedBeforeStart,
+                    _ => LoaderStatus::Failed,
+                };
+                if loader.loader_status == LoaderStatus::Failed
+                    && let Some(read) = loader.clip_read.take()
+                {
+                    read.abort();
+                }
             }
         }
     }
@@ -377,61 +414,6 @@ impl<'gc> LoadManager<'gc> {
         false
     }
 
-    /// Kick off a movie clip load.
-    ///
-    /// Returns the loader's async process, which you will need to spawn.
-    pub fn load_movie_into_clip(
-        &mut self,
-        player: Arc<Mutex<Player>>,
-        target_clip: DisplayObject<'gc>,
-        request: Request,
-        loader_url: Option<String>,
-        vm_data: MovieLoaderVMData<'gc>,
-    ) -> OwnedFuture<(), Error> {
-        // A new request for the same target supersedes every older request,
-        // including AVM1 loads that are not wrapped in an abortable read.
-        self.invalidate_target_loads(target_clip);
-
-        // When an AVM2 movie loads an AVM1 movie, that AVM1 movie cannot load
-        // another movie over itself, as in loadMovie(..., _root). Attempts to
-        // do so will be silently ignored.
-        //
-        // However, if the AVM1 movie uses MovieClipLoader.loadClip to load into
-        // its _root, FP32 will segfault. We don't reproduce that behavior.
-        if matches!(vm_data, MovieLoaderVMData::Avm1 { .. }) {
-            // This check works because the only time AVM1 can access an MC with
-            // `loader_info` set is when that MC is the root MC of an AVM1 movie
-            // that was loaded by AVM2
-            if target_clip
-                .as_movie_clip()
-                .and_then(|mc| mc.loader_info())
-                .is_some()
-            {
-                // Return a future that does nothing
-                return Box::pin(async move { Ok(()) });
-            }
-        }
-
-        let loader = MovieLoader {
-            self_handle: None,
-            generation: 0,
-            target_clip,
-            vm_data,
-            loader_status: LoaderStatus::Pending,
-            movie: None,
-        };
-        let handle = self.add_loader(loader);
-        let loader = self.get_loader_mut(handle).unwrap();
-        let future = loader.movie_loader(player.clone(), request, loader_url);
-        if let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data
-            && let Some(owner) = loader_info.loader()
-        {
-            self.cancellable_read(owner.into(), &player, Some(handle), future)
-        } else {
-            future
-        }
-    }
-
     pub fn load_asset_movie(
         uc: &UpdateContext<'gc>,
         request: Request,
@@ -445,6 +427,12 @@ impl<'gc> LoadManager<'gc> {
         let importer_movie = MovieClipHandle::stash(uc, importer_movie);
 
         Box::pin(async move {
+            let address = player
+                .lock()
+                .unwrap()
+                .navigator()
+                .resolve_url(request.url());
+            let preparation = Preparation::for_url(address.as_ref().map_or("", Url::as_str)).await;
             let fetch = player.lock().unwrap().fetch(request, FetchReason::LoadSwf);
 
             match wait_for_full_response(fetch).await {
@@ -461,8 +449,9 @@ impl<'gc> LoadManager<'gc> {
                         body.len(),
                         None,
                     );
-                    let (parsed, parse_duration_ns) =
-                        prepare_swf_movie_for_url(body, url.clone(), Some(url.clone()), None).await;
+                    let (parsed, parse_duration_ns) = preparation
+                        .prepare(body, url.clone(), Some(url.clone()), None)
+                        .await;
                     let prepared = parsed.map_err(|error| {
                         Error::FetchError(format!("Could not parse imported SWF: {error}"))
                     })?;
@@ -527,9 +516,12 @@ impl<'gc> LoadManager<'gc> {
         loader_url: String,
         vm_data: MovieLoaderVMData<'gc>,
     ) -> Result<(), Error> {
-        context.load_manager.invalidate_target_loads(target_clip);
+        context
+            .load_manager
+            .invalidate_target_loads(target_clip, TargetLoadChange::Replacement);
         let loader = MovieLoader {
             self_handle: None,
+            clip_read: None,
             generation: 0,
             target_clip,
             vm_data,
@@ -617,6 +609,78 @@ impl<'gc> LoadManager<'gc> {
     }
 }
 
+impl<'gc> UpdateContext<'gc> {
+    /// Kick off a movie clip load.
+    ///
+    /// Returns the loader's async process, which you will need to spawn.
+    pub fn load_movie_into_clip(
+        &mut self,
+        target_clip: DisplayObject<'gc>,
+        request: Request,
+        loader_url: Option<String>,
+        vm_data: MovieLoaderVMData<'gc>,
+    ) -> OwnedFuture<(), Error> {
+        let player = self.player_handle();
+
+        // When an AVM2 movie loads an AVM1 movie, that AVM1 movie cannot load
+        // another movie over itself, as in loadMovie(..., _root). Attempts to
+        // do so will be silently ignored.
+        //
+        // However, if the AVM1 movie uses MovieClipLoader.loadClip to load into
+        // its _root, FP32 will segfault. We don't reproduce that behavior.
+        if matches!(vm_data, MovieLoaderVMData::Avm1 { .. }) {
+            // This check works because the only time AVM1 can access an MC with
+            // `loader_info` set is when that MC is the root MC of an AVM1 movie
+            // that was loaded by AVM2
+            if target_clip
+                .as_movie_clip()
+                .and_then(|mc| mc.loader_info())
+                .is_some()
+            {
+                // Return a future that does nothing
+                return Box::pin(async move { Ok(()) });
+            }
+        }
+
+        self.load_manager
+            .invalidate_target_loads(target_clip, TargetLoadChange::Replacement);
+        let replacing_root = self
+            .stage
+            .root_clip()
+            .is_some_and(|root| DisplayObject::ptr_eq(target_clip, root));
+        let loader = MovieLoader {
+            self_handle: None,
+            clip_read: None,
+            generation: 0,
+            target_clip,
+            vm_data,
+            loader_status: LoaderStatus::BeforeStart,
+            movie: None,
+        };
+        let handle = self.load_manager.add_loader(loader);
+        let loader = self.load_manager.get_loader_mut(handle).unwrap();
+        let future = loader.movie_loader(player.clone(), request, loader_url, replacing_root);
+        let registration = if replacing_root {
+            self.load_manager.start_root_read(Some(handle)).1
+        } else if let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data
+            && let Some(owner) = loader_info.loader()
+        {
+            return self
+                .load_manager
+                .cancellable_read(owner.into(), &player, Some(handle), future);
+        } else {
+            let (abort, registration) = futures::future::AbortHandle::new_pair();
+            loader.clip_read = Some(abort);
+            registration
+        };
+        Box::pin(async move {
+            futures::future::Abortable::new(future, registration)
+                .await
+                .unwrap_or(Ok(()))
+        })
+    }
+}
+
 impl Default for LoadManager<'_> {
     fn default() -> Self {
         Self::new()
@@ -696,9 +760,18 @@ async fn wait_for_full_response(
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum TargetLoadChange {
+    Replacement,
+    Unload,
+}
+
 /// The completion status of a `Loader` loading a movie.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoaderStatus {
+    BeforeStart,
+    /// Flash still sends one AVM1 onLoadStart after an explicit same-turn unload.
+    UnloadedBeforeStart,
     /// The movie hasn't been loaded yet.
     Pending,
     /// The movie is currently being parsed (e.g. mc.preload)
@@ -754,6 +827,8 @@ pub struct MovieLoader<'gc> {
     /// The handle to refer to this loader instance.
     #[collect(require_static)]
     self_handle: Option<LoaderHandle>,
+    #[collect(require_static)]
+    clip_read: Option<futures::future::AbortHandle>,
 
     /// Monotonically increasing request token. Results from older requests
     /// are discarded before they can touch AVM state.
@@ -889,17 +964,40 @@ impl<'gc> MovieLoader<'gc> {
         player: Arc<Mutex<Player>>,
         request: Request,
         loader_url: Option<String>,
+        replacing_root_movie: bool,
     ) -> OwnedFuture<(), Error> {
         let handle = self.self_handle.expect("Loader not self-introduced");
         let generation = next_generation(&mut self.generation);
 
         Box::pin(async move {
+            let current =
+                player
+                    .lock()
+                    .unwrap()
+                    .mutate_with_update_context(|uc| -> Result<bool, Error> {
+                        let Some(loader) = uc.load_manager.get_loader_mut(handle) else {
+                            return Ok(false);
+                        };
+                        if loader.generation != generation {
+                            if loader.loader_status == LoaderStatus::UnloadedBeforeStart {
+                                loader.loader_status = LoaderStatus::Failed;
+                                MovieLoader::movie_loader_start(handle, uc)?;
+                            }
+                            return Ok(false);
+                        }
+                        loader.loader_status = LoaderStatus::Pending;
+                        Ok(true)
+                    })?;
+            if !current {
+                return Ok(());
+            }
             let request_url = request.url().to_string();
             let resolved_url = player.lock().unwrap().navigator().resolve_url(&request_url);
 
-            let fetch = player.lock().unwrap().fetch(request, FetchReason::LoadSwf);
+            let address = resolved_url
+                .as_ref()
+                .map_or_else(|_| request_url.clone(), ToString::to_string);
 
-            let mut replacing_root_movie = false;
             player.lock().unwrap().update(|uc| -> Result<(), Error> {
                 let clip = match uc.load_manager.get_loader(handle) {
                     Some(MovieLoader { target_clip, .. }) => *target_clip,
@@ -910,12 +1008,6 @@ impl<'gc> MovieLoader<'gc> {
                     tracing::warn!("movie_loader: Target clip was already AVM1 removed");
                     return Err(Error::Cancelled);
                 }
-
-                replacing_root_movie = uc
-                    .stage
-                    .root_clip()
-                    .map(|root| DisplayObject::ptr_eq(clip, root))
-                    .unwrap_or(false);
 
                 if let Some(mc) = clip.as_movie_clip() {
                     if !mc.movie().is_action_script_3() {
@@ -947,6 +1039,8 @@ impl<'gc> MovieLoader<'gc> {
                 MovieLoader::movie_loader_start(handle, uc)
             })?;
 
+            let preparation = Preparation::for_url(&address).await;
+            let fetch = player.lock().unwrap().fetch(request, FetchReason::LoadSwf);
             let response = wait_for_full_response(fetch).await;
             match response {
                 Ok((body, url, status, redirected)) => {
@@ -959,9 +1053,9 @@ impl<'gc> MovieLoader<'gc> {
                         body_len,
                         None,
                     );
-                    let (parsed, elapsed) =
-                        prepare_swf_movie_for_url(body, url.clone(), loader_url.clone(), None)
-                            .await;
+                    let (parsed, elapsed) = preparation
+                        .prepare(body, url.clone(), loader_url.clone(), None)
+                        .await;
                     let mut player = player.lock().unwrap();
                     if !player.mutate_with_update_context(|uc| {
                         uc.load_manager.generation_matches(handle, generation)
@@ -972,19 +1066,35 @@ impl<'gc> MovieLoader<'gc> {
                         Ok(prepared) => prepared,
                         Err(_) => {
                             return player.mutate_with_update_context(|uc| {
-                                MovieLoader::movie_loader_parse_error(handle, uc, generation, url)
+                                MovieLoader::movie_loader_error(
+                                    handle,
+                                    uc,
+                                    "Could not parse SWF",
+                                    status,
+                                    redirected,
+                                    url,
+                                )
                             });
                         }
                     };
                     if replacing_root_movie {
+                        let movie = match prepared.into_movie() {
+                            Ok(movie) => movie,
+                            Err(error) => {
+                                return player.mutate_with_update_context(|uc| {
+                                    MovieLoader::movie_loader_error(
+                                        handle,
+                                        uc,
+                                        &error.to_string(),
+                                        status,
+                                        redirected,
+                                        url,
+                                    )
+                                });
+                            }
+                        };
                         Self::on_success_root_movie(
-                            player,
-                            handle,
-                            generation,
-                            body_len,
-                            elapsed,
-                            prepared.into_movie()?,
-                            status,
+                            player, handle, generation, body_len, elapsed, movie, status,
                             redirected,
                         )?;
                     } else {
@@ -1066,6 +1176,10 @@ impl<'gc> MovieLoader<'gc> {
                 }
             }
 
+            if !uc.load_manager.generation_matches(handle, generation) {
+                return Ok(());
+            }
+            uc.load_manager.root_read.take();
             uc.replace_root_movie(movie);
 
             if let Some(root_clip) = uc.stage.root_clip()
@@ -1193,7 +1307,6 @@ impl<'gc> MovieLoader<'gc> {
                 }
                 mc.replace_with_movie(uc, None, false, None);
             }
-            MovieLoader::movie_loader_start(handle, uc)?;
             let generated_url = format!("{}/[[DYNAMIC]]/1", loader_url);
             let load_bytes_info = vm_data.load_bytes_info();
             let future = Box::pin(async move {
@@ -1205,13 +1318,14 @@ impl<'gc> MovieLoader<'gc> {
                     bytes.len(),
                     None,
                 );
-                let (parsed, parse_duration_ns) = prepare_swf_movie_for_url(
-                    bytes,
-                    generated_url.clone(),
-                    Some(loader_url.clone()),
-                    load_bytes_info,
-                )
-                .await;
+                let (parsed, parse_duration_ns) = Preparation::for_bytes()
+                    .prepare(
+                        bytes,
+                        generated_url.clone(),
+                        Some(loader_url.clone()),
+                        load_bytes_info,
+                    )
+                    .await;
                 let mut player = player.lock().unwrap();
                 match parsed {
                     Ok(content) => Self::on_success(
@@ -1230,6 +1344,19 @@ impl<'gc> MovieLoader<'gc> {
                     }),
                 }
             });
+            let future = if let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data
+                && let Some(owner) = loader_info.loader()
+            {
+                uc.load_manager.cancellable_read(
+                    owner.into(),
+                    &uc.player_handle(),
+                    Some(handle),
+                    future,
+                )
+            } else {
+                future
+            };
+            MovieLoader::movie_loader_start(handle, uc)?;
             uc.spawn_future(future);
             return Ok(());
         }
@@ -1277,20 +1404,21 @@ pub fn load_root_movie(
     parameters: Vec<(String, String)>,
     on_metadata: Box<dyn FnOnce(&swf::HeaderExt)>,
 ) -> OwnedFuture<(), Error> {
-    uc.load_manager.cancel_root_read();
-    let (abort, registration) = futures::future::AbortHandle::new_pair();
-    uc.load_manager.root_read = Some(abort.clone());
+    let (abort, registration) = uc.load_manager.start_root_read(None);
     let player = Arc::downgrade(&uc.player_handle());
-    let fetch = uc
-        .resources
-        .fetch(uc.navigator, request, FetchReason::LoadSwf);
+    let address = uc
+        .navigator
+        .resolve_url(request.url())
+        .map_or_else(|_| request.url().to_owned(), |url| url.to_string());
+    let fetch = uc.resources.root_movie(uc.navigator, request);
     let spoofed = uc.spoofed_url.map(str::to_owned);
     let load = async move {
         let prepared = async {
+            let preparation = Preparation::for_url(&address).await;
             let response = fetch.await.map_err(|e| (false, e.error))?;
             let url = spoofed.unwrap_or_else(|| response.url().into_owned());
             let bytes = response.body().await.map_err(|e| (true, e))?;
-            let (content, _) = prepare_swf_movie_for_url(bytes, url, None, None).await;
+            let (content, _) = preparation.prepare(bytes, url, None, None).await;
             content
                 .map_err(|e| Error::FetchError(format!("Could not parse root SWF: {e}")))
                 .and_then(PreparedContent::into_movie)
@@ -2688,12 +2816,13 @@ impl<'gc> MovieLoader<'gc> {
         //error types we can actually inspect.
         //This also can get errors from decoding an invalid SWF file,
         //too. We should distinguish those to player code.
-        let (clip, vm_data) = match uc.load_manager.get_loader(handle) {
+        let (clip, vm_data, generation) = match uc.load_manager.get_loader(handle) {
             Some(Self {
                 target_clip,
                 vm_data,
+                generation,
                 ..
-            }) => (*target_clip, *vm_data),
+            }) => (*target_clip, *vm_data, *generation),
             None => return Err(Error::Cancelled),
         };
 
@@ -2731,6 +2860,14 @@ impl<'gc> MovieLoader<'gc> {
 
                 Avm2::dispatch_event(activation.context, http_status_evt, loader_info.into());
 
+                if !activation
+                    .context
+                    .load_manager
+                    .generation_matches(handle, generation)
+                {
+                    return Ok(());
+                }
+
                 // FIXME - Match the exact error message and code generated by Flash
                 let io_error_evt = Avm2EventObject::io_error_event(&mut activation, msg, 0);
 
@@ -2738,8 +2875,11 @@ impl<'gc> MovieLoader<'gc> {
             }
         }
 
-        let loader = uc.load_manager.get_loader_mut(handle).unwrap();
-        loader.loader_status = LoaderStatus::Failed;
+        if let Some(loader) = uc.load_manager.get_loader_mut(handle)
+            && loader.generation == generation
+        {
+            loader.loader_status = LoaderStatus::Failed;
+        }
 
         Ok(())
     }
@@ -2805,7 +2945,9 @@ impl<'gc> MovieLoader<'gc> {
         strings: &StringContext<'gc>,
     ) -> bool {
         match self.loader_status {
-            LoaderStatus::Pending => false,
+            LoaderStatus::BeforeStart
+            | LoaderStatus::UnloadedBeforeStart
+            | LoaderStatus::Pending => false,
             LoaderStatus::Parsing => false,
             LoaderStatus::Failed => true,
             LoaderStatus::Succeeded => {

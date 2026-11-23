@@ -112,6 +112,103 @@ fn metadata_callback_can_replace_the_root_before_installation() {
     assert_eq!(current_url(), second);
 }
 
+fn root_fixture(name: &str) -> String {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/tests/swfs/avm1");
+    Url::from_file_path(dir.join(name).canonicalize().unwrap())
+        .unwrap()
+        .into()
+}
+
+fn file_session(url: &str) -> crate::PlayerSession {
+    let mut movie = SwfMovieData::empty(8, None);
+    movie.set_url(url.into());
+    PlayerBuilder::new().with_movie(movie).build()
+}
+
+fn avm1_root_request(player: &crate::PlayerSession, url: String) -> OwnedFuture<(), Error> {
+    player.lock().unwrap().mutate_with_update_context(|uc| {
+        let clip = uc.stage.root_clip().unwrap();
+        uc.load_movie_into_clip(
+            clip,
+            Request::get(url),
+            None,
+            MovieLoaderVMData::Avm1 {
+                broadcaster: None,
+                base_clip: clip,
+            },
+        )
+    })
+}
+
+#[test]
+fn host_and_level_zero_replacements_only_deliver_the_latest_root() {
+    for host_is_last in [true, false] {
+        for newest_first in [true, false] {
+            let initial = root_fixture("load_cancel_via_unloadmovie/child.swf");
+            let session = file_session(&initial);
+            let host_url = initial.clone();
+            let clip_url = root_fixture("load_cancel_via_unloadmovie/test.swf");
+            let host = || {
+                session.lock().unwrap().mutate_with_update_context(|uc| {
+                    load_root_movie(uc, Request::get(host_url.clone()), vec![], Box::new(|_| {}))
+                })
+            };
+            let avm = || avm1_root_request(&session, clip_url.clone());
+            let (old, latest) = if host_is_last {
+                (avm(), host())
+            } else {
+                (host(), avm())
+            };
+            let first_url = if host_is_last { &host_url } else { &clip_url };
+            let (first, second) = if newest_first {
+                (latest, old)
+            } else {
+                (old, latest)
+            };
+            futures::executor::block_on(first).unwrap();
+            futures::executor::block_on(second).unwrap();
+            session
+                .lock()
+                .unwrap()
+                .mutate_with_update_context(|uc| assert_eq!(uc.root_swf.url(), first_url));
+        }
+    }
+}
+
+#[test]
+fn non_movie_level_zero_response_finishes_its_loader() {
+    let url = root_fixture("asnew/output.txt");
+    let session = file_session(&url);
+    futures::executor::block_on(avm1_root_request(&session, url)).unwrap();
+    session.lock().unwrap().mutate_with_update_context(|uc| {
+        assert!(
+            uc.load_manager
+                .movies
+                .values()
+                .all(|l| l.loader_status == LoaderStatus::Failed)
+        );
+    });
+}
+
+#[test]
+fn native_file_access_follows_the_selected_movies_directory() {
+    let file = root_fixture("asnew/output.txt");
+    for root in [
+        root_fixture("load_cancel_via_unloadmovie/test.swf"),
+        "https://example.test/movie.swf".into(),
+    ] {
+        let session = file_session(&root);
+        let request = session
+            .lock()
+            .unwrap()
+            .fetch(Request::get(file.clone()), FetchReason::UrlLoader);
+        assert!(
+            futures::executor::block_on(request).is_err(),
+            "{root} unexpectedly opened a file outside its directory"
+        );
+    }
+}
+
 #[test]
 fn prepared_movie_is_installed_without_reparsing_transport_bytes() {
     let bytes = movie_bytes();
@@ -130,6 +227,7 @@ fn prepared_movie_is_installed_without_reparsing_transport_bytes() {
         let clip = uc.stage.root_clip().unwrap();
         let handle = uc.load_manager.add_loader(MovieLoader {
             self_handle: None,
+            clip_read: None,
             generation: 1,
             target_clip: clip,
             vm_data: MovieLoaderVMData::Avm1 {
@@ -169,6 +267,7 @@ fn stale_load_bytes_parse_error_does_not_fail_a_new_loader_generation() {
         let clip = uc.stage.root_clip().unwrap();
         let handle = uc.load_manager.add_loader(MovieLoader {
             self_handle: None,
+            clip_read: None,
             generation: 2,
             target_clip: clip,
             vm_data: MovieLoaderVMData::Avm1 {
@@ -356,4 +455,35 @@ fn removed_main_thread_parse_cost_benchmark() {
         share[15],
         share[29],
     );
+}
+
+#[test]
+fn closing_a_remote_load_bytes_retires_both_superseded_preparations() {
+    use std::{cell::RefCell, rc::Rc};
+    struct Log(Rc<RefCell<Vec<String>>>);
+    impl crate::backend::log::LogBackend for Log {
+        fn avm_trace(&self, message: &str) {
+            self.0.borrow_mut().push(message.to_string());
+        }
+        fn avm_warning(&self, _: &str) {}
+    }
+    let messages = Rc::new(RefCell::new(Vec::new()));
+    let movie = SwfMovieData::from_data(
+        include_bytes!("../../../tests/tests/swfs/avm2/loader_reentrant_close/test.swf"),
+        "https://example.test/loader.swf".into(),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut session = PlayerBuilder::new()
+        .with_movie(movie)
+        .with_log(Log(messages.clone()))
+        .build();
+    session.lock().unwrap().run_frame();
+    session
+        .lock()
+        .unwrap()
+        .mutate_with_update_context(|uc| assert_eq!(uc.load_manager.pending_counts(), (0, 0)));
+    session.poll_tasks();
+    assert_eq!(&*messages.borrow(), &["closed byte loads"]);
 }

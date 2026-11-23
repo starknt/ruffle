@@ -122,8 +122,7 @@ pub fn load<'gc>(
 
     let loader_url = activation.caller_movie_or_root().url().to_string();
 
-    let future = activation.context.load_manager.load_movie_into_clip(
-        activation.context.player_handle(),
+    let future = activation.context.load_movie_into_clip(
         content.into(),
         request,
         Some(loader_url),

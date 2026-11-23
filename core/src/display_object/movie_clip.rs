@@ -2470,7 +2470,9 @@ impl<'gc> MovieClip<'gc> {
         // Invalidate any external parse targeting this clip before the unload
         // state transition. Detached futures may finish, but cannot install a
         // movie or dispatch stale loader events afterward.
-        context.load_manager.invalidate_target_loads(self.into());
+        context
+            .load_manager
+            .invalidate_target_loads(self.into(), crate::loader::TargetLoadChange::Unload);
 
         if self.is_root() {
             let player = context.player_handle();

@@ -299,7 +299,9 @@ impl<'gc> LoaderInfoObject<'gc> {
 
         if let Some(content) = content {
             content.movie().record_lifetime("loader-unload");
-            context.load_manager.invalidate_target_loads(content);
+            context
+                .load_manager
+                .invalidate_target_loads(content, crate::loader::TargetLoadChange::Replacement);
         }
 
         if content.is_some() {

@@ -99,14 +99,14 @@ impl RenderBackend for NullRenderer {
         Ok(output)
     }
 
-    fn submit_frame(
+    fn submit_prepared_frame(
         &mut self,
         _clear: Color,
         _commands: CommandList,
         _cache_entries: Vec<BitmapCacheEntry>,
-    ) -> Result<super::FrameOutcome, crate::error::RenderFailure> {
+    ) -> Result<super::FrameSubmission, crate::error::RenderFailure> {
         self.health.check()?;
-        Ok(super::FrameOutcome::NoOutput)
+        Ok(super::FrameSubmission::NoOutput)
     }
 
     fn register_bitmap(&mut self, _bitmap: Bitmap<'_>) -> Result<BitmapHandle, Error> {

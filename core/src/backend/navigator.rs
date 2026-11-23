@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::fmt::Display;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use swf::avm1::types::SendVarsMethod;
@@ -307,6 +307,11 @@ pub trait NavigatorBackend: Any {
     /// Fetch data and return it some time in the future.
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>;
 
+    /// Fetch a top-level movie explicitly selected by the host.
+    fn fetch_root(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        self.fetch_buffered(request, FetchReason::LoadSwf)
+    }
+
     /// This caller consumes the entire response with `body`. Chunked clients use `fetch`.
     fn fetch_buffered(
         &self,
@@ -353,11 +358,18 @@ pub trait NavigatorBackend: Any {
 #[derive(Default)]
 pub struct FileNavigator {
     root_url: Option<Url>,
+    directory: Option<PathBuf>,
 }
 
 impl NavigatorBackend for FileNavigator {
     fn set_root_url(&mut self, url: &str) {
         self.root_url = Url::parse(url).ok();
+        self.directory = self
+            .root_url
+            .as_ref()
+            .and_then(|url| url.to_file_path().ok())
+            .and_then(|file| file.canonicalize().ok())
+            .and_then(|file| file.parent().map(Path::to_owned));
     }
 
     fn navigate_to_url(
@@ -369,6 +381,16 @@ impl NavigatorBackend for FileNavigator {
     }
 
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        let Some(directory) = self.directory.as_deref() else {
+            return async_return(Err(create_fetch_error(
+                request.url(),
+                "no local movie directory",
+            )));
+        };
+        fetch_path_in_directory(self, "FileNavigator", request.url(), None, Some(directory))
+    }
+
+    fn fetch_root(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
         fetch_path(self, "FileNavigator", request.url(), None)
     }
 
@@ -474,6 +496,16 @@ pub fn fetch_path<NavigatorType: NavigatorBackend>(
     url: &str,
     base_path: Option<&Path>,
 ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+    fetch_path_in_directory(navigator, navigator_name, url, base_path, None)
+}
+
+fn fetch_path_in_directory<N: NavigatorBackend>(
+    navigator: &N,
+    navigator_name: &str,
+    url: &str,
+    base_path: Option<&Path>,
+    directory: Option<&Path>,
+) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
     struct LocalResponse {
         url: String,
         path: PathBuf,
@@ -491,9 +523,16 @@ pub fn fetch_path<NavigatorType: NavigatorBackend>(
             self.url = url;
         }
 
-        fn body(self: Box<Self>) -> OwnedFuture<Vec<u8>, Error> {
+        fn body(mut self: Box<Self>) -> OwnedFuture<Vec<u8>, Error> {
             Box::pin(async move {
-                std::fs::read(self.path).map_err(|e| Error::FetchError(e.to_string()))
+                if let Some(mut file) = self.open_file.take() {
+                    file.rewind()?;
+                    let mut body = Vec::new();
+                    file.read_to_end(&mut body)?;
+                    Ok(body)
+                } else {
+                    std::fs::read(self.path).map_err(|e| Error::FetchError(e.to_string()))
+                }
             })
         }
 
@@ -537,9 +576,10 @@ pub fn fetch_path<NavigatorType: NavigatorBackend>(
         }
 
         fn expected_length(&self) -> Result<Option<u64>, Error> {
-            Ok(Some(
-                std::fs::File::open(self.path.clone())?.metadata()?.len(),
-            ))
+            Ok(Some(match &self.open_file {
+                Some(file) => file.metadata()?.len(),
+                None => File::open(&self.path)?.metadata()?.len(),
+            }))
         }
     }
 
@@ -582,11 +622,26 @@ pub fn fetch_path<NavigatorType: NavigatorBackend>(
         )));
     };
 
+    let directory = directory.map(Path::to_owned);
     Box::pin(async move {
+        let open_file = if let Some(directory) = directory {
+            let checked = path
+                .canonicalize()
+                .map_err(|e| create_fetch_error(url.as_str(), e))?;
+            if !checked.starts_with(directory) {
+                return Err(create_fetch_error(
+                    url.as_str(),
+                    "outside the movie directory",
+                ));
+            }
+            Some(File::open(checked).map_err(|e| create_fetch_error(url.as_str(), e))?)
+        } else {
+            None
+        };
         let response: Box<dyn SuccessResponse> = Box::new(LocalResponse {
             url: url.to_string(),
             path,
-            open_file: None,
+            open_file,
             status: 0,
             redirected: false,
         });

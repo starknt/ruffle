@@ -1,5 +1,9 @@
 #![deny(clippy::unwrap_used)]
 
+// The native profiler requires one demangler in each executable that links it.
+#[cfg(feature = "tracy_demangle")]
+tracy_client::register_demangler!();
+
 pub mod atf;
 pub mod backend;
 pub mod bitmap;

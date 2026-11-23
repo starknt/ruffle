@@ -855,21 +855,21 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     }
 
     #[instrument(level = "debug", skip_all)]
-    fn submit_frame(
+    fn submit_prepared_frame(
         &mut self,
         clear: Color,
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
-    ) -> Result<ruffle_render::backend::FrameOutcome, crate::gpu_runtime::RenderFailure> {
+    ) -> Result<ruffle_render::backend::FrameSubmission, crate::gpu_runtime::RenderFailure> {
         let _render_backend =
             ruffle_render::profile::time(ruffle_render::profile::Phase::RenderBackend);
-        if !self.prepare_frame()? {
-            return Ok(ruffle_render::backend::FrameOutcome::Deferred);
-        }
-        let frame_output = self
-            .stage_frame
-            .take()
-            .expect("stage frame was just acquired");
+        let frame_output = self.stage_frame.take().ok_or_else(|| {
+            crate::gpu_runtime::RenderFailure::new(
+                crate::gpu_runtime::RenderFailureKind::Internal,
+                "stage submission without a reserved output",
+            )
+        })?;
+        self.descriptors.runtime.check_health()?;
 
         if let Some(tiles) = &mut self.filtered_tiles {
             tiles.begin_frame();
@@ -1121,7 +1121,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.collect_gpu_samples();
 
         self.descriptors.runtime.check_health()?;
-        Ok(ruffle_render::backend::FrameOutcome::Submitted)
+        Ok(ruffle_render::backend::FrameSubmission::Submitted)
     }
 
     #[instrument(level = "debug", skip_all)]

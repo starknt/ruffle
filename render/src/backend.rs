@@ -49,6 +49,22 @@ pub enum FrameOutcome {
     NoOutput,
 }
 
+/// After display traversal has produced cache draws, the reserved frame must be consumed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameSubmission {
+    Submitted,
+    NoOutput,
+}
+
+impl From<FrameSubmission> for FrameOutcome {
+    fn from(value: FrameSubmission) -> Self {
+        match value {
+            FrameSubmission::Submitted => Self::Submitted,
+            FrameSubmission::NoOutput => Self::NoOutput,
+        }
+    }
+}
+
 pub trait RenderBackend: Any {
     fn display_sampling_revision(&self) -> u64 {
         0
@@ -144,7 +160,20 @@ pub trait RenderBackend: Any {
         clear: swf::Color,
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
-    ) -> Result<FrameOutcome, RenderFailure>;
+    ) -> Result<FrameOutcome, RenderFailure> {
+        if !self.prepare_frame()? {
+            return Ok(FrameOutcome::Deferred);
+        }
+        self.submit_prepared_frame(clear, commands, cache_entries)
+            .map(Into::into)
+    }
+
+    fn submit_prepared_frame(
+        &mut self,
+        clear: swf::Color,
+        commands: CommandList,
+        cache_entries: Vec<BitmapCacheEntry>,
+    ) -> Result<FrameSubmission, RenderFailure>;
 
     fn create_empty_texture(
         &mut self,

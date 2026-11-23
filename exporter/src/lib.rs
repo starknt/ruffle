@@ -41,11 +41,11 @@ fn capture_frames(
     };
 
     for _ in 0..movie.frames.start {
-        movie.run_frame();
+        movie.run_frame()?;
     }
     for (index, frame) in movie.frames.clone().enumerate() {
         progress.set_message(format!("{} frame {frame}", swf.display()));
-        movie.run_frame();
+        movie.run_frame()?;
         let image = movie
             .capture_frame()
             .with_context(|| format!("Unable to capture frame {frame} of {}", swf.display()))?;

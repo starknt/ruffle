@@ -282,12 +282,12 @@ mod test {
         ) -> Result<Option<Box<dyn SyncHandle>>, crate::error::Error> {
             unimplemented!()
         }
-        fn submit_frame(
+        fn submit_prepared_frame(
             &mut self,
             _clear: Color,
             _commands: CommandList,
             _cache_entries: Vec<BitmapCacheEntry>,
-        ) -> Result<crate::backend::FrameOutcome, crate::error::RenderFailure> {
+        ) -> Result<crate::backend::FrameSubmission, crate::error::RenderFailure> {
             unimplemented!()
         }
         fn create_empty_texture(

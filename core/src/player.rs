@@ -518,8 +518,7 @@ impl Player {
 
     /// Fetch the root movie.
     ///
-    /// This should not be called if a root movie fetch has already been kicked
-    /// off.
+    /// A new request replaces the previous root load.
     ///
     /// `parameters` are *extra* parameters to set on the LoaderInfo -
     /// parameters from `movie_url` query parameters will be automatically added.
@@ -2539,12 +2538,12 @@ impl Player {
         });
 
         self.check_render_health()?;
-        let outcome = self
-            .renderer
-            .submit_frame(background_color, commands, cache_draws)?;
+        let outcome =
+            self.renderer
+                .submit_prepared_frame(background_color, commands, cache_draws)?;
         self.check_render_health()?;
-        self.needs_render = outcome == ruffle_render::backend::FrameOutcome::Deferred;
-        Ok(outcome)
+        self.needs_render = false;
+        Ok(outcome.into())
     }
 
     /// The current frame of the main timeline, if available.

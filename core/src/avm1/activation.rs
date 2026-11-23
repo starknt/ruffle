@@ -397,9 +397,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         id: ActivationIdentifier<'a>,
         base_clip: DisplayObject<'gc>,
     ) -> Self {
-        avm_debug!(context.avm1, "START {id}");
+        Self::from_nothing_with_version(context, id, base_clip, base_clip.swf_version())
+    }
 
-        let swf_version = base_clip.swf_version();
+    fn from_nothing_with_version(
+        context: &'a mut UpdateContext<'gc>,
+        id: ActivationIdentifier<'a>,
+        base_clip: DisplayObject<'gc>,
+        swf_version: u8,
+    ) -> Self {
+        avm_debug!(context.avm1, "START {id}");
         debug_assert!(swf_version > 0, "cannot execute code with SWF version 0");
         let scope = context.avm1.global_scope(swf_version);
         #[cfg(feature = "tracy_avm")]
@@ -450,7 +457,13 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         id: ActivationIdentifier<'a>,
     ) -> Option<Self> {
         if let Some(level0) = context.stage.root_clip() {
-            Some(Self::from_nothing(context, id, level0))
+            // An unsuccessful _level0 replacement leaves a version-zero placeholder.
+            // Flush the previous movie's shared objects with its original VM version.
+            let version = match level0.swf_version() {
+                0 => context.root_swf.version(),
+                version => version,
+            };
+            (version != 0).then(|| Self::from_nothing_with_version(context, id, level0, version))
         } else {
             None
         }
@@ -1294,8 +1307,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                         }
                     } else {
                         let level = self.get_or_create_level(level_id);
-                        let future = self.context.load_manager.load_movie_into_clip(
-                            self.context.player_handle(),
+                        let future = self.context.load_movie_into_clip(
                             level,
                             Request::get(url.to_string()),
                             None,
@@ -1416,8 +1428,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                         url,
                         NavigationMethod::from_send_vars_method(action.send_vars_method()),
                     );
-                    let future = self.context.load_manager.load_movie_into_clip(
-                        self.context.player_handle(),
+                    let future = self.context.load_movie_into_clip(
                         clip_target,
                         request,
                         None,
@@ -1444,8 +1455,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                         mc.avm1_unload_movie(self.context);
                     }
                 } else {
-                    let future = self.context.load_manager.load_movie_into_clip(
-                        self.context.player_handle(),
+                    let future = self.context.load_movie_into_clip(
                         clip_target,
                         Request::get(url.to_utf8_lossy().into_owned()),
                         None,
