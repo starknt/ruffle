@@ -1,0 +1,4 @@
+true true rotate90
+true true rotate180
+true true rotate270
+null rotate0

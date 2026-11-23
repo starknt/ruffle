@@ -19,6 +19,12 @@ package flash.text.engine {
             }
 
             this.elementFormat = elementFormat;
+            if (eventMirror !== null) {
+                this.eventMirror = eventMirror;
+            }
+            if (textRotation !== "rotate0") {
+                this.textRotation = textRotation;
+            }
         }
 
         public native function get text():String;
