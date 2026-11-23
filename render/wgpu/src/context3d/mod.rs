@@ -752,31 +752,20 @@ impl Context3D for WgpuContext3D {
                 }
                 let buffer: &mut IndexBufferWrapper = <dyn Any>::downcast_mut(buffer).unwrap();
 
-                // Unfortunately, ActionScript works with 2-byte indices, while wgpu requires
-                // copy offsets and sizes to have 4-byte alignment. To support this, we need
-                // to keep a copy of the data on the CPU side. We round *down* the offset to
-                // the closest multiple of 4 bytes, and round *up* the length to the closest
-                // multiple of 4 bytes. We then perform a copy from our CPU-side buffer, which
-                // which uses the existing data (at the beginning or end) to fill out the copy
-                // to the required length and offset. Without this, we would lose data in the CPU
-                // buffer whenever we performed a copy with an unalignd offset or length.
-                let offset_bytes = start_offset * std::mem::size_of::<u16>();
-                let rounded_down_offset =
-                    offset_bytes - (offset_bytes % COPY_BUFFER_ALIGNMENT as usize);
-                let rounded_up_length = align_copy_buffer_size(data.len());
-
-                buffer.data[offset_bytes..(offset_bytes + data.len())].copy_from_slice(data);
+                // Flash writes 16-bit indices. Copy both aligned endpoints from
+                // the shadow buffer so adjacent indices keep their previous bytes.
+                let offset = start_offset * size_of::<u16>();
+                let start = offset - offset % COPY_BUFFER_ALIGNMENT as usize;
+                let end = align_copy_buffer_size(offset + data.len());
+                buffer.data[offset..offset + data.len()].copy_from_slice(data);
                 self.buffer_staging_belt
                     .write_buffer(
                         &mut self.buffer_command_encoder,
                         &buffer.buffer,
-                        rounded_down_offset as u64,
-                        NonZeroU64::new(rounded_up_length as u64).unwrap(),
+                        start as u64,
+                        NonZeroU64::new((end - start) as u64).unwrap(),
                     )?
-                    .copy_from_slice(
-                        &buffer.data
-                            [rounded_down_offset..(rounded_down_offset + rounded_up_length)],
-                    );
+                    .copy_from_slice(&buffer.data[start..end]);
             }
 
             Context3DCommand::UploadToVertexBuffer {

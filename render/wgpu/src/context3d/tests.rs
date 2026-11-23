@@ -22,6 +22,80 @@ fn descriptors(staging: u64) -> Arc<Descriptors> {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn odd_index_upload_preserves_neighbors_and_snapshots_the_entire_input() {
+    let descriptors = descriptors(4096);
+    let mut context = WgpuContext3D::new(descriptors.clone(), Context3DProfile::Baseline).unwrap();
+    let mut indices = IndexBufferWrapper {
+        buffer: descriptors
+            .device
+            .create_buffer(&BufferDescriptor {
+                label: None,
+                size: 8,
+                usage: BufferUsages::INDEX | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+            .unwrap(),
+        data: vec![0; 8],
+    };
+    let mut bytes = [1, 2, 3, 4, 5, 6, 7, 8];
+    context
+        .process_command(Context3DCommand::UploadToIndexBuffer {
+            buffer: &mut indices,
+            start_offset: 0,
+            data: &bytes,
+        })
+        .unwrap();
+    bytes[..4].copy_from_slice(&[10, 11, 12, 13]);
+    context
+        .process_command(Context3DCommand::UploadToIndexBuffer {
+            buffer: &mut indices,
+            start_offset: 1,
+            data: &bytes[..4],
+        })
+        .unwrap();
+    bytes.fill(0);
+    let output = descriptors
+        .device
+        .create_buffer(&BufferDescriptor {
+            label: None,
+            size: 8,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    context.buffer_staging_belt.finish();
+    let mut encoder = std::mem::replace(
+        &mut context.buffer_command_encoder,
+        descriptors
+            .device
+            .create_command_encoder(&Default::default())
+            .unwrap(),
+    );
+    encoder.copy_buffer_to_buffer(&indices.buffer, 0, &output, 0, 8);
+    let index = descriptors
+        .queue
+        .submit([encoder.finish().unwrap()])
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    output.map_async(wgpu::MapMode::Read, .., move |result| {
+        tx.send(result).unwrap()
+    });
+    descriptors
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: Some(Duration::from_secs(3)),
+        })
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+    assert_eq!(
+        &*output.get_mapped_range(..).unwrap(),
+        &[1, 2, 10, 11, 12, 13, 7, 8]
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn bitmap_uploads_exceeding_staging_budget_are_sliced_and_preserve_rows() {
     let descriptors = descriptors(4096);
     let mut context = WgpuContext3D::new(descriptors.clone(), Context3DProfile::Baseline).unwrap();
