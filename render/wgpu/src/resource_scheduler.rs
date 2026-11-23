@@ -93,43 +93,58 @@ impl ResourceScheduler {
         if bytes > limit {
             return None;
         }
+        let mut exhausted = false;
         loop {
-            {
-                let mut state = self
-                    .0
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.bytes[index] <= limit - bytes {
-                    state.bytes[index] += bytes;
-                    return Some(CacheTicket {
-                        scheduler: self.clone(),
-                        class,
-                        bytes,
-                    });
-                }
+            let mut state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.bytes[index] <= limit - bytes {
+                state.bytes[index] += bytes;
+                return Some(CacheTicket {
+                    scheduler: self.clone(),
+                    class,
+                    bytes,
+                });
             }
-            if !self.evict_one(class) {
+            if exhausted {
                 return None;
             }
+            drop(state);
+            // Even an unsuccessful scan may race a ticket being released.
+            exhausted = !self.evict_one(class);
         }
     }
     pub fn evict_one(&self, class: ReclaimClass) -> bool {
-        let hooks: Vec<_> = self
+        let state = self
             .0
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let initial_bytes = state.bytes[class as usize];
+        let mut hooks: Vec<_> = state
             .hooks
             .iter()
             .filter(|(c, _)| *c == class)
             .filter_map(|(_, hook)| hook.upgrade())
             .collect();
-        hooks
-            .into_iter()
-            .filter_map(|hook| hook.oldest().map(|age| (age, hook)))
-            .min_by_key(|(age, _)| *age)
-            .is_some_and(|(_, hook)| hook.evict_oldest())
+        drop(state);
+
+        while let Some((index, _)) = hooks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hook)| hook.oldest().map(|age| (index, age)))
+            .min_by_key(|&(_, age)| age)
+        {
+            // A checkout can win between oldest() and evict_oldest(). Let
+            // the caller recheck its budget if space was freed, otherwise
+            // try the remaining owners.
+            if hooks.swap_remove(index).evict_oldest() || self.bytes(class) < initial_bytes {
+                return true;
+            }
+        }
+        false
     }
     pub fn reclaim(&self) {
         while self.evict_one(ReclaimClass::Idle) {}
@@ -181,6 +196,57 @@ mod tests {
         drop(b);
         assert_eq!(scheduler.bytes(ReclaimClass::Cache), 0);
     }
+    #[test]
+    fn admission_rechecks_the_budget_and_remaining_owners_after_a_missed_eviction() {
+        // Another user checks the entry out after the scheduler observes its age.
+        struct CheckedOut(Mutex<Option<CacheTicket>>);
+        impl Reclaim for CheckedOut {
+            fn oldest(&self) -> Option<u64> {
+                self.0.lock().unwrap().take().map(|_| 0)
+            }
+            fn evict_oldest(&self) -> bool {
+                false
+            }
+        }
+
+        for requested in [4, 8] {
+            let scheduler = ResourceScheduler::new(0, 8);
+            let first = Arc::new(CheckedOut(Mutex::new(
+                scheduler.admit(ReclaimClass::Cache, 4),
+            )));
+            let cached = scheduler.admit(ReclaimClass::Cache, 4).unwrap();
+            let second = Arc::new(Cache(Mutex::new(vec![(1, cached)])));
+            scheduler.register(ReclaimClass::Cache, first.clone());
+            scheduler.register(ReclaimClass::Cache, second.clone());
+            let ticket = scheduler.admit(ReclaimClass::Cache, requested).unwrap();
+            assert_eq!(ticket.bytes, requested);
+            assert_eq!(second.0.lock().unwrap().len(), usize::from(requested == 4));
+            assert_eq!(scheduler.bytes(ReclaimClass::Cache), 8);
+        }
+    }
+
+    #[test]
+    fn reclaim_tries_the_next_owner_when_the_oldest_entry_is_unavailable() {
+        struct Unavailable;
+        impl Reclaim for Unavailable {
+            fn oldest(&self) -> Option<u64> {
+                Some(0)
+            }
+            fn evict_oldest(&self) -> bool {
+                false
+            }
+        }
+
+        let scheduler = ResourceScheduler::new(0, 4);
+        let first = Arc::new(Unavailable);
+        let cached = scheduler.admit(ReclaimClass::Cache, 4).unwrap();
+        let second = Arc::new(Cache(Mutex::new(vec![(1, cached)])));
+        scheduler.register(ReclaimClass::Cache, first.clone());
+        scheduler.register(ReclaimClass::Cache, second.clone());
+        scheduler.reclaim();
+        assert_eq!(scheduler.bytes(ReclaimClass::Cache), 0);
+    }
+
     #[test]
     fn reclaim_calls_run_outside_the_governor_lock() {
         let scheduler = ResourceScheduler::new(8, 8);
