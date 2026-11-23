@@ -93,8 +93,6 @@ pub enum SnapshotCommand {
     },
     Mask(MaskCommand),
     Shared(Arc<[SnapshotNode]>),
-    /// Index into the player-thread immutable block table for this capture.
-    Retained(usize),
     Blend {
         children: Arc<[SnapshotNode]>,
         mode: SnapshotBlend,
@@ -193,12 +191,17 @@ pub struct PreparedSnapshot {
     pub snapshot: RenderSnapshot,
     resources: Vec<(ResourceVersion, Handle)>,
     resource_indices: HashMap<ResourceVersion, usize>,
-    retained: Vec<Rc<CommandList>>,
+}
+// Only the VM cache carries local resource bindings. The shared node array
+// can outlive the originating page or any previous frame that used it.
+struct FrozenPage {
+    device: u64,
+    nodes: Arc<[SnapshotNode]>,
+    shapes: Vec<(ResourceVersion, Handle)>,
 }
 #[derive(Default)]
 struct Capture {
     device: Option<u64>,
-    retained: Vec<Rc<CommandList>>,
     known: HashMap<ResourceVersion, usize>,
     resources: Vec<(ResourceVersion, Handle)>,
     recipes: Vec<ResourceRecipe>,
@@ -287,6 +290,49 @@ impl Capture {
         self.resources.push((resource, handle));
         Ok(resource)
     }
+    fn frozen_page(
+        &mut self,
+        page: &CommandList,
+        device: u64,
+    ) -> Result<Option<Arc<[SnapshotNode]>>, RenderFailure> {
+        let frozen = if let Some(cached) = page.cached_snapshot::<FrozenPage>()
+            && cached.device == device
+        {
+            ruffle_render::profile::work(|w| w.prepared_chunk_hits += 1);
+            cached
+        } else {
+            // Cache leaf pages. A changed directory can still refer to the
+            // unchanged pages on either side of the edit.
+            if page.iter().any(|cmd| matches!(cmd, Command::Shared(_)))
+                || !Self::immutable(page, device)
+            {
+                return Ok(None);
+            }
+            let mut local = Self::default();
+            let nodes = local.commands(page)?;
+            let bytes = size_of::<FrozenPage>()
+                + size_of_val(&*nodes)
+                + local.resources.capacity() * size_of::<(ResourceVersion, Handle)>();
+            let frozen = Rc::new(FrozenPage {
+                device,
+                nodes,
+                shapes: local.resources,
+            });
+            page.store_snapshot(frozen.clone(), bytes);
+            frozen
+        };
+        // Certification admits only resident, untextured geometry and
+        // primitives. Every shape therefore has exactly one external input.
+        for (version, handle) in &frozen.shapes {
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.known.entry(*version) {
+                entry.insert(self.resources.len());
+                self.resources.push((*version, handle.clone()));
+                self.recipes.push(ResourceRecipe::Resident(*version));
+            }
+        }
+        Ok(Some(frozen.nodes.clone()))
+    }
+
     fn commands(&mut self, commands: &CommandList) -> Result<Arc<[SnapshotNode]>, RenderFailure> {
         let mut nodes = Vec::with_capacity(commands.iter().len());
         self.commands_into(commands, &mut nodes)?;
@@ -334,20 +380,13 @@ impl Capture {
                         rectangle: matches!(command, Command::DrawLineRect { .. }),
                     }
                 }
-                Command::Shared(children)
-                    if self.device.is_some_and(|d| Self::immutable(children, d)) =>
-                {
-                    let index = self.retained.len();
-                    self.retained.push(children.clone());
-                    ruffle_render::profile::work(|w| w.prepared_chunk_hits += 1);
-                    SnapshotCommand::Retained(index)
-                }
-                Command::Shared(children) if self.device.is_some() => {
-                    // An unprepared directory is just painter order. Expanding it
-                    // into this array avoids a worker allocation and scratch
-                    // reservation per logical slot on cold or volatile frames.
-                    self.commands_into(children, nodes)?;
-                    continue;
+                Command::Shared(children) if let Some(device) = self.device => {
+                    if let Some(page) = self.frozen_page(children, device)? {
+                        SnapshotCommand::Shared(page)
+                    } else {
+                        self.commands_into(children, nodes)?;
+                        continue;
+                    }
                 }
                 Command::Shared(children) => SnapshotCommand::Shared(self.commands(children)?),
                 Command::Blend(children, mode) => SnapshotCommand::Blend {
@@ -370,8 +409,7 @@ impl Capture {
             };
             leaves += u64::from(!matches!(
                 command,
-                SnapshotCommand::Retained(_)
-                    | SnapshotCommand::Shared(_)
+                SnapshotCommand::Shared(_)
                     | SnapshotCommand::Blend { .. }
                     | SnapshotCommand::AlphaMask { .. }
             ));
@@ -430,7 +468,6 @@ impl PreparedSnapshot {
     }
     pub fn leaf(&self, node: &SnapshotNode) -> Result<Command, RenderFailure> {
         Ok(match &node.command {
-            SnapshotCommand::Retained(index) => Command::Shared(self.retained[*index].clone()),
             SnapshotCommand::Bitmap {
                 resource,
                 transform,
@@ -501,26 +538,13 @@ impl PreparedSnapshot {
         Self::capture_for_device(commands, None)
     }
 
-    /// A dense frame can change every transform while all geometry is already
-    /// resident. Move a long, dependency-free command stream to the owner
-    /// table for this submission. The next submission supplies fresh commands.
-    pub(super) fn capture_owned(commands: CommandList, device: u64) -> Result<Self, RenderFailure> {
-        if commands.iter().len() >= 64 && Capture::immutable(&commands, device) {
-            let node = SnapshotNode {
-                command: SnapshotCommand::Retained(0),
-                region: commands.region(),
-            };
-            return Ok(Self {
-                snapshot: RenderSnapshot {
-                    commands: Arc::from([node]),
-                    recipes: Vec::new(),
-                },
-                resources: Vec::new(),
-                resource_indices: Default::default(),
-                retained: vec![Rc::new(commands)],
-            });
-        }
-        Self::capture_for_device(&commands, Some(device))
+    /// The synchronous encoder can consume certified draws directly at the
+    /// requested stage quality. This list never enters a queued snapshot.
+    pub(super) fn direct_resident_draws(commands: &CommandList, device: u64) -> bool {
+        !commands.is_empty()
+            && (commands.iter().len() >= 64
+                || commands.iter().all(|cmd| matches!(cmd, Command::Shared(_))))
+            && Capture::immutable(commands, device)
     }
 
     pub(super) fn capture_for_device(
@@ -530,7 +554,6 @@ impl PreparedSnapshot {
         let capacity = commands.iter().len().min(64);
         let mut capture = Capture {
             device,
-            retained: Vec::new(),
             known: HashMap::with_capacity_and_hasher(capacity, Default::default()),
             resources: Vec::with_capacity(capacity),
             recipes: Vec::with_capacity(capacity),
@@ -543,7 +566,6 @@ impl PreparedSnapshot {
             },
             resource_indices: capture.known,
             resources: capture.resources,
-            retained: capture.retained,
         })
     }
     fn validate<T: crate::target::RenderTarget>(
@@ -783,6 +805,74 @@ impl PreparedSnapshot {
 mod stage_capture_tests {
     use super::*;
     use ruffle_render::commands::CommandHandler;
+
+    #[test]
+    fn replacement_frame_carries_immutable_draws_after_the_vm_and_first_capture_drop() {
+        let mut block = CommandList::new();
+        block.draw_rect(Color::RED, Matrix::IDENTITY);
+        let block = Rc::new(block);
+        let weak_source = Rc::downgrade(&block);
+        let mut frame = CommandList::new();
+        frame.push(Command::Shared(block.clone()));
+        drop(block);
+        let first = PreparedSnapshot::capture_for_device(&frame, Some(1)).unwrap();
+        frame.draw_rect(Color::BLUE, Matrix::IDENTITY);
+        let replacement = PreparedSnapshot::capture_for_device(&frame, Some(1)).unwrap();
+        drop(first);
+        drop(frame);
+        assert!(
+            weak_source.upgrade().is_none(),
+            "the frame still pins a VM command list"
+        );
+        let snapshot = replacement.snapshot;
+        std::thread::spawn(move || {
+            fn colors(nodes: &[SnapshotNode], out: &mut Vec<Color>) {
+                for node in nodes {
+                    match &node.command {
+                        SnapshotCommand::Rect { color, .. } => out.push(*color),
+                        SnapshotCommand::Shared(children) => colors(children, out),
+                        _ => panic!("the captured rectangle cannot be decoded independently"),
+                    }
+                }
+            }
+            let mut drawn = Vec::new();
+            colors(&snapshot.commands, &mut drawn);
+            assert_eq!(drawn, vec![Color::RED, Color::BLUE]);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn mixed_frames_share_the_owned_page_within_the_display_tree_budget() {
+        let mut page = CommandList::new();
+        page.draw_rect(Color::RED, Matrix::IDENTITY);
+        let page = Rc::new(page);
+        let budget = Rc::new(std::cell::Cell::new(0usize));
+        page.charge_storage(&budget, 1 << 20);
+        let make_frame = || {
+            let mut frame = CommandList::new();
+            frame.push(Command::Shared(page.clone()));
+            frame.push_mask();
+            frame.activate_mask();
+            frame.deactivate_mask();
+            frame.pop_mask();
+            PreparedSnapshot::capture_for_device(&frame, Some(3))
+                .unwrap()
+                .snapshot
+        };
+        let first = make_frame();
+        let before = budget.get();
+        let second = make_frame();
+        let nodes = |s: &RenderSnapshot| match &s.commands[0].command {
+            SnapshotCommand::Shared(nodes) => nodes.clone(),
+            _ => panic!("expected an owned shared page"),
+        };
+        assert!(Arc::ptr_eq(&nodes(&first), &nodes(&second)));
+        assert_eq!(budget.get(), before);
+        drop(page);
+        assert_eq!(budget.get(), 0);
+    }
 
     #[test]
     fn unprepared_stage_blocks_flatten_in_painter_order_for_workers() {

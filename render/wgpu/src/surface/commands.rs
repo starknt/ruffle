@@ -364,6 +364,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             && let Some(prepared) = commands.prepared_draws::<PreparedDraws>()
             && prepared.key == key
         {
+            ruffle_render::profile::work(|w| w.prepared_chunk_hits += 1);
             self.replay_groups(&prepared);
             return;
         }

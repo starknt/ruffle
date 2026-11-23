@@ -525,6 +525,14 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         {
             return Ok(SurfaceCommands::CachedBitmaps(commands));
         }
+        if matches!(load, crate::pass_graph::Load::Clear(_))
+            && crate::render_snapshot::PreparedSnapshot::direct_resident_draws(
+                &commands,
+                self.descriptors.runtime.generation(),
+            )
+        {
+            return Ok(SurfaceCommands::ResidentDraws(commands));
+        }
         let samples = crate::utils::supported_sample_count(
             &self.descriptors.adapter,
             quality.sample_count(),

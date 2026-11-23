@@ -113,6 +113,15 @@ impl Surface {
                 let direct = graph.graph.direct_attachment();
                 (self, direct, graph.into_commands()?)
             }
+            SurfaceCommands::ResidentDraws(list) => {
+                let bounds = ruffle_render::region::RenderRect {
+                    x: 0,
+                    y: 0,
+                    width: self.size.width,
+                    height: self.size.height,
+                };
+                (self, true, PlannedList::from_resident_draws(list, bounds))
+            }
             SurfaceCommands::CachedBitmaps(list) => {
                 let bounds = ruffle_render::region::RenderRect {
                     x: 0,
@@ -130,7 +139,7 @@ impl Surface {
                 (
                     &aligned_surface,
                     true,
-                    PlannedList::from_cache_bitmaps(list, bounds),
+                    PlannedList::from_resident_draws(list, bounds),
                 )
             }
         };

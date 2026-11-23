@@ -36,7 +36,7 @@ pub struct PlannedList {
     reads_layer: bool,
 }
 impl PlannedList {
-    pub fn from_cache_bitmaps(list: CommandList, bounds: RenderRect) -> Self {
+    pub fn from_resident_draws(list: CommandList, bounds: RenderRect) -> Self {
         let mut plan = Self::default();
         plan.commands.reserve(list.iter().len());
         for command in list.into_commands() {
@@ -119,6 +119,7 @@ impl PlannedList {
 pub enum SurfaceCommands {
     Graph(GraphEncoder),
     CachedBitmaps(CommandList),
+    ResidentDraws(CommandList),
 }
 
 impl SurfaceCommands {
@@ -163,8 +164,10 @@ impl GraphEncoder {
         samples: u32,
         load: Load,
     ) -> Result<Self, RenderFailure> {
-        let prepared =
-            PreparedSnapshot::capture_owned(commands, backend.descriptors.runtime.generation())?;
+        let prepared = PreparedSnapshot::capture_for_device(
+            &commands,
+            Some(backend.descriptors.runtime.generation()),
+        )?;
         Self::from_prepared(backend, prepared, bounds, samples, load)
     }
     pub fn from_prepared<T: crate::target::RenderTarget>(
