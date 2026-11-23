@@ -38,7 +38,7 @@ pub fn add_event_listener<'gc>(
     let listener = args.get_function(activation, 1, "listener")?;
     let use_capture = args.get_bool(2);
     let priority = args.get_i32(3);
-    let wall_clock = !activation.context.playback.wall_classes.is_empty()
+    let wall_clock = !activation.context.host_playback.wall_classes.is_empty()
         && (activation.context.in_wall_clock_method()
             || listener
                 .executable()
@@ -47,7 +47,7 @@ pub fn add_event_listener<'gc>(
                 .is_some_and(|class| {
                     crate::avm2::call_stack::wall_clock_method(
                         class.i_class().unwrap_or(class).name(),
-                        activation.context.playback.wall_classes,
+                        activation.context.host_playback.wall_classes,
                     )
                 }));
 
@@ -57,7 +57,7 @@ pub fn add_event_listener<'gc>(
         .expect("Internal properties should have what I put in them")
         .add_event_listener(event_type, priority, listener, use_capture, wall_clock);
 
-    if !activation.context.playback.wall_classes.is_empty()
+    if !activation.context.host_playback.wall_classes.is_empty()
         && (event_type.as_wstr() == b"timer" || event_type.as_wstr() == b"timerComplete")
     {
         if let Some((id, wall, mixed)) = dispatch_list
@@ -90,7 +90,7 @@ pub fn remove_event_listener<'gc>(
         .as_dispatch_mut(activation.gc())
         .expect("Internal properties should have what I put in them")
         .remove_event_listener(event_type, listener, use_capture);
-    if !activation.context.playback.wall_classes.is_empty()
+    if !activation.context.host_playback.wall_classes.is_empty()
         && (event_type.as_wstr() == b"timer" || event_type.as_wstr() == b"timerComplete")
     {
         if let Some((id, wall, mixed)) = dispatch_list

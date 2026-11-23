@@ -13,6 +13,75 @@ fn movie_bytes() -> Vec<u8> {
 }
 
 #[test]
+fn a_replaced_root_load_cannot_deliver_metadata_or_install_its_movie() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let session = PlayerBuilder::new().build_session();
+    let player = session.player();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let request = |name: &'static str| {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/tests/swfs/avm1/asnew/test.swf")
+            .canonicalize()
+            .unwrap();
+        let url = Url::from_file_path(path).unwrap().to_string();
+        let seen = seen.clone();
+        player.lock().unwrap().mutate_with_update_context(|ctx| {
+            load_root_movie(
+                ctx,
+                Request::get(url),
+                vec![],
+                Box::new(move |_| seen.borrow_mut().push(name)),
+            )
+        })
+    };
+    let first = request("old");
+    let second = request("new");
+    futures::executor::block_on(second).unwrap();
+    futures::executor::block_on(first).unwrap();
+    assert_eq!(*seen.borrow(), ["new"]);
+}
+
+#[test]
+fn metadata_callback_can_replace_the_root_before_installation() {
+    let mut session = PlayerBuilder::new().build_session();
+    let player = session.player().clone();
+    let newer = player.clone();
+    let swfs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/tests/swfs/avm1");
+    let url = |name: &str| {
+        Url::from_file_path(swfs.join(name).join("test.swf").canonicalize().unwrap())
+            .unwrap()
+            .to_string()
+    };
+    let first = url("asnew");
+    let second = url("load_cancel_via_unloadmovie");
+    let replacement = second.clone();
+    let load = player.lock().unwrap().mutate_with_update_context(|uc| {
+        load_root_movie(
+            uc,
+            Request::get(first.clone()),
+            vec![],
+            Box::new(move |_| {
+                newer
+                    .lock()
+                    .unwrap()
+                    .fetch_root_movie(replacement, vec![], Box::new(|_| {}));
+            }),
+        )
+    });
+    futures::executor::block_on(load).unwrap();
+    let current_url = || {
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|ctx| ctx.root_swf.url().to_owned())
+    };
+    assert_ne!(current_url(), first);
+    session.poll_tasks();
+    assert_eq!(current_url(), second);
+}
+
+#[test]
 fn prepared_movie_is_installed_without_reparsing_transport_bytes() {
     let bytes = movie_bytes();
     let prepared = SwfMovieData::from_data(
@@ -94,7 +163,7 @@ fn stale_load_bytes_parse_error_does_not_fail_a_new_loader_generation() {
 
 #[test]
 fn worker_returns_shared_bytes_before_main_thread_installation() {
-    let (_, movie) = futures::executor::block_on(prepare_swf_movie(
+    let movie = futures::executor::block_on(prepare_swf_movie(
         movie_bytes(),
         "https://example.test/shared.swf".into(),
         None,
@@ -102,7 +171,7 @@ fn worker_returns_shared_bytes_before_main_thread_installation() {
     ))
     .unwrap();
     assert!(
-        movie.unwrap().shared_file().is_some(),
+        movie.into_movie().unwrap().shared_file().is_some(),
         "shared-file preparation must finish on the parsing worker"
     );
 }
@@ -125,19 +194,17 @@ fn swz(bytes: &[u8]) -> Vec<u8> {
 #[test]
 fn worker_returns_inner_swf_without_requiring_main_thread_swz_extraction() {
     let bytes = movie_bytes();
-    let (transport, movie) = futures::executor::block_on(prepare_swf_movie(
+    let movie = futures::executor::block_on(prepare_swf_movie(
         swz(&bytes),
         "https://example.test/envelope.swz".into(),
         None,
         None,
     ))
     .unwrap();
-    assert!(movie.is_some());
-    assert!(
-        transport.is_empty(),
-        "parsed SWF must release transport bytes"
+    assert_eq!(
+        movie.into_movie().unwrap().compressed_len(),
+        swz(&bytes).len()
     );
-    assert_eq!(movie.unwrap().compressed_len(), swz(&bytes).len());
 }
 
 #[test]
@@ -161,7 +228,10 @@ fn worker_parse_yields_before_work_can_run_on_a_single_thread_pool() {
         let mut context = Context::from_waker(futures::task::noop_waker_ref());
         assert!(future.as_mut().poll(&mut context).is_pending());
     });
-    assert!(futures::executor::block_on(future).unwrap().1.is_some());
+    assert!(matches!(
+        futures::executor::block_on(future).unwrap(),
+        PreparedContent::Movie(_)
+    ));
 }
 
 #[test]
@@ -174,17 +244,15 @@ fn inline_and_worker_preparation_preserve_bytes_metadata_and_shared_storage() {
         });
         let url = "https://example.test/movie.swf?mode=fixture".to_string();
         let origin = Some("https://example.test/parent.swf".to_string());
-        let (worker_body, worker) = futures::executor::block_on(prepare_swf_movie(
+        let worker = futures::executor::block_on(prepare_swf_movie(
             body.clone(),
             url.clone(),
             origin.clone(),
             info,
         ))
         .unwrap();
-        let (inline_body, inline) = prepare_swf_movie_data(body, url, origin, info).unwrap();
-        let (worker, inline) = (worker.unwrap(), inline.unwrap());
-        assert_eq!(worker_body, inline_body);
-        assert!(worker_body.is_empty());
+        let inline = prepare_swf_movie_data(body, url, origin, info).unwrap();
+        let (worker, inline) = (worker.into_movie().unwrap(), inline.into_movie().unwrap());
         assert_eq!(worker.data(), inline.data());
         assert_eq!(worker.url(), inline.url());
         assert_eq!(worker.parameters(), inline.parameters());
@@ -199,15 +267,14 @@ fn inline_and_worker_preparation_preserve_bytes_metadata_and_shared_storage() {
 #[test]
 fn worker_preserves_non_movie_payload_and_rejects_malformed_swf() {
     let image = b"GIF89a fixture".to_vec();
-    let (body, movie) = futures::executor::block_on(prepare_swf_movie(
+    let content = futures::executor::block_on(prepare_swf_movie(
         image.clone(),
         "https://example.test/image.gif".into(),
         None,
         None,
     ))
     .unwrap();
-    assert_eq!(body, image);
-    assert!(movie.is_none());
+    assert!(matches!(content, PreparedContent::Other(body) if body == image));
     for bytes in [b"FWS\x08\0\0\0\0".to_vec(), swz(b"FWS\x08\0\0\0\0")] {
         assert!(
             futures::executor::block_on(prepare_swf_movie(

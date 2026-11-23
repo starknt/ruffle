@@ -58,7 +58,7 @@ pub fn start<'gc>(
             false,
             origin,
         );
-        if !activation.context.playback.wall_classes.is_empty() {
+        if !activation.context.host_playback.wall_classes.is_empty() {
             let list = crate::avm2::globals::flash::events::event_dispatcher::dispatch_list(
                 activation, this,
             )?;

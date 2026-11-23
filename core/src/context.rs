@@ -101,6 +101,8 @@ pub struct UpdateContext<'gc> {
 
     /// The navigator backend, used by the AVM to make HTTP requests and visit webpages.
     pub navigator: &'gc mut dyn NavigatorBackend,
+    pub(crate) resources: &'gc crate::loader::resource::Resources,
+    pub(crate) spoofed_url: Option<&'gc str>,
     pub(crate) task_spawner: Option<&'gc dyn crate::backend::tasks::TaskSpawner>,
 
     /// The renderer, used by the display objects to draw themselves.
@@ -190,6 +192,7 @@ pub struct UpdateContext<'gc> {
     /// The instant at which the SWF was launched.
     pub start_time: Instant,
     pub playback: &'gc crate::playback::PlaybackClock,
+    pub(crate) host_playback: &'gc crate::playback::HostPlayback,
 
     /// The instant at which the current update started.
     pub update_start: Instant,
@@ -269,10 +272,10 @@ impl<'gc> UpdateContext<'gc> {
     }
 
     pub(crate) fn in_wall_clock_method(&self) -> bool {
-        !self.playback.wall_classes.is_empty()
+        !self.host_playback.wall_classes.is_empty()
             && self.avm2.call_stack().borrow().wall_clock(
                 self.avm2,
-                self.playback.wall_classes,
+                self.host_playback.wall_classes,
                 self.playback.callback_clock.get(),
             )
     }
@@ -384,6 +387,7 @@ impl<'gc> UpdateContext<'gc> {
     /// of previous stage contents. If you need to load a new root movie, you
     /// should use `replace_root_movie`.
     pub fn set_root_movie(&mut self, movie: SwfMovieData) {
+        self.load_manager.cancel_root_read();
         if !self.forced_frame_rate {
             *self.frame_rate = movie.frame_rate().into();
         }

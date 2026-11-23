@@ -86,7 +86,12 @@ mod tests {
         assert_eq!(executor.pending_tasks(), 1);
         drop(executor);
         assert_eq!(spawner.pending.get(), 0);
-        assert!(spawner.try_spawn(Box::pin(async { Ok(()) })).unwrap_err().is_shutdown());
+        assert!(
+            spawner
+                .try_spawn(Box::pin(async { Ok(()) }))
+                .unwrap_err()
+                .is_shutdown()
+        );
         assert_eq!(spawner.pending.get(), 0);
     }
 }

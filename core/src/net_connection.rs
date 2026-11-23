@@ -5,9 +5,7 @@ use crate::avm2::object::{
     NetConnectionObject as Avm2NetConnectionObject, ResponderObject as Avm2ResponderObject,
 };
 use crate::avm2::{Activation as Avm2Activation, Avm2, EventObject as Avm2EventObject};
-use crate::backend::navigator::{
-    ErrorResponse, FetchReason, OwnedFuture, Request,
-};
+use crate::backend::navigator::{ErrorResponse, FetchReason, OwnedFuture, Request};
 use crate::context::UpdateContext;
 use crate::loader::Error;
 use flash_lso::packet::{Header, Message, Packet};

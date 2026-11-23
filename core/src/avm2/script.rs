@@ -155,7 +155,7 @@ impl<'gc> TranslationUnit<'gc> {
             // We currently don't handle them and just export it in the domain in both cases.
             activation
                 .context
-                .playback
+                .host_playback
                 .check_definition(class.name(), self.movie().data());
             self.domain()
                 .export_class(class.name(), class, activation.gc());
@@ -644,7 +644,7 @@ impl<'gc> Script<'gc> {
                 if newtrait.name() != class.name() {
                     activation
                         .context
-                        .playback
+                        .host_playback
                         .check_definition(newtrait.name(), unit.movie().data());
                 }
                 domain.export_class(newtrait.name(), *class, mc);

@@ -840,16 +840,22 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     fn prepare_frame(&mut self) -> Result<bool, crate::gpu_runtime::RenderFailure> {
         self.descriptors.runtime.check_health()?;
         if self.stage_frame.is_none() {
-            let _timer = ruffle_render::profile::native_time(ruffle_render::profile::NativePhase::SurfaceAcquire);
+            let _timer = ruffle_render::profile::native_time(
+                ruffle_render::profile::NativePhase::SurfaceAcquire,
+            );
             self.stage_frame = self.target.get_next_texture()?;
         }
         Ok(self.stage_frame.is_some())
     }
 
     fn submit_frame(
-        &mut self, clear: Color, commands: CommandList, cache_entries: Vec<BitmapCacheEntry>,
+        &mut self,
+        clear: Color,
+        commands: CommandList,
+        cache_entries: Vec<BitmapCacheEntry>,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
-        self.submit_frame_with_outcome(clear, commands, cache_entries).map(|_| ())
+        self.submit_frame_with_outcome(clear, commands, cache_entries)
+            .map(|_| ())
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -859,11 +865,15 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
     ) -> Result<ruffle_render::backend::FrameOutcome, crate::gpu_runtime::RenderFailure> {
-        let _render_backend = ruffle_render::profile::time(ruffle_render::profile::Phase::RenderBackend);
+        let _render_backend =
+            ruffle_render::profile::time(ruffle_render::profile::Phase::RenderBackend);
         if !self.prepare_frame()? {
             return Ok(ruffle_render::backend::FrameOutcome::Deferred);
         }
-        let frame_output = self.stage_frame.take().expect("stage frame was just acquired");
+        let frame_output = self
+            .stage_frame
+            .take()
+            .expect("stage frame was just acquired");
 
         if let Some(tiles) = &mut self.filtered_tiles {
             tiles.begin_frame();

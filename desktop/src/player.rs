@@ -540,7 +540,10 @@ struct WinitExecutor {
 }
 
 impl ruffle_core::backend::tasks::TaskSpawner for WinitExecutor {
-    fn try_spawn(&self, future: ruffle_core::backend::tasks::PlayerTask) -> Result<(), ruffle_core::backend::tasks::SpawnError> {
+    fn try_spawn(
+        &self,
+        future: ruffle_core::backend::tasks::PlayerTask,
+    ) -> Result<(), ruffle_core::backend::tasks::SpawnError> {
         // Discard any errors.
         let future = async {
             if let Err(e) = future.await {
@@ -563,7 +566,8 @@ impl ruffle_core::backend::tasks::TaskSpawner for WinitExecutor {
         // The future should run in the background.
         task.detach();
         // Immediately schedule the future to be polled for the first time.
-        self.event_loop.send_event(RuffleEvent::TaskPoll(PlayerRunnable(runnable)))
+        self.event_loop
+            .send_event(RuffleEvent::TaskPoll(PlayerRunnable(runnable)))
             .map_err(|_| ruffle_core::backend::tasks::SpawnError::shutdown())
     }
 }

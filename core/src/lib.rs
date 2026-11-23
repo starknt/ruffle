@@ -62,11 +62,13 @@ pub mod stub;
 
 pub use context_menu::ContextMenuItem;
 pub use events::PlayerEvent;
-pub use ruffle_render::backend::FrameOutcome;
 pub use indexmap;
 pub use loader::LoadBehavior;
-pub use player::{Player, PlayerBuilder, PlayerMode, PlayerRuntime, PlayerSession, StaticCallstack};
+pub use player::{
+    Player, PlayerBuilder, PlayerMode, PlayerRuntime, PlayerSession, StaticCallstack,
+};
 pub use ruffle_common::duration::FloatDuration;
+pub use ruffle_render::backend::FrameOutcome;
 pub use ruffle_render::backend::ViewportDimensions;
 pub use swf;
 pub use swf::Color;

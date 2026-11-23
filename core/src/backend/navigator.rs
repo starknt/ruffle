@@ -386,7 +386,10 @@ impl NullNavigatorBackend {
     }
 
     pub fn for_directory(path: &Path) -> std::io::Result<Self> {
-        Ok(Self { relative_base_path: path.canonicalize()?, ..Self::new() })
+        Ok(Self {
+            relative_base_path: path.canonicalize()?,
+            ..Self::new()
+        })
     }
 
     pub fn with_base_path(path: &Path, executor: &NullExecutor) -> Result<Self, std::io::Error> {

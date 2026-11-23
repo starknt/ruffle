@@ -23,7 +23,6 @@ use crate::backend::{
     ui::{MouseCursor, UiBackend},
 };
 use crate::compatibility_rules::CompatibilityRules;
-use crate::compatibility_rules::UrlRewriteStage;
 use crate::config::Letterbox;
 use crate::context::{ActionQueue, ActionType, RenderContext, UpdateContext};
 use crate::context_menu::{
@@ -48,6 +47,7 @@ use crate::input::InputEvent;
 use crate::input::InputManager;
 use crate::library::Library;
 use crate::limits::ExecutionLimit;
+use crate::loader::resource::Resources;
 use crate::loader::{LoadBehavior, LoadManager};
 use crate::local_connection::LocalConnections;
 use crate::net_connection::NetConnections;
@@ -421,6 +421,7 @@ pub struct Player {
     /// The instant at which the SWF was launched.
     start_time: Instant,
     playback: crate::playback::PlaybackClock,
+    host_playback: crate::playback::HostPlayback,
 
     /// The maximum amount of time that can be called before a `Error::ExecutionTimeout`
     /// is raised. This defaults to 15 seconds but can be changed.
@@ -445,7 +446,7 @@ pub struct Player {
     spoofed_url: Option<String>,
 
     /// Any compatibility rules to apply for this movie.
-    compatibility_rules: CompatibilityRules,
+    resources: Resources,
 
     /// Sends notifications back from the core player to the frontend.
     notification_sender: Option<Sender<PlayerNotification>>,
@@ -578,23 +579,38 @@ impl Player {
         FloatDuration::from_millis(self.frame_time(1000.0))
     }
 
+    /// Install this session's eligibility policy. A newly restricted player immediately
+    /// resumes ordinary wall-clock playback without advancing its sample clock.
+    pub fn set_playback_policy(
+        &mut self,
+        policy: std::rc::Rc<dyn crate::playback::PlaybackPolicy>,
+    ) {
+        self.host_playback.install(policy);
+        if !self.host_playback.allows_acceleration() {
+            self.set_playback_rate(crate::playback::PlaybackRate::Normal);
+        }
+    }
+
     pub fn install_module_check(
         &mut self,
         rules: &'static [crate::playback::ModuleRule],
         verify: fn(&[u8], &[&str]) -> bool,
     ) {
-        self.playback.install_module_check(rules, verify);
+        self.host_playback.install_module_check(rules, verify);
+        if !self.host_playback.allows_acceleration() {
+            self.set_playback_rate(crate::playback::PlaybackRate::Normal);
+        }
     }
     pub fn unverified_module(&self) -> Option<(&'static crate::playback::ModuleRule, bool)> {
-        self.playback.unverified_module()
+        self.host_playback.unverified_module()
     }
 
     pub fn set_realtime_avm2_classes(&mut self, classes: &'static [(&'static str, &'static str)]) {
-        self.playback.wall_classes = classes;
+        self.host_playback.wall_classes = classes;
     }
 
     pub fn has_mixed_protocol_timer(&mut self) -> bool {
-        !self.playback.wall_classes.is_empty()
+        !self.host_playback.wall_classes.is_empty()
             && self.mutate_with_update_context(|ctx| ctx.timers.has_mixed())
     }
 
@@ -641,7 +657,7 @@ impl Player {
 
     pub fn set_playback_rate(&mut self, rate: crate::playback::PlaybackRate) {
         if rate != crate::playback::PlaybackRate::Normal
-            && (self.unverified_module().is_some() || self.has_mixed_protocol_timer())
+            && (!self.host_playback.allows_acceleration() || self.has_mixed_protocol_timer())
         {
             return;
         }
@@ -740,7 +756,7 @@ impl Player {
             *self.playback.elapsed.as_mut().expect("accelerated clock") += step;
             self.audio.advance_simulated_output(step);
             self.tick_step(FloatDuration::from_millis(step), None);
-            if self.unverified_module().is_some() || self.has_mixed_protocol_timer() {
+            if !self.host_playback.allows_acceleration() || self.has_mixed_protocol_timer() {
                 self.set_playback_rate(crate::playback::PlaybackRate::Normal);
                 break;
             }
@@ -762,7 +778,7 @@ impl Player {
     }
 
     fn refresh_wall_deadline(&mut self) {
-        if !self.playback.wall_classes.is_empty() {
+        if !self.host_playback.wall_classes.is_empty() {
             self.playback.wall_deadline =
                 self.mutate_with_update_context(|ctx| ctx.timers.wall_deadline());
         }
@@ -865,7 +881,7 @@ impl Player {
                     ruffle_render::profile::time(ruffle_render::profile::Phase::NetConnection);
                 self.update_net_connections();
             }
-            if !self.playback.wall_classes.is_empty() {
+            if !self.host_playback.wall_classes.is_empty() {
                 let _wall_timers =
                     ruffle_render::profile::time(ruffle_render::profile::Phase::WallTimers);
                 self.mutate_with_update_context(|ctx| Timers::update_wall_timers(ctx, wall_dt));
@@ -2449,7 +2465,9 @@ impl Player {
         self.render_with_outcome().map(|_| ())
     }
 
-    pub fn render_with_outcome(&mut self) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
+    pub fn render_with_outcome(
+        &mut self,
+    ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
         self.check_render_health()?;
         let result = self.render_inner();
         if let Err(error) = &result {
@@ -2470,7 +2488,9 @@ impl Player {
         }
     }
 
-    fn render_inner(&mut self) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
+    fn render_inner(
+        &mut self,
+    ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
         if self.playback.sample_time.is_none() {
             self.broadcast_render_if_invalidated();
         }
@@ -2528,7 +2548,9 @@ impl Player {
         });
 
         self.check_render_health()?;
-        let outcome = self.renderer.submit_frame_with_outcome(background_color, commands, cache_draws)?;
+        let outcome =
+            self.renderer
+                .submit_frame_with_outcome(background_color, commands, cache_draws)?;
         self.check_render_health()?;
         self.needs_render = outcome == ruffle_render::backend::FrameOutcome::Deferred;
         Ok(outcome)
@@ -2724,6 +2746,8 @@ impl Player {
                 renderer: this.renderer.deref_mut(),
                 audio: this.audio.deref_mut(),
                 navigator: this.navigator.deref_mut(),
+                resources: &this.resources,
+                spoofed_url: this.spoofed_url.as_deref(),
                 task_spawner: this.task_spawner.as_deref(),
                 ui: this.ui.deref_mut(),
                 action_queue,
@@ -2754,6 +2778,7 @@ impl Player {
                 external_interface,
                 start_time: this.start_time,
                 playback: &this.playback,
+                host_playback: &this.host_playback,
                 update_start: Instant::now(),
                 max_execution_duration: this.max_execution_duration,
                 focus_tracker: stage.focus_tracker(),
@@ -2962,7 +2987,7 @@ impl Player {
     }
 
     pub fn compatibility_rules(&self) -> &CompatibilityRules {
-        &self.compatibility_rules
+        self.resources.rules()
     }
 
     pub fn log_backend(&self) -> &dyn LogBackend {
@@ -3005,66 +3030,16 @@ impl Player {
         request: Request,
         reason: FetchReason,
     ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
-        self.fetch_with_buffering(
-            request,
-            reason,
-            matches!(reason, FetchReason::LoadSwf | FetchReason::UrlLoader),
-        )
+        self.resources
+            .fetch(self.navigator.as_ref(), request, reason)
     }
+
     pub fn fetch_buffered_sound(
         &self,
         request: Request,
     ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
-        self.fetch_with_buffering(request, FetchReason::Other, true)
-    }
-    fn fetch_with_buffering(
-        &self,
-        mut request: Request,
-        fetch_reason: FetchReason,
-        buffered: bool,
-    ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
-        match self.compatibility_rules.block_or_rewrite_swf_url(
-            request.url().into(),
-            UrlRewriteStage::BeforeRequest,
-            fetch_reason,
-        ) {
-            Ok(Some(new_url)) => request.set_url(new_url),
-            Ok(None) => {}
-            Err(error) => return Box::pin(async move { Err(error) }),
-        }
-
-        let self_reference = self.self_reference.clone();
-        let fetch = if buffered {
-            self.navigator.fetch_buffered(request, fetch_reason)
-        } else {
-            self.navigator.fetch(request)
-        };
-        Box::pin(async move {
-            let response = fetch.await;
-
-            let Ok(mut response) = response else {
-                return response;
-            };
-
-            let Some(player) = self_reference.upgrade() else {
-                return Ok(response);
-            };
-
-            let new_url = player
-                .lock()
-                .unwrap()
-                .compatibility_rules
-                .block_or_rewrite_swf_url(
-                    response.url(),
-                    UrlRewriteStage::AfterResponse,
-                    fetch_reason,
-                )?;
-            if let Some(new_url) = new_url {
-                response.set_url(new_url);
-            }
-
-            Ok(response)
-        })
+        self.resources
+            .buffered_sound(self.navigator.as_ref(), request)
     }
 }
 
@@ -3494,11 +3469,17 @@ impl PlayerBuilder {
         PlayerSession { player, executor }
     }
 
-    pub fn build_with_spawner(self, spawner: impl crate::backend::tasks::TaskSpawner + 'static) -> Arc<Mutex<Player>> {
+    pub fn build_with_spawner(
+        self,
+        spawner: impl crate::backend::tasks::TaskSpawner + 'static,
+    ) -> Arc<Mutex<Player>> {
         self.build_inner(Some(Box::new(spawner)))
     }
 
-    fn build_inner(self, task_spawner: Option<Box<dyn crate::backend::tasks::TaskSpawner>>) -> Arc<Mutex<Player>> {
+    fn build_inner(
+        self,
+        task_spawner: Option<Box<dyn crate::backend::tasks::TaskSpawner>>,
+    ) -> Arc<Mutex<Player>> {
         use crate::backend::*;
         use ruffle_video::null;
         let audio = self
@@ -3562,6 +3543,7 @@ impl PlayerBuilder {
                 recent_run_frame_timings: VecDeque::with_capacity(10),
                 start_time: Instant::now(),
                 playback: Default::default(),
+                host_playback: Default::default(),
                 time_offset: 0,
                 time_til_next_timer: None,
                 max_execution_duration: self.max_execution_duration,
@@ -3594,7 +3576,7 @@ impl PlayerBuilder {
                 self_reference: self_ref.clone(),
                 load_behavior: self.load_behavior,
                 spoofed_url: self.spoofed_url.clone(),
-                compatibility_rules: self.compatibility_rules.clone(),
+                resources: Resources::new(self.compatibility_rules.clone()),
                 stub_tracker: StubCollection::new(),
                 notification_sender: self.notification_sender,
                 #[cfg(feature = "egui")]
@@ -3815,17 +3797,44 @@ mod tests {
         let weak = Arc::downgrade(&player);
         let flag = Rc::new(std::cell::Cell::new(false));
         let task_flag = flag.clone();
-        player.lock().unwrap().mutate_with_update_context(|context| {
-            context.spawn_future(Box::pin(async move {
-                assert!(weak.upgrade().unwrap().try_lock().is_ok());
-                task_flag.set(true);
-                Ok(())
-            }));
-        });
-        assert_eq!(Rc::strong_count(&flag), 2, "queued task was dropped before polling");
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                context.spawn_future(Box::pin(async move {
+                    assert!(weak.upgrade().unwrap().try_lock().is_ok());
+                    task_flag.set(true);
+                    Ok(())
+                }));
+            });
+        assert_eq!(
+            Rc::strong_count(&flag),
+            2,
+            "queued task was dropped before polling"
+        );
         assert!(!flag.get());
         session.poll_tasks();
         assert!(flag.get());
+    }
+
+    #[test]
+    fn replacing_host_eligibility_while_accelerated_restores_normal_time() {
+        use crate::playback::{ModuleRule, PlaybackRate};
+        let session = PlayerBuilder::new().build_session();
+        let mut player = session.player().lock().unwrap();
+        player.set_sample_time(Duration::from_millis(750));
+        player.set_playback_rate(PlaybackRate::Double);
+        assert_eq!(player.playback_rate(), PlaybackRate::Double);
+        player.install_module_check(
+            &[ModuleRule {
+                namespace: "example",
+                class: "Unseen",
+                fingerprints: &[],
+            }],
+            |_, _| false,
+        );
+        assert_eq!(player.playback_rate(), PlaybackRate::Normal);
+        assert_eq!(player.playback_time_ms(), 750.0);
     }
 
     #[test]

@@ -183,7 +183,8 @@ impl RenderTarget for SwapChainTarget {
                 ));
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
-                self.device.configure_surface(&self.window_surface, &self.surface_config)?;
+                self.device
+                    .configure_surface(&self.window_surface, &self.surface_config)?;
                 return Ok(None);
             }
             state => {

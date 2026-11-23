@@ -2,6 +2,10 @@
 use std::cell::Cell;
 use std::time::Instant;
 
+mod policy;
+pub(crate) use policy::HostPlayback;
+pub use policy::{ModuleRule, PlaybackPolicy};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PlaybackRate {
@@ -24,29 +28,14 @@ impl TryFrom<u8> for PlaybackRate {
     }
 }
 
-/// A frontend identifies only the definitions whose bytecode it has audited.
-pub struct ModuleRule {
-    pub namespace: &'static str,
-    pub class: &'static str,
-    pub fingerprints: &'static [&'static str],
-}
-struct ModuleCheck {
-    rules: &'static [ModuleRule],
-    verify: fn(&[u8], &[&str]) -> bool,
-    seen: std::cell::RefCell<Vec<bool>>,
-    mismatch: Cell<Option<usize>>,
-}
-
 #[derive(Default)]
 pub struct PlaybackClock {
-    modules: Option<ModuleCheck>,
     pub(crate) sample_time: Option<std::time::Duration>,
     pub(crate) rate: PlaybackRate,
     pub(crate) elapsed: Option<f64>,
     pub(crate) credit: f64,
     pub(crate) executing_since: Option<Instant>,
     last_read: Cell<f64>,
-    pub(crate) wall_classes: &'static [(&'static str, &'static str)],
     pub(crate) wall_frame_credit: f64,
     pub(crate) batching_input: bool,
     pub(crate) callback_clock: Cell<Option<(usize, bool)>>,
@@ -55,51 +44,6 @@ pub struct PlaybackClock {
     pub(crate) wall_frame_due: bool,
 }
 impl PlaybackClock {
-    pub(crate) fn install_module_check(
-        &mut self,
-        rules: &'static [ModuleRule],
-        verify: fn(&[u8], &[&str]) -> bool,
-    ) {
-        self.modules = Some(ModuleCheck {
-            rules,
-            verify,
-            seen: std::cell::RefCell::new(vec![false; rules.len()]),
-            mismatch: Cell::default(),
-        });
-    }
-    pub(crate) fn check_definition(&self, name: crate::avm2::QName<'_>, data: &[u8]) {
-        let Some(check) = &self.modules else {
-            return;
-        };
-        if check.mismatch.get().is_some() {
-            return;
-        }
-        let Some(uri) = name.namespace().as_uri_opt() else {
-            return;
-        };
-        if let Some((i, rule)) = check.rules.iter().enumerate().find(|(_, r)| {
-            name.local_name().as_wstr() == r.class.as_bytes()
-                && uri.as_wstr() == r.namespace.as_bytes()
-        }) {
-            if (check.verify)(data, rule.fingerprints) {
-                check.seen.borrow_mut()[i] = true;
-            } else {
-                check.mismatch.set(Some(i));
-            }
-        }
-    }
-    pub(crate) fn unverified_module(&self) -> Option<(&'static ModuleRule, bool)> {
-        let check = self.modules.as_ref()?;
-        if let Some(i) = check.mismatch.get() {
-            return Some((&check.rules[i], true));
-        }
-        check
-            .seen
-            .borrow()
-            .iter()
-            .position(|seen| !*seen)
-            .map(|i| (&check.rules[i], false))
-    }
     pub(crate) fn begin_action(&mut self) {
         self.action_base = self.last_read.get().max(self.elapsed.unwrap_or(0.));
         self.executing_since = Some(Instant::now());
