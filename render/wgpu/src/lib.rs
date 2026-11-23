@@ -52,6 +52,7 @@ mod pipelines;
 mod pixel_bender;
 mod prepare;
 mod render_snapshot;
+pub use render_snapshot::FramePacket;
 mod resource_scheduler;
 mod shape_recipe;
 pub mod target;
@@ -347,6 +348,7 @@ struct CopiedReadback {
 
 #[derive(Debug)]
 struct VersionedRead {
+    dependency: render_snapshot::OperationDependency,
     source: render_snapshot::ResourceVersion,
     area: PixelRegion,
     saved: std::sync::Mutex<Option<Result<CopiedReadback, gpu_runtime::RenderFailure>>>,
@@ -360,6 +362,7 @@ impl VersionedRead {
         pool: &BufferPool<gpu_resources::Buffer, BufferDimensions>,
         frame: &mut ActiveFrame,
     ) -> Result<CopiedReadback, gpu_runtime::RenderFailure> {
+        self.dependency.check(&frame.operations)?;
         if render_snapshot::bitmap_version(handle)? != self.source {
             return Err(gpu_runtime::RenderFailure::new(
                 gpu_runtime::RenderFailureKind::Validation,
@@ -402,6 +405,7 @@ enum ReadbackSource {
 
 #[derive(Debug)]
 pub struct QueueSyncHandle {
+    dependency: render_snapshot::OperationDependency,
     descriptors: Arc<Descriptors>,
     source: ReadbackSource,
 }
@@ -418,9 +422,11 @@ impl QueueSyncHandle {
         area: PixelRegion,
         descriptors: Arc<Descriptors>,
         pool: Arc<BufferPool<gpu_resources::Buffer, BufferDimensions>>,
+        dependency: render_snapshot::OperationDependency,
         track: bool,
     ) -> Result<Self, gpu_runtime::RenderFailure> {
         let read = Arc::new(VersionedRead {
+            dependency: dependency.clone(),
             source: render_snapshot::bitmap_version(&handle)?,
             area,
             saved: Default::default(),
@@ -434,6 +440,7 @@ impl QueueSyncHandle {
                 .unwrap() = Arc::downgrade(&read);
         }
         Ok(Self {
+            dependency,
             descriptors,
             source: ReadbackSource::Deferred { handle, read, pool },
         })
@@ -443,6 +450,7 @@ impl QueueSyncHandle {
         self,
         frame: &mut ActiveFrame,
     ) -> Result<(Arc<Descriptors>, CopiedReadback), gpu_runtime::RenderFailure> {
+        self.dependency.check(&frame.operations)?;
         let copy = match self.source {
             ReadbackSource::Copied(copy) => copy,
             ReadbackSource::Deferred { handle, read, pool } => {

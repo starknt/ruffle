@@ -3404,6 +3404,253 @@ fn bgra_bitmap_cache_supports_multisample_draw_and_region_updates() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn stage_packets_include_reliable_uploads_from_their_context3d() {
+    use ruffle_render::backend::{BufferUsage, Context3DCommand, Context3DProfile};
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (2, 2)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let mut context = renderer
+        .create_context3d(Context3DProfile::Baseline)
+        .unwrap();
+    let buffer = context
+        .create_vertex_buffer(BufferUsage::DynamicDraw, 1, 1)
+        .unwrap();
+    let capture = |r: &mut WgpuRenderBackend<TextureTarget>| {
+        r.capture_stage_packet(Color::BLACK, CommandList::new(), vec![])
+            .unwrap()
+    };
+    let before = capture(&mut renderer);
+    let mut bytes = [1, 2, 3, 4];
+    context
+        .process_command(Context3DCommand::UploadToVertexBuffer {
+            buffer,
+            start_vertex: 0,
+            data32_per_vertex: 1,
+            data: &bytes,
+        })
+        .unwrap();
+    bytes.fill(0);
+    let after = capture(&mut renderer);
+    assert!(
+        after.after_operation() > before.after_operation(),
+        "the stage dependency omitted its Context3D upload"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn detached_stage3d_frame_keeps_pixels_when_the_independent_encoder_reuses_its_target() {
+    use ruffle_render::backend::{Context3DCommand, Context3DProfile};
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (4, 4)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    let mut context = renderer
+        .create_context3d(Context3DProfile::Baseline)
+        .unwrap();
+    context
+        .process_command(Context3DCommand::ConfigureBackBuffer {
+            width: 4,
+            height: 4,
+            anti_alias: 0,
+            depth_and_stencil: false,
+            wants_best_resolution: false,
+            wants_best_resolution_on_browser_zoom: false,
+        })
+        .unwrap();
+    let buffer = context.back_buffer_handle().unwrap();
+    let write = |color| {
+        let view = &crate::as_texture(&buffer, &descriptors.device)
+            .unwrap()
+            .view;
+        let mut encoder = descriptors
+            .device
+            .create_command_encoder(&Default::default())
+            .unwrap();
+        drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(color),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        }));
+        descriptors
+            .queue
+            .submit([encoder.finish().unwrap()])
+            .unwrap();
+    };
+    write(wgpu::Color::RED);
+    let mut stage = CommandList::new();
+    stage.render_stage3d(buffer.clone(), Default::default());
+    let packet = renderer
+        .capture_stage_packet(Color::BLACK, stage, vec![])
+        .unwrap();
+    write(wgpu::Color::BLUE);
+    assert!(renderer.prepare_frame().unwrap());
+    renderer.submit_stage_packet(packet).unwrap();
+    let image = renderer.capture_frame().unwrap().unwrap();
+    assert_eq!(image.get_pixel(1, 1).0, [255, 0, 0, 255]);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn a_replacement_packet_draws_cache_work_from_a_discarded_picture() {
+    use ruffle_render::backend::BitmapCacheEntry;
+    use ruffle_render::bitmap::{PixelRegion, PixelSnapping};
+    use std::num::NonZeroU32;
+
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (4, 2)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let cache = renderer
+        .create_bitmap_cache(NonZeroU32::new(4).unwrap(), NonZeroU32::new(2).unwrap())
+        .unwrap();
+    let mut tile = CommandList::new();
+    rect(&mut tile, 1.0, 0.0, 2.0, 2.0, Color::RED);
+    let first = renderer
+        .capture_stage_packet(
+            Color::BLUE,
+            CommandList::new(),
+            vec![BitmapCacheEntry {
+                handle: cache.clone(),
+                commands: tile,
+                clear: Color::TRANSPARENT,
+                filters: vec![],
+            }],
+        )
+        .unwrap();
+    let mut stage = CommandList::new();
+    stage.render_bitmap(
+        cache,
+        Default::default(),
+        false,
+        PixelSnapping::Never,
+        PixelRegion::for_whole_size(4, 2),
+    );
+    let next = renderer
+        .capture_stage_packet(Color::BLACK, stage, vec![])
+        .unwrap();
+    assert!(next.id() > first.id());
+    assert_eq!(next.after_operation(), first.after_operation());
+    assert!(
+        next.after_operation() > 0,
+        "the cache write has no reliable dependency"
+    );
+
+    // The execution endpoint has its own bindings. Neither the packet nor
+    // transferring it can depend on the VM's last command list.
+    let next = std::thread::spawn(move || next).join().unwrap();
+    assert!(renderer.prepare_frame().unwrap());
+    assert!(renderer.submit_stage_packet(first).is_err());
+    renderer.submit_stage_packet(next).unwrap();
+    let image = renderer.capture_frame().unwrap().unwrap();
+    for row in image.rows() {
+        assert_eq!(
+            row.map(|p| p.0).collect::<Vec<_>>(),
+            [
+                [0, 0, 0, 255],
+                [255, 0, 0, 255],
+                [255, 0, 0, 255],
+                [0, 0, 0, 255]
+            ]
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn pending_stage_uses_the_bitmap_version_seen_at_capture() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (2, 1)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let pixels = |color: [u8; 4]| Bitmap::new(2, 1, BitmapFormat::Rgba, color.repeat(2));
+    let handle = renderer.register_bitmap(pixels([255, 0, 0, 255])).unwrap();
+    let region = PixelRegion::for_whole_size(2, 1);
+    let commands = || {
+        let mut list = CommandList::new();
+        list.render_bitmap(
+            handle.clone(),
+            Default::default(),
+            false,
+            PixelSnapping::Never,
+            region,
+        );
+        list
+    };
+    let before = renderer
+        .capture_stage_packet(Color::BLACK, commands(), vec![])
+        .unwrap();
+    // A does not have an output slot yet. The VM can still write V+1.
+    renderer
+        .update_texture(&handle, pixels([0, 0, 255, 255]), region)
+        .unwrap();
+    assert!(renderer.prepare_frame().unwrap());
+    renderer.submit_stage_packet(before).unwrap();
+    assert_eq!(
+        renderer.capture_frame().unwrap().unwrap().into_raw(),
+        [255, 0, 0, 255].repeat(2)
+    );
+    let after = renderer
+        .capture_stage_packet(Color::BLACK, commands(), vec![])
+        .unwrap();
+    assert!(renderer.prepare_frame().unwrap());
+    renderer.submit_stage_packet(after).unwrap();
+    assert_eq!(
+        renderer.capture_frame().unwrap().unwrap().into_raw(),
+        [0, 0, 255, 255].repeat(2)
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn a_shared_device_cannot_resolve_another_sessions_unsubmitted_bitmap_write() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
+    let descriptors = gpu();
+    let make = || {
+        WgpuRenderBackend::with_options(
+            descriptors.clone(),
+            TextureTarget::new_without_readback(&descriptors.device, (2, 1)).unwrap(),
+            false,
+        )
+        .unwrap()
+    };
+    let (mut producer, mut other) = (make(), make());
+    let pixels = |color: [u8; 4]| Bitmap::new(2, 1, BitmapFormat::Rgba, color.repeat(2));
+    let source = producer.register_bitmap(pixels([255, 0, 0, 255])).unwrap();
+    let target = producer.register_bitmap(pixels([0, 0, 0, 255])).unwrap();
+    let region = PixelRegion::for_whole_size(2, 1);
+    let token = producer
+        .copy_bitmap_region(source, region, target.clone(), region)
+        .unwrap()
+        .unwrap();
+    let called = std::cell::Cell::new(false);
+    assert!(
+        other
+            .resolve_sync_handle(token, Box::new(|_, _| called.set(true)))
+            .is_err(),
+        "a different session resolved a write still in the producer's encoder"
+    );
+    assert!(!called.get());
+    descriptors.runtime.check_health().unwrap();
+    producer
+        .read_bitmap_region(
+            &target,
+            region,
+            Box::new(|bytes, _| {
+                assert_eq!(&bytes[..8], &[255, 0, 0, 255].repeat(2));
+            }),
+        )
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn a_live_bitmap_read_keeps_the_requested_version_across_later_writes() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
     let descriptors = gpu();

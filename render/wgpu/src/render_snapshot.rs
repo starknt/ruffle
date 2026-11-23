@@ -187,10 +187,111 @@ fn foreign() -> RenderFailure {
     )
 }
 
+/// CPU-owned stage data; the receiving renderer resolves the resource versions.
+pub struct FramePacket {
+    pub(crate) key: PacketKey,
+    pub(crate) draw: Arc<PacketDraw>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PacketDraw {
+    pub clear: Color,
+    pub snapshot: RenderSnapshot,
+    pub route: StageDrawRoute,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StageDrawRoute {
+    Graph,
+    AlignedBitmaps,
+    Resident,
+}
+
+impl FramePacket {
+    pub fn id(&self) -> u64 {
+        self.key
+            .reservation
+            .map_or(self.key.packet, |r| r.packet_id)
+    }
+
+    pub fn after_operation(&self) -> u64 {
+        self.key.operation
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PacketKey {
+    pub device: u64,
+    pub session: ResourceOwner,
+    pub target_generation: u64,
+    pub reservation: Option<crate::target::FrameReservation>,
+    pub packet: u64,
+    pub operation: u64,
+}
+
+/// The stage and its Context3D instances issue reliable work on the same
+/// owner thread. A packet records the last completed encoding operation.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OperationSequence(Arc<std::sync::atomic::AtomicU64>);
+impl OperationSequence {
+    pub fn applied(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn dependency(&self) -> OperationDependency {
+        OperationDependency {
+            session: self.clone(),
+            after_operation: self.applied(),
+        }
+    }
+
+    pub fn record(&self) -> Result<(), RenderFailure> {
+        use std::sync::atomic::Ordering;
+        self.0
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .map(|_| ())
+            .map_err(|_| {
+                RenderFailure::new(
+                    RenderFailureKind::Internal,
+                    "renderer operation sequence exhausted",
+                )
+            })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OperationDependency {
+    session: OperationSequence,
+    after_operation: u64,
+}
+
+impl OperationDependency {
+    pub fn check(&self, executor: &OperationSequence) -> Result<(), RenderFailure> {
+        if !Arc::ptr_eq(&self.session.0, &executor.0) || executor.applied() < self.after_operation {
+            return Err(RenderFailure::new(
+                RenderFailureKind::Validation,
+                "readback dependency belongs to another session or has not been applied",
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub struct PreparedSnapshot {
     pub snapshot: RenderSnapshot,
+    pub(crate) bindings: SnapshotBindings,
+}
+
+/// The endpoint pins the exact local handles until the picture is used or replaced.
+pub(crate) struct SnapshotBindings {
+    pub(crate) reads_stage3d: bool,
     resources: Vec<(ResourceVersion, Handle)>,
     resource_indices: HashMap<ResourceVersion, usize>,
+}
+impl SnapshotBindings {
+    pub(crate) fn reads(&self, resource: ResourceVersion) -> bool {
+        self.resource_indices.contains_key(&resource)
+    }
 }
 // Only the VM cache carries local resource bindings. The shared node array
 // can outlive the originating page or any previous frame that used it.
@@ -202,6 +303,7 @@ struct FrozenPage {
 #[derive(Default)]
 struct Capture {
     device: Option<u64>,
+    reads_stage3d: bool,
     known: HashMap<ResourceVersion, usize>,
     resources: Vec<(ResourceVersion, Handle)>,
     recipes: Vec<ResourceRecipe>,
@@ -365,10 +467,13 @@ impl Capture {
                     resource: self.resource(Handle::Shape(shape.clone()))?,
                     transform: transform.clone(),
                 },
-                Command::RenderStage3D { bitmap, transform } => SnapshotCommand::Stage3D {
-                    resource: self.resource(Handle::Bitmap(bitmap.clone()))?,
-                    transform: transform.clone(),
-                },
+                Command::RenderStage3D { bitmap, transform } => {
+                    self.reads_stage3d = true;
+                    SnapshotCommand::Stage3D {
+                        resource: self.resource(Handle::Bitmap(bitmap.clone()))?,
+                        transform: transform.clone(),
+                    }
+                }
                 Command::DrawRect { color, matrix } => SnapshotCommand::Rect {
                     color: *color,
                     matrix: *matrix,
@@ -426,7 +531,7 @@ impl PreparedSnapshot {
         let [node] = &*self.snapshot.commands else {
             return None;
         };
-        let [(_, handle)] = self.resources.as_slice() else {
+        let [(_, handle)] = self.bindings.resources.as_slice() else {
             return None;
         };
         match (&node.command, handle) {
@@ -447,9 +552,10 @@ impl PreparedSnapshot {
     }
 
     fn handle(&self, resource: ResourceVersion) -> Result<&Handle, RenderFailure> {
-        self.resource_indices
+        self.bindings
+            .resource_indices
             .get(&resource)
-            .map(|index| &self.resources[*index].1)
+            .map(|index| &self.bindings.resources[*index].1)
             .ok_or_else(|| {
                 RenderFailure::new(
                     RenderFailureKind::Validation,
@@ -534,6 +640,28 @@ impl PreparedSnapshot {
         })
     }
 
+    /// The direct stage routes accept only primitive draws or resident shapes
+    /// and bitmaps. Flatten owned pages at the endpoint in painter order.
+    pub(crate) fn direct_commands(&self) -> Result<CommandList, RenderFailure> {
+        fn append(
+            prepared: &PreparedSnapshot,
+            nodes: &[SnapshotNode],
+            output: &mut CommandList,
+        ) -> Result<(), RenderFailure> {
+            for node in nodes {
+                if let SnapshotCommand::Shared(children) = &node.command {
+                    append(prepared, children, output)?;
+                } else {
+                    output.push(prepared.leaf(node)?);
+                }
+            }
+            Ok(())
+        }
+        let mut commands = CommandList::new();
+        append(self, &self.snapshot.commands, &mut commands)?;
+        Ok(commands)
+    }
+
     pub fn capture(commands: &CommandList) -> Result<Self, RenderFailure> {
         Self::capture_for_device(commands, None)
     }
@@ -554,6 +682,7 @@ impl PreparedSnapshot {
         let capacity = commands.iter().len().min(64);
         let mut capture = Capture {
             device,
+            reads_stage3d: false,
             known: HashMap::with_capacity_and_hasher(capacity, Default::default()),
             resources: Vec::with_capacity(capacity),
             recipes: Vec::with_capacity(capacity),
@@ -564,17 +693,20 @@ impl PreparedSnapshot {
                 commands,
                 recipes: capture.recipes,
             },
-            resource_indices: capture.known,
-            resources: capture.resources,
+            bindings: SnapshotBindings {
+                reads_stage3d: capture.reads_stage3d,
+                resource_indices: capture.known,
+                resources: capture.resources,
+            },
         })
     }
-    fn validate<T: crate::target::RenderTarget>(
+    pub(crate) fn validate<T: crate::target::RenderTarget>(
         &self,
         backend: &crate::backend::WgpuRenderBackend<T>,
     ) -> Result<(), RenderFailure> {
         // Reject the whole snapshot before any candidate uploads or allocations.
         backend.descriptors.runtime.check_health()?;
-        for (version, handle) in &self.resources {
+        for (version, handle) in &self.bindings.resources {
             if version.key.device() != backend.descriptors.runtime.generation()
                 || handle.version()? != *version
             {
@@ -786,7 +918,7 @@ impl PreparedSnapshot {
                 ));
             }
         }
-        for (_, handle) in &self.resources {
+        for (_, handle) in &self.bindings.resources {
             if let Handle::Bitmap(handle) = handle {
                 crate::as_texture(handle, &backend.descriptors.device)?;
             }

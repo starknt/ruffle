@@ -13,8 +13,23 @@ pub trait RenderTargetFrame: Debug {
     fn view(&self) -> &crate::gpu_resources::TextureView;
 }
 
+/// Identity assigned by a host that reserves output images before stage extraction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameReservation {
+    pub packet_id: u64,
+    pub sample_id: Option<u32>,
+    pub window_generation: u64,
+    pub pool_generation: u64,
+    pub slot: usize,
+    pub lease: u64,
+}
+
 pub trait RenderTarget: Debug + 'static {
     type Frame: RenderTargetFrame;
+
+    fn frame_reservation(&self) -> Option<FrameReservation> {
+        None
+    }
 
     fn resize(
         &mut self,

@@ -23,13 +23,14 @@ use crate::context3d::current_pipeline::{AGAL_FLOATS_PER_REGISTER, BoundTextureD
 use crate::descriptors::Descriptors;
 use crate::utils::supported_sample_count;
 
-use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::instrument;
 
 mod current_pipeline;
 mod shader_pair;
+mod uploads;
+use uploads::{UploadLayout, UploadQueue, UploadTarget};
 #[cfg(test)]
 mod tests;
 
@@ -51,6 +52,9 @@ pub struct WgpuContext3D {
     profile: Context3DProfile,
 
     buffer_staging_belt: StagingBelt,
+    uploads: UploadQueue,
+    operations: crate::render_snapshot::OperationSequence,
+    owned_uploads: bool,
 
     current_texture_view: Option<crate::gpu_resources::TextureView>,
     current_texture_size: Option<Extent3d>,
@@ -98,6 +102,14 @@ impl WgpuContext3D {
     pub fn new(
         descriptors: Arc<Descriptors>,
         profile: Context3DProfile,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        Self::for_session(descriptors, profile, Default::default())
+    }
+
+    pub(crate) fn for_session(
+        descriptors: Arc<Descriptors>,
+        profile: Context3DProfile,
+        operations: crate::render_snapshot::OperationSequence,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let device = descriptors.device.with_owner(
             descriptors
@@ -153,6 +165,9 @@ impl WgpuContext3D {
             descriptors,
             device,
             buffer_staging_belt,
+            uploads: UploadQueue::default(),
+            operations,
+            owned_uploads: std::env::var_os("RUFFLE_OWNED_FRAMES").as_deref() == Some("1".as_ref()),
             back_buffer_raw_texture_handle,
             front_buffer_raw_texture_handle,
             current_pipeline,
@@ -180,6 +195,32 @@ impl WgpuContext3D {
             seen_clear_command: false,
             scissor_rectangle: None,
         })
+    }
+
+    fn upload(
+        &mut self,
+        target: UploadTarget,
+        layout: UploadLayout,
+        bytes: &[u8],
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        if self.owned_uploads {
+            self.uploads.enqueue(target, layout, bytes)?;
+            self.flush_uploads()
+        } else {
+            layout.encode(
+                &target,
+                bytes,
+                &mut self.buffer_staging_belt,
+                &mut self.buffer_command_encoder,
+            )
+        }
+    }
+
+    fn flush_uploads(&mut self) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.uploads.flush(
+            &mut self.buffer_staging_belt,
+            &mut self.buffer_command_encoder,
+        )
     }
 
     fn create_depth_texture(
@@ -758,14 +799,13 @@ impl Context3D for WgpuContext3D {
                 let start = offset - offset % COPY_BUFFER_ALIGNMENT as usize;
                 let end = align_copy_buffer_size(offset + data.len());
                 buffer.data[offset..offset + data.len()].copy_from_slice(data);
-                self.buffer_staging_belt
-                    .write_buffer(
-                        &mut self.buffer_command_encoder,
-                        &buffer.buffer,
-                        start as u64,
-                        NonZeroU64::new((end - start) as u64).unwrap(),
-                    )?
-                    .copy_from_slice(&buffer.data[start..end]);
+                self.upload(
+                    UploadTarget::Buffer(buffer.buffer.clone()),
+                    UploadLayout::Buffer {
+                        offset: start as u64,
+                    },
+                    &buffer.data[start..end],
+                )?;
             }
 
             Context3DCommand::UploadToVertexBuffer {
@@ -783,16 +823,14 @@ impl Context3D for WgpuContext3D {
 
                 // ActionScript can only work with 32-bit chunks of data, so our `write_buffer`
                 // offset and size will always be a multiple of `COPY_BUFFER_ALIGNMENT` (4 bytes)
-                self.buffer_staging_belt
-                    .write_buffer(
-                        &mut self.buffer_command_encoder,
-                        &buffer.buffer,
-                        (start_vertex * (data32_per_vertex as usize) * std::mem::size_of::<f32>())
-                            as u64,
-                        NonZeroU64::new(data.len() as u64).unwrap(),
-                    )?
-                    .slice(..data.len())
-                    .copy_from_slice(data);
+                let offset = start_vertex * data32_per_vertex as usize * size_of::<f32>();
+                self.upload(
+                    UploadTarget::Buffer(buffer.buffer.clone()),
+                    UploadLayout::Buffer {
+                        offset: offset as u64,
+                    },
+                    data,
+                )?;
             }
 
             Context3DCommand::SetRenderToTexture {
@@ -952,6 +990,9 @@ impl Context3D for WgpuContext3D {
                     render_command_encoder.finish()?,
                 ])?;
                 self.buffer_staging_belt.recall();
+                if self.current_texture_view == self.back_buffer_texture_view {
+                    crate::record_bitmap_write(&self.back_buffer_raw_texture_handle)?;
+                }
             }
 
             Context3DCommand::SetVertexBufferAt {
@@ -999,18 +1040,12 @@ impl Context3D for WgpuContext3D {
                     * AGAL_FLOATS_PER_REGISTER
                     * std::mem::size_of::<f32>() as u64;
 
-                let mut buffer_view = self.buffer_staging_belt.write_buffer(
-                    &mut self.buffer_command_encoder,
-                    buffer,
-                    offset,
-                    NonZeroU64::new(std::mem::size_of_val(matrix_raw_data_column_major) as u64)
-                        .unwrap(),
+                // Flash's non-transposed constants use the existing column-major byte order.
+                self.upload(
+                    UploadTarget::Buffer(buffer.clone()),
+                    UploadLayout::Buffer { offset },
+                    matrix_raw_data_column_major.as_flattened(),
                 )?;
-                // Despite what the docs claim, we copy in *column* major order, rather than *row* major order.
-                // See this code in OpenFL: https://github.com/openfl/openfl/blob/971a4c9e43b5472fd84d73920a2b7c1b3d8d9257/src/openfl/display3D/Context3D.hx#L1532-L1550
-                // When the 'transposedMatrix' flag is false, it copies data *directly* from matrix.rawData,
-                // which is stored in column-major order
-                buffer_view.copy_from_slice(matrix_raw_data_column_major.as_flattened());
             }
             Context3DCommand::SetCulling { face } => {
                 self.current_pipeline.set_culling(face);
@@ -1030,25 +1065,18 @@ impl Context3D for WgpuContext3D {
                 // If we were to use `self.buffer_command_encoder.copy_texture_to_texture`, the
                 // BitmapData's gpu texture might be modified before we actually submit
                 // `buffer_command_encoder` to the device.
-                self.buffer_staging_belt.write_texture(
-                    &mut self.buffer_command_encoder,
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &dest.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: 0,
-                            y: 0,
-                            z: layer,
+                self.upload(
+                    UploadTarget::Texture(dest.texture.clone()),
+                    UploadLayout::Texture {
+                        layer,
+                        size: wgpu::Extent3d {
+                            width: source_width,
+                            height: source_height,
+                            depth_or_array_layers: 1,
                         },
-                        aspect: wgpu::TextureAspect::All,
+                        bgra: source_is_bgra,
                     },
                     source,
-                    source_is_bgra,
-                    wgpu::Extent3d {
-                        width: source_width,
-                        height: source_height,
-                        depth_or_array_layers: 1,
-                    },
                 )?;
             }
             Context3DCommand::SetTextureAt {
@@ -1200,7 +1228,7 @@ impl Context3D for WgpuContext3D {
             }
         }
 
-        Ok(())
+        self.operations.record()
     }
 
     #[instrument(level = "debug", skip_all)]

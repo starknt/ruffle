@@ -54,11 +54,54 @@ fn odd_index_upload_preserves_neighbors_and_snapshots_the_entire_input() {
         })
         .unwrap();
     bytes.fill(0);
-    let output = descriptors
+    assert_eq!(
+        read_buffer(&mut context, &indices.buffer),
+        [1, 2, 10, 11, 12, 13, 7, 8]
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn queued_stage3d_uploads_retain_bytes_and_execute_in_issue_order() {
+    use super::uploads::{UploadLayout, UploadTarget};
+    let descriptors = descriptors(4096);
+    let mut context = WgpuContext3D::new(descriptors.clone(), Context3DProfile::Baseline).unwrap();
+    let buffer = descriptors
         .device
         .create_buffer(&BufferDescriptor {
             label: None,
             size: 8,
+            usage: BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let target = UploadTarget::Buffer(buffer.clone());
+    let mut source = [1, 2, 3, 4, 5, 6, 7, 8];
+    context
+        .uploads
+        .enqueue(target.clone(), UploadLayout::Buffer { offset: 0 }, &source)
+        .unwrap();
+    source[..4].copy_from_slice(&[9, 10, 11, 12]);
+    context
+        .uploads
+        .enqueue(target, UploadLayout::Buffer { offset: 4 }, &source[..4])
+        .unwrap();
+    source.fill(0);
+    context.flush_uploads().unwrap();
+    assert_eq!(
+        read_buffer(&mut context, &buffer),
+        [1, 2, 3, 4, 9, 10, 11, 12]
+    );
+    assert_eq!(context.uploads.applied(), 2);
+}
+
+fn read_buffer(context: &mut WgpuContext3D, source: &crate::gpu_resources::Buffer) -> Vec<u8> {
+    let descriptors = context.descriptors.clone();
+    let output = descriptors
+        .device
+        .create_buffer(&BufferDescriptor {
+            label: None,
+            size: source.size(),
             usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
@@ -71,7 +114,7 @@ fn odd_index_upload_preserves_neighbors_and_snapshots_the_entire_input() {
             .create_command_encoder(&Default::default())
             .unwrap(),
     );
-    encoder.copy_buffer_to_buffer(&indices.buffer, 0, &output, 0, 8);
+    encoder.copy_buffer_to_buffer(source, 0, &output, 0, source.size());
     let index = descriptors
         .queue
         .submit([encoder.finish().unwrap()])
@@ -88,10 +131,9 @@ fn odd_index_upload_preserves_neighbors_and_snapshots_the_entire_input() {
         })
         .unwrap();
     rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
-    assert_eq!(
-        &*output.get_mapped_range(..).unwrap(),
-        &[1, 2, 10, 11, 12, 13, 7, 8]
-    );
+    let bytes = output.get_mapped_range(..).unwrap().to_vec();
+    output.unmap();
+    bytes
 }
 
 #[test]

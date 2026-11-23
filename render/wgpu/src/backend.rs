@@ -3,8 +3,10 @@ use crate::buffer_pool::{BufferPool, TexturePool};
 use crate::context3d::WgpuContext3D;
 use crate::filters::FilterSource;
 use crate::gpu_profiler::{GpuProfiler, GpuProfilerSettings};
+use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
 use crate::mesh::{CommonGradient, Mesh, PendingDraw};
 use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
+use crate::render_snapshot::{PacketKey, StageDrawRoute};
 use crate::surface::buffers::ChunkBuffers;
 use crate::surface::{LayerRef, Surface};
 use crate::target::{MaybeOwnedBuffer, TextureTarget};
@@ -37,6 +39,9 @@ use std::sync::Arc;
 use swf::Color;
 use tracing::instrument;
 use wgpu::SubmissionIndex;
+
+mod stage;
+use stage::PendingStage;
 
 pub const DEFAULT_IMMUTABLE_BITMAP_CACHE_LIMIT: u64 = 256 * 1024 * 1024;
 
@@ -78,6 +83,9 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     budget: crate::idle_pool::Budget,
     target: T,
     stage_frame: Option<T::Frame>,
+    packet_key: PacketKey,
+    pending_stage: Option<PendingStage>,
+    owned_frames: bool,
     display_enhancer: Option<Arc<dyn crate::display_bitmap::DisplayBitmapEnhancer>>,
     surface: Surface,
     meshes: Vec<Mesh>,
@@ -161,6 +169,7 @@ impl WgpuRenderBackend<SwapChainTarget> {
         self.stage_frame = None;
         self.target =
             SwapChainTarget::new(surface, &descriptors.adapter, size, &descriptors.device)?;
+        self.invalidate_stage_packets()?;
         Ok(())
     }
 }
@@ -294,6 +303,18 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         descriptors.runtime.check_health()?;
         Ok(Self {
             budget: budget.clone(),
+            packet_key: PacketKey {
+                device: descriptors.runtime.generation(),
+                session: descriptors
+                    .runtime
+                    .issue_owner(crate::gpu_runtime::OwnerKind::Scene)?,
+                target_generation: 1,
+                reservation: None,
+                packet: 0,
+                operation: 0,
+            },
+            pending_stage: None,
+            owned_frames: std::env::var_os("RUFFLE_OWNED_FRAMES").as_deref() == Some("1".as_ref()),
             descriptors,
             target,
             stage_frame: None,
@@ -513,25 +534,14 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         use crate::graph_encoder::SurfaceCommands;
         // Stage cache redraws have finished. Keep these handles only through this
         // submission. Offscreen targets may alias their inputs and use the graph.
-        if matches!(load, crate::pass_graph::Load::Clear(_))
-            && matches!(
-                format,
-                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
-            )
-            && SurfaceCommands::pixel_aligned_caches(
-                &commands,
-                self.descriptors.runtime.generation(),
-            )
-        {
-            return Ok(SurfaceCommands::CachedBitmaps(commands));
-        }
-        if matches!(load, crate::pass_graph::Load::Clear(_))
-            && crate::render_snapshot::PreparedSnapshot::direct_resident_draws(
-                &commands,
-                self.descriptors.runtime.generation(),
-            )
-        {
-            return Ok(SurfaceCommands::ResidentDraws(commands));
+        if matches!(load, crate::pass_graph::Load::Clear(_)) {
+            match self.stage_draw_route(&commands, format) {
+                StageDrawRoute::AlignedBitmaps => {
+                    return Ok(SurfaceCommands::CachedBitmaps(commands));
+                }
+                StageDrawRoute::Resident => return Ok(SurfaceCommands::ResidentDraws(commands)),
+                StageDrawRoute::Graph => {}
+            }
         }
         let samples = crate::utils::supported_sample_count(
             &self.descriptors.adapter,
@@ -575,6 +585,9 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
 
     /// Collect completed timestamp queries without blocking or inventing missing samples.
     pub fn collect_gpu_samples(&mut self) {
+        if self.pending_stage.as_ref().is_some_and(|p| p.cancelled()) {
+            self.pending_stage = None;
+        }
         if ruffle_render::profile::enabled() {
             #[cfg(target_os = "linux")]
             if let Some(previous) = &mut self.pool_trim_counts {
@@ -625,10 +638,16 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         &self.descriptors.device
     }
 
+    fn finish_bitmap_write(&mut self, handle: &BitmapHandle) -> Result<(), RenderFailure> {
+        crate::record_bitmap_write(handle)?;
+        self.active_frame.operations.record()
+    }
+
     fn preserve_read_before_write(
         &mut self,
         destination: &BitmapHandle,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.preserve_stage_before_write(destination)?;
         if let Some(recipe) =
             (&*destination.0 as &dyn Any).downcast_ref::<crate::bitmap_recipe::BitmapRecipe>()
             && !recipe.is_resident()
@@ -636,7 +655,15 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             return Ok(());
         }
         let texture = as_texture(destination, &self.descriptors.device)?;
-        let pending = std::mem::take(&mut *texture.pending_read.lock().unwrap()).upgrade();
+        let pending = {
+            let mut weak = texture.pending_read.lock().unwrap();
+            let pending = weak.upgrade();
+            if let Some(read) = &pending {
+                read.dependency.check(&self.active_frame.operations)?;
+            }
+            *weak = Default::default();
+            pending
+        };
         if let Some(read) = pending {
             let result = read.record(
                 destination,
@@ -664,12 +691,14 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                 copy_area,
                 self.descriptors.clone(),
                 self.offscreen_buffer_pool.clone(),
+                self.active_frame.operations.dependency(),
                 true,
             )?,
             Some(TextureBufferInfo {
                 buffer: MaybeOwnedBuffer::Borrowed(buffer, dimensions),
                 ..
             }) => QueueSyncHandle {
+                dependency: self.active_frame.operations.dependency(),
                 descriptors: self.descriptors.clone(),
                 source: crate::ReadbackSource::Copied(crate::CopiedReadback {
                     index,
@@ -706,6 +735,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         dimensions: ViewportDimensions,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
         self.stage_frame = None;
+        self.invalidate_stage_packets()?;
         self.preparation_generation.invalidate();
         self.descriptors.runtime.check_health()?;
         if dimensions.width > self.descriptors.limits.max_texture_dimension_2d
@@ -744,10 +774,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     ) -> Result<Box<dyn Context3D>, BitmapError> {
         self.descriptors.runtime.check_health()?;
         self.descriptors.runtime.check_health()?;
-        Ok(Box::new(WgpuContext3D::new(
+        let context = WgpuContext3D::for_session(
             self.descriptors.clone(),
             profile,
-        )?))
+            self.active_frame.operations.clone(),
+        )?;
+        self.active_frame.operations.record()?;
+        Ok(Box::new(context))
     }
 
     fn debug_info(&self) -> Cow<'static, str> {
@@ -787,6 +820,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         &mut self,
         quality: StageQuality,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.invalidate_stage_packets()?;
         self.preparation_generation.invalidate();
         self.descriptors.runtime.check_health()?;
         self.surface = Surface::new(
@@ -890,6 +924,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
     fn discard_frame(&mut self) {
         self.stage_frame = None;
+        self.pending_stage = None;
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -899,268 +934,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
     ) -> Result<ruffle_render::backend::FrameSubmission, crate::gpu_runtime::RenderFailure> {
-        let _render_backend =
-            ruffle_render::profile::time(ruffle_render::profile::Phase::RenderBackend);
-        let frame_output = self.stage_frame.take().ok_or_else(|| {
-            crate::gpu_runtime::RenderFailure::new(
-                crate::gpu_runtime::RenderFailureKind::Internal,
-                "stage submission without a reserved output",
-            )
-        })?;
-        self.descriptors.runtime.check_health()?;
-
-        if let Some(tiles) = &mut self.filtered_tiles {
-            tiles.begin_frame();
-        }
-        if let Some(inputs) = &self.descriptors.blend_inputs {
-            inputs.begin_frame();
-        }
-        let display = self
-            .display_enhancer
-            .as_ref()
-            .filter(|e| e.enabled())
-            .cloned();
-        self.surface.display = display.clone();
-        for entry in cache_entries {
-            let prepared = crate::render_snapshot::PreparedSnapshot::capture(&entry.commands)?;
-            let cache =
-                (&*entry.handle.0 as &dyn Any).downcast_ref::<crate::bitmap_cache::CacheImage>();
-            let texture = as_texture(&entry.handle, &self.descriptors.device)?;
-            let valid = ruffle_render::region::RenderRect {
-                x: 0,
-                y: 0,
-                width: texture.texture.width(),
-                height: texture.texture.height(),
-            };
-            let (dirty, history) = if let Some(cache) = cache {
-                cache.prepare_redraw(
-                    &prepared.snapshot,
-                    entry.clear,
-                    self.surface.quality(),
-                    &entry.filters,
-                    self.descriptors.runtime.scheduler(),
-                )
-            } else {
-                (ruffle_render::region::RenderRegion::Full, None)
-            };
-            let Some(dirty) = dirty.clip(valid) else {
-                if let Some(cache) = cache {
-                    cache.finish_redraw(history);
-                }
-                continue;
-            };
-            self.preserve_read_before_write(&entry.handle)?;
-            let tile = if display.is_none() && self.filtered_tiles.is_some() && cache.is_some() {
-                crate::filtered_tiles::Input::capture(
-                    &prepared,
-                    &entry.filters,
-                    entry.clear,
-                    self.surface.quality(),
-                    self.surface.sample_count(),
-                    valid.width,
-                    valid.height,
-                )
-            } else {
-                None
-            };
-            if let (Some(tiles), Some(input)) = (&mut self.filtered_tiles, &tile) {
-                if let Some(id) = tiles.replay(
-                    input,
-                    &texture.texture,
-                    self.active_frame.command_encoder.record(),
-                ) {
-                    ruffle_render::profile::work(|w| w.filtered_tile_hits += 1);
-                    crate::record_bitmap_write(&entry.handle)?;
-                    if let Some(cache) = cache {
-                        cache
-                            .tile_id
-                            .store(id, std::sync::atomic::Ordering::Relaxed);
-                        cache.finish_redraw(history);
-                    }
-                    self.active_frame.maybe_flush(&self.descriptors)?;
-                    continue;
-                }
-                ruffle_render::profile::work(|w| w.filtered_tile_misses += 1);
-            }
-            let (input, output) = crate::bitmap_cache::filter_regions(dirty, valid, &entry.filters);
-            let partial = input != valid;
-            let surface = Surface::new(
-                &self.descriptors,
-                self.surface.quality(),
-                input.width,
-                input.height,
-                texture.texture.format(),
-            )?
-            .with_origin([input.x, input.y])
-            .with_display(display.clone());
-            let graph = crate::graph_encoder::GraphEncoder::from_prepared(
-                self,
-                prepared,
-                input,
-                surface.sample_count(),
-                crate::pass_graph::Load::Clear(entry.clear),
-            )?;
-            let commands = graph.into_commands()?;
-            ruffle_render::profile::work(|w| {
-                w.offscreen_targets += 1;
-                w.offscreen_pixels += u64::from(input.width) * u64::from(input.height);
-            });
-            let color = wgpu::Color {
-                r: f64::from(entry.clear.r) / 255.0,
-                g: f64::from(entry.clear.g) / 255.0,
-                b: f64::from(entry.clear.b) / 255.0,
-                a: f64::from(entry.clear.a) / 255.0,
-            };
-            let mode = if partial {
-                RenderTargetMode::FreshWithColor(color)
-            } else {
-                RenderTargetMode::ExistingWithColor(texture.texture.clone(), color)
-            };
-            let mut scope = self
-                .profiler
-                .scope("Draw to CAB", self.active_frame.command_encoder.record());
-            let mut target = surface.draw_commands(
-                mode,
-                &self.descriptors,
-                &self.meshes,
-                commands,
-                &mut self.active_frame.staging_belt,
-                &mut self.chunk_buffers,
-                &mut scope,
-                LayerRef::None,
-                &mut self.offscreen_texture_pool,
-            )?;
-            target.ensure_cleared(&mut scope);
-            let mut filtered = false;
-            if !entry.filters.is_empty()
-                && let Some(result) = self.descriptors.filters.apply_chain(
-                    &self.descriptors,
-                    &mut scope.scope("Filter chain"),
-                    &mut self.offscreen_texture_pool,
-                    &mut self.active_frame.staging_belt,
-                    FilterSource::for_entire_texture(target.color_texture()),
-                    entry.filters,
-                )?
-            {
-                target = result;
-                filtered = true;
-            }
-            if partial {
-                scope.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: target.color_texture(),
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: output.x - input.x,
-                            y: output.y - input.y,
-                            z: 0,
-                        },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &texture.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: output.x,
-                            y: output.y,
-                            z: 0,
-                        },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: output.width,
-                        height: output.height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            } else if filtered {
-                run_copy_pipeline(
-                    &self.descriptors,
-                    texture.texture.format(),
-                    &texture.texture.create_view(&Default::default())?,
-                    target.color_view(),
-                    target.color_texture().sample_count(),
-                    &mut scope.scope("Copy filtered to CAB"),
-                )?;
-            }
-            drop(scope);
-            crate::record_bitmap_write(&entry.handle)?;
-            if let (Some(tiles), Some(input), Some(cache)) = (&mut self.filtered_tiles, tile, cache)
-            {
-                if let Some(id) = tiles.store(
-                    input,
-                    &texture.texture,
-                    &self.descriptors.device,
-                    self.active_frame.command_encoder.record(),
-                )? {
-                    cache
-                        .tile_id
-                        .store(id, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            if let Some(cache) = cache {
-                cache.finish_redraw(history);
-            }
-            self.active_frame.maybe_flush(&self.descriptors)?;
-        }
-
-        let graph = self.prepare_commands(
-            commands,
-            self.target.width(),
-            self.target.height(),
-            self.surface.quality(),
-            self.target.format(),
-            crate::pass_graph::Load::Clear(clear),
-        )?;
-        self.surface.draw_graph_and_copy_to(
-            frame_output.view(),
-            RenderTargetMode::FreshWithColor(wgpu::Color {
-                r: f64::from(clear.r) / 255.0,
-                g: f64::from(clear.g) / 255.0,
-                b: f64::from(clear.b) / 255.0,
-                a: f64::from(clear.a) / 255.0,
-            }),
-            &self.descriptors,
-            &mut self.active_frame.staging_belt,
-            &mut self.chunk_buffers,
-            &mut self.profiler.scope(
-                ruffle_render::profile::next_frame()
-                    .map(|n| format!("Stage {n}"))
-                    .unwrap_or_else(|| "Frame commands".into()),
-                self.active_frame.command_encoder.record(),
-            ),
-            &self.meshes,
-            graph,
-            LayerRef::None,
-            &mut self.texture_pool,
-        )?;
-        if let Some(e) = &display {
-            e.finish_frame(self.active_frame.command_encoder.record())?;
-        }
-        self.profiler
-            .resolve_queries(self.active_frame.command_encoder.record());
-        self.active_frame.staging_belt.finish();
-
-        self.last_submission = Some(self.active_frame.submit_for_target(
-            &self.descriptors,
-            &self.target,
-            frame_output,
-        )?);
-        if let Some(e) = &display {
-            e.submitted(self.descriptors.queue.raw());
-        }
-        let (idle, peak, combined) = self.budget.stats();
-        ruffle_render::profile::pool(idle, peak, combined);
-        self.texture_pool.end_frame();
-        self.offscreen_texture_pool.end_frame();
-        self.profiler
-            .end_frame()
-            .map_err(|error| self.descriptors.runtime.health().record(error.into()))?;
-        ruffle_render::profile::submitted();
-        self.collect_gpu_samples();
-
-        self.descriptors.runtime.check_health()?;
-        Ok(ruffle_render::backend::FrameSubmission::Submitted)
+        self.submit_inline_frame(clear, commands, cache_entries)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1263,7 +1037,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             if recipe.is_resident() && self.active_frame.command_encoder.dirty {
                 self.active_frame.submit_direct(&self.descriptors)?;
             }
-            return Ok(recipe.update(bitmap, region)?);
+            recipe.update(bitmap, region)?;
+            self.active_frame.operations.record()?;
+            return Ok(());
         }
         let texture = as_texture(handle, &self.descriptors.device)?;
 
@@ -1306,7 +1082,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             extent,
         )?;
 
-        crate::record_bitmap_write(handle)?;
+        self.finish_bitmap_write(handle)?;
         self.descriptors.runtime.check_health()?;
         Ok(())
     }
@@ -1368,7 +1144,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             destination_region,
         )?;
 
-        crate::record_bitmap_write(&destination)?;
+        self.finish_bitmap_write(&destination)?;
         self.active_frame.maybe_flush(&self.descriptors)?;
         self.descriptors.runtime.check_health()?;
         Ok(Some(self.make_queue_sync_handle(
@@ -1446,7 +1222,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             &mut self.offscreen_texture_pool,
         )?;
 
-        crate::record_bitmap_write(&handle)?;
+        self.finish_bitmap_write(&handle)?;
         self.active_frame.maybe_flush(&self.descriptors)?;
         self.descriptors.runtime.check_health()?;
         Ok(Some(
@@ -1620,7 +1396,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 PixelRegion::for_region(final_dest_x, final_dest_y, copy_width, copy_height),
             )?;
         }
-        crate::record_bitmap_write(&destination)?;
+        self.finish_bitmap_write(&destination)?;
         self.active_frame.maybe_flush(&self.descriptors)?;
         self.descriptors.runtime.check_health()?;
         Ok(Some(self.make_queue_sync_handle(
@@ -1846,7 +1622,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             &FilterSource::for_entire_texture(&target_texture.texture),
         )?;
 
-        crate::record_bitmap_write(&target_handle)?;
+        self.finish_bitmap_write(&target_handle)?;
         let index = Some(self.active_frame.submit_for_target(
             &self.descriptors,
             &texture_target,
@@ -1998,6 +1774,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             region,
             self.descriptors.clone(),
             self.offscreen_buffer_pool.clone(),
+            self.active_frame.operations.dependency(),
             false,
         )?
         .capture_native(read, &mut self.active_frame)
@@ -2029,6 +1806,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     "foreign readback handle",
                 ))
         })?;
+        handle.dependency.check(&self.active_frame.operations)?;
         handle
             .capture_native(read, &mut self.active_frame)
             .map_err(|error| self.descriptors.runtime.health().record(error))?;
@@ -2156,6 +1934,7 @@ impl TrackedEncoder {
     }
 }
 pub struct ActiveFrame {
+    pub(crate) operations: crate::render_snapshot::OperationSequence,
     pub staging_belt: crate::gpu_resources::StagingBelt,
     command_encoder: TrackedEncoder,
     budget: crate::idle_pool::Budget,
@@ -2167,6 +1946,7 @@ impl ActiveFrame {
         budget: crate::idle_pool::Budget,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         Ok(Self {
+            operations: Default::default(),
             budget,
             command_encoder: TrackedEncoder {
                 dirty: false,
