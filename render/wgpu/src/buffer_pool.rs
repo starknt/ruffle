@@ -2,10 +2,10 @@ use crate::descriptors::Descriptors;
 use crate::globals::Globals;
 use crate::idle_pool::Budget;
 use fnv::FnvHashMap;
+use parking_lot::Mutex;
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
-use std::rc::{Rc, Weak};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 type Constructor<Type, Description> =
     Box<dyn Fn(&Descriptors, &Description) -> Result<Type, crate::gpu_runtime::RenderFailure>>;
@@ -41,7 +41,7 @@ impl TexturePool {
         self.clock += 1;
         if self.clock.is_multiple_of(16) {
             self.pools
-                .retain(|_, p| Rc::weak_count(&p.owner) > 0 || self.budget.contains(p.owner.key));
+                .retain(|_, p| Arc::weak_count(&p.owner) > 0 || self.budget.contains(p.owner.key));
             self.globals_cache
                 .retain(|_, (used, _)| self.clock - *used <= 16);
         }
@@ -181,20 +181,20 @@ struct Owner<T, D> {
     budget: Budget,
     key: u64,
     kind: usize,
-    stock: Option<std::cell::RefCell<Vec<(T, D, u64)>>>,
+    stock: Option<Mutex<Vec<(T, D, u64)>>>,
 }
 impl<T, D> Drop for Owner<T, D> {
     fn drop(&mut self) {
         if let Some(v) = &self.stock {
             self.budget
-                .stock_delta(self.kind, 0, v.borrow().iter().map(|e| e.2).sum())
+                .stock_delta(self.kind, 0, v.lock().iter().map(|e| e.2).sum())
         } else {
             self.budget.clear_pool(self.key);
         }
     }
 }
 pub struct BufferPool<T: PooledResource, D: BufferDescription> {
-    owner: Rc<Owner<T, D>>,
+    owner: Arc<Owner<T, D>>,
     constructor: Constructor<T, D>,
     bytes: Box<dyn Fn(&D) -> u64>,
 }
@@ -213,7 +213,7 @@ impl<T: PooledResource, D: BufferDescription> BufferPool<T, D> {
         let key = budget.key();
         let stock = (!budget.limited()).then(Default::default);
         Self {
-            owner: Rc::new(Owner {
+            owner: Arc::new(Owner {
                 budget,
                 key,
                 kind,
@@ -229,7 +229,7 @@ impl<T: PooledResource, D: BufferDescription> BufferPool<T, D> {
         description: D,
     ) -> Result<PoolEntry<T, D>, crate::gpu_runtime::RenderFailure> {
         let cached = if let Some(stock) = &self.owner.stock {
-            let mut v = stock.borrow_mut();
+            let mut v = stock.lock();
             let best = v
                 .iter()
                 .enumerate()
@@ -254,7 +254,7 @@ impl<T: PooledResource, D: BufferDescription> BufferPool<T, D> {
         Ok(PoolEntry {
             item: Some(item),
             description,
-            owner: Rc::downgrade(&self.owner),
+            owner: Arc::downgrade(&self.owner),
             bytes,
         })
     }
@@ -294,7 +294,7 @@ impl<T: PooledResource, D: BufferDescription> Drop for PoolEntry<T, D> {
             item.set_idle(true);
             if let Some(stock) = &owner.stock {
                 stock
-                    .borrow_mut()
+                    .lock()
                     .push((item, self.description.clone(), self.bytes));
                 owner.budget.stock_delta(owner.kind, self.bytes, 0);
             } else {

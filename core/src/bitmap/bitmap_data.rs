@@ -1133,7 +1133,11 @@ impl<'gc> BitmapRawData<'gc> {
         }
         self.validity.cpu.remove(region);
         self.validity.gpu.add(region);
-        self.validity.pending = Some((sync_handle, region));
+        let live_read = self
+            .bitmap_handle
+            .as_ref()
+            .is_some_and(|handle| sync_handle.can_read_current_without_token(handle));
+        self.validity.pending = (!live_read).then_some((sync_handle, region));
         self.validity.last_pixel_read_tile = None;
         self.validity.coherent_pixel_reads = false;
         self.inform_display_objects(gc_context);

@@ -356,6 +356,37 @@ fn gpu_fill(handle: &BitmapHandle, region: PixelRegion, color: [u8; 4]) -> Box<d
 }
 
 #[test]
+fn tracking_current_pixels_releases_a_redundant_version_reader() {
+    use crate::bitmap::{bitmap_data::BitmapData, operations::get_pixel32};
+    #[derive(Debug)]
+    struct Reader(BitmapHandle, Arc<()>);
+    impl SyncHandle for Reader {
+        fn can_read_current_without_token(&self, bitmap: &BitmapHandle) -> bool {
+            self.0 == *bitmap
+        }
+    }
+    gc_arena::arena::rootless_mutate(|mc| {
+        let bitmap = BitmapData::new(mc, 4, 1, true, 0xff000000);
+        let mut renderer = renderer(false);
+        renderer.regional = true;
+        let handle = bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+        let region = PixelRegion::for_whole_size(4, 1);
+        drop(gpu_fill(&handle, region, [10, 20, 30, 255]));
+        let reader = Reader(handle, Arc::new(()));
+        let live = Arc::downgrade(&reader.1);
+        bitmap.mark_gpu_dirty(mc, Box::new(reader), region);
+        assert!(
+            live.upgrade().is_none(),
+            "tracking current GPU pixels retained a version reader"
+        );
+        assert_eq!(
+            get_pixel32(bitmap, &mut renderer, 1, 0).unwrap(),
+            0xff0a141e
+        );
+    });
+}
+
+#[test]
 fn evicted_symbol_can_release_its_gpu_view_while_as3_pixels_remain_alive() {
     let mut renderer = renderer(true);
     let mut pixels = Pixels::symbol(source());

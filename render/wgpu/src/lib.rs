@@ -339,133 +339,155 @@ impl Drop for AsyncReadback {
 }
 
 #[derive(Debug)]
-pub enum QueueSyncHandle {
-    AlreadyCopied {
-        index: Option<wgpu::SubmissionIndex>,
-        buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
-        copy_dimensions: BufferDimensions,
-        descriptors: Arc<Descriptors>,
-    },
-    NotCopied {
+struct CopiedReadback {
+    index: Option<wgpu::SubmissionIndex>,
+    buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
+    dimensions: BufferDimensions,
+}
+
+#[derive(Debug)]
+struct VersionedRead {
+    source: render_snapshot::ResourceVersion,
+    area: PixelRegion,
+    saved: std::sync::Mutex<Option<Result<CopiedReadback, gpu_runtime::RenderFailure>>>,
+}
+
+impl VersionedRead {
+    fn record(
+        &self,
+        handle: &BitmapHandle,
+        descriptors: &Descriptors,
+        pool: &BufferPool<gpu_resources::Buffer, BufferDimensions>,
+        frame: &mut ActiveFrame,
+    ) -> Result<CopiedReadback, gpu_runtime::RenderFailure> {
+        if render_snapshot::bitmap_version(handle)? != self.source {
+            return Err(gpu_runtime::RenderFailure::new(
+                gpu_runtime::RenderFailureKind::Validation,
+                "bitmap readback version changed before its copy",
+            ));
+        }
+        let texture = as_texture(handle, &descriptors.device)?;
+        let dimensions = BufferDimensions::new(
+            self.area.width() as usize,
+            self.area.height() as usize,
+            texture.texture.format(),
+        );
+        let buffer = pool.take(descriptors, dimensions.clone())?;
+        transfers::readback(
+            descriptors,
+            frame.encoder(),
+            handle,
+            self.area,
+            &buffer,
+            &dimensions,
+        )?;
+        let index = Some(frame.submit_direct(descriptors)?);
+        Ok(CopiedReadback {
+            index,
+            buffer,
+            dimensions,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum ReadbackSource {
+    Copied(CopiedReadback),
+    Deferred {
         handle: BitmapHandle,
-        copy_area: PixelRegion,
-        descriptors: Arc<Descriptors>,
-        pool: Arc<BufferPool<crate::gpu_resources::Buffer, BufferDimensions>>,
+        read: Arc<VersionedRead>,
+        pool: Arc<BufferPool<gpu_resources::Buffer, BufferDimensions>>,
     },
 }
 
-impl SyncHandle for QueueSyncHandle {}
+#[derive(Debug)]
+pub struct QueueSyncHandle {
+    descriptors: Arc<Descriptors>,
+    source: ReadbackSource,
+}
+
+impl SyncHandle for QueueSyncHandle {
+    fn can_read_current_without_token(&self, bitmap: &BitmapHandle) -> bool {
+        matches!(&self.source, ReadbackSource::Deferred { handle, .. } if handle == bitmap)
+    }
+}
 
 impl QueueSyncHandle {
+    fn deferred(
+        handle: BitmapHandle,
+        area: PixelRegion,
+        descriptors: Arc<Descriptors>,
+        pool: Arc<BufferPool<gpu_resources::Buffer, BufferDimensions>>,
+        track: bool,
+    ) -> Result<Self, gpu_runtime::RenderFailure> {
+        let read = Arc::new(VersionedRead {
+            source: render_snapshot::bitmap_version(&handle)?,
+            area,
+            saved: Default::default(),
+        });
+        // One sync token is issued per write. The next writer orders a copy
+        // first only while somebody still holds this version's token.
+        if track {
+            *as_texture(&handle, &descriptors.device)?
+                .pending_read
+                .lock()
+                .unwrap() = Arc::downgrade(&read);
+        }
+        Ok(Self {
+            descriptors,
+            source: ReadbackSource::Deferred { handle, read, pool },
+        })
+    }
+
+    fn into_copy(
+        self,
+        frame: &mut ActiveFrame,
+    ) -> Result<(Arc<Descriptors>, CopiedReadback), gpu_runtime::RenderFailure> {
+        let copy = match self.source {
+            ReadbackSource::Copied(copy) => copy,
+            ReadbackSource::Deferred { handle, read, pool } => {
+                let saved = read.saved.lock().unwrap().take();
+                match saved {
+                    Some(result) => result?,
+                    None => read.record(&handle, &self.descriptors, &pool, frame)?,
+                }
+            }
+        };
+        Ok((self.descriptors, copy))
+    }
+
     pub fn prepare_async(
         self,
         frame: &mut ActiveFrame,
-    ) -> Result<AsyncReadback, crate::gpu_runtime::RenderFailure> {
-        Ok(match self {
-            QueueSyncHandle::AlreadyCopied {
-                index,
-                buffer,
-                copy_dimensions,
-                descriptors,
-            } => AsyncReadback::new(buffer, copy_dimensions, descriptors, index),
-            QueueSyncHandle::NotCopied {
-                handle,
-                copy_area,
-                descriptors,
-                pool,
-            } => {
-                let texture = as_texture(&handle, &descriptors.device)?;
-                let dimensions = BufferDimensions::new(
-                    copy_area.width() as usize,
-                    copy_area.height() as usize,
-                    texture.texture.format(),
-                );
-                let buffer = pool.take(&descriptors, dimensions.clone())?;
-                crate::transfers::readback(
-                    &descriptors,
-                    frame.encoder(),
-                    &handle,
-                    copy_area,
-                    &buffer,
-                    &dimensions,
-                )?;
-                let index = frame.submit_direct(&descriptors)?;
-                AsyncReadback::new(buffer, dimensions, descriptors, Some(index))
-            }
-        })
+    ) -> Result<AsyncReadback, gpu_runtime::RenderFailure> {
+        let (descriptors, copy) = self.into_copy(frame)?;
+        Ok(AsyncReadback::new(
+            copy.buffer,
+            copy.dimensions,
+            descriptors,
+            copy.index,
+        ))
     }
 
     pub fn capture_native<R, F: FnOnce(&[u8], u32, ruffle_render::bitmap::BitmapFormat) -> R>(
         self,
         read: F,
         frame: &mut ActiveFrame,
-    ) -> Result<R, crate::gpu_runtime::RenderFailure> {
+    ) -> Result<R, gpu_runtime::RenderFailure> {
         let _readback = ruffle_render::profile::time(ruffle_render::profile::Phase::Readback);
-        let capture = |bytes: &[u8], stride, format| {
-            let format = if format == wgpu::TextureFormat::Bgra8Unorm {
-                ruffle_render::bitmap::BitmapFormat::Bgra
-            } else {
-                ruffle_render::bitmap::BitmapFormat::Rgba
-            };
-            read(bytes, stride, format)
+        let (descriptors, copy) = self.into_copy(frame)?;
+        let format = if copy.dimensions.format == wgpu::TextureFormat::Bgra8Unorm {
+            ruffle_render::bitmap::BitmapFormat::Bgra
+        } else {
+            ruffle_render::bitmap::BitmapFormat::Rgba
         };
-        match self {
-            QueueSyncHandle::AlreadyCopied {
-                index,
-                buffer,
-                copy_dimensions,
-                descriptors,
-            } => capture_image(
-                &descriptors.device,
-                &buffer,
-                &copy_dimensions,
-                index,
-                |bytes, stride| capture(bytes, stride, copy_dimensions.format),
-            ),
-            QueueSyncHandle::NotCopied {
-                handle,
-                copy_area,
-                descriptors,
-                pool,
-            } => {
-                let texture = as_texture(&handle, &descriptors.device)?;
-
-                let buffer_dimensions = BufferDimensions::new(
-                    copy_area.width() as usize,
-                    copy_area.height() as usize,
-                    texture.texture.format(),
-                );
-
-                let buffer = pool.take(&descriptors, buffer_dimensions.clone())?;
-                crate::transfers::readback(
-                    &descriptors,
-                    frame.encoder(),
-                    &handle,
-                    copy_area,
-                    &buffer,
-                    &buffer_dimensions,
-                )?;
-                let index = frame.submit_direct(&descriptors)?;
-
-                let image = capture_image(
-                    &descriptors.device,
-                    &buffer,
-                    &buffer_dimensions,
-                    Some(index),
-                    |bytes, stride| capture(bytes, stride, buffer_dimensions.format),
-                );
-
-                // After we've read pixels from a texture enough times, we'll store this buffer so that
-                // future reads will be faster (it'll copy as part of the draw process instead)
-                let _ = texture.copy_count.try_update(
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                    |count| Some(count.saturating_add(1)),
-                );
-
-                image
-            }
-        }
+        capture_image(
+            &descriptors.device,
+            &copy.buffer,
+            &copy.dimensions,
+            copy.index,
+            |bytes, stride| read(bytes, stride, format),
+        )
     }
 }
 
@@ -479,7 +501,7 @@ pub struct Texture {
     repeating_nearest: OnceLock<BitmapBinds>,
     clamped_linear: OnceLock<BitmapBinds>,
     clamped_nearest: OnceLock<BitmapBinds>,
-    copy_count: std::sync::atomic::AtomicU8,
+    pending_read: std::sync::Mutex<std::sync::Weak<VersionedRead>>,
     version: std::sync::atomic::AtomicU64,
 }
 

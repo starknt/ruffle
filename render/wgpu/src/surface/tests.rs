@@ -3404,6 +3404,120 @@ fn bgra_bitmap_cache_supports_multisample_draw_and_region_updates() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn a_live_bitmap_read_keeps_the_requested_version_across_later_writes() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
+    let descriptors = gpu();
+    let stage = TextureTarget::new(&descriptors.device, (4, 1)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, stage, false).unwrap();
+    let red = renderer
+        .register_bitmap(Bitmap::new(
+            4,
+            1,
+            BitmapFormat::Rgba,
+            [255, 0, 0, 255].repeat(4),
+        ))
+        .unwrap();
+    let dest = renderer
+        .register_bitmap(Bitmap::new(
+            4,
+            1,
+            BitmapFormat::Rgba,
+            [0, 0, 0, 255].repeat(4),
+        ))
+        .unwrap();
+    let area = PixelRegion::for_region(1, 0, 2, 1);
+    let old = renderer
+        .copy_bitmap_region(red.clone(), area, dest.clone(), area)
+        .unwrap()
+        .unwrap();
+    let full = PixelRegion::for_whole_size(4, 1);
+    renderer
+        .update_texture(
+            &dest,
+            Bitmap::new(4, 1, BitmapFormat::Rgba, [0, 0, 255, 255].repeat(4)),
+            full,
+        )
+        .unwrap();
+    let middle = renderer
+        .copy_bitmap_region(
+            dest.clone(),
+            area,
+            dest.clone(),
+            PixelRegion::for_region(0, 0, 2, 1),
+        )
+        .unwrap()
+        .unwrap();
+    drop(
+        renderer
+            .copy_bitmap_region(red, full, dest.clone(), full)
+            .unwrap()
+            .unwrap(),
+    );
+    for (token, expected) in [(middle, [0, 0, 255, 255]), (old, [255, 0, 0, 255])] {
+        renderer
+            .resolve_sync_handle(
+                token,
+                Box::new(|bytes, _| {
+                    assert_eq!(&bytes[..8], &expected.repeat(2));
+                }),
+            )
+            .unwrap();
+    }
+    renderer
+        .read_bitmap_region(
+            &dest,
+            full,
+            Box::new(|bytes, _| {
+                assert_eq!(&bytes[..16], &[255, 0, 0, 255].repeat(4));
+            }),
+        )
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn dropped_bitmap_version_requests_do_not_submit_or_allocate_readback_buffers() {
+    use crate::gpu_runtime::ResourceKind;
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
+
+    let descriptors = gpu();
+    let stage = TextureTarget::new_without_readback(&descriptors.device, (4, 1)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), stage, false).unwrap();
+    let pixels = || Bitmap::new(4, 1, BitmapFormat::Rgba, [12, 34, 56, 255].repeat(4));
+    let src = renderer.register_bitmap(pixels()).unwrap();
+    let dst = renderer.register_bitmap(pixels()).unwrap();
+    let area = PixelRegion::for_whole_size(4, 1);
+    // Realize both uploads and then measure only the chain of GPU copies.
+    crate::as_texture(&src, &descriptors.device).unwrap();
+    crate::as_texture(&dst, &descriptors.device).unwrap();
+    let before = descriptors.runtime.stats();
+    for _ in 0..12 {
+        drop(
+            renderer
+                .copy_bitmap_region(src.clone(), area, dst.clone(), area)
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let after = descriptors.runtime.stats();
+    assert_eq!(before.submitted, after.submitted);
+    let kind = ResourceKind::ReadbackBuffer as usize;
+    assert_eq!(before.kind_counts[kind], after.kind_counts[kind]);
+    renderer
+        .read_bitmap_region(
+            &dst,
+            area,
+            Box::new(|bytes, _| {
+                assert_eq!(&bytes[..16], &[12, 34, 56, 255].repeat(4));
+            }),
+        )
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn bitmap_region_readback_does_not_capture_unrequested_rows() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
     let descriptors = gpu();

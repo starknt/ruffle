@@ -65,7 +65,13 @@ pub type RgbaBufRead<'a> = Box<dyn FnOnce(&[u8], u32) + 'a>;
 /// Native premultiplied RGBA or BGRA pixels and their padded row stride.
 pub type BitmapBufRead<'a> = Box<dyn FnOnce(&[u8], u32, BitmapFormat) + 'a>;
 
-pub trait SyncHandle: Any + Debug {}
+pub trait SyncHandle: Any + Debug {
+    /// A BitmapData tracking only current pixels may release this token when
+    /// the same bitmap has guaranteed region readback on its renderer.
+    fn can_read_current_without_token(&self, _bitmap: &BitmapHandle) -> bool {
+        false
+    }
+}
 
 /// How bitmaps should snap to the pixel grid when rendering
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]

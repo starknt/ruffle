@@ -625,34 +625,64 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         &self.descriptors.device
     }
 
-    pub fn make_queue_sync_handle(
+    fn preserve_read_before_write(
+        &mut self,
+        destination: &BitmapHandle,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        if let Some(recipe) =
+            (&*destination.0 as &dyn Any).downcast_ref::<crate::bitmap_recipe::BitmapRecipe>()
+            && !recipe.is_resident()
+        {
+            return Ok(());
+        }
+        let texture = as_texture(destination, &self.descriptors.device)?;
+        let pending = std::mem::take(&mut *texture.pending_read.lock().unwrap()).upgrade();
+        if let Some(read) = pending {
+            let result = read.record(
+                destination,
+                &self.descriptors,
+                &self.offscreen_buffer_pool,
+                &mut self.active_frame,
+            );
+            let status = result.as_ref().map(|_| ()).map_err(Clone::clone);
+            *read.saved.lock().unwrap() = Some(result);
+            status?;
+        }
+        Ok(())
+    }
+
+    fn make_queue_sync_handle(
         &self,
         target: TextureTarget,
         index: Option<SubmissionIndex>,
         destination: BitmapHandle,
         copy_area: PixelRegion,
-    ) -> Box<QueueSyncHandle> {
-        match target.take_buffer() {
-            None => Box::new(QueueSyncHandle::NotCopied {
-                handle: destination,
+    ) -> Result<Box<QueueSyncHandle>, crate::gpu_runtime::RenderFailure> {
+        let handle = match target.take_buffer() {
+            None => QueueSyncHandle::deferred(
+                destination,
                 copy_area,
-                descriptors: self.descriptors.clone(),
-                pool: self.offscreen_buffer_pool.clone(),
-            }),
+                self.descriptors.clone(),
+                self.offscreen_buffer_pool.clone(),
+                true,
+            )?,
             Some(TextureBufferInfo {
-                buffer: MaybeOwnedBuffer::Borrowed(buffer, copy_dimensions),
+                buffer: MaybeOwnedBuffer::Borrowed(buffer, dimensions),
                 ..
-            }) => Box::new(QueueSyncHandle::AlreadyCopied {
-                index,
-                buffer,
-                copy_dimensions,
+            }) => QueueSyncHandle {
                 descriptors: self.descriptors.clone(),
-            }),
+                source: crate::ReadbackSource::Copied(crate::CopiedReadback {
+                    index,
+                    buffer,
+                    dimensions,
+                }),
+            },
             Some(TextureBufferInfo {
                 buffer: MaybeOwnedBuffer::Owned(..),
                 ..
-            }) => unreachable!("Buffer must be Borrowed as it was set to be Borrowed earlier"),
-        }
+            }) => unreachable!("offscreen sync uses a pooled buffer"),
+        };
+        Ok(Box::new(handle))
     }
 }
 
@@ -919,6 +949,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 }
                 continue;
             };
+            self.preserve_read_before_write(&entry.handle)?;
             let tile = if display.is_none() && self.filtered_tiles.is_some() && cache.is_some() {
                 crate::filtered_tiles::Input::capture(
                     &prepared,
@@ -1225,6 +1256,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             return Ok(());
         }
 
+        self.preserve_read_before_write(handle)?;
         if let Some(recipe) =
             (&*handle.0 as &dyn Any).downcast_ref::<crate::bitmap_recipe::BitmapRecipe>()
         {
@@ -1325,6 +1357,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             buffer: None,
         };
 
+        self.preserve_read_before_write(&destination)?;
         crate::transfers::copy(
             &self.descriptors,
             &mut self.offscreen_texture_pool,
@@ -1343,7 +1376,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             None,
             destination,
             destination_region,
-        )))
+        )?))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1355,6 +1388,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         bounds: PixelRegion,
     ) -> Result<Option<Box<dyn SyncHandle>>, BitmapError> {
         self.descriptors.runtime.check_health()?;
+        self.preserve_read_before_write(&handle)?;
         let texture = as_texture(&handle, &self.descriptors.device)?;
 
         let extent = wgpu::Extent3d {
@@ -1416,7 +1450,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.active_frame.maybe_flush(&self.descriptors)?;
         self.descriptors.runtime.check_health()?;
         Ok(Some(
-            self.make_queue_sync_handle(target, None, handle, bounds),
+            self.make_queue_sync_handle(target, None, handle, bounds)?,
         ))
     }
 
@@ -1459,6 +1493,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 }
                 _ => false,
             };
+        self.preserve_read_before_write(&destination)?;
         let source_texture = as_texture(&source, &self.descriptors.device)?;
         let dest_texture = as_texture(&destination, &self.descriptors.device)?;
 
@@ -1593,7 +1628,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             None,
             destination,
             copy_area,
-        )))
+        )?))
     }
 
     fn compile_pixelbender_shader(
@@ -1739,12 +1774,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     repeating_nearest: Default::default(),
                     clamped_linear: Default::default(),
                     clamped_nearest: Default::default(),
-                    copy_count: Default::default(),
+                    pending_read: Default::default(),
                     version: Default::default(),
                 }))
             }
         };
 
+        self.preserve_read_before_write(&target_handle)?;
         let target_texture = as_texture(&target_handle, &self.descriptors.device)?;
 
         let extent = wgpu::Extent3d {
@@ -1822,7 +1858,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             index,
             target_handle,
             PixelRegion::for_whole_size(extent.width, extent.height),
-        );
+        )?;
 
         match target {
             PixelBenderTarget::Bitmap(_) => Ok(PixelBenderPending::from_backend(
@@ -1921,7 +1957,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             repeating_nearest: Default::default(),
             clamped_linear: Default::default(),
             clamped_nearest: Default::default(),
-            copy_count: Default::default(),
+            pending_read: Default::default(),
             version: Default::default(),
         })))
     }
@@ -1957,12 +1993,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             )
             .into());
         }
-        QueueSyncHandle::NotCopied {
-            handle: handle.clone(),
-            copy_area: region,
-            descriptors: self.descriptors.clone(),
-            pool: self.offscreen_buffer_pool.clone(),
-        }
+        QueueSyncHandle::deferred(
+            handle.clone(),
+            region,
+            self.descriptors.clone(),
+            self.offscreen_buffer_pool.clone(),
+            false,
+        )?
         .capture_native(read, &mut self.active_frame)
         .map_err(|error| self.descriptors.runtime.health().record(error))?;
         self.descriptors.runtime.check_health()?;
