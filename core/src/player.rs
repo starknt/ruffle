@@ -2458,6 +2458,26 @@ impl Player {
     pub fn render(
         &mut self,
     ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
+        self.render_opportunity()?;
+        self.render_stage()
+    }
+
+    /// Dispatch a pending realtime RENDER on the VM thread. Hosts with a bounded
+    /// output queue call this once per redraw opportunity, even without a target.
+    /// Fixed-step sessions dispatch at the authored frame boundary in `run_frame`.
+    pub fn render_opportunity(&mut self) -> Result<(), ruffle_render::error::RenderFailure> {
+        self.check_render_health()?;
+        if self.playback.sample_time.is_none() {
+            self.broadcast_render_if_invalidated();
+        }
+        self.check_render_health()
+    }
+
+    /// Extract and submit the stage after the host has driven the render opportunity.
+    /// The host may defer this step until its presentation target has capacity.
+    pub fn render_stage(
+        &mut self,
+    ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
         self.check_render_health()?;
         let result = self.render_inner();
         if let Err(error) = &result {
@@ -2475,16 +2495,13 @@ impl Player {
                 let stage = context.stage;
                 stage.broadcast_render(context);
             });
+            self.needs_render = true;
         }
     }
 
     fn render_inner(
         &mut self,
     ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
-        if self.playback.sample_time.is_none() {
-            self.broadcast_render_if_invalidated();
-        }
-
         if !self.renderer.prepare_frame()? {
             self.needs_render = true;
             return Ok(ruffle_render::backend::FrameOutcome::Deferred);
@@ -3810,6 +3827,19 @@ mod tests {
             ruffle_render::backend::FrameOutcome::NoOutput
         );
         assert!(!player.needs_render());
+    }
+
+    #[test]
+    fn an_invalidation_between_opportunity_and_extraction_waits_for_the_next_opportunity() {
+        let session = PlayerBuilder::new().build();
+        let mut player = session.lock().unwrap();
+        player.render_opportunity().unwrap();
+        player.mutate_with_update_context(|ctx| ctx.stage.set_invalidated(true));
+        player.render_stage().unwrap();
+        assert!(player.mutate_with_update_context(|ctx| ctx.stage.invalidated()));
+        player.render_opportunity().unwrap();
+        assert!(!player.mutate_with_update_context(|ctx| ctx.stage.invalidated()));
+        assert!(player.needs_render());
     }
 
     #[test]
