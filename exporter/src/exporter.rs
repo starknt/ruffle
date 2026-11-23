@@ -122,7 +122,9 @@ impl MovieExport {
     pub fn capture_frame(&self) -> Result<RgbaImage> {
         let player = self.session.player();
         let image = || {
-            player.lock().unwrap().render()?;
+            if player.lock().unwrap().render_with_outcome()? != ruffle_core::FrameOutcome::Submitted {
+                return Ok(None);
+            }
             player.capture_frame()
         };
         match catch_unwind(image) {

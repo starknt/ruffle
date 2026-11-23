@@ -182,8 +182,12 @@ impl RenderTarget for SwapChainTarget {
                     "surface acquisition failed",
                 ));
             }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.device.configure_surface(&self.window_surface, &self.surface_config)?;
+                return Ok(None);
+            }
             state => {
-                tracing::warn!("Couldn't acquire surface texture: {:?}", state);
+                tracing::debug!("Couldn't acquire surface texture: {:?}", state);
                 return Ok(None);
             }
         };

@@ -77,6 +77,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     pub(crate) descriptors: Arc<Descriptors>,
     budget: crate::idle_pool::Budget,
     target: T,
+    stage_frame: Option<T::Frame>,
     display_enhancer: Option<Arc<dyn crate::display_bitmap::DisplayBitmapEnhancer>>,
     surface: Surface,
     meshes: Vec<Mesh>,
@@ -294,6 +295,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             budget: budget.clone(),
             descriptors,
             target,
+            stage_frame: None,
             surface,
             display_enhancer: None,
             meshes: Vec::new(),
@@ -835,31 +837,33 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         Ok(handle)
     }
 
-    #[instrument(level = "debug", skip_all)]
+    fn prepare_frame(&mut self) -> Result<bool, crate::gpu_runtime::RenderFailure> {
+        self.descriptors.runtime.check_health()?;
+        if self.stage_frame.is_none() {
+            let _timer = ruffle_render::profile::native_time(ruffle_render::profile::NativePhase::SurfaceAcquire);
+            self.stage_frame = self.target.get_next_texture()?;
+        }
+        Ok(self.stage_frame.is_some())
+    }
+
     fn submit_frame(
+        &mut self, clear: Color, commands: CommandList, cache_entries: Vec<BitmapCacheEntry>,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.submit_frame_with_outcome(clear, commands, cache_entries).map(|_| ())
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    fn submit_frame_with_outcome(
         &mut self,
         clear: Color,
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
-    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
-        self.descriptors.runtime.check_health()?;
-        let _render_backend =
-            ruffle_render::profile::time(ruffle_render::profile::Phase::RenderBackend);
-        let frame_output = {
-            let _timer = ruffle_render::profile::native_time(
-                ruffle_render::profile::NativePhase::SurfaceAcquire,
-            );
-            self.target.get_next_texture()?
-        };
-        let Some(frame_output) = frame_output else {
-            // Attempt to recreate the swap chain in this case.
-            self.target.resize(
-                &self.descriptors.device,
-                self.target.width(),
-                self.target.height(),
-            )?;
-            return Ok(());
-        };
+    ) -> Result<ruffle_render::backend::FrameOutcome, crate::gpu_runtime::RenderFailure> {
+        let _render_backend = ruffle_render::profile::time(ruffle_render::profile::Phase::RenderBackend);
+        if !self.prepare_frame()? {
+            return Ok(ruffle_render::backend::FrameOutcome::Deferred);
+        }
+        let frame_output = self.stage_frame.take().expect("stage frame was just acquired");
 
         if let Some(tiles) = &mut self.filtered_tiles {
             tiles.begin_frame();
@@ -1111,7 +1115,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.collect_gpu_samples();
 
         self.descriptors.runtime.check_health()?;
-        Ok(())
+        Ok(ruffle_render::backend::FrameOutcome::Submitted)
     }
 
     #[instrument(level = "debug", skip_all)]

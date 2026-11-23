@@ -41,6 +41,14 @@ pub enum BitmapUsage {
     Excluded,
 }
 
+/// Outcome of the stage submission. GPU completion and window presentation occur separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameOutcome {
+    Submitted,
+    Deferred,
+    NoOutput,
+}
+
 pub trait RenderBackend: Any {
     fn display_sampling_revision(&self) -> u64 {
         0
@@ -120,6 +128,22 @@ pub trait RenderBackend: Any {
 
     fn is_offscreen_supported(&self) -> bool {
         false
+    }
+
+    /// Reserve the output before display traversal mutates bitmap caches. A deferred
+    /// frame must be retried with the current display list.
+    fn prepare_frame(&mut self) -> Result<bool, RenderFailure> {
+        Ok(true)
+    }
+
+    fn submit_frame_with_outcome(
+        &mut self,
+        clear: swf::Color,
+        commands: CommandList,
+        cache_entries: Vec<BitmapCacheEntry>,
+    ) -> Result<FrameOutcome, RenderFailure> {
+        self.submit_frame(clear, commands, cache_entries)?;
+        Ok(FrameOutcome::Submitted)
     }
 
     fn submit_frame(

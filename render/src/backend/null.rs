@@ -99,6 +99,16 @@ impl RenderBackend for NullRenderer {
         Ok(output)
     }
 
+    fn submit_frame_with_outcome(
+        &mut self,
+        _clear: Color,
+        _commands: CommandList,
+        _cache_entries: Vec<BitmapCacheEntry>,
+    ) -> Result<super::FrameOutcome, crate::error::RenderFailure> {
+        self.health.check()?;
+        Ok(super::FrameOutcome::NoOutput)
+    }
+
     fn submit_frame(
         &mut self,
         _clear: Color,

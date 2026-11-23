@@ -2446,12 +2446,17 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn render(&mut self) -> Result<(), ruffle_render::error::RenderFailure> {
+        self.render_with_outcome().map(|_| ())
+    }
+
+    pub fn render_with_outcome(&mut self) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
         self.check_render_health()?;
         let result = self.render_inner();
-        if let Err(error) = result {
-            self.renderer.health().fail(error);
+        if let Err(error) = &result {
+            self.renderer.health().fail(error.clone());
         }
-        self.check_render_health()
+        self.check_render_health()?;
+        result
     }
 
     fn broadcast_render_if_invalidated(&mut self) {
@@ -2465,9 +2470,14 @@ impl Player {
         }
     }
 
-    fn render_inner(&mut self) -> Result<(), ruffle_render::error::RenderFailure> {
+    fn render_inner(&mut self) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
         if self.playback.sample_time.is_none() {
             self.broadcast_render_if_invalidated();
+        }
+
+        if !self.renderer.prepare_frame()? {
+            self.needs_render = true;
+            return Ok(ruffle_render::backend::FrameOutcome::Deferred);
         }
 
         self.render_epoch = self.render_epoch.wrapping_add(1);
@@ -2518,11 +2528,10 @@ impl Player {
         });
 
         self.check_render_health()?;
-        self.renderer
-            .submit_frame(background_color, commands, cache_draws)?;
+        let outcome = self.renderer.submit_frame_with_outcome(background_color, commands, cache_draws)?;
         self.check_render_health()?;
-        self.needs_render = false;
-        Ok(())
+        self.needs_render = outcome == ruffle_render::backend::FrameOutcome::Deferred;
+        Ok(outcome)
     }
 
     /// The current frame of the main timeline, if available.
