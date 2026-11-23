@@ -232,10 +232,39 @@ pub(crate) struct PacketKey {
 /// The stage and its Context3D instances issue reliable work on the same
 /// owner thread. A packet records the last completed encoding operation.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct OperationSequence(Arc<std::sync::atomic::AtomicU64>);
+pub(crate) struct OperationSequence(Arc<SessionOperations>);
+
+#[derive(Default, Debug)]
+struct SessionOperations {
+    applied: std::sync::atomic::AtomicU64,
+    health: ruffle_render::error::RendererHealth,
+}
+
+/// The last logical handle orders its release. Native storage is separately
+/// retired by the device after its last GPU submission completes.
+#[derive(Debug)]
+pub(crate) struct ResourceLifetime(OperationSequence);
+
+impl Drop for ResourceLifetime {
+    fn drop(&mut self) {
+        let _ = self.0.record();
+    }
+}
 impl OperationSequence {
+    pub fn new(health: &ruffle_render::error::RendererHealth) -> Self {
+        Self(Arc::new(SessionOperations {
+            applied: Default::default(),
+            health: health.clone(),
+        }))
+    }
+
+    pub fn create_resource(&self) -> Result<ResourceLifetime, RenderFailure> {
+        self.record()?;
+        Ok(ResourceLifetime(self.clone()))
+    }
+
     pub fn applied(&self) -> u64 {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
+        self.0.applied.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn dependency(&self) -> OperationDependency {
@@ -248,13 +277,14 @@ impl OperationSequence {
     pub fn record(&self) -> Result<(), RenderFailure> {
         use std::sync::atomic::Ordering;
         self.0
+            .applied
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
             .map(|_| ())
             .map_err(|_| {
-                RenderFailure::new(
+                self.0.health.record(RenderFailure::new(
                     RenderFailureKind::Internal,
                     "renderer operation sequence exhausted",
-                )
+                ))
             })
     }
 }

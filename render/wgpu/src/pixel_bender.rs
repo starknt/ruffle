@@ -44,6 +44,7 @@ pub struct PixelBenderWgpuShader {
     int_parameters_buffer_size: u64,
     zeroed_out_of_range_mode: crate::gpu_resources::Buffer,
     staging_belt: RefCell<StagingBelt>,
+    _lifetime: crate::render_snapshot::ResourceLifetime,
 }
 
 impl PixelBenderWgpuShader {
@@ -120,6 +121,7 @@ impl PixelBenderWgpuShader {
     pub fn new(
         descriptors: &Descriptors,
         shader: PixelBenderShader,
+        operations: &crate::render_snapshot::OperationSequence,
     ) -> Result<PixelBenderWgpuShader, crate::gpu_runtime::RenderFailure> {
         let device = descriptors.device.with_owner(
             descriptors
@@ -254,6 +256,7 @@ impl PixelBenderWgpuShader {
         })?;
 
         Ok(PixelBenderWgpuShader {
+            _lifetime: operations.create_resource()?,
             bind_group_layout,
             pipeline_layout,
             pipelines: Default::default(),
@@ -350,7 +353,8 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         &self,
         shader: PixelBenderShader,
     ) -> Result<PixelBenderShaderHandle, BitmapError> {
-        let handle = PixelBenderWgpuShader::new(&self.descriptors, shader)?;
+        let handle =
+            PixelBenderWgpuShader::new(&self.descriptors, shader, &self.active_frame.operations)?;
         Ok(PixelBenderShaderHandle(Arc::new(handle)))
     }
 }
@@ -506,6 +510,7 @@ pub(super) fn run_pixelbender_shader_impl(
                                     clamped_linear: Default::default(),
                                     clamped_nearest: Default::default(),
                                     pending_read: Default::default(),
+                                    _lifetime: None,
                                     version: Default::default(),
                                 },
                             )))

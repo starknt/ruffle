@@ -64,6 +64,12 @@ pub type RgbaBufRead<'a> = Box<dyn FnOnce(&[u8], u32) + 'a>;
 
 /// Native premultiplied RGBA or BGRA pixels and their padded row stride.
 pub type BitmapBufRead<'a> = Box<dyn FnOnce(&[u8], u32, BitmapFormat) + 'a>;
+pub type BitmapRegionRead<'a> = &'a mut dyn FnMut(
+    PixelRegion,
+    &[u8],
+    u32,
+    BitmapFormat,
+) -> Result<(), crate::error::RenderFailure>;
 
 pub trait SyncHandle: Any + Debug {
     /// A BitmapData tracking only current pixels may release this token when

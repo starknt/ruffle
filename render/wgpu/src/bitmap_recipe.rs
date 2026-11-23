@@ -30,6 +30,7 @@ pub struct BitmapRecipe {
     pub(crate) detail: Option<crate::display_bitmap::BitmapDetail>,
     state: Mutex<State>,
     resident: OnceLock<Texture>,
+    _lifetime: crate::render_snapshot::ResourceLifetime,
 }
 impl BitmapHandleImpl for BitmapRecipe {
     fn retained_bytes(&self) -> Option<usize> {
@@ -43,24 +44,18 @@ impl BitmapHandleImpl for BitmapRecipe {
     }
 }
 impl BitmapRecipe {
-    #[cfg(test)]
-    pub fn new(pixels: Bitmap<'_>, device: &Device) -> Result<Arc<Self>, RenderFailure> {
-        Self::with_usage(
-            pixels,
-            device,
-            ruffle_render::backend::BitmapUsage::Mutable,
-            None,
-        )
-    }
     pub fn with_usage(
         pixels: Bitmap<'_>,
         device: &Device,
         usage: ruffle_render::backend::BitmapUsage,
         detail: Option<crate::display_bitmap::BitmapDetail>,
+        operations: &crate::render_snapshot::OperationSequence,
     ) -> Result<Arc<Self>, RenderFailure> {
         let owner = device.runtime().issue_owner(OwnerKind::BitmapData)?;
         let (width, height) = (pixels.width(), pixels.height());
+        let lifetime = operations.create_resource()?;
         Ok(Arc::new_cyclic(|weak_self| Self {
+            _lifetime: lifetime,
             owner,
             device_generation: device.runtime().generation(),
             format: pixels.format(),
@@ -273,6 +268,7 @@ impl BitmapRecipe {
                 clamped_linear: Default::default(),
                 clamped_nearest: Default::default(),
                 pending_read: Default::default(),
+                _lifetime: None,
                 version: Default::default(),
             })
         })?;

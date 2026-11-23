@@ -141,6 +141,47 @@ impl Coverage {
     pub fn for_each<E>(&self, visit: impl FnMut(PixelRegion) -> Result<(), E>) -> Result<(), E> {
         self.for_each_in(self.bounds, visit)
     }
+    /// Coalesce small reads from this version. Each callback gets the GPU copy
+    /// bounds and the exact subregions it may publish into CPU-owned pixels.
+    pub fn for_each_readback_in<E>(
+        &self,
+        area: PixelRegion,
+        mut visit: impl FnMut(PixelRegion, &[PixelRegion]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if self.mask.is_none() {
+            return self.for_each_in(area, |part| visit(part, std::slice::from_ref(&part)));
+        }
+        let mut parts = smallvec::SmallVec::<[PixelRegion; 16]>::new();
+        let mut bounds = PixelRegion::for_whole_size(0, 0);
+        let mut dirty_pixels = 0u64;
+        let pixels = |r: PixelRegion| u64::from(r.width()) * u64::from(r.height());
+        self.for_each_in(area, |part| {
+            let mut merged = part;
+            if !parts.is_empty() {
+                merged.union(bounds);
+                // Use at most the 4 KiB pixel-prefetch footprint for a merged
+                // read, and at most twice the amount of authoritative data.
+                if parts.len() == 16
+                    || pixels(merged) > 1024
+                    || pixels(merged) > 2 * (dirty_pixels + pixels(part))
+                {
+                    visit(bounds, parts.as_slice())?;
+                    parts.clear();
+                    dirty_pixels = 0;
+                    merged = part;
+                }
+            }
+            bounds = merged;
+            parts.push(part);
+            dirty_pixels += pixels(part);
+            Ok(())
+        })?;
+        if !parts.is_empty() {
+            visit(bounds, parts.as_slice())?;
+        }
+        Ok(())
+    }
+
     pub fn for_each_in<E>(
         &self,
         region: PixelRegion,
@@ -201,6 +242,41 @@ fn intersection(a: PixelRegion, b: PixelRegion) -> PixelRegion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearby_dirty_readers_share_a_copy_without_publishing_cpu_owned_holes() {
+        let mut gpu = Coverage::empty(256, 2);
+        let left = PixelRegion::for_region(1, 0, 3, 2);
+        let right = PixelRegion::for_region(5, 0, 3, 2);
+        let distant = PixelRegion::for_pixel(240, 1);
+        for part in [left, right, distant] {
+            gpu.add(part);
+        }
+        let mut copies = Vec::new();
+        gpu.for_each_readback_in(gpu.bounds(), |origin, dirty| {
+            copies.push((origin, dirty.to_vec()));
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(
+            copies,
+            vec![
+                (PixelRegion::for_region(1, 0, 7, 2), vec![left, right]),
+                (distant, vec![distant])
+            ]
+        );
+        let mut published = [false; 512];
+        for (_, dirty) in copies {
+            for part in dirty {
+                for y in part.y_min..part.y_max {
+                    for x in part.x_min..part.x_max {
+                        published[(y * 256 + x) as usize] = true;
+                    }
+                }
+            }
+        }
+        assert!(!published[4] && !published[260]);
+    }
 
     #[test]
     fn fragmented_coverage_never_merges_unwritten_pixels_across_words_or_rows() {

@@ -11,6 +11,7 @@ use wgpu::SamplerBindingType;
 use super::MAX_VERTEX_ATTRIBUTES;
 
 pub struct ShaderPairAgal {
+    _lifetime: Option<crate::render_snapshot::ResourceLifetime>,
     vertex_shader: ParsedBytecode,
 
     fragment_shader: ParsedBytecode,
@@ -29,12 +30,19 @@ pub struct CompiledShaderProgram {
 }
 
 impl ShaderPairAgal {
-    pub fn new(vertex_bytecode: Vec<u8>, fragment_bytecode: Vec<u8>) -> Result<Self, AgalError> {
+    pub fn new(
+        vertex_bytecode: Vec<u8>,
+        fragment_bytecode: Vec<u8>,
+        operations: &crate::render_snapshot::OperationSequence,
+    ) -> Result<Self, AgalError> {
         let vertex_shader = naga_agal::parse_bytecode(&vertex_bytecode)?;
         let fragment_shader = naga_agal::parse_bytecode(&fragment_bytecode)?;
         let fragment_sampler_configs = naga_agal::extract_sampler_configs(&fragment_shader)?;
 
         Ok(Self {
+            // Program3D reports AGAL parsing errors here. A terminal sequence
+            // failure is already delivered through renderer health.
+            _lifetime: operations.create_resource().ok(),
             vertex_shader,
             fragment_shader,
             fragment_sampler_configs,

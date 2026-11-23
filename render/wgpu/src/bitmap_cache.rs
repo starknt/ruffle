@@ -26,6 +26,7 @@ use std::{
 
 #[derive(Debug)]
 pub struct CacheImage {
+    _lifetime: crate::render_snapshot::ResourceLifetime,
     pub owner: ResourceOwner,
     pub device_generation: u64,
     width: u32,
@@ -40,7 +41,12 @@ pub struct CacheImage {
 }
 impl BitmapHandleImpl for CacheImage {}
 impl CacheImage {
-    pub fn new(width: u32, height: u32, device: &Device) -> Result<Arc<Self>, RenderFailure> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        device: &Device,
+        operations: &crate::render_snapshot::OperationSequence,
+    ) -> Result<Arc<Self>, RenderFailure> {
         device.runtime().check_health()?;
         if width == 0
             || height == 0
@@ -53,7 +59,9 @@ impl CacheImage {
             ));
         }
         let owner = device.runtime().issue_owner(OwnerKind::BitmapCache)?;
+        let lifetime = operations.create_resource()?;
         Ok(Arc::new_cyclic(|weak| Self {
+            _lifetime: lifetime,
             owner,
             device_generation: device.runtime().generation(),
             width,
@@ -107,6 +115,7 @@ impl CacheImage {
                 clamped_linear: Default::default(),
                 clamped_nearest: Default::default(),
                 pending_read: Default::default(),
+                _lifetime: None,
                 version: Default::default(),
             })
         })

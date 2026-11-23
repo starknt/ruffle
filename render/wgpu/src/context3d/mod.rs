@@ -53,6 +53,7 @@ pub struct WgpuContext3D {
 
     buffer_staging_belt: StagingBelt,
     uploads: UploadQueue,
+    _lifetime: crate::render_snapshot::ResourceLifetime,
     operations: crate::render_snapshot::OperationSequence,
     owned_uploads: bool,
 
@@ -103,7 +104,9 @@ impl WgpuContext3D {
         descriptors: Arc<Descriptors>,
         profile: Context3DProfile,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
-        Self::for_session(descriptors, profile, Default::default())
+        let operations =
+            crate::render_snapshot::OperationSequence::new(descriptors.runtime.health());
+        Self::for_session(descriptors, profile, operations)
     }
 
     pub(crate) fn for_session(
@@ -144,6 +147,7 @@ impl WgpuContext3D {
                 view: dummy_texture.create_view(&Default::default())?,
                 texture: dummy_texture,
                 pending_read: Default::default(),
+                _lifetime: None,
                 version: Default::default(),
             })))
         };
@@ -166,6 +170,7 @@ impl WgpuContext3D {
             device,
             buffer_staging_belt,
             uploads: UploadQueue::default(),
+            _lifetime: operations.create_resource()?,
             operations,
             owned_uploads: std::env::var_os("RUFFLE_OWNED_FRAMES").as_deref() == Some("1".as_ref()),
             back_buffer_raw_texture_handle,
@@ -372,6 +377,7 @@ impl WgpuContext3D {
 }
 
 pub struct IndexBufferWrapper {
+    _lifetime: crate::render_snapshot::ResourceLifetime,
     pub buffer: crate::gpu_resources::Buffer,
     /// A cpu-side copy of the buffer data. This is used to allow us to
     /// perform unaligned writes to the GPU buffer, which is required by ActionScript.
@@ -380,12 +386,14 @@ pub struct IndexBufferWrapper {
 
 #[derive(Debug)]
 pub struct VertexBufferWrapper {
+    _lifetime: crate::render_snapshot::ResourceLifetime,
     pub buffer: crate::gpu_resources::Buffer,
     pub data_32_per_vertex: u8,
 }
 
 #[derive(Debug)]
 pub struct TextureWrapper {
+    _lifetime: crate::render_snapshot::ResourceLifetime,
     texture: crate::gpu_resources::Texture,
 }
 
@@ -449,6 +457,7 @@ impl Context3D for WgpuContext3D {
             mapped_at_creation: false,
         })?;
         Ok(Box::new(IndexBufferWrapper {
+            _lifetime: self.operations.create_resource()?,
             buffer,
             data: vec![0; size as usize],
         }))
@@ -468,6 +477,7 @@ impl Context3D for WgpuContext3D {
             mapped_at_creation: false,
         })?;
         Ok(Rc::new(VertexBufferWrapper {
+            _lifetime: self.operations.create_resource()?,
             buffer,
             data_32_per_vertex,
         }))
@@ -519,7 +529,10 @@ impl Context3D for WgpuContext3D {
             view_formats: &[format],
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | render_attachment,
         })?;
-        Ok(Rc::new(TextureWrapper { texture }))
+        Ok(Rc::new(TextureWrapper {
+            texture,
+            _lifetime: self.operations.create_resource()?,
+        }))
     }
 
     fn create_cube_texture(
@@ -557,7 +570,10 @@ impl Context3D for WgpuContext3D {
                 | TextureUsages::COPY_DST
                 | TextureUsages::RENDER_ATTACHMENT,
         })?;
-        Ok(Rc::new(TextureWrapper { texture }))
+        Ok(Rc::new(TextureWrapper {
+            texture,
+            _lifetime: self.operations.create_resource()?,
+        }))
     }
 
     fn upload_shaders(
@@ -566,7 +582,8 @@ impl Context3D for WgpuContext3D {
         vertex_shader_agal: Vec<u8>,
         fragment_shader_agal: Vec<u8>,
     ) -> Result<(), AgalError> {
-        let shader_pair = ShaderPairAgal::new(vertex_shader_agal, fragment_shader_agal)?;
+        let shader_pair =
+            ShaderPairAgal::new(vertex_shader_agal, fragment_shader_agal, &self.operations)?;
 
         *module.borrow_mut() = Some(Rc::new(shader_pair));
 
@@ -731,6 +748,7 @@ impl Context3D for WgpuContext3D {
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         pending_read: Default::default(),
+                        _lifetime: None,
                         version: Default::default(),
                     }));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
@@ -743,6 +761,7 @@ impl Context3D for WgpuContext3D {
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         pending_read: Default::default(),
+                        _lifetime: None,
                         version: Default::default(),
                     }));
                 } else {
@@ -759,6 +778,7 @@ impl Context3D for WgpuContext3D {
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         pending_read: Default::default(),
+                        _lifetime: None,
                         version: Default::default(),
                     }));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
@@ -771,6 +791,7 @@ impl Context3D for WgpuContext3D {
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         pending_read: Default::default(),
+                        _lifetime: None,
                         version: Default::default(),
                     }));
                     self.current_texture_resolve_view = None;
@@ -1253,6 +1274,7 @@ impl Context3D for WgpuContext3D {
         self.set_render_to_back_buffer();
         self.seen_clear_command = false;
         self.clear_color = None;
+        let _ = self.operations.record();
     }
 }
 

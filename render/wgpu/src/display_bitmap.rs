@@ -93,6 +93,7 @@ impl DisplaySample {
                 clamped_linear: Default::default(),
                 clamped_nearest: Default::default(),
                 pending_read: Default::default(),
+                _lifetime: None,
                 version: Default::default(),
             }),
             uv: [0., 0., 1., 1.],

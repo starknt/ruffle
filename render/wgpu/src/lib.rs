@@ -369,10 +369,47 @@ impl VersionedRead {
                 "bitmap readback version changed before its copy",
             ));
         }
+        CopiedReadback::record_regions(
+            handle,
+            self.area,
+            std::slice::from_ref(&self.area),
+            descriptors,
+            pool,
+            frame,
+        )
+    }
+}
+
+impl CopiedReadback {
+    fn record_regions(
+        handle: &BitmapHandle,
+        bounds: PixelRegion,
+        parts: &[PixelRegion],
+        descriptors: &Descriptors,
+        pool: &BufferPool<gpu_resources::Buffer, BufferDimensions>,
+        frame: &mut ActiveFrame,
+    ) -> Result<Self, gpu_runtime::RenderFailure> {
         let texture = as_texture(handle, &descriptors.device)?;
+        if bounds.is_empty()
+            || bounds.x_max > texture.texture.width()
+            || bounds.y_max > texture.texture.height()
+            || parts.is_empty()
+            || parts.iter().any(|r| {
+                r.is_empty()
+                    || r.x_min < bounds.x_min
+                    || r.y_min < bounds.y_min
+                    || r.x_max > bounds.x_max
+                    || r.y_max > bounds.y_max
+            })
+        {
+            return Err(gpu_runtime::RenderFailure::new(
+                gpu_runtime::RenderFailureKind::Validation,
+                "invalid bitmap readback regions",
+            ));
+        }
         let dimensions = BufferDimensions::new(
-            self.area.width() as usize,
-            self.area.height() as usize,
+            bounds.width() as usize,
+            bounds.height() as usize,
             texture.texture.format(),
         );
         let buffer = pool.take(descriptors, dimensions.clone())?;
@@ -380,12 +417,13 @@ impl VersionedRead {
             descriptors,
             frame.encoder(),
             handle,
-            self.area,
+            bounds,
+            parts,
             &buffer,
             &dimensions,
         )?;
         let index = Some(frame.submit_direct(descriptors)?);
-        Ok(CopiedReadback {
+        Ok(Self {
             index,
             buffer,
             dimensions,
@@ -461,6 +499,7 @@ impl QueueSyncHandle {
                 }
             }
         };
+        frame.operations.record()?;
         Ok((self.descriptors, copy))
     }
 
@@ -511,6 +550,7 @@ pub struct Texture {
     clamped_nearest: OnceLock<BitmapBinds>,
     pending_read: std::sync::Mutex<std::sync::Weak<VersionedRead>>,
     version: std::sync::atomic::AtomicU64,
+    _lifetime: Option<render_snapshot::ResourceLifetime>,
 }
 
 impl Texture {

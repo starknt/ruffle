@@ -31,6 +31,7 @@ pub struct ShapeRecipe {
     pub geometry: RefCell<Option<Arc<OwnedDistilledShape>>>,
     pub bitmaps: FrozenBitmapSource,
     pub scale: f32,
+    pub(crate) _lifetime: crate::render_snapshot::ResourceLifetime,
 }
 impl ShapeRecipe {
     pub fn publish<T: RenderTarget>(

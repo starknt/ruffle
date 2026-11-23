@@ -104,7 +104,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     pub(crate) offscreen_buffer_pool:
         Arc<BufferPool<crate::gpu_resources::Buffer, BufferDimensions>>,
     chunk_buffers: ChunkBuffers,
-    active_frame: ActiveFrame,
+    pub(super) active_frame: ActiveFrame,
     profiler: GpuProfiler,
     last_submission: Option<SubmissionIndex>,
     bitmap_residency:
@@ -779,7 +779,6 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             profile,
             self.active_frame.operations.clone(),
         )?;
-        self.active_frame.operations.record()?;
         Ok(Box::new(context))
     }
 
@@ -880,6 +879,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             geometry: std::cell::RefCell::new(Some(geometry)),
             bitmaps,
             scale,
+            _lifetime: self.active_frame.operations.create_resource()?,
         })))
     }
 
@@ -999,6 +999,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 &self.descriptors.device,
                 usage,
                 detail,
+                &self.active_frame.operations,
             )?,
         ))
     }
@@ -1551,6 +1552,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     clamped_linear: Default::default(),
                     clamped_nearest: Default::default(),
                     pending_read: Default::default(),
+                    _lifetime: Some(self.active_frame.operations.create_resource()?),
                     version: Default::default(),
                 }))
             }
@@ -1660,6 +1662,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             width.get(),
             height.get(),
             &self.descriptors.device,
+            &self.active_frame.operations,
         )?))
     }
     fn retain_bitmap_cache(
@@ -1734,6 +1737,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             clamped_linear: Default::default(),
             clamped_nearest: Default::default(),
             pending_read: Default::default(),
+            _lifetime: Some(self.active_frame.operations.create_resource()?),
             version: Default::default(),
         })))
     }
@@ -1779,6 +1783,45 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         )?
         .capture_native(read, &mut self.active_frame)
         .map_err(|error| self.descriptors.runtime.health().record(error))?;
+        self.descriptors.runtime.check_health()?;
+        Ok(Some(()))
+    }
+
+    fn read_bitmap_regions_native(
+        &mut self,
+        handle: &BitmapHandle,
+        bounds: PixelRegion,
+        parts: &[PixelRegion],
+        visit: ruffle_render::bitmap::BitmapRegionRead<'_>,
+    ) -> Result<Option<()>, BitmapError> {
+        self.descriptors.runtime.check_health()?;
+        let copy = crate::CopiedReadback::record_regions(
+            handle,
+            bounds,
+            parts,
+            &self.descriptors,
+            &self.offscreen_buffer_pool,
+            &mut self.active_frame,
+        )?;
+        let pixel_bytes = copy.dimensions.format.block_copy_size(None).unwrap() as usize;
+        let token = QueueSyncHandle {
+            dependency: self.active_frame.operations.dependency(),
+            descriptors: self.descriptors.clone(),
+            source: crate::ReadbackSource::Copied(copy),
+        };
+        token.capture_native(
+            |bytes, stride, format| {
+                for &part in parts {
+                    let start = (part.y_min - bounds.y_min) as usize * stride as usize
+                        + (part.x_min - bounds.x_min) as usize * pixel_bytes;
+                    let length = (part.height() - 1) as usize * stride as usize
+                        + part.width() as usize * pixel_bytes;
+                    visit(part, &bytes[start..start + length], stride, format)?;
+                }
+                Ok::<_, RenderFailure>(())
+            },
+            &mut self.active_frame,
+        )??;
         self.descriptors.runtime.check_health()?;
         Ok(Some(()))
     }
@@ -1946,7 +1989,9 @@ impl ActiveFrame {
         budget: crate::idle_pool::Budget,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         Ok(Self {
-            operations: Default::default(),
+            operations: crate::render_snapshot::OperationSequence::new(
+                descriptors.runtime.health(),
+            ),
             budget,
             command_encoder: TrackedEncoder {
                 dirty: false,

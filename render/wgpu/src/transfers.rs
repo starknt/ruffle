@@ -138,14 +138,18 @@ pub fn readback(
     descriptors: &Descriptors,
     encoder: &mut CommandEncoder,
     source: &BitmapHandle,
-    region: PixelRegion,
+    bounds: PixelRegion,
+    parts: &[PixelRegion],
     buffer: &Buffer,
     dimensions: &BufferDimensions,
 ) -> Result<(), RenderFailure> {
     let texture = as_texture(source, &descriptors.device)?;
     let mut graph = PassGraph::default();
     let source_key = graph.import(bitmap_version(source)?);
-    graph.readback(source_key, rect(region))?;
+    for &part in parts {
+        graph.readback(source_key, rect(part))?;
+    }
+    let bytes_per_pixel = u64::from(dimensions.format.block_copy_size(None).unwrap());
     for pass in graph.passes {
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -157,7 +161,9 @@ pub fn readback(
             wgpu::TexelCopyBufferInfo {
                 buffer,
                 layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
+                    offset: u64::from(pass.bounds.y - bounds.y_min)
+                        * u64::from(dimensions.padded_bytes_per_row)
+                        + u64::from(pass.bounds.x - bounds.x_min) * bytes_per_pixel,
                     bytes_per_row: Some(dimensions.padded_bytes_per_row),
                     rows_per_image: None,
                 },

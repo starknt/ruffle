@@ -695,60 +695,67 @@ mod wrapper {
             let empty = Coverage::empty(write.width, write.height);
             let mut gpu = std::mem::replace(&mut write.validity.gpu, empty);
             let mut fallback_done = false;
-            let result = gpu.for_each_in(area, |region| -> Result<(), RenderFailure> {
-                if fallback_done {
-                    return Ok(());
-                }
-                let started = Instant::now();
-                let mut copied = Err(RenderFailure::new(
-                    RenderFailureKind::MapFailed,
-                    "bitmap readback returned no pixels",
-                ));
-                let result = if let Some(handle) = write.bitmap_handle.clone() {
-                    renderer
-                        .read_bitmap_region_native(
-                            &handle,
-                            region,
-                            Box::new(|buffer, stride, format| {
-                                copied = copy_pixels_to_bitmapdata(
-                                    &mut write, buffer, stride, format, region, region,
-                                );
-                            }),
-                        )
-                        .map_err(|error| error.into_render_failure())?
-                } else {
-                    None
-                };
-                let bytes = if result.is_some() {
-                    copied?;
-                    u64::from(region.width()) * u64::from(region.height()) * 4
-                } else {
-                    let (pending, origin) = write.validity.pending.take().ok_or_else(|| {
-                        RenderFailure::new(
-                            RenderFailureKind::MapFailed,
-                            "bitmap has no pending readback",
-                        )
-                    })?;
-                    renderer
-                        .resolve_sync_handle_native(
-                            pending,
-                            Box::new(|buffer, stride, format| {
-                                copied = gpu.for_each(|part| {
+            let result =
+                gpu.for_each_readback_in(area, |region, parts| -> Result<(), RenderFailure> {
+                    if fallback_done {
+                        return Ok(());
+                    }
+                    let started = Instant::now();
+                    let result = if let Some(handle) = write.bitmap_handle.clone() {
+                        renderer
+                            .read_bitmap_regions_native(
+                                &handle,
+                                region,
+                                parts,
+                                &mut |part, buffer, stride, format| {
                                     copy_pixels_to_bitmapdata(
-                                        &mut write, buffer, stride, format, origin, part,
+                                        &mut write, buffer, stride, format, part, part,
                                     )
-                                });
-                            }),
-                        )
-                        .map_err(|error| error.into_render_failure())?;
-                    copied?;
-                    fallback_done = true;
-                    u64::from(origin.width()) * u64::from(origin.height()) * 4
-                };
-                renderer.health().check()?;
-                ruffle_render::profile::bitmap_readback(bytes, started.elapsed().as_nanos() as u64);
-                Ok(())
-            });
+                                },
+                            )
+                            .map_err(|error| error.into_render_failure())?
+                    } else {
+                        None
+                    };
+                    let bytes = if result.is_some() {
+                        parts
+                            .iter()
+                            .map(|r| u64::from(r.width()) * u64::from(r.height()) * 4)
+                            .sum()
+                    } else {
+                        let mut copied = Err(RenderFailure::new(
+                            RenderFailureKind::MapFailed,
+                            "bitmap readback returned no pixels",
+                        ));
+                        let (pending, origin) = write.validity.pending.take().ok_or_else(|| {
+                            RenderFailure::new(
+                                RenderFailureKind::MapFailed,
+                                "bitmap has no pending readback",
+                            )
+                        })?;
+                        renderer
+                            .resolve_sync_handle_native(
+                                pending,
+                                Box::new(|buffer, stride, format| {
+                                    copied = gpu.for_each(|part| {
+                                        copy_pixels_to_bitmapdata(
+                                            &mut write, buffer, stride, format, origin, part,
+                                        )
+                                    });
+                                }),
+                            )
+                            .map_err(|error| error.into_render_failure())?;
+                        copied?;
+                        fallback_done = true;
+                        u64::from(origin.width()) * u64::from(origin.height()) * 4
+                    };
+                    renderer.health().check()?;
+                    ruffle_render::profile::bitmap_readback(
+                        bytes,
+                        started.elapsed().as_nanos() as u64,
+                    );
+                    Ok(())
+                });
             if let Err(error) = result {
                 write.validity.gpu = gpu;
                 let error = renderer.health().record(error);

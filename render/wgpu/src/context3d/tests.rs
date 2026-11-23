@@ -26,6 +26,9 @@ fn odd_index_upload_preserves_neighbors_and_snapshots_the_entire_input() {
     let descriptors = descriptors(4096);
     let mut context = WgpuContext3D::new(descriptors.clone(), Context3DProfile::Baseline).unwrap();
     let mut indices = IndexBufferWrapper {
+        _lifetime: crate::render_snapshot::OperationSequence::default()
+            .create_resource()
+            .unwrap(),
         buffer: descriptors
             .device
             .create_buffer(&BufferDescriptor {
@@ -143,6 +146,7 @@ fn bitmap_uploads_exceeding_staging_budget_are_sliced_and_preserve_rows() {
     let mut context = WgpuContext3D::new(descriptors.clone(), Context3DProfile::Baseline).unwrap();
     // A readback-capable destination lets us verify this exact Stage3D command.
     let destination = Rc::new(TextureWrapper {
+        _lifetime: context.operations.create_resource().unwrap(),
         texture: descriptors
             .device
             .create_texture(&TextureDescriptor {

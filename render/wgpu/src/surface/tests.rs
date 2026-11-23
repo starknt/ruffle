@@ -3404,6 +3404,107 @@ fn bgra_bitmap_cache_supports_multisample_draw_and_region_updates() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn compatible_sparse_regions_share_one_submission_and_preserve_row_offsets() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (2, 2)).unwrap();
+    let mut renderer = WgpuRenderBackend::new(descriptors.clone(), target).unwrap();
+    let pixels = (0..48).flat_map(|n| [n, 0, 0, 255]).collect::<Vec<u8>>();
+    let image = renderer
+        .register_bitmap(Bitmap::new(12, 4, BitmapFormat::Rgba, pixels))
+        .unwrap();
+    crate::as_texture(&image, &descriptors.device).unwrap();
+    let before = descriptors.runtime.stats().submitted;
+    let parts = [
+        PixelRegion::for_region(2, 1, 2, 2),
+        PixelRegion::for_region(5, 2, 2, 1),
+    ];
+    let mut seen = Vec::new();
+    renderer
+        .read_bitmap_regions_native(
+            &image,
+            PixelRegion::for_region(2, 1, 5, 2),
+            &parts,
+            &mut |part, data, stride, format| {
+                assert_eq!(format, BitmapFormat::Rgba);
+                for row in 0..part.height() {
+                    for col in 0..part.width() {
+                        assert_eq!(
+                            data[(row * stride + col * 4) as usize],
+                            ((part.y_min + row) * 12 + part.x_min + col) as u8
+                        );
+                    }
+                }
+                seen.push(part);
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen, parts);
+    assert_eq!(
+        descriptors.runtime.stats().submitted - before,
+        1,
+        "one version, one GPU submission"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn packets_order_bitmap_creation_reads_and_the_last_release() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
+    use std::num::NonZeroU32;
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (2, 2)).unwrap();
+    let mut renderer = WgpuRenderBackend::new(descriptors, target).unwrap();
+    let operation = |renderer: &mut WgpuRenderBackend<TextureTarget>| {
+        renderer
+            .capture_stage_packet(Color::BLACK, CommandList::new(), vec![])
+            .unwrap()
+            .after_operation()
+    };
+    let initial = operation(&mut renderer);
+    let bitmap = renderer
+        .register_bitmap(Bitmap::new(1, 1, BitmapFormat::Rgba, vec![32, 64, 96, 255]))
+        .unwrap();
+    let allocated = operation(&mut renderer);
+    assert!(
+        allocated > initial,
+        "registration absent from packet dependency"
+    );
+    renderer
+        .read_bitmap_region(
+            &bitmap,
+            PixelRegion::for_whole_size(1, 1),
+            Box::new(|data, _| {
+                assert_eq!(&data[..4], &[32, 64, 96, 255]);
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let read = operation(&mut renderer);
+    assert!(
+        read > allocated,
+        "synchronous read absent from packet dependency"
+    );
+    drop(bitmap.clone());
+    assert_eq!(operation(&mut renderer), read);
+    drop(bitmap);
+    let released = operation(&mut renderer);
+    assert!(
+        released > read,
+        "final resource release absent from packet dependency"
+    );
+    let one = NonZeroU32::new(1).unwrap();
+    let empty = renderer.create_empty_texture(one, one).unwrap();
+    let cache = renderer.create_bitmap_cache(one, one).unwrap();
+    assert!(operation(&mut renderer) >= released + 2);
+    drop((empty, cache));
+    assert!(operation(&mut renderer) >= released + 4);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn stage_packets_include_reliable_uploads_from_their_context3d() {
     use ruffle_render::backend::{BufferUsage, Context3DCommand, Context3DProfile};
     let descriptors = gpu();
@@ -3434,6 +3535,48 @@ fn stage_packets_include_reliable_uploads_from_their_context3d() {
     assert!(
         after.after_operation() > before.after_operation(),
         "the stage dependency omitted its Context3D upload"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn stage_dependencies_include_valid_program_replacement_and_stage3d_present() {
+    use ruffle_render::backend::Context3DProfile;
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (2, 2)).unwrap();
+    let mut renderer = WgpuRenderBackend::new(descriptors, target).unwrap();
+    let mut context = renderer
+        .create_context3d(Context3DProfile::Baseline)
+        .unwrap();
+    let mut operation = || {
+        renderer
+            .capture_stage_packet(Color::BLACK, CommandList::new(), vec![])
+            .unwrap()
+            .after_operation()
+    };
+    let start = operation();
+    let program = Default::default();
+    assert!(context.upload_shaders(&program, vec![], vec![]).is_err());
+    assert_eq!(operation(), start);
+    context
+        .upload_shaders(
+            &program,
+            include_bytes!("../../../../tests/tests/swfs/avm2/stage3d_raytrace/precompiled_vertex_shader.agal").to_vec(),
+            include_bytes!("../../../../tests/tests/swfs/avm2/stage3d_raytrace/precompiled_fragment_shader.agal").to_vec(),
+        )
+        .unwrap();
+    let installed = operation();
+    assert!(installed > start, "AGAL publication omitted from packet");
+    context.present();
+    let presented = operation();
+    assert!(
+        presented > installed,
+        "back-buffer exchange omitted from packet"
+    );
+    drop(program);
+    assert!(
+        operation() > presented,
+        "last program owner omitted from packet"
     );
 }
 
@@ -3987,8 +4130,8 @@ fn bitmap_lease_budget_preserves_separate_owners_and_global_recency() {
         let scheduler = ResourceScheduler::new(0, 3 * bytes);
         let left = indexed.then(|| RetainedBitmaps::new(&scheduler));
         let right = indexed.then(|| RetainedBitmaps::new(&scheduler));
-        let a = CacheImage::new(4, 4, &descriptors.device).unwrap();
-        let b = CacheImage::new(4, 4, &descriptors.device).unwrap();
+        let a = CacheImage::new(4, 4, &descriptors.device, &Default::default()).unwrap();
+        let b = CacheImage::new(4, 4, &descriptors.device, &Default::default()).unwrap();
         let weak = Arc::downgrade(&a);
         let first = a.retain(&scheduler, left.as_ref());
         let other = b.retain(&scheduler, right.as_ref());
@@ -4002,7 +4145,7 @@ fn bitmap_lease_budget_preserves_separate_owners_and_global_recency() {
         assert!(second.bitmap().is_some());
         drop(second);
         assert!(weak.upgrade().is_none(), "last display owner unloaded");
-        let oversize = CacheImage::new(16, 16, &descriptors.device).unwrap();
+        let oversize = CacheImage::new(16, 16, &descriptors.device, &Default::default()).unwrap();
         let denied = oversize.retain(&scheduler, left.as_ref());
         let weak = Arc::downgrade(&oversize);
         drop(oversize);
@@ -4581,7 +4724,9 @@ fn pixelbender_allocations_are_attributed_to_the_shader_until_drop() {
         true,
     )
     .unwrap();
-    let shader = crate::pixel_bender::PixelBenderWgpuShader::new(&descriptors, parsed).unwrap();
+    let shader =
+        crate::pixel_bender::PixelBenderWgpuShader::new(&descriptors, parsed, &Default::default())
+            .unwrap();
     let shader_resources: Vec<_> = descriptors
         .runtime
         .resources()
