@@ -392,39 +392,18 @@ pub fn strip_suffix<'a, P: Pattern<'a>>(string: &'a WStr, pattern: P) -> Option<
 }
 
 pub fn str_trim_matches<'a, P: Pattern<'a>>(string: &'a WStr, pattern: P) -> &'a WStr {
-    let mut i = 0;
-    let mut j = 0;
     let mut searcher = pattern.into_searcher(string);
-    if let Some((start, end)) = searcher.next_reject() {
-        i = start;
-        j = end;
-    }
-
-    if let Some((_, end)) = searcher.next_reject_back() {
-        j = end;
-    }
-
-    &string[i..j]
+    let start = searcher.trim_start();
+    let end = searcher.trim_end(string.len());
+    &string[start..end]
 }
 
 pub fn str_trim_start_matches<'a, P: Pattern<'a>>(string: &'a WStr, pattern: P) -> &'a WStr {
-    let mut i = string.len();
-    let mut searcher = pattern.into_searcher(string);
-    if let Some((start, _)) = searcher.next_reject() {
-        i = start;
-    }
-
-    &string[i..]
+    &string[pattern.into_searcher(string).trim_start()..]
 }
 
 pub fn str_trim_end_matches<'a, P: Pattern<'a>>(string: &'a WStr, pattern: P) -> &'a WStr {
-    let mut i = 0;
-    let mut searcher = pattern.into_searcher(string);
-    if let Some((_, end)) = searcher.next_reject_back() {
-        i = end;
-    }
-
-    &string[..i]
+    &string[..pattern.into_searcher(string).trim_end(string.len())]
 }
 
 pub struct Split<'a, P: Pattern<'a>> {

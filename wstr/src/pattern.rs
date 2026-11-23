@@ -47,23 +47,27 @@ pub trait Searcher<'a> {
         }
     }
 
-    fn next_reject(&mut self) -> Option<(usize, usize)> {
+    /// Advance past complete, nonempty matches at the front.
+    fn trim_start(&mut self) -> usize {
+        let mut trimmed = 0;
         loop {
-            break match self.next() {
-                SearchStep::Match(_, _) => continue,
-                SearchStep::Reject(i, j) => Some((i, j)),
-                SearchStep::Done => None,
-            };
+            match self.next() {
+                SearchStep::Match(start, end) if start < end => trimmed = end,
+                SearchStep::Reject(start, _) => return start,
+                _ => return trimmed,
+            }
         }
     }
 
-    fn next_reject_back(&mut self) -> Option<(usize, usize)> {
+    /// A search can finish with a remainder shorter than the needle.
+    fn trim_end(&mut self, len: usize) -> usize {
+        let mut end = len;
         loop {
-            break match self.next_back() {
-                SearchStep::Match(_, _) => continue,
-                SearchStep::Reject(i, j) => Some((i, j)),
-                SearchStep::Done => None,
-            };
+            match self.next_back() {
+                SearchStep::Match(start, stop) if start < stop => end = start,
+                SearchStep::Reject(_, stop) => return stop,
+                _ => return end,
+            }
         }
     }
 }
@@ -217,17 +221,17 @@ impl<'a, T: Searcher<'a>, U: Searcher<'a>> Searcher<'a> for Either<T, U> {
         }
     }
 
-    fn next_reject(&mut self) -> Option<(usize, usize)> {
+    fn trim_start(&mut self) -> usize {
         match self {
-            Either::Left(s) => s.next_reject(),
-            Either::Right(s) => s.next_reject(),
+            Either::Left(s) => s.trim_start(),
+            Either::Right(s) => s.trim_start(),
         }
     }
 
-    fn next_reject_back(&mut self) -> Option<(usize, usize)> {
+    fn trim_end(&mut self, len: usize) -> usize {
         match self {
-            Either::Left(s) => s.next_reject_back(),
-            Either::Right(s) => s.next_reject_back(),
+            Either::Left(s) => s.trim_end(len),
+            Either::Right(s) => s.trim_end(len),
         }
     }
 }

@@ -239,6 +239,28 @@ fn str_patterns() {
 }
 
 #[test]
+fn trimming_keeps_the_units_outside_complete_matches() {
+    fn check<'a, P: Pattern<'a> + Copy>(text: &'a WStr, pattern: P, start: usize, end: usize) {
+        assert_eq!(text.trim_start_matches(pattern), &text[start..]);
+        assert_eq!(text.trim_end_matches(pattern), &text[..end]);
+        assert_eq!(text.trim_matches(pattern), &text[start..end]);
+    }
+
+    for text in [bstr!(b"abXab"), wstr!('a''b''X''a''b')] {
+        for pattern in [bstr!(b"ab"), wstr!('a''b')] {
+            check(text, pattern, 2, 3);
+        }
+        check(text, bstr!(b""), 0, 5);
+        check(text, bstr!(b"longer"), 0, 5);
+        check(text, &[] as &[u8], 0, 5);
+        check(text, wstr!('雪'), 0, 5);
+    }
+    check(bstr!(b"abX"), bstr!(b"ab"), 2, 3);
+    check(bstr!(b"Xab"), bstr!(b"ab"), 0, 1);
+    check(bstr!(b"abc"), '雪' as u16, 0, 3);
+}
+
+#[test]
 fn split_ascii_prefix() {
     assert_eq!(utils::split_ascii_prefix(""), (&b""[..], ""));
     assert_eq!(utils::split_ascii_prefix("abc"), (&b"abc"[..], ""));
