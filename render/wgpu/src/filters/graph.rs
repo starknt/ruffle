@@ -8,6 +8,26 @@ pub enum FilterStep {
     Pointwise(Range<usize>),
     Single(usize),
 }
+
+impl FilterStep {
+    pub fn profile_label(&self, filters: &[Filter]) -> &'static str {
+        let Self::Single(index) = self else {
+            return "ColorMatrixFilter";
+        };
+        match &filters[*index] {
+            Filter::BlurFilter(_) => "BlurFilter",
+            Filter::ColorMatrixFilter(_) => "ColorMatrixFilter",
+            Filter::GlowFilter(_) => "GlowFilter",
+            Filter::BevelFilter(_) => "BevelFilter",
+            Filter::DropShadowFilter(_) => "DropShadowFilter",
+            Filter::DisplacementMapFilter(_) => "DisplacementMapFilter",
+            Filter::ConvolutionFilter(_) => "ConvolutionFilter",
+            Filter::GradientGlowFilter(_) => "GradientGlowFilter",
+            Filter::GradientBevelFilter(_) => "GradientBevelFilter",
+            Filter::ShaderFilter(_) => "ShaderFilter",
+        }
+    }
+}
 #[derive(Clone, Copy, Debug)]
 enum Sampling {
     Local([i64; 4]),

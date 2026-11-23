@@ -407,13 +407,28 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             )?
             .with_origin([input.x, input.y])
             .with_display(display.clone());
-            let graph = crate::graph_encoder::GraphEncoder::from_prepared(
+            let mut graph = crate::graph_encoder::GraphEncoder::from_prepared(
                 self,
                 prepared,
                 input,
                 surface.sample_count(),
                 crate::pass_graph::Load::Clear(entry.clear),
             )?;
+            let filter_passes = if entry.filters.is_empty() {
+                None
+            } else {
+                let max_groups = if self.descriptors.compute_filters {
+                    self.descriptors.capabilities.max_compute_groups
+                } else {
+                    0
+                };
+                Some(graph.graph.take_filter_chain(
+                    &entry.filters,
+                    input,
+                    texture.texture.format(),
+                    max_groups,
+                )?)
+            };
             let commands = graph.into_commands()?;
             ruffle_render::profile::work(|w| {
                 w.offscreen_targets += 1;
@@ -446,14 +461,15 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             )?;
             target.ensure_cleared(&mut scope);
             let mut filtered = false;
-            if !entry.filters.is_empty()
+            if let Some(plan) = filter_passes
                 && let Some(result) = self.descriptors.filters.apply_chain(
                     &self.descriptors,
                     &mut scope.scope("Filter chain"),
                     &mut self.offscreen_texture_pool,
                     &mut self.active_frame.staging_belt,
                     FilterSource::for_entire_texture(target.color_texture()),
-                    entry.filters,
+                    &entry.filters,
+                    plan,
                 )?
             {
                 target = result;

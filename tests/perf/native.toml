@@ -11,6 +11,10 @@ name = "filter_cache"
 path = "../tests/swfs/native_perf/filter_cache"
 
 [[case]]
+name = "blur_color_matrix"
+path = "../tests/swfs/native_perf/blur_color_matrix"
+
+[[case]]
 name = "portrait_particles"
 path = "../tests/swfs/native_perf/portrait_particles"
 

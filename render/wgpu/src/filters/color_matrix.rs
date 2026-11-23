@@ -22,6 +22,10 @@ pub struct ColorMatrixFilter {
     vertices_size: wgpu::BufferSize,
     uniform_size: wgpu::BufferSize,
     pipelines: FilterPipelines,
+    compute_pipeline: std::sync::OnceLock<(
+        crate::gpu_resources::ComputePipeline,
+        crate::gpu_resources::BindGroupLayout,
+    )>,
 }
 
 impl ColorMatrixFilter {
@@ -86,6 +90,7 @@ impl ColorMatrixFilter {
 
         Ok(Self {
             pipelines: Default::default(),
+            compute_pipeline: Default::default(),
             pipeline_layout,
             vertex_buffer,
             uniform_buffer,
@@ -157,6 +162,7 @@ impl ColorMatrixFilter {
             staging_belt,
             source,
             std::slice::from_ref(filter),
+            false,
         )
     }
 
@@ -168,6 +174,7 @@ impl ColorMatrixFilter {
         staging_belt: &mut StagingBelt,
         source: &FilterSource,
         filters: &[ColorMatrixFilterArgs],
+        compute: bool,
     ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
         if filters.is_empty() || filters.len() > super::graph::MAX_POINTWISE_FILTERS {
             return Err(crate::gpu_runtime::RenderFailure::new(
@@ -179,7 +186,12 @@ impl ColorMatrixFilter {
             channels: [0, 1, 2, 3],
             matrix: filters[filters.len() - 1].matrix,
         };
-        for filter in &filters[..filters.len() - 1] {
+        let permutations = if compute {
+            filters
+        } else {
+            &filters[..filters.len() - 1]
+        };
+        for filter in permutations {
             let channels = super::graph::channel_permutation(filter).ok_or_else(|| {
                 crate::gpu_runtime::RenderFailure::new(
                     crate::gpu_runtime::RenderFailureKind::Validation,
@@ -193,8 +205,6 @@ impl ColorMatrixFilter {
         }
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
-        let pipeline = self.pipeline(descriptors, sample_count, format)?;
-
         let target = CommandTarget::new(
             descriptors,
             texture_pool,
@@ -205,13 +215,78 @@ impl ColorMatrixFilter {
             },
             format,
             sample_count,
-            RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
+            if compute {
+                RenderTargetMode::FreshStorage
+            } else {
+                RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT)
+            },
             draw_encoder,
         )?;
         let source_view = source.texture.create_view(&Default::default())?;
         staging_belt
             .write_buffer(draw_encoder, &self.uniform_buffer, 0, self.uniform_size)?
             .copy_from_slice(bytemuck::bytes_of(&uniforms));
+        if compute {
+            let device = &descriptors.persistent_device;
+            let (pipeline, layout) =
+                crate::gpu_resources::try_sync_cell(&self.compute_pipeline, || {
+                    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("Color matrix compute"),
+                        source: wgpu::ShaderSource::Wgsl(
+                            include_str!("../../shaders/filter/color_matrix_compute.wgsl").into(),
+                        ),
+                    })?;
+                    let pipeline =
+                        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: Some("Color matrix compute"),
+                            layout: None,
+                            module: &shader,
+                            entry_point: Some("main_compute"),
+                            compilation_options: Default::default(),
+                            cache: None,
+                        })?;
+                    let layout = pipeline.get_bind_group_layout(0)?;
+                    Ok::<_, crate::gpu_runtime::RenderFailure>((pipeline, layout))
+                })?;
+            let group = descriptors.cached_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Color matrix compute"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&source_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(target.color_view()),
+                    },
+                ],
+            })?;
+            draw_encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Color matrix compute"),
+                    timestamp_writes: None,
+                })
+                .dispatch(
+                    pipeline,
+                    &group,
+                    [source.size.0.div_ceil(8), source.size.1.div_ceil(8)],
+                );
+            ruffle_render::profile::work(|w| {
+                w.filter_passes += 1;
+                w.compute_filter_passes += 1;
+                w.filter_kind_color_matrix += 1;
+                w.pipeline_changes += 1;
+                w.material_binds += 1;
+                w.pass_pixels += u64::from(target.width()) * u64::from(target.height());
+            });
+            return Ok(target);
+        }
+        let pipeline = self.pipeline(descriptors, sample_count, format)?;
         staging_belt
             .write_buffer(draw_encoder, &self.vertex_buffer, 0, self.vertices_size)?
             .copy_from_slice(bytemuck::cast_slice(&[source.vertices()]));

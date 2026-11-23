@@ -1,6 +1,7 @@
 //! Stable native pass dependencies. Versions describe logical content; physical
 //! temporary lifetimes span every version and are never shortened by a write.
 
+use crate::filters::graph::{FilterGraph, FilterStep};
 use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
 use crate::render_snapshot::{
     MaskCommand, RenderSnapshot, ResourceKey, ResourceRecipe, ResourceVersion, SnapshotBlend,
@@ -67,7 +68,7 @@ pub enum PassKind {
     AlphaMask,
     Copy { source_bounds: RenderRect },
     Readback,
-    Filter(usize),
+    Filter { step: FilterStep, compute: bool },
     Opaque(SnapshotNode),
 }
 #[derive(Clone, Debug)]
@@ -79,6 +80,14 @@ pub struct Pass {
     pub attachment: Option<Attachment>,
     pub bounds: RenderRect,
     pub submit_after: bool,
+}
+
+/// Linear filter consumers of a rendered cache attachment. Dependency indices
+/// retain their positions in the graph that produced the source pixels.
+pub struct FilterPasses {
+    pub source: Version,
+    pub first: usize,
+    pub passes: Vec<Pass>,
 }
 #[derive(Clone, Debug)]
 pub struct Lifetime {
@@ -246,6 +255,20 @@ impl PassGraph {
         bounds: RenderRect,
         samples: u32,
     ) -> Result<GraphResource, RenderFailure> {
+        self.temporary_with_format(
+            bounds,
+            samples,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::empty(),
+        )
+    }
+    fn temporary_with_format(
+        &mut self,
+        bounds: RenderRect,
+        samples: u32,
+        format: wgpu::TextureFormat,
+        extra_usage: wgpu::TextureUsages,
+    ) -> Result<GraphResource, RenderFailure> {
         let resource = GraphResource::Temporary(self.next_temporary);
         self.next_temporary = self
             .next_temporary
@@ -255,15 +278,99 @@ impl PassGraph {
             width: bounds.width,
             height: bounds.height,
             samples,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
+                | wgpu::TextureUsages::COPY_DST
+                | extra_usage,
         };
         key.bytes()?;
         self.textures.insert(resource, key);
         Ok(resource)
+    }
+    /// Append filters to the completed draw plan, then transfer only that
+    /// suffix to the filter encoder. The draw encoder consumes the prefix.
+    pub fn take_filter_chain(
+        &mut self,
+        filters: &[ruffle_render::filters::Filter],
+        bounds: RenderRect,
+        format: wgpu::TextureFormat,
+        compute_groups_limit: u32,
+    ) -> Result<FilterPasses, RenderFailure> {
+        use ruffle_render::filters::Filter;
+        use ruffle_render::pixel_bender_support::{ImageInputTexture, PixelBenderShaderArgument};
+
+        let first = self.passes.len();
+        let source = Version {
+            resource: GraphResource::Output,
+            version: self
+                .states
+                .get(&GraphResource::Output)
+                .ok_or_else(|| invalid("filter chain has no rendered source"))?
+                .version,
+        };
+        let mut previous = source.resource;
+        // CommandTarget::color_texture supplies the single-sampled resolve image.
+        for step in FilterGraph::new(filters, format == wgpu::TextureFormat::Rgba8Unorm).steps {
+            let mut reads: smallvec::SmallVec<[GraphResource; 2]> = smallvec::smallvec![previous];
+            let mut read_bitmap = |bitmap| -> Result<(), RenderFailure> {
+                reads.push(self.import(crate::render_snapshot::bitmap_version(bitmap)?));
+                Ok(())
+            };
+            if let FilterStep::Single(index) = &step {
+                match &filters[*index] {
+                    Filter::DisplacementMapFilter(filter) => {
+                        if let Some(bitmap) = &filter.map_bitmap {
+                            read_bitmap(bitmap)?;
+                        }
+                    }
+                    Filter::ShaderFilter(filter) => {
+                        // ShaderFilter binds the chain source to the first image argument.
+                        for texture in filter
+                            .shader_args
+                            .iter()
+                            .filter_map(|arg| match arg {
+                                PixelBenderShaderArgument::ImageInput { texture, .. } => {
+                                    Some(texture)
+                                }
+                                _ => None,
+                            })
+                            .skip(1)
+                        {
+                            if let Some(ImageInputTexture::Bitmap(bitmap)) = texture {
+                                read_bitmap(bitmap)?;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let compute = matches!(&step, FilterStep::Pointwise(range)
+                if bounds.width.div_ceil(8).max(bounds.height.div_ceil(8)) <= compute_groups_limit
+                && matches!(&filters[range.end - 1], Filter::ColorMatrixFilter(matrix)
+                    if crate::filters::graph::channel_permutation(matrix).is_some()));
+            let usage = if compute {
+                wgpu::TextureUsages::STORAGE_BINDING
+            } else {
+                wgpu::TextureUsages::empty()
+            };
+            let next = self.temporary_with_format(bounds, 1, format, usage)?;
+            self.add(
+                PassKind::Filter { step, compute },
+                &reads,
+                &[next],
+                None,
+                bounds,
+                false,
+            )?;
+            previous = next;
+        }
+        Ok(FilterPasses {
+            source,
+            first,
+            passes: self.passes.split_off(first),
+        })
     }
     fn append_draw(
         &mut self,
@@ -735,6 +842,59 @@ mod tests {
             y: 0,
             width: 32,
             height: 32,
+        }
+    }
+
+    #[test]
+    fn filter_chain_reads_the_draw_and_each_previous_filtered_version_once() {
+        use ruffle_render::filters::Filter;
+        let snapshot = RenderSnapshot {
+            commands: Arc::from([rect()]),
+            recipes: vec![],
+        };
+        let mut graph =
+            PassGraph::compile(&snapshot, viewport(), 4, Load::Clear(Color::BLACK)).unwrap();
+        let draw_passes = graph.passes.len();
+        let drawn = graph.passes.last().unwrap().writes[0];
+        let filters = [
+            Filter::BlurFilter(swf::BlurFilter {
+                blur_x: swf::Fixed16::from_f32(5.0),
+                blur_y: swf::Fixed16::ONE,
+                flags: swf::BlurFilterFlags::from_passes(1),
+            }),
+            Filter::default(),
+            Filter::default(),
+        ];
+        let plan = graph
+            .take_filter_chain(&filters, viewport(), wgpu::TextureFormat::Rgba8Unorm, 4)
+            .unwrap();
+        assert_eq!(graph.passes.len(), draw_passes);
+        assert_eq!(plan.first, draw_passes);
+        assert_eq!(plan.source, drawn);
+        assert_eq!(plan.passes.len(), 2);
+        assert!(matches!(
+            plan.passes[0].kind,
+            PassKind::Filter {
+                step: FilterStep::Single(0),
+                compute: false
+            }
+        ));
+        assert!(
+            matches!(&plan.passes[1].kind, PassKind::Filter { step: FilterStep::Pointwise(r), compute: true } if *r == (1..3))
+        );
+        assert!(
+            graph.textures[&plan.passes[1].writes[0].resource]
+                .usage
+                .contains(wgpu::TextureUsages::STORAGE_BINDING)
+        );
+        let mut previous = drawn;
+        for (index, pass) in plan.passes.iter().enumerate() {
+            assert_eq!(pass.reads, [previous]);
+            assert_eq!(pass.dependencies, [draw_passes + index - 1]);
+            assert_eq!(pass.writes.len(), 1);
+            assert_ne!(pass.writes[0].resource, previous.resource);
+            assert_eq!(graph.textures[&pass.writes[0].resource].samples, 1);
+            previous = pass.writes[0];
         }
     }
 

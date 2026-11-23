@@ -30,6 +30,7 @@ work_counters!(
     blend_passes,
     mask_passes,
     filter_passes,
+    compute_filter_passes,
     filter_kind_blur,
     filter_kind_glow_shadow,
     filter_kind_bevel,

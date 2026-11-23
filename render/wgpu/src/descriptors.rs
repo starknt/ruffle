@@ -19,6 +19,8 @@ pub struct Descriptors {
     pub descriptor_owner: crate::gpu_runtime::ResourceOwner,
     pub(crate) persistent_device: crate::gpu_resources::Device,
     pub limits: wgpu::Limits,
+    pub capabilities: crate::capabilities::NativeCapabilities,
+    pub(crate) compute_filters: bool,
     pub backend: Backend,
     pub queue: crate::gpu_resources::Queue,
     pub bitmap_samplers: BitmapSamplers,
@@ -82,6 +84,7 @@ impl Descriptors {
         let device = device.with_owner(runtime.issue_owner(crate::gpu_runtime::OwnerKind::Scene)?);
         let queue = device.queue();
         let limits = device.limits();
+        let capabilities = crate::capabilities::NativeCapabilities::granted(&adapter, &device);
         let bind_layouts = BindLayouts::new(&persistent_device)?;
         let bitmap_samplers = BitmapSamplers::new(&persistent_device)?;
         let shaders = Shaders::new(&persistent_device)?;
@@ -108,6 +111,9 @@ impl Descriptors {
             descriptor_owner,
             persistent_device,
             limits,
+            capabilities,
+            compute_filters: capabilities.compute_rgba8
+                && crate::capabilities::compute_filters_requested(),
             backend,
             queue,
             bitmap_samplers,

@@ -267,6 +267,11 @@ impl CommandTarget {
                         | wgpu::TextureUsages::COPY_SRC
                         | wgpu::TextureUsages::COPY_DST
                         | wgpu::TextureUsages::TEXTURE_BINDING
+                        | if matches!(render_target_mode, RenderTargetMode::FreshStorage) {
+                            wgpu::TextureUsages::STORAGE_BINDING
+                        } else {
+                            wgpu::TextureUsages::empty()
+                        }
                 },
                 pool,
             )

@@ -2826,7 +2826,7 @@ fn render_filter_chain_test(
     for chain in [false, true] {
         let target = TextureTarget::new(&descriptors.device, (width, height)).unwrap();
         let mut renderer =
-            WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+            WgpuRenderBackend::with_options(descriptors.clone(), target, true).unwrap();
         renderer.set_quality(StageQuality::Low).unwrap();
         let source = renderer
             .register_bitmap(Bitmap::new(
@@ -2893,6 +2893,33 @@ fn render_filter_chain_test(
                 .unwrap();
         }
         let work = metrics.snapshot().work;
+        if chain
+            && std::env::var_os("RUFFLE_COMPUTE_FILTERS").as_deref() == Some("1".as_ref())
+            && work.filter_kind_color_matrix != 0
+        {
+            let byte_matrix = filters
+                .iter()
+                .filter_map(|filter| match filter {
+                    ruffle_render::filters::Filter::ColorMatrixFilter(matrix) => Some(matrix),
+                    _ => None,
+                })
+                .all(|matrix| crate::filters::graph::channel_permutation(matrix).is_some());
+            if byte_matrix {
+                assert!(
+                    work.compute_filter_passes > 0,
+                    "the requested byte-preserving Vulkan compute filter must actually dispatch"
+                );
+            } else if filters
+                .iter()
+                .all(|f| matches!(f, ruffle_render::filters::Filter::ColorMatrixFilter(_)))
+            {
+                // These fixtures end every non-skipped group in a general matrix.
+                assert_eq!(
+                    work.compute_filter_passes, 0,
+                    "native RGBA8 attachment rounding is observable"
+                );
+            }
+        }
         assert_eq!(
             work.entries()
                 .filter(|(name, _)| name.starts_with("filter_kind_"))
@@ -2901,10 +2928,32 @@ fn render_filter_chain_test(
             work.filter_passes,
             "each encoded filter pass must be attributed to its shader"
         );
-        results.push((
-            renderer.capture_frame().unwrap().unwrap().into_raw(),
-            work.filter_passes,
-        ));
+        let image = renderer.capture_frame().unwrap().unwrap().into_raw();
+        if chain
+            && matches!(
+                filters,
+                [
+                    ruffle_render::filters::Filter::BlurFilter(_),
+                    ruffle_render::filters::Filter::ColorMatrixFilter(_),
+                    ..
+                ]
+            )
+            && descriptors
+                .device
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+        {
+            renderer.collect_gpu_samples();
+            let samples = metrics.take_gpu_samples();
+            assert_eq!(samples.len(), 1);
+            for name in ["Filter chain", "BlurFilter", "ColorMatrixFilter"] {
+                assert!(
+                    samples[0].phases.iter().any(|(label, _)| label == name),
+                    "missing GPU interval for {name}"
+                );
+            }
+        }
+        results.push((image, work.filter_passes));
     }
     results
 }
@@ -3172,6 +3221,30 @@ fn pointwise_channel_permutations_fuse_without_changing_alpha_or_bytes() {
     );
     assert_eq!(results[0].1, 3);
     assert_eq!(results[1].1, 1);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn filter_chain_byte_permutations_preserve_each_rgba8_channel() {
+    let mut rotate = swf::ColorMatrixFilter::default();
+    for (row, input) in [1, 2, 0].into_iter().enumerate() {
+        rotate.matrix[row * 5 + row] = 0.;
+        rotate.matrix[row * 5 + input] = 1.;
+    }
+    let mut pixels = Vec::new();
+    for alpha in 0..=255u32 {
+        for x in 0..=255u32 {
+            pixels.extend([
+                (x * alpha / 255) as u8,
+                ((255 - x) * alpha / 255) as u8,
+                ((x * 17 % 256) * alpha / 255) as u8,
+                alpha as u8,
+            ]);
+        }
+    }
+    let result = render_color_matrix_test(&[rotate.clone(), rotate], pixels, 256, 256);
+    assert_eq!(result[0].0, result[1].0);
+    assert_eq!((result[0].1, result[1].1), (2, 1));
 }
 
 #[test]

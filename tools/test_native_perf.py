@@ -10,6 +10,18 @@ from native_perf import summarize, compare, main
 
 
 class NativePerfTest(unittest.TestCase):
+    def test_compute_comparison_requires_the_opt_in_dispatch_on_every_measured_frame(self):
+        from native_perf import compare_filter_paths
+        before, after = NativeWgpuAcceptanceTest().paired()
+        for row in before + after:
+            row['gpuPhaseP95Ms'] = {'ColorMatrixFilter': 2.}
+            row['computeFilterFrames'] = 0
+        for row in after:
+            row.update(completedFrameMs=9., gpuPhaseP95Ms={'ColorMatrixFilter': 1.6}, computeFilterFrames=1200)
+        self.assertTrue(compare_filter_paths(before, after, 'gpu:ColorMatrixFilter')['accepted'])
+        after[0]['computeFilterFrames'] = 1199
+        with self.assertRaises(ValueError):
+            compare_filter_paths(before, after, 'gpu:ColorMatrixFilter')
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux driver disk caches')
     def test_each_measured_process_starts_with_private_empty_shader_caches(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -87,6 +99,27 @@ class NativePerfTest(unittest.TestCase):
             self.assertEqual(result['cpuP95Ms'], 2)
             self.assertIsNone(result['gpuP95Ms'])
 
+    def test_named_gpu_phases_remain_inclusive_and_require_every_frame(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self.trace(d)
+            with path.open('a') as stream:
+                for frame, phases in [(1, [['Filter chain', 8000], ['BlurFilter', 6000]]),
+                                      (2, [['Filter chain', 9000]])]:
+                    stream.write('\n' + json.dumps(dict(event='gpu', frameId=frame, ns=11000, phaseNs=phases)))
+            phases = summarize(path)['gpuPhaseP95Ms']
+            self.assertEqual(phases['Filter chain'], .009)
+            self.assertIsNone(phases['BlurFilter'])
+
+    def test_duplicate_or_invalid_named_timestamp_is_rejected(self):
+        for phases in [[['BlurFilter', 1], ['BlurFilter', 2]], [['BlurFilter', -1]],
+                       [['BlurFilter', True]], [['BlurFilter', float('nan')]]]:
+            with self.subTest(phases=phases), tempfile.TemporaryDirectory() as d:
+                path = self.trace(d)
+                with path.open('a') as stream:
+                    stream.write('\n' + json.dumps(dict(event='gpu', frameId=1, ns=11000, phaseNs=phases)))
+                with self.assertRaises(ValueError):
+                    summarize(path)
+
     def test_rss_gate_is_not_relaxed_for_a_faster_candidate(self):
         baseline, candidate = NativeWgpuAcceptanceTest().paired()
         for run in candidate:
@@ -133,6 +166,16 @@ class NativeWgpuAcceptanceTest(unittest.TestCase):
         for run in after:
             run.update(gpuP95Ms=8., gpuP99Ms=9., phaseP95Ms={'renderBackend': 1.})
         self.assertFalse(compare(before, after, 'gpu')['accepted'])
+
+    def test_named_gpu_gate_uses_shader_time_and_rejects_missing_queries(self):
+        before, after = self.paired()
+        for run in before:
+            run['gpuPhaseP95Ms'] = {'ColorMatrixFilter': 2.}
+        for run in after:
+            run.update(completedFrameMs=9., gpuPhaseP95Ms={'ColorMatrixFilter': 1.6})
+        self.assertTrue(compare(before, after, 'gpu:ColorMatrixFilter')['accepted'])
+        after[2]['gpuPhaseP95Ms'] = {}
+        self.assertFalse(compare(before, after, 'gpu:ColorMatrixFilter')['accepted'])
 
     def test_worker_targets_use_preparation_time(self):
         before, after = self.paired()

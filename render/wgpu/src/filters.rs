@@ -242,21 +242,39 @@ impl Filters {
     pub fn apply_chain(
         &self,
         descriptors: &Descriptors,
-        draw_encoder: &mut crate::gpu_resources::CommandEncoder,
+        scope: &mut crate::gpu_profiler::Scope<'_, crate::gpu_resources::CommandEncoder>,
         texture_pool: &mut TexturePool,
         staging_belt: &mut StagingBelt,
         source: FilterSource,
-        filters: Vec<Filter>,
+        filters: &[Filter],
+        plan: crate::pass_graph::FilterPasses,
     ) -> Result<Option<CommandTarget>, crate::gpu_runtime::RenderFailure> {
-        let graph = graph::FilterGraph::new(
-            &filters,
-            source.texture.sample_count() == 1
-                && source.texture.format() == wgpu::TextureFormat::Rgba8Unorm,
-        );
+        use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
+        use crate::pass_graph::PassKind;
+        let invalid = || {
+            RenderFailure::new(
+                RenderFailureKind::Validation,
+                "invalid filter pass dependency",
+            )
+        };
+        let mut version = plan.source;
         let mut current: Option<CommandTarget> = None;
         let mut premultiplied = false;
-        for step in graph.steps {
-            draw_encoder.flush_uploads_if_needed(staging_belt.page_size())?;
+        for (index, pass) in plan.passes.into_iter().enumerate() {
+            let (PassKind::Filter { step, compute }, [output]) =
+                (pass.kind, pass.writes.as_slice())
+            else {
+                return Err(invalid());
+            };
+            if pass.reads.first() != Some(&version)
+                || pass.dependencies.iter().any(|&d| d >= plan.first + index)
+            {
+                return Err(invalid());
+            }
+            // A no-op aliases its input at this logical output version.
+            version = *output;
+            scope.flush_uploads_if_needed(staging_belt.page_size())?;
+            let draw_encoder = &mut scope.scope(step.profile_label(filters));
             let input = current
                 .as_ref()
                 .map(|target| FilterSource::for_entire_texture(target.color_texture()));
@@ -291,6 +309,7 @@ impl Filters {
                         staging_belt,
                         source,
                         &matrices,
+                        compute,
                     )?)
                 }
                 graph::FilterStep::Single(index) => self.apply(

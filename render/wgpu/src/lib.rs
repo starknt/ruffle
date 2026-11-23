@@ -65,6 +65,7 @@ mod blend;
 mod blend_inputs;
 mod buffer_builder;
 mod buffer_pool;
+pub mod capabilities;
 #[cfg(feature = "clap")]
 pub mod clap;
 pub mod descriptors;

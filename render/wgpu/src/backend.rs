@@ -833,6 +833,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         result.push(format!("Enabled features: {enabled_features:?}"));
         result.push(format!("Available features: {available_features:?}"));
+        let granted = self.descriptors.capabilities;
+        result.push(format!("Native GPU capabilities: {granted:?}"));
         result.push(format!("Current limits: {current_limits:?}"));
         result.push(format!("Surface quality: {}", self.surface.quality()));
         result.push(format!("Surface samples: {}", self.surface.sample_count()));
@@ -1916,42 +1918,19 @@ pub async fn request_adapter_and_device(
 async fn request_device(
     adapter: &wgpu::Adapter,
 ) -> Result<(wgpu::Device, wgpu::Queue), wgpu::RequestDeviceError> {
-    // This wgpu preset also matches native GLES 3.0, which lacks compute and storage buffers.
-    let mut limits = wgpu::Limits::downlevel_webgl2_defaults();
-    // Then we increase parts of it to the maximum supported by the adapter, to take advantage of
-    // more powerful hardware or capabilities
-    limits = limits.using_resolution(adapter.limits());
-    limits = limits.using_alignment(adapter.limits());
-    limits.max_uniform_buffer_binding_size = adapter.limits().max_uniform_buffer_binding_size;
-    limits.max_inter_stage_shader_variables = adapter.limits().max_inter_stage_shader_variables;
-    // This will be a default limit in a future wgpu version (down from 8).
-    // Keep the GLES-compatible baseline for native GL adapters.
-    limits.max_color_attachments = 4;
-
-    let mut features = Default::default();
-
-    let optional_features = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
-        | wgpu::Features::TEXTURE_COMPRESSION_BC
-        | wgpu::Features::FLOAT32_FILTERABLE
-        | GpuProfiler::ALL_WGPU_TIMER_FEATURES;
-
-    features |= optional_features & adapter.features();
-
     adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            label: None,
-            required_features: features,
-            required_limits: limits,
-            memory_hints: Default::default(),
-            trace: wgpu::Trace::Off,
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-        })
+        .request_device(&crate::capabilities::device_descriptor(
+            adapter,
+            crate::capabilities::NativeGpuUse::Standalone,
+        ))
         .await
 }
 
 /// Determines how we choose our frame buffer
 #[derive(Clone)]
 pub enum RenderTargetMode {
+    /// A compute pass writes every pixel of this pooled single-sample target.
+    FreshStorage,
     // Construct a new frame buffer, clearng it with the provided color.
     // This is used when rendering to the actual display,
     // or when applying a filter. In both cases, we have a fixed background color,
@@ -1973,7 +1952,7 @@ impl RenderTargetMode {
         match self {
             RenderTargetMode::FreshWithColor(color)
             | RenderTargetMode::ExistingWithView(_, color) => Some(*color),
-            RenderTargetMode::FreshWithTexture(_) => None,
+            RenderTargetMode::FreshWithTexture(_) | RenderTargetMode::FreshStorage => None,
             RenderTargetMode::ExistingWithColor(_, color) => Some(*color),
         }
     }

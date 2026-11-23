@@ -41,6 +41,21 @@ def summarize(path):
         raise ValueError('invalid GPU timestamp duration')
     if len({r['frameId'] for r in gpu}) != len(gpu):
         raise ValueError('duplicate GPU frame identity')
+    gpu_phases = {}
+    for record in gpu:
+        seen = set()
+        intervals = record.get('phaseNs', [])
+        if not isinstance(intervals, list):
+            raise ValueError('invalid named GPU intervals')
+        for interval in intervals:
+            if not isinstance(interval, list) or len(interval) != 2:
+                raise ValueError('invalid named GPU interval')
+            name, ns = interval
+            if (not isinstance(name, str) or not name or name in seen or type(ns) not in (float, int)
+                    or not math.isfinite(ns) or ns < 0):
+                raise ValueError('duplicate or invalid named GPU interval')
+            seen.add(name)
+            gpu_phases.setdefault(name, []).append(ns / 1e6)
     phase_values = [dict(r.get('phaseNs', {}), **r.get('nativeNs', {})) for r in frames]
     phase_names = {key for r in phase_values for key in r}
     if any(not isinstance(r.get('cpuNs'), (float, int)) or not math.isfinite(r['cpuNs']) or r['cpuNs'] < 0 for r in frames):
@@ -58,12 +73,15 @@ def summarize(path):
         'gpuP95Ms': percentile([r['ns']/1e6 for r in gpu], .95),
         'gpuP99Ms': percentile([r['ns']/1e6 for r in gpu], .99),
         'gpuCoverage': len(gpu)/len(frames), 'peakRssBytes': summary.get('peakRssBytes'),
+        'gpuPhaseP95Ms': {name: percentile(times, .95) if len(times) == len(frames) else None
+                          for name, times in gpu_phases.items()},
         'phaseP95Ms': {key: percentile([r[key]/1e6 for r in phase_values], .95)
                        if all(key in r for r in phase_values) else None for key in phase_names},
         'resourcesAfterDrain': summary.get('resourcesAfterDrain'),
         'allocatorAfterDrain': summary.get('allocatorAfterDrain'),
         'workTotals': {key: sum(r.get('work', {}).get(key, 0) for r in frames)
                        for key in {key for r in frames for key in r.get('work', {})}},
+        'computeFilterFrames': sum(r.get('work', {}).get('compute_filter_passes', 0) > 0 for r in frames),
     }
 
 
@@ -109,7 +127,8 @@ def compare(baseline, candidate, phase, control=False):
     if phase == 'gpu':
         improvement = -gpu95
     else:
-        phases = [(b['phaseP95Ms'].get(phase), c['phaseP95Ms'].get(phase)) for b,c in zip(baseline,candidate)]
+        field, name = ('gpuPhaseP95Ms', phase[4:]) if phase.startswith('gpu:') else ('phaseP95Ms', phase)
+        phases = [(b.get(field, {}).get(name), c.get(field, {}).get(name)) for b,c in zip(baseline,candidate)]
         improvement = None if any(not b or c is None or not math.isfinite(c) or c < 0 for b,c in phases) else median(1-c/b for b,c in phases)
     stable = rss <= .05 and max(p95, p99, gpu95, gpu99) <= .03
     accepted = stable and (median(ratios('completedFrameMs')) <= .03 if control else
@@ -117,6 +136,13 @@ def compare(baseline, candidate, phase, control=False):
     return {'accepted': accepted, 'throughputGain':throughput, 'cpuP95Regression':p95,
             'cpuP99Regression':p99, 'gpuP95Regression':gpu95, 'gpuP99Regression':gpu99,
             'peakRssGrowth':rss, 'phase':phase, 'phaseP95Gain':improvement}
+
+
+def compare_filter_paths(baseline, candidate, phase):
+    if (any(run.get('computeFilterFrames') != 0 for run in baseline)
+            or any(run.get('computeFilterFrames') != run['frames'] for run in candidate)):
+        raise ValueError('filter comparison requires fragment and compute execution on every measured frame')
+    return compare(baseline, candidate, phase)
 
 
 @contextmanager
@@ -142,17 +168,23 @@ def main():
     parser.add_argument('--warmup', type=int, default=120)
     parser.add_argument('--frames', type=int, default=1200)
     parser.add_argument('--pairs', type=int, default=5)
-    parser.add_argument('--phase', default='gpu', help='gpu or CPU phase, e.g. preparation')
+    parser.add_argument('--phase', default='gpu', help='gpu, gpu:ColorMatrixFilter, or a CPU phase such as preparation')
     parser.add_argument('--control', action='store_true')
+    parser.add_argument('--compare-compute-filters', action='store_true',
+                        help='compare fragment with opt-in compute in the same binary')
     parser.add_argument('--profile-off', action='store_true',
                         help='disable measurement instrumentation in both binaries')
     args = parser.parse_args()
+    if args.compare_compute_filters and (not args.baseline.samefile(args.candidate) or args.control or args.profile_off):
+        parser.error('compute filter comparisons need the same executable and enabled target measurements')
     args.output.mkdir(parents=True, exist_ok=False)
     cases = args.case or [r['name'] for r in tomllib.loads(args.manifest.read_text())['case']]
     binaries = {'baseline': args.baseline.resolve(), 'candidate': args.candidate.resolve()}
     metadata = {label: {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
                 for label,path in binaries.items()}
     metadata['manifestSha256'] = hashlib.sha256(args.manifest.read_bytes()).hexdigest()
+    if args.compare_compute_filters:
+        metadata['filterPaths'] = {'baseline': 'fragment', 'candidate': 'compute'}
     isolate_shader_cache = sys.platform.startswith('linux') and args.backend in ('vulkan', 'gl')
     metadata['shaderDiskCache'] = 'empty-per-process' if isolate_shader_cache else 'system'
     (args.output/'builds.json').write_text(json.dumps(metadata, indent=2)+'\n')
@@ -168,10 +200,15 @@ def main():
                 if args.profile_off:
                     command.append('--profile-off')
                 with path.with_suffix('.log').open('w') as log, driver_environment(isolate_shader_cache) as env:
+                    if args.compare_compute_filters:
+                        env = dict(os.environ if env is None else env,
+                                   RUFFLE_COMPUTE_FILTERS='1' if label == 'candidate' else '0')
                     subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=3600, env=env)
                 runs[label].append(summarize(path))
             print(f'{case}: pair {pair+1}/{args.pairs} complete', flush=True)
-        report[case] = {'runs':runs, 'comparison': compare(runs['baseline'], runs['candidate'], args.phase, args.control)}
+        comparison = (compare_filter_paths(runs['baseline'], runs['candidate'], args.phase)
+                      if args.compare_compute_filters else compare(runs['baseline'], runs['candidate'], args.phase, args.control))
+        report[case] = {'runs':runs, 'comparison': comparison}
         (args.output/'summary.json').write_text(json.dumps(report,indent=2)+'\n')
 
 
