@@ -537,6 +537,23 @@ fn stopped_enter_frame_benchmark() {
 }
 
 #[test]
+fn empty_clip_can_seek_before_and_after_its_first_frame() {
+    with_tree(|_, child, context| {
+        assert_eq!(child.current_frame(), 0);
+        for frame in [1, 2] {
+            child.goto_frame(
+                context,
+                GotoInfo {
+                    frame,
+                    stop_or_play: StopOrPlay::Stop,
+                },
+            );
+            assert_eq!(child.current_frame(), 1);
+        }
+    });
+}
+
+#[test]
 fn queued_goto_survives_construction_before_frame_scripts() {
     with_tree(|root, child, context| {
         // Exercise the enqueue path used while an AS3 frame script is active.

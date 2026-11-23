@@ -1,5 +1,6 @@
 //! `MovieClip` display object and support code.
 
+#[cfg(test)]
 mod construction_cache_tests;
 #[cfg(test)]
 mod mouse_pick_tests;
@@ -1640,14 +1641,26 @@ impl<'gc> MovieClip<'gc> {
     fn assert_expected_tag_start(self) {}
 
     #[cfg(feature = "timeline_debug")]
+    fn expected_tag_end(self) -> Option<u64> {
+        match self.current_frame() {
+            // No tags have been read before the first frame. Script-created
+            // empty clips also have a single frame with no ShowFrame tag.
+            0 => Some(0),
+            1 if self.0.shared.get().swf_data.as_ref().is_empty() => Some(0),
+            frame => self
+                .0
+                .shared_cell()
+                .tag_frame_boundaries
+                .get(&frame)
+                .map(|(_, end)| *end),
+        }
+    }
+
+    #[cfg(feature = "timeline_debug")]
     fn assert_expected_tag_start(self) {
         assert_eq!(
             Some(self.0.tag_stream_pos.get()),
-            self.0
-                .shared_cell()
-                .tag_frame_boundaries
-                .get(&self.0.current_frame())
-                .map(|(_start, end)| *end), // Yes, this is correct, at least for AVM1.
+            self.expected_tag_end(),
             "[{:?}] Gotos must start from the correct tag position for frame {}",
             self.base().name,
             self.0.current_frame()
@@ -1659,12 +1672,7 @@ impl<'gc> MovieClip<'gc> {
 
     #[cfg(feature = "timeline_debug")]
     fn assert_expected_tag_end(self, hit_target_frame: bool) {
-        let tag_frame_end = self
-            .0
-            .shared_cell()
-            .tag_frame_boundaries
-            .get(&self.0.current_frame.get())
-            .map(|(_start, end)| *end);
+        let tag_frame_end = self.expected_tag_end();
 
         // Gotos that do *not* hit their target frame will not update their tag
         // stream position, as they do not run the final frame's tags, and thus
@@ -2633,6 +2641,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         if self.base().enter_frame_idle() && self.button_cache_valid() {
             return;
         }
+        #[cfg(test)]
         construction_cache_tests::record_enter_visit();
         let skip_frame = self.base().should_skip_next_enter_frame();
         // Preserve propagation of the skip flag even to otherwise inert leaves.
@@ -2703,6 +2712,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             lifecycle::add(Count::ConstructHit, 1);
             return;
         }
+        #[cfg(test)]
         construction_cache_tests::record_visit();
         let revision = super::construction_revision();
         let mut children_settled = false;
@@ -2890,6 +2900,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             return;
         }
         let revision = super::construction_revision();
+        #[cfg(test)]
         construction_cache_tests::record_script_visit();
         self.run_local_frame_scripts(context);
 
