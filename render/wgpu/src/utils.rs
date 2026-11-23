@@ -139,7 +139,7 @@ pub fn capture_image<R, F: FnOnce(&[u8], u32) -> R>(
     let started = std::time::Instant::now();
     let deadline = std::time::Duration::from_secs(2);
     let (sender, receiver) = std::sync::mpsc::channel();
-    let buffer_slice = buffer.slice(..);
+    let buffer_slice = buffer.slice(..dimensions.size());
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
     });

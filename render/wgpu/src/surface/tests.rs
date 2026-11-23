@@ -1684,6 +1684,13 @@ fn async_readback_completion_and_cancellation_return_unmapped_pool_entries() {
     let target = TextureTarget::new_without_readback(&descriptors.device, (1, 1)).unwrap();
     let renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
     let dimensions = crate::utils::BufferDimensions::new(1, 1, wgpu::TextureFormat::Rgba8Unorm);
+    let larger = crate::utils::BufferDimensions::new(1, 5, wgpu::TextureFormat::Rgba8Unorm);
+    drop(
+        renderer
+            .offscreen_buffer_pool
+            .take(&descriptors, larger)
+            .unwrap(),
+    );
     for complete in [true, false, true] {
         let buffer = renderer
             .offscreen_buffer_pool
@@ -1698,6 +1705,7 @@ fn async_readback_completion_and_cancellation_return_unmapped_pool_entries() {
                 .unwrap();
             let (pixels, stride) = readback.poll().unwrap().unwrap();
             assert_eq!(stride, 256);
+            assert_eq!(pixels.len(), stride as usize);
             assert!(pixels.iter().all(|&byte| byte == 0));
         }
         drop(readback);
@@ -1706,6 +1714,79 @@ fn async_readback_completion_and_cancellation_return_unmapped_pool_entries() {
             .poll(wgpu::PollType::wait_indefinitely())
             .unwrap();
         descriptors.runtime.check_health().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn pixel_bender_byte_output_packs_each_shader_channel_and_row() {
+    use ruffle_render::backend::{PixelBenderOutput, PixelBenderTarget};
+    use ruffle_render::pixel_bender::{
+        Operation, PixelBenderParam, PixelBenderParamQualifier, PixelBenderReg,
+        PixelBenderRegChannel::*, PixelBenderRegKind, PixelBenderShader, PixelBenderTypeOpcode,
+    };
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (1, 1)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let components = [R, G, B, A];
+    for (len, ty) in [
+        PixelBenderTypeOpcode::TFloat,
+        PixelBenderTypeOpcode::TFloat2,
+        PixelBenderTypeOpcode::TFloat3,
+        PixelBenderTypeOpcode::TFloat4,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let channels = &components[..=len];
+        let reg = |channels| PixelBenderReg {
+            index: 0,
+            kind: PixelBenderRegKind::Float,
+            channels,
+        };
+        let shader = renderer
+            .compile_pixelbender_shader(PixelBenderShader {
+                name: "constant".into(),
+                version: 1,
+                metadata: vec![],
+                params: vec![PixelBenderParam::Normal {
+                    qualifier: PixelBenderParamQualifier::Output,
+                    param_type: ty,
+                    reg: reg(channels.to_vec()),
+                    name: "dst".into(),
+                    metadata: vec![],
+                }],
+                operations: channels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &c)| Operation::LoadFloat {
+                        dst: reg(vec![c]),
+                        val: (i + 1) as f32,
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        for width in [3, 65] {
+            let PixelBenderOutput::Bytes(output) = renderer
+                .run_pixelbender_shader(
+                    shader.clone(),
+                    &[],
+                    &PixelBenderTarget::Bytes { width, height: 2 },
+                )
+                .unwrap()
+            else {
+                panic!("expected bytes")
+            };
+            let pixel: Vec<u8> = (1..=channels.len())
+                .flat_map(|v| (v as f32).to_ne_bytes())
+                .collect();
+            assert_eq!(
+                output,
+                pixel.repeat(width as usize * 2),
+                "{} channels at width {width}",
+                channels.len()
+            );
+        }
     }
 }
 
@@ -3333,6 +3414,13 @@ fn bitmap_region_readback_does_not_capture_unrequested_rows() {
         .collect();
     let bitmap = renderer
         .register_bitmap(Bitmap::new(64, 64, BitmapFormat::Rgba, pixels))
+        .unwrap();
+    renderer
+        .read_bitmap_region(
+            &bitmap,
+            PixelRegion::for_whole_size(64, 64),
+            Box::new(|_, _| {}),
+        )
         .unwrap();
     let mut observed = None;
     let result = renderer

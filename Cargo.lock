@@ -1621,6 +1621,7 @@ dependencies = [
  "rayon",
  "ruffle_core",
  "ruffle_render_wgpu",
+ "tempfile",
  "walkdir",
 ]
 

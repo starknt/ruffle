@@ -245,7 +245,7 @@ impl AsyncReadback {
     ) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
         buffer
-            .slice(..)
+            .slice(..dimensions.size())
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = sender.send(result);
             });
@@ -278,12 +278,16 @@ impl AsyncReadback {
             })?;
         match self.receiver.try_recv() {
             Ok(Ok(())) => {
-                let map = self.buffer.slice(..).get_mapped_range().map_err(|error| {
-                    self.descriptors.runtime.health().record(RenderFailure::new(
-                        RenderFailureKind::MapFailed,
-                        error.to_string(),
-                    ))
-                })?;
+                let map = self
+                    .buffer
+                    .slice(..self.dimensions.size())
+                    .get_mapped_range()
+                    .map_err(|error| {
+                        self.descriptors.runtime.health().record(RenderFailure::new(
+                            RenderFailureKind::MapFailed,
+                            error.to_string(),
+                        ))
+                    })?;
                 let bytes = map.to_vec();
                 drop(map);
                 self.buffer.unmap();

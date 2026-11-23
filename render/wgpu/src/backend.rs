@@ -652,7 +652,6 @@ enum WgpuPixelBenderPending {
         readback: Option<AsyncReadback>,
         width: usize,
         output_channels: usize,
-        has_padding: bool,
     },
 }
 
@@ -1634,7 +1633,6 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 readback,
                 width,
                 output_channels,
-                has_padding,
             } => {
                 if readback.is_none() {
                     let handle = sync_handle
@@ -1646,27 +1644,23 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 let Some((raw_pixels, buffer_width)) = readback.as_mut().unwrap().poll()? else {
                     return Ok(None);
                 };
-                let pixels = if buffer_width as usize
-                    != *width * *output_channels as usize * std::mem::size_of::<f32>()
-                {
-                    let mut new_pixels = Vec::new();
-                    for row in raw_pixels.chunks(buffer_width as usize) {
-                        let actual_row = &row[0..(*width * std::mem::size_of::<[f32; 4]>())];
-                        for pixel in actual_row
-                            .as_chunks::<{ std::mem::size_of::<[f32; 4]>() }>()
-                            .0
-                        {
-                            if *has_padding {
-                                new_pixels
-                                    .extend_from_slice(&pixel[0..(3 * std::mem::size_of::<f32>())]);
-                            } else {
-                                new_pixels.extend_from_slice(pixel);
+                let stride = buffer_width as usize;
+                let row_bytes = *width * *output_channels * size_of::<f32>();
+                let pixels = if row_bytes == stride {
+                    raw_pixels
+                } else {
+                    let mut packed = Vec::with_capacity(raw_pixels.len() / stride * row_bytes);
+                    for row in raw_pixels.chunks_exact(stride) {
+                        if *output_channels == 3 {
+                            // RGB uses an RGBA32Float texture. Omit each pixel's unused alpha.
+                            for pixel in row.chunks_exact(size_of::<[f32; 4]>()).take(*width) {
+                                packed.extend_from_slice(&pixel[..size_of::<[f32; 3]>()]);
                             }
+                        } else {
+                            packed.extend_from_slice(&row[..row_bytes]);
                         }
                     }
-                    new_pixels
-                } else {
-                    raw_pixels
+                    packed
                 };
                 Ok(Some(PixelBenderOutput::Bytes(pixels)))
             }
@@ -1685,8 +1679,6 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             .parsed_shader()
             .output_channels()
             .expect("No output parameter");
-        let has_padding = output_channels == 3;
-
         let texture_format =
             crate::pixel_bender::temporary_texture_format_for_channels(output_channels as u32);
 
@@ -1824,7 +1816,6 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     readback: None,
                     width: *width as usize,
                     output_channels,
-                    has_padding,
                 },
             )),
         }

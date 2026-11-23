@@ -4,6 +4,7 @@ use clap::Parser;
 use ruffle_core::Player;
 use ruffle_render_wgpu::clap::{GraphicsBackend, PowerPreference};
 use std::num::NonZeroU32;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -38,11 +39,19 @@ impl FrameSelection {
     }
 
     pub fn total_frames(self, player: &Arc<Mutex<Player>>, skipframes: u32) -> u32 {
-        match self {
-            // TODO Getting frame count from the header won't always work.
-            FrameSelection::All => player.header_frames() as u32,
-            FrameSelection::Count(n) => n.get() + skipframes,
-        }
+        self.capture_range(player, skipframes)
+            .end
+            .try_into()
+            .unwrap_or(u32::MAX)
+    }
+
+    pub(crate) fn capture_range(self, player: &Arc<Mutex<Player>>, skipframes: u32) -> Range<u64> {
+        let start = u64::from(skipframes);
+        let end = match self {
+            FrameSelection::All => u64::from(player.header_frames()),
+            FrameSelection::Count(n) => start + u64::from(n.get()),
+        };
+        start.min(end)..end
     }
 }
 

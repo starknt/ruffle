@@ -1,1 +1,2 @@
+swf = "movie.v2.swf"
 args = ["--frames", "1"]

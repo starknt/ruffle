@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::panic::catch_unwind;
 use std::path::Path;
 use std::sync::Arc;
@@ -85,9 +86,8 @@ impl Exporter {
             .build();
 
         Ok(MovieExport {
+            frames: self.frames.capture_range(&player, self.skipframes),
             player,
-            skipframes: self.skipframes,
-            frames: self.frames,
             force_play: self.force_play,
         })
     }
@@ -95,16 +95,11 @@ impl Exporter {
 
 pub struct MovieExport {
     player: Arc<Mutex<Player>>,
-    skipframes: u32,
-    frames: FrameSelection,
+    pub frames: Range<u64>,
     force_play: bool,
 }
 
 impl MovieExport {
-    pub fn total_frames(&self) -> u32 {
-        self.frames.total_frames(&self.player, self.skipframes)
-    }
-
     pub fn run_frame(&self) {
         if self.force_play {
             self.player.force_root_clip_play();

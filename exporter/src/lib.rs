@@ -4,250 +4,200 @@ mod exporter;
 mod player_ext;
 mod progress;
 
-use anyhow::{Result, anyhow};
-use image::RgbaImage;
+use anyhow::{Context, Result, anyhow, bail};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
-use std::fs::create_dir_all;
+use std::collections::HashSet;
+use std::fs::{create_dir_all, rename};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::cli::{FrameSelection, Opt};
-use crate::exporter::Exporter;
+use crate::exporter::{Exporter, MovieExport};
 use crate::progress::ExporterProgress;
 
-/// Captures a screenshot. The resulting image uses straight alpha
-fn take_screenshot(
-    exporter: &Exporter,
-    swf_path: &Path,
-    frames: FrameSelection, // TODO Figure out a way to get framecount before calling take_screenshot, so that we can have accurate progress bars when using --frames all
-    skipframes: u32,
-    progress: &ExporterProgress,
-) -> Result<Vec<RgbaImage>> {
-    let movie_export = exporter.start_exporting_movie(swf_path)?;
-
-    let mut result = Vec::new();
-    let totalframes = movie_export.total_frames();
-
-    for i in 0..totalframes {
-        progress.set_message(format!(
-            "{} frame {}",
-            swf_path.file_stem().unwrap().to_string_lossy(),
-            i
-        ));
-
-        movie_export.run_frame();
-
-        if i >= skipframes {
-            match movie_export.capture_frame() {
-                Ok(image) => result.push(image),
-                Err(e) => {
-                    return Err(anyhow!(
-                        "Unable to capture frame {} of {:?}: {:?}",
-                        i,
-                        swf_path,
-                        e
-                    ));
-                }
-            }
-        }
-
-        if !matches!(frames, FrameSelection::All) {
-            progress.inc(1);
-        }
-    }
-    Ok(result)
+enum Output<'a> {
+    File(&'a Path),
+    Directory(&'a Path),
+    Stdout,
 }
 
-fn find_files(root: &Path, with_progress: bool) -> Vec<DirEntry> {
-    let progress = if with_progress {
-        Some(ProgressBar::new_spinner())
+fn capture_frames(
+    movie: &MovieExport,
+    swf: &Path,
+    output: Output<'_>,
+    progress: &ExporterProgress,
+) -> Result<()> {
+    let count = movie.frames.end - movie.frames.start;
+    let digits = count.to_string().len();
+    // Keep each PNG on disk until the movie has rendered successfully. Only
+    // one captured frame per movie needs to be resident at a time.
+    let staging = if let Output::Directory(path) = output {
+        create_dir_all(path)?;
+        Some(tempfile::tempdir_in(path)?)
     } else {
         None
     };
+
+    for _ in 0..movie.frames.start {
+        movie.run_frame();
+    }
+    for (index, frame) in movie.frames.clone().enumerate() {
+        progress.set_message(format!("{} frame {frame}", swf.display()));
+        movie.run_frame();
+        let image = movie
+            .capture_frame()
+            .with_context(|| format!("Unable to capture frame {frame} of {}", swf.display()))?;
+        match output {
+            Output::File(path) => image.save(path)?,
+            Output::Stdout => {
+                let mut png = io::Cursor::new(Vec::new());
+                image.write_to(&mut png, image::ImageFormat::Png)?;
+                io::stdout().lock().write_all(png.get_ref())?;
+            }
+            Output::Directory(_) => {
+                let directory = staging.as_ref().expect("frame staging directory");
+                image.save(directory.path().join(format!("{index:0digits$}.png")))?;
+            }
+        }
+        progress.inc(1);
+    }
+    if let (Output::Directory(output), Some(directory)) = (output, staging) {
+        for index in 0..count {
+            let name = format!("{index:0digits$}.png");
+            rename(directory.path().join(&name), output.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+fn find_files(root: &Path, with_progress: bool) -> Result<Vec<DirEntry>> {
+    let progress = with_progress.then(ProgressBar::new_spinner);
     let mut results = Vec::new();
+    let mut destinations = HashSet::new();
 
-    for entry in WalkDir::new(root)
-        .follow_links(true)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let f_name = entry.file_name().to_string_lossy();
-
-        if f_name.ends_with(".swf") {
+    for entry in WalkDir::new(root).follow_links(true) {
+        let entry = entry?;
+        if entry.file_type().is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("swf"))
+        {
+            if !destinations.insert(entry.path().with_extension("")) {
+                bail!(
+                    "Multiple SWFs have the same output name at {}",
+                    entry.path().display()
+                );
+            }
             results.push(entry);
             if let Some(progress) = &progress {
                 progress.set_message(format!("Searching for swf files... {}", results.len()));
             }
         }
     }
-
-    if let Some(progress) = &progress {
+    if let Some(progress) = progress {
         progress.finish_with_message(format!("Found {} swf files to export", results.len()));
     }
-
-    results
+    Ok(results)
 }
 
 fn capture_single_swf(exporter: &Exporter, opt: &Opt) -> Result<()> {
-    let is_single_frame = opt.frames.is_single_frame();
+    let single = opt.frames.is_single_frame();
     let output = opt.output_path.clone().unwrap_or_else(|| {
-        let mut result = PathBuf::new();
-        result.set_file_name(opt.swf.file_stem().unwrap());
-        if is_single_frame {
-            result.set_extension("png");
-        }
-        result
+        Path::new(opt.swf.file_name().expect("SWF file name")).with_extension(if single {
+            "png"
+        } else {
+            ""
+        })
     });
-
-    if !is_single_frame {
-        let _ = create_dir_all(&output);
-    }
-
-    let progress = ExporterProgress::new(opt, 1);
-
-    let frames = take_screenshot(exporter, &opt.swf, opt.frames, opt.skipframes, &progress)?;
-
-    progress.set_message(opt.swf.file_stem().unwrap().to_string_lossy().into_owned());
-
-    if is_single_frame {
-        let image = frames.first().unwrap();
-        if opt.output_path == Some(PathBuf::from("-")) {
-            let mut bytes: Vec<u8> = Vec::new();
-            image
-                .write_to(&mut io::Cursor::new(&mut bytes), image::ImageFormat::Png)
-                .expect("Encoding failed");
-            io::stdout()
-                .write_all(bytes.as_slice())
-                .expect("Writing to stdout failed");
-        } else {
-            image.save(&output)?;
-        }
+    let destination = if single && output == Path::new("-") {
+        Output::Stdout
+    } else if single {
+        Output::File(&output)
     } else {
-        let digits = frames.len().to_string().len();
-        for (frame, image) in frames.iter().enumerate() {
-            let mut path: PathBuf = (&output).into();
-            path.push(format!("{frame:0digits$}.png"));
-            image.save(&path)?;
-        }
-    }
-
-    let message = if frames.len() == 1 {
-        if !opt.silent {
-            Some(format!(
-                "Saved first frame of {} to {}",
-                opt.swf.to_string_lossy(),
-                output.to_string_lossy()
-            ))
-        } else {
-            None
-        }
-    } else {
-        Some(format!(
-            "Saved first {} frames of {} to {}",
-            frames.len(),
-            opt.swf.to_string_lossy(),
-            output.to_string_lossy()
-        ))
+        Output::Directory(&output)
     };
 
-    if let Some(message) = message {
-        progress.finish_with_message(message);
+    let progress = ExporterProgress::new(opt, 1);
+    let movie = exporter.start_exporting_movie(&opt.swf)?;
+    capture_frames(&movie, &opt.swf, destination, &progress)?;
+    let count = movie.frames.end - movie.frames.start;
+    if count == 1 && opt.silent {
+        return Ok(());
     }
-
+    let frames = if count == 1 {
+        "first frame".to_string()
+    } else {
+        format!("first {count} frames")
+    };
+    progress.finish_with_message(format!(
+        "Saved {frames} of {} to {}",
+        opt.swf.display(),
+        output.display()
+    ));
     Ok(())
 }
 
-fn capture_multiple_swfs(exporter: &Exporter, opt: &Opt) -> Result<()> {
-    let output = opt.output_path.clone().unwrap();
-    let files = find_files(&opt.swf, !opt.silent);
-
+fn capture_multiple_swfs(exporter: &Exporter, opt: &Opt, output: &Path) -> Result<()> {
+    let files = find_files(&opt.swf, !opt.silent)?;
     let progress = ExporterProgress::new(opt, files.len() as u64);
 
-    files.par_iter().try_for_each(|file| -> Result<()> {
-        progress.set_message(
-            file.path()
-                .file_stem()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-        );
-        if let Ok(frames) =
-            take_screenshot(exporter, file.path(), opt.frames, opt.skipframes, &progress)
-        {
-            let mut relative_path = file
-                .path()
-                .strip_prefix(&opt.swf)
-                .unwrap_or_else(|_| file.path())
-                .to_path_buf();
-
-            if frames.len() == 1 {
-                let mut destination: PathBuf = (&output).into();
-                relative_path.set_extension("png");
-                destination.push(relative_path);
-                if let Some(parent) = destination.parent() {
-                    let _ = create_dir_all(parent);
-                }
-                frames.first().unwrap().save(&destination)?;
-            } else {
-                let mut parent: PathBuf = (&output).into();
-                relative_path.set_extension("");
-                parent.push(&relative_path);
-                let _ = create_dir_all(&parent);
-                let digits = frames.len().to_string().len();
-                for (frame, image) in frames.iter().enumerate() {
-                    let mut destination = parent.clone();
-                    destination.push(format!("{frame:0digits$}.png"));
-                    image.save(&destination)?;
-                }
+    let export_file = |entry: &DirEntry| -> Result<()> {
+        let file = entry.path();
+        let movie = exporter.start_exporting_movie(file)?;
+        let single = movie.frames.end - movie.frames.start == 1;
+        let relative = file.strip_prefix(&opt.swf)?;
+        let destination = output.join(relative.with_extension(if single { "png" } else { "" }));
+        if single {
+            if let Some(parent) = destination.parent() {
+                create_dir_all(parent)?;
             }
+            capture_frames(&movie, file, Output::File(&destination), &progress)
+        } else {
+            capture_frames(&movie, file, Output::Directory(&destination), &progress)
         }
-
-        Ok(())
-    })?;
-
-    let message = match opt.frames {
-        FrameSelection::Count(n) if n.get() == 1 => format!(
-            "Saved first frame of {} files to {}",
-            files.len(),
-            output.to_string_lossy()
-        ),
-        FrameSelection::All => format!(
-            "Saved all frames of {} files to {}",
-            files.len(),
-            output.to_string_lossy()
-        ),
-        FrameSelection::Count(n) => format!(
-            "Saved first {} frames of {} files to {}",
-            n,
-            files.len(),
-            output.to_string_lossy()
-        ),
     };
-
-    progress.finish_with_message(message);
-
+    // A bad input should not suppress valid siblings or turn a partial export into success.
+    let failures: Vec<_> = files
+        .par_iter()
+        .filter_map(|entry| {
+            export_file(entry)
+                .err()
+                .map(|e| format!("{}: {e:#}", entry.path().display()))
+        })
+        .collect();
+    if !failures.is_empty() {
+        bail!(
+            "Failed to export {} of {} files:\n{}",
+            failures.len(),
+            files.len(),
+            failures.join("\n")
+        );
+    }
+    let frames = match opt.frames {
+        FrameSelection::Count(n) if n.get() == 1 => "first frame".to_owned(),
+        FrameSelection::Count(n) => format!("first {n} frames"),
+        FrameSelection::All => "all frames".to_owned(),
+    };
+    progress.finish_with_message(format!(
+        "Saved {frames} of {} files to {}",
+        files.len(),
+        output.display()
+    ));
     Ok(())
 }
 
 pub fn run_main(opt: Opt) -> Result<()> {
-    let exporter = Exporter::new(&opt)?;
-
     if opt.swf.is_file() {
-        capture_single_swf(&exporter, &opt)?;
-    } else if !opt.swf.is_dir() {
-        return Err(anyhow!(
-            "Not a file or directory: {}",
-            opt.swf.to_string_lossy()
-        ));
-    } else if opt.output_path.is_some() {
-        capture_multiple_swfs(&exporter, &opt)?;
+        capture_single_swf(&Exporter::new(&opt)?, &opt)
+    } else if opt.swf.is_dir() {
+        let output = opt.output_path.as_deref().ok_or_else(|| {
+            anyhow!("Output directory is required when exporting multiple files.")
+        })?;
+        capture_multiple_swfs(&Exporter::new(&opt)?, &opt, output)
     } else {
-        return Err(anyhow!(
-            "Output directory is required when exporting multiple files."
-        ));
+        bail!("Not a file or directory: {}", opt.swf.display())
     }
-
-    Ok(())
 }
