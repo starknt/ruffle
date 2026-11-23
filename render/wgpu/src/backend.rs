@@ -691,7 +691,6 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
     fn make_queue_sync_handle(
         &self,
         target: TextureTarget,
-        index: Option<SubmissionIndex>,
         destination: BitmapHandle,
         copy_area: PixelRegion,
     ) -> Result<Box<QueueSyncHandle>, crate::gpu_runtime::RenderFailure> {
@@ -710,11 +709,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             }) => QueueSyncHandle {
                 dependency: self.active_frame.operations.dependency(),
                 descriptors: self.descriptors.clone(),
-                source: crate::ReadbackSource::Copied(crate::CopiedReadback {
-                    index,
-                    buffer,
-                    dimensions,
-                }),
+                source: crate::ReadbackSource::Copied(crate::CopiedReadback { buffer, dimensions }),
             },
             Some(TextureBufferInfo {
                 buffer: MaybeOwnedBuffer::Owned(..),
@@ -733,6 +728,35 @@ enum WgpuPixelBenderPending {
         width: usize,
         output_channels: usize,
     },
+}
+
+impl WgpuPixelBenderPending {
+    fn from_pending(pending: &mut PixelBenderPending) -> Result<&mut Self, BitmapError> {
+        pending
+            .backend_mut::<Self>()
+            .ok_or(BitmapError::Unimplemented(Cow::Borrowed(
+                "Invalid Pixel Bender pending state",
+            )))
+    }
+}
+
+fn pack_shader_bytes(raw: Cow<'_, [u8]>, stride: usize, width: usize, channels: usize) -> Vec<u8> {
+    let row_bytes = width * channels * size_of::<f32>();
+    if row_bytes == stride {
+        return raw.into_owned();
+    }
+    let mut packed = Vec::with_capacity(raw.len() / stride * row_bytes);
+    for row in raw.chunks_exact(stride) {
+        if channels == 3 {
+            // RGB uses an RGBA32Float texture. Omit each pixel's unused alpha.
+            for pixel in row.chunks_exact(size_of::<[f32; 4]>()).take(width) {
+                packed.extend_from_slice(&pixel[..size_of::<[f32; 3]>()]);
+            }
+        } else {
+            packed.extend_from_slice(&row[..row_bytes]);
+        }
+    }
+    packed
 }
 
 impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
@@ -1160,7 +1184,6 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.descriptors.runtime.check_health()?;
         Ok(Some(self.make_queue_sync_handle(
             target,
-            None,
             destination,
             destination_region,
         )?))
@@ -1236,9 +1259,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.finish_bitmap_write(&handle)?;
         self.active_frame.maybe_flush(&self.descriptors)?;
         self.descriptors.runtime.check_health()?;
-        Ok(Some(
-            self.make_queue_sync_handle(target, None, handle, bounds)?,
-        ))
+        Ok(Some(self.make_queue_sync_handle(target, handle, bounds)?))
     }
 
     fn is_filter_supported(&self, filter: &Filter) -> bool {
@@ -1412,7 +1433,6 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.descriptors.runtime.check_health()?;
         Ok(Some(self.make_queue_sync_handle(
             target,
-            None,
             destination,
             copy_area,
         )?))
@@ -1434,22 +1454,26 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     ) -> Result<PixelBenderOutput, BitmapError> {
         self.descriptors.runtime.check_health()?;
         let mut pending = self.submit_pixelbender_shader(shader, arguments, target)?;
-        loop {
-            if let Some(output) = self.poll_pixelbender_shader(&mut pending)? {
-                return Ok(output);
+        let state = WgpuPixelBenderPending::from_pending(&mut pending)?;
+        match state {
+            WgpuPixelBenderPending::Bitmap(handle) => Ok(PixelBenderOutput::Bitmap(
+                handle.take().expect("new bitmap shader job"),
+            )),
+            WgpuPixelBenderPending::Bytes {
+                sync_handle,
+                width,
+                output_channels,
+                ..
+            } => {
+                let handle = sync_handle.take().expect("new byte shader job");
+                let pixels = handle.capture_native(
+                    |data, stride, _| {
+                        pack_shader_bytes(data.into(), stride as usize, *width, *output_channels)
+                    },
+                    &mut self.active_frame,
+                )?;
+                Ok(PixelBenderOutput::Bytes(pixels))
             }
-            self.descriptors
-                .device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: Some(std::time::Duration::from_secs(2)),
-                })
-                .map_err(|error| {
-                    self.descriptors
-                        .runtime
-                        .health()
-                        .record(crate::utils::poll_failure(error))
-                })?;
         }
     }
 
@@ -1458,12 +1482,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         pending: &mut PixelBenderPending,
     ) -> Result<Option<PixelBenderOutput>, BitmapError> {
         self.descriptors.runtime.check_health()?;
-        let state =
-            pending
-                .backend_mut::<WgpuPixelBenderPending>()
-                .ok_or(BitmapError::Unimplemented(Cow::Borrowed(
-                    "Invalid Pixel Bender pending state",
-                )))?;
+        let state = WgpuPixelBenderPending::from_pending(pending)?;
         match state {
             WgpuPixelBenderPending::Bitmap(handle) => {
                 Ok(handle.take().map(PixelBenderOutput::Bitmap))
@@ -1484,24 +1503,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 let Some((raw_pixels, buffer_width)) = readback.as_mut().unwrap().poll()? else {
                     return Ok(None);
                 };
-                let stride = buffer_width as usize;
-                let row_bytes = *width * *output_channels * size_of::<f32>();
-                let pixels = if row_bytes == stride {
-                    raw_pixels
-                } else {
-                    let mut packed = Vec::with_capacity(raw_pixels.len() / stride * row_bytes);
-                    for row in raw_pixels.chunks_exact(stride) {
-                        if *output_channels == 3 {
-                            // RGB uses an RGBA32Float texture. Omit each pixel's unused alpha.
-                            for pixel in row.chunks_exact(size_of::<[f32; 4]>()).take(*width) {
-                                packed.extend_from_slice(&pixel[..size_of::<[f32; 3]>()]);
-                            }
-                        } else {
-                            packed.extend_from_slice(&row[..row_bytes]);
-                        }
-                    }
-                    packed
-                };
+                let pixels = pack_shader_bytes(
+                    raw_pixels.into(),
+                    buffer_width as usize,
+                    *width,
+                    *output_channels,
+                );
                 Ok(Some(PixelBenderOutput::Bytes(pixels)))
             }
         }
@@ -1635,15 +1642,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         )?;
 
         self.finish_bitmap_write(&target_handle)?;
-        let index = Some(self.active_frame.submit_for_target(
-            &self.descriptors,
-            &texture_target,
-            frame_output,
-        )?);
+        self.active_frame
+            .submit_for_target(&self.descriptors, &texture_target, frame_output)?;
 
         let sync_handle = self.make_queue_sync_handle(
             texture_target,
-            index,
             target_handle,
             PixelRegion::for_whole_size(extent.width, extent.height),
         )?;

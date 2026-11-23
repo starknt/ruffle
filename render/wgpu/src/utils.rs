@@ -128,16 +128,32 @@ impl BufferDescription for BufferDimensions {
     }
 }
 
+/// Mapping fences all submitted uses of this buffer. Callers can additionally
+/// name an explicit queue submission on which their capture depends.
 pub fn capture_image<R, F: FnOnce(&[u8], u32) -> R>(
     device: &crate::gpu_resources::Device,
     buffer: &crate::gpu_resources::Buffer,
     dimensions: &BufferDimensions,
-    index: Option<wgpu::SubmissionIndex>,
+    dependency: Option<wgpu::SubmissionIndex>,
     with_rgba: F,
 ) -> Result<R, crate::gpu_runtime::RenderFailure> {
     use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
     let timeout = std::time::Duration::from_secs(2);
     device.runtime().check_health()?;
+    if buffer.lease().id().device_generation() != device.runtime().generation() {
+        return Err(RenderFailure::new(
+            RenderFailureKind::Validation,
+            "readback buffer belongs to another device",
+        ));
+    }
+    if let Some(index) = dependency {
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(index),
+                timeout: Some(timeout),
+            })
+            .map_err(poll_failure)?;
+    }
     let failed = device.runtime().health().failure_signal();
     let (sender, receiver) = crossbeam_channel::bounded(1);
     let buffer_slice = buffer.slice(..dimensions.size());
@@ -145,17 +161,6 @@ pub fn capture_image<R, F: FnOnce(&[u8], u32) -> R>(
         let _ = sender.try_send(result);
     });
     let result = (|| {
-        // Mapping fences the buffer's last use. A later submission on a shared
-        // queue must not extend a synchronous pixel read's wait.
-        if let Some(index) = index {
-            match device.poll(wgpu::PollType::Wait {
-                submission_index: Some(index),
-                timeout: Some(std::time::Duration::ZERO),
-            }) {
-                Ok(_) | Err(wgpu::PollError::Timeout) => (),
-                Err(error) => return Err(poll_failure(error)),
-            }
-        }
         device.runtime().request_poll(device)?;
         crossbeam_channel::select_biased! {
             recv(failed) -> _ => return Err(device.runtime().failure().expect("failed signal")),

@@ -1655,6 +1655,68 @@ fn bitmap_gpu_copy_preserves_the_requested_region() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn pixel_capture_rejects_buffers_from_another_device_before_mapping() {
+    let owner = gpu();
+    let other = gpu();
+    let dimensions = crate::utils::BufferDimensions::new(1, 1, wgpu::TextureFormat::Rgba8Unorm);
+    let buffer = owner
+        .device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let failure = crate::utils::capture_image(&other.device, &buffer, &dimensions, None, |_, _| ())
+        .unwrap_err();
+    assert_eq!(
+        failure.kind(),
+        crate::gpu_runtime::RenderFailureKind::Validation
+    );
+    owner.runtime.check_health().unwrap();
+    crate::utils::capture_image(&owner.device, &buffer, &dimensions, None, |pixels, _| {
+        assert_eq!(&pixels[..4], &[0; 4])
+    })
+    .unwrap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn explicit_pixel_capture_dependency_must_have_been_submitted() {
+    let owner = gpu();
+    let other = gpu();
+    let mut later = other.queue.raw().submit([]);
+    for _ in 0..32 {
+        later = other.queue.raw().submit([]);
+    }
+    let dimensions = crate::utils::BufferDimensions::new(1, 1, wgpu::TextureFormat::Rgba8Unorm);
+    let buffer = owner
+        .device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    assert!(
+        crate::utils::capture_image(&owner.device, &buffer, &dimensions, Some(later), |_, _| ())
+            .is_err()
+    );
+    let index = owner.queue.raw().submit([]);
+    crate::utils::capture_image(
+        &owner.device,
+        &buffer,
+        &dimensions,
+        Some(index),
+        |bytes, _| assert_eq!(&bytes[..4], &[0; 4]),
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn destroyed_readback_buffer_returns_error_without_publishing_pixels()
 -> Result<(), crate::gpu_runtime::RenderFailure> {
     let descriptors = gpu();
@@ -1697,7 +1759,7 @@ fn async_readback_completion_and_cancellation_return_unmapped_pool_entries() {
             .take(&descriptors, dimensions.clone())
             .unwrap();
         let mut readback =
-            crate::AsyncReadback::new(buffer, dimensions.clone(), descriptors.clone(), None);
+            crate::AsyncReadback::new(buffer, dimensions.clone(), descriptors.clone());
         if complete {
             descriptors
                 .device

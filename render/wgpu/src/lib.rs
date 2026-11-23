@@ -242,7 +242,6 @@ impl AsyncReadback {
         buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
         dimensions: BufferDimensions,
         descriptors: Arc<Descriptors>,
-        index: Option<wgpu::SubmissionIndex>,
     ) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
         buffer
@@ -250,7 +249,6 @@ impl AsyncReadback {
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = sender.send(result);
             });
-        let _ = index;
         let _ = descriptors.runtime.request_poll(&descriptors.device);
         Self {
             buffer,
@@ -341,7 +339,6 @@ impl Drop for AsyncReadback {
 
 #[derive(Debug)]
 struct CopiedReadback {
-    index: Option<wgpu::SubmissionIndex>,
     buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
     dimensions: BufferDimensions,
 }
@@ -422,12 +419,8 @@ impl CopiedReadback {
             &buffer,
             &dimensions,
         )?;
-        let index = Some(frame.submit_direct(descriptors)?);
-        Ok(Self {
-            index,
-            buffer,
-            dimensions,
-        })
+        frame.submit_direct(descriptors)?;
+        Ok(Self { buffer, dimensions })
     }
 }
 
@@ -512,7 +505,6 @@ impl QueueSyncHandle {
             copy.buffer,
             copy.dimensions,
             descriptors,
-            copy.index,
         ))
     }
 
@@ -532,7 +524,7 @@ impl QueueSyncHandle {
             &descriptors.device,
             &copy.buffer,
             &copy.dimensions,
-            copy.index,
+            None,
             |bytes, stride| read(bytes, stride, format),
         )
     }
