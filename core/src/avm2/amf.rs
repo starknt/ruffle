@@ -335,16 +335,8 @@ pub fn deserialize_value_impl<'gc>(
             let array = ArrayObject::from_storage(activation.context, empty_storage);
             object_map.insert(*id, array.into());
 
-            // First let's create an array out of `values` (dense portion), then we add the elements onto it.
-            let mut arr: Vec<Option<Value<'gc>>> = Vec::with_capacity(values.len());
-            for value in values {
-                arr.push(Some(deserialize_value_impl(activation, value, object_map)?));
-            }
-            array
-                .storage_mut(activation.gc())
-                .replace_dense_storage(arr);
-
-            // Now let's add each element as a property
+            // AMF3 emits the associative entries first. A later dense entry
+            // may refer to an object introduced by one of these entries.
             for element in elements {
                 let name = ruffle_wstr::from_utf8(element.name());
                 let value = deserialize_value_impl(activation, element.value(), object_map)?;
@@ -360,6 +352,10 @@ pub fn deserialize_value_impl<'gc>(
                         activation.gc(),
                     );
                 }
+            }
+            for (index, value) in values.iter().enumerate() {
+                let value = deserialize_value_impl(activation, value, object_map)?;
+                array.storage_mut(activation.gc()).set(index, value);
             }
             array.into()
         }
