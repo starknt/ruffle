@@ -69,6 +69,7 @@ anyhow = "1.0"
 gc-arena = { version = "0.7.0", features = ["enum-map", "hashbrown", "indexmap", "slotmap", "smallvec"] }
 slotmap = "1.1.1"
 async-channel = "2.5.0"
+crossbeam-channel = "0.5"
 bitflags = "2.12.1"
 bytemuck = "1.25.0"
 chrono = { version = "0.4.44", default-features = false }

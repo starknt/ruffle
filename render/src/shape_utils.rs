@@ -146,6 +146,30 @@ pub struct OwnedDistilledShape {
     pub edge_bounds: Rectangle<Twips>,
     pub id: CharacterId,
 }
+
+impl OwnedDistilledShape {
+    pub fn storage_bytes(&self) -> usize {
+        let mut bytes = size_of::<Self>() + self.paths.capacity() * size_of::<OwnedDrawPath>();
+        for path in &self.paths {
+            let (style, commands) = match path {
+                OwnedDrawPath::Stroke {
+                    style, commands, ..
+                } => (style.fill_style(), commands),
+                OwnedDrawPath::Fill {
+                    style, commands, ..
+                } => (style, commands),
+            };
+            bytes += commands.capacity() * size_of::<DrawCommand>();
+            if let FillStyle::LinearGradient(gradient)
+            | FillStyle::RadialGradient(gradient)
+            | FillStyle::FocalGradient { gradient, .. } = style
+            {
+                bytes += gradient.records.capacity() * size_of::<swf::GradientRecord>();
+            }
+        }
+        bytes
+    }
+}
 #[derive(Clone, Debug)]
 pub enum OwnedDrawPath {
     Stroke {

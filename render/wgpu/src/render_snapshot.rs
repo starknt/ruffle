@@ -189,6 +189,7 @@ fn foreign() -> RenderFailure {
 
 /// CPU-owned stage data; the receiving renderer resolves the resource versions.
 pub struct FramePacket {
+    pub(crate) payload: Option<crate::gpu_runtime::OwnedPayload>,
     pub(crate) key: PacketKey,
     pub(crate) draw: Arc<PacketDraw>,
 }
@@ -555,6 +556,67 @@ impl Capture {
     }
 }
 impl PreparedSnapshot {
+    /// Conservative retained weight while this snapshot waits in a session.
+    /// Shared display pages are counted once within a packet. Independent
+    /// live packets each reserve enough space to retain their dependencies.
+    pub(crate) fn packet_bytes(&self) -> u64 {
+        let mut bytes = size_of::<PacketDraw>() + size_of::<FramePacket>();
+        let mut seen = fnv::FnvHashSet::default();
+        let mut pending = vec![self.snapshot.commands.as_ref()];
+        while let Some(nodes) = pending.pop() {
+            if !seen.insert(nodes.as_ptr()) {
+                continue;
+            }
+            bytes = bytes.saturating_add(size_of_val(nodes));
+            for node in nodes {
+                match &node.command {
+                    SnapshotCommand::Shared(children) | SnapshotCommand::Blend { children, .. } => {
+                        pending.push(children)
+                    }
+                    SnapshotCommand::AlphaMask { maskee, mask } => {
+                        pending.extend([maskee.as_ref(), mask.as_ref()])
+                    }
+                    _ => (),
+                }
+            }
+        }
+        bytes = bytes
+            .saturating_add(
+                self.bindings.resources.capacity() * size_of::<(ResourceVersion, Handle)>(),
+            )
+            .saturating_add(
+                self.bindings.resource_indices.capacity() * size_of::<(ResourceVersion, usize)>(),
+            )
+            .saturating_add(self.snapshot.recipes.capacity() * size_of::<ResourceRecipe>());
+        for recipe in &self.snapshot.recipes {
+            match recipe {
+                ResourceRecipe::Bitmap {
+                    pixels, coverage, ..
+                } => {
+                    bytes = bytes
+                        .saturating_add(pixels.data().len())
+                        .saturating_add(coverage.mask_storage_bytes());
+                }
+                ResourceRecipe::Shape {
+                    geometry,
+                    bitmap_sizes,
+                    bitmaps,
+                    ..
+                } => {
+                    bytes = bytes
+                        .saturating_add(geometry.as_ref().map_or(0, |shape| shape.storage_bytes()))
+                        .saturating_add(
+                            bitmap_sizes.capacity()
+                                * size_of::<(u16, ruffle_render::bitmap::BitmapSize)>(),
+                        )
+                        .saturating_add(bitmaps.capacity() * size_of::<(u16, ResourceVersion)>());
+                }
+                ResourceRecipe::Resident(_) => (),
+            }
+        }
+        bytes as u64
+    }
+
     /// A filtered tile can be replayed only if this version describes every
     /// pixel input. Textured meshes may refer to mutable BitmapData.
     pub(super) fn single_tile_draw(&self) -> Option<&SnapshotCommand> {

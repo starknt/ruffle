@@ -98,6 +98,116 @@ fn queued_stage3d_uploads_retain_bytes_and_execute_in_issue_order() {
     assert_eq!(context.uploads.applied(), 2);
 }
 
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn saturated_upload_queue_leaves_sibling_uploads_and_pixel_reads_live() {
+    use crate::{backend::WgpuRenderBackend, target::TextureTarget};
+    use ruffle_render::{
+        backend::RenderBackend,
+        bitmap::{Bitmap, BitmapFormat, PixelRegion},
+    };
+    let descriptors = descriptors(4096);
+    let context = || WgpuContext3D::new(descriptors.clone(), Context3DProfile::Baseline).unwrap();
+    let mut stalled = context();
+    let mut sibling = context();
+    sibling.owned_uploads = true;
+    let mut renderer = WgpuRenderBackend::with_options(
+        descriptors.clone(),
+        TextureTarget::new(&descriptors.device, (2, 1)).unwrap(),
+        false,
+    )
+    .unwrap();
+    let bitmap = renderer
+        .register_bitmap(Bitmap::new(
+            2,
+            1,
+            BitmapFormat::Rgba,
+            vec![2, 4, 6, 255, 23, 67, 211, 255],
+        ))
+        .unwrap();
+    let buffer = descriptors
+        .device
+        .create_buffer(&BufferDescriptor {
+            label: None,
+            size: 4096,
+            usage: BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let target = UploadTarget::Buffer(buffer.clone());
+    let layout = UploadLayout::Buffer { offset: 0 };
+    stalled
+        .uploads
+        .enqueue(target.clone(), layout, &[0; 4096])
+        .unwrap();
+    let full = sibling
+        .uploads
+        .enqueue(target.clone(), layout, &[0; 4])
+        .unwrap_err();
+    assert_eq!(
+        full.kind(),
+        crate::gpu_runtime::RenderFailureKind::BudgetExceeded
+    );
+
+    let mut indices = IndexBufferWrapper {
+        _lifetime: sibling.operations.create_resource().unwrap(),
+        buffer: buffer.clone(),
+        data: vec![0; 4096],
+    };
+    sibling
+        .process_command(Context3DCommand::UploadToIndexBuffer {
+            buffer: &mut indices,
+            start_offset: 0,
+            data: &[11, 22, 33, 44],
+        })
+        .unwrap();
+    assert_eq!(&read_buffer(&mut sibling, &buffer)[..4], &[11, 22, 33, 44]);
+    let mut observed = Vec::new();
+    renderer
+        .read_bitmap_region(
+            &bitmap,
+            PixelRegion::for_pixel(1, 0),
+            Box::new(|pixels, _| observed.extend_from_slice(&pixels[..4])),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed, [23, 67, 211, 255]);
+    drop(stalled);
+    sibling.uploads.enqueue(target, layout, &[0; 4]).unwrap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn large_stage3d_vertex_upload_preserves_every_byte_across_staging_pages() {
+    let descriptors = descriptors(4096);
+    let mut context = WgpuContext3D::new(descriptors.clone(), Context3DProfile::Baseline).unwrap();
+    context.owned_uploads = true;
+    let source: Vec<u8> = (0..12292).map(|i| (i % 251) as u8).collect();
+    let buffer = descriptors
+        .device
+        .create_buffer(&BufferDescriptor {
+            label: None,
+            size: source.len() as u64,
+            usage: BufferUsages::COPY_SRC | BufferUsages::COPY_DST | BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let vertex = Rc::new(VertexBufferWrapper {
+        _lifetime: context.operations.create_resource().unwrap(),
+        buffer: buffer.clone(),
+        data_32_per_vertex: 1,
+    });
+    context
+        .process_command(Context3DCommand::UploadToVertexBuffer {
+            buffer: vertex,
+            start_vertex: 0,
+            data32_per_vertex: 1,
+            data: &source,
+        })
+        .unwrap();
+    assert_eq!(read_buffer(&mut context, &buffer), source);
+}
+
 fn read_buffer(context: &mut WgpuContext3D, source: &crate::gpu_resources::Buffer) -> Vec<u8> {
     let descriptors = context.descriptors.clone();
     let output = descriptors

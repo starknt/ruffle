@@ -4871,6 +4871,7 @@ dependencies = [
  "approx",
  "byteorder",
  "clap",
+ "crossbeam-channel",
  "enum-map",
  "flate2",
  "gif",
@@ -4904,6 +4905,7 @@ version = "0.7.1"
 dependencies = [
  "bytemuck",
  "clap",
+ "crossbeam-channel",
  "enum-map",
  "fnv",
  "futures",

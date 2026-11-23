@@ -3505,6 +3505,68 @@ fn packets_order_bitmap_creation_reads_and_the_last_release() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn held_frame_packets_share_the_upload_budget_and_release_it_on_drop() {
+    let descriptors = gpu_with_budgets(None, Some(8192));
+    let target = TextureTarget::new(&descriptors.device, (2, 1)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    let commands = || {
+        let mut commands = CommandList::new();
+        rect(&mut commands, 0., 0., 2., 1., Color::WHITE);
+        commands
+    };
+    let packet = renderer
+        .capture_stage_packet(Color::BLACK, commands(), vec![])
+        .unwrap();
+    assert!(
+        descriptors
+            .runtime
+            .reserve_payload(crate::gpu_runtime::PayloadKind::Upload, 8192)
+            .is_err(),
+        "a held picture must count against the device-wide queue"
+    );
+    let large = || {
+        let mut list = CommandList::new();
+        for _ in 0..200 {
+            rect(&mut list, 0., 0., 2., 1., Color::WHITE);
+        }
+        list
+    };
+    let failure = renderer
+        .capture_stage_packet(Color::BLACK, large(), vec![])
+        .err()
+        .unwrap();
+    assert_eq!(
+        failure.kind(),
+        crate::gpu_runtime::RenderFailureKind::BudgetExceeded
+    );
+    drop(packet);
+    let uploads = descriptors
+        .runtime
+        .reserve_payload(crate::gpu_runtime::PayloadKind::Upload, 8192)
+        .unwrap();
+    assert!(renderer.prepare_frame().unwrap());
+    renderer
+        .submit_frame(Color::BLACK, commands(), vec![])
+        .unwrap();
+    assert_eq!(
+        renderer.capture_frame().unwrap().unwrap().into_raw(),
+        [255; 8]
+    );
+    drop(uploads);
+    let next = renderer
+        .capture_stage_packet(Color::BLACK, commands(), vec![])
+        .unwrap();
+    drop(next);
+    assert!(
+        descriptors
+            .runtime
+            .reserve_payload(crate::gpu_runtime::PayloadKind::Upload, 8192)
+            .is_ok()
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn stage_packets_include_reliable_uploads_from_their_context3d() {
     use ruffle_render::backend::{BufferUsage, Context3DCommand, Context3DProfile};
     let descriptors = gpu();

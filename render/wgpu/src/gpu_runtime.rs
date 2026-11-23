@@ -4,6 +4,9 @@
 //! and binding dependencies. Once the last lease dies, bytes remain charged until
 //! the last recorded submission completes, even though wgpu owns GPU retirement.
 
+mod progress;
+pub use progress::GpuProgress;
+
 use fnv::FnvHashMap;
 pub use ruffle_render::error::{RenderFailure, RenderFailureKind, RendererHealth};
 use std::sync::{
@@ -169,6 +172,7 @@ pub enum ResourcePriority {
 #[derive(Clone, Debug)]
 pub struct ResourceInfo {
     visited: u64,
+    host_readers: usize,
     pub id: ResourceId,
     pub owner: ResourceOwner,
     pub kind: ResourceKind,
@@ -183,6 +187,11 @@ pub struct ResourceInfo {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuMemoryStats {
+    pub in_flight_bytes: u64,
+    pub host_sampling_bytes: u64,
+    pub queued_upload_bytes: u64,
+    pub queued_frame_bytes: u64,
+    pub encoding_payload_bytes: u64,
     pub reserved_bytes: u64,
     pub active_bytes: u64,
     pub idle_bytes: u64,
@@ -204,6 +213,10 @@ pub struct GpuMemoryStats {
 
 #[derive(Default)]
 struct Ledger {
+    owned_messages: usize,
+    // At most two submissions can be outstanding. Each bucket contains the
+    // unique bytes whose most recent use is that serial.
+    submission_bytes: [u64; 2],
     visit: u64,
     retiring: Vec<ResourceId>,
     records: FnvHashMap<ResourceId, ResourceInfo>,
@@ -219,6 +232,7 @@ struct Inner {
     config: GpuBudgetConfig,
     ledger: Mutex<Ledger>,
     failure: RendererHealth,
+    progress: Mutex<std::sync::Weak<GpuProgress>>,
 }
 
 impl Inner {
@@ -235,6 +249,53 @@ impl Inner {
 
 #[derive(Clone)]
 pub struct GpuRuntime(Arc<Inner>);
+
+/// CPU payload storage is admitted before copying. Keep GPU staging available
+/// to drain reliable work even when another session owns the entire CPU queue.
+#[derive(Clone, Copy)]
+pub(crate) enum PayloadKind {
+    Upload,
+    Frame,
+}
+
+pub(crate) struct OwnedPayload {
+    kind: PayloadKind,
+    runtime: GpuRuntime,
+    bytes: u64,
+    encoding: bool,
+}
+
+impl PayloadKind {
+    fn queued(self, stats: &mut GpuMemoryStats) -> &mut u64 {
+        match self {
+            Self::Upload => &mut stats.queued_upload_bytes,
+            Self::Frame => &mut stats.queued_frame_bytes,
+        }
+    }
+}
+
+impl OwnedPayload {
+    pub(crate) fn begin_encoding(&mut self) {
+        if !self.encoding {
+            let mut ledger = self.runtime.0.ledger();
+            *self.kind.queued(&mut ledger.stats) -= self.bytes;
+            ledger.stats.encoding_payload_bytes += self.bytes;
+            self.encoding = true;
+        }
+    }
+}
+
+impl Drop for OwnedPayload {
+    fn drop(&mut self) {
+        let mut ledger = self.runtime.0.ledger();
+        if self.encoding {
+            ledger.stats.encoding_payload_bytes -= self.bytes;
+        } else {
+            *self.kind.queued(&mut ledger.stats) -= self.bytes;
+        }
+        ledger.owned_messages -= 1;
+    }
+}
 
 impl std::fmt::Debug for GpuRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -321,7 +382,42 @@ impl GpuRuntime {
             config,
             ledger: Mutex::default(),
             failure,
+            progress: Default::default(),
         })))
+    }
+
+    /// Share the worker between the native owner and all renderer sessions.
+    /// Resource leases may outlive these owners while the last callback drains.
+    pub fn progress_owner(
+        &self,
+        device: &crate::gpu_resources::Device,
+    ) -> Result<Arc<GpuProgress>, RenderFailure> {
+        if !Arc::ptr_eq(&self.0, &device.runtime().0) {
+            return Err(failure(
+                RenderFailureKind::Validation,
+                "GPU progress belongs to another device",
+            ));
+        }
+        self.check_health()?;
+        let mut entry = self
+            .0
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(owner) = entry.upgrade() {
+            return Ok(owner);
+        }
+        let owner = Arc::new(GpuProgress::new(
+            device.raw().clone(),
+            self.health().clone(),
+        ));
+        *entry = Arc::downgrade(&owner);
+        Ok(owner)
+    }
+
+    /// Drive callbacks even while the VM and presenter are parked.
+    pub fn request_poll(&self, device: &crate::gpu_resources::Device) -> Result<(), RenderFailure> {
+        self.progress_owner(device)?.request()
     }
 
     pub fn scheduler(&self) -> &crate::resource_scheduler::ResourceScheduler {
@@ -334,6 +430,34 @@ impl GpuRuntime {
 
     pub fn config(&self) -> GpuBudgetConfig {
         self.0.config
+    }
+
+    pub(crate) fn reserve_payload(
+        &self,
+        kind: PayloadKind,
+        bytes: u64,
+    ) -> Result<OwnedPayload, RenderFailure> {
+        self.check_health()?;
+        let mut ledger = self.0.ledger();
+        let used = ledger.stats.queued_upload_bytes
+            + ledger.stats.queued_frame_bytes
+            + ledger.stats.encoding_payload_bytes;
+        if bytes > self.0.config.staging_limit - used
+            || ledger.owned_messages >= self.0.config.resource_limit
+        {
+            return Err(failure(
+                RenderFailureKind::BudgetExceeded,
+                "owned GPU payload queue is full",
+            ));
+        }
+        *kind.queued(&mut ledger.stats) += bytes;
+        ledger.owned_messages += 1;
+        Ok(OwnedPayload {
+            kind,
+            runtime: self.clone(),
+            bytes,
+            encoding: false,
+        })
     }
 
     pub fn generation(&self) -> u64 {
@@ -419,6 +543,7 @@ impl GpuRuntime {
         let created_submission = ledger.stats.submitted;
         ledger.insert(ResourceInfo {
             visited: 0,
+            host_readers: 0,
             id,
             owner,
             kind,
@@ -449,6 +574,11 @@ impl GpuRuntime {
         let stats = self.stats();
         let work = self.preparation().stats();
         ruffle_render::profile::NativeResources {
+            in_flight_bytes: stats.in_flight_bytes,
+            host_sampling_bytes: stats.host_sampling_bytes,
+            queued_frame_bytes: stats.queued_frame_bytes,
+            queued_upload_bytes: stats.queued_upload_bytes,
+            encoding_payload_bytes: stats.encoding_payload_bytes,
             device_generation: self.generation(),
             logical_bytes: stats.total_bytes,
             active_bytes: stats.active_bytes,
@@ -549,8 +679,10 @@ impl GpuRuntime {
             })?;
             if record.visited != visit {
                 record.visited = visit;
-                record.last_submission = serial;
                 pending.extend_from_slice(&record.dependencies);
+                let previous = std::mem::replace(&mut record.last_submission, serial);
+                let bytes = record.bytes;
+                ledger.submitted_bytes(serial, previous, bytes);
             }
         }
         ledger.stats.submitted = serial;
@@ -585,7 +717,9 @@ impl GpuRuntime {
                     "submission references a retired resource",
                 )
             })?;
-            record.last_submission = serial;
+            let previous = std::mem::replace(&mut record.last_submission, serial);
+            let bytes = record.bytes;
+            ledger.submitted_bytes(serial, previous, bytes);
         }
         ledger.stats.submitted = serial;
         Ok(SubmissionSerial {
@@ -603,6 +737,10 @@ impl GpuRuntime {
         let mut ledger = self.0.ledger();
         if serial.index <= ledger.stats.completed || serial.index > ledger.stats.submitted {
             return false;
+        }
+        for completed in ledger.stats.completed + 1..=serial.index {
+            let bytes = std::mem::take(&mut ledger.submission_bytes[(completed % 2) as usize]);
+            ledger.stats.in_flight_bytes -= bytes;
         }
         ledger.stats.completed = serial.index;
         // Completion only needs resources whose last owning lease has gone.
@@ -626,6 +764,15 @@ impl GpuRuntime {
 }
 
 impl Ledger {
+    fn submitted_bytes(&mut self, serial: u64, previous: u64, bytes: u64) {
+        if previous > self.stats.completed {
+            self.submission_bytes[(previous % 2) as usize] -= bytes;
+        } else {
+            self.stats.in_flight_bytes += bytes;
+        }
+        self.submission_bytes[(serial % 2) as usize] += bytes;
+    }
+
     fn next_submission(&self) -> Result<u64, RenderFailure> {
         if self.stats.submitted - self.stats.completed >= 2 {
             return Err(failure(
@@ -789,6 +936,25 @@ impl Drop for Allocation {
 #[derive(Clone)]
 pub struct ResourceLease(Arc<Allocation>);
 
+/// The host can hold a stage image across a resize and through the final
+/// consumer submission. Count its storage once even with overlapping readers.
+pub struct HostSample(ResourceLease);
+
+impl Drop for HostSample {
+    fn drop(&mut self) {
+        let mut ledger = self.0.0.runtime.0.ledger();
+        let record = ledger
+            .records
+            .get_mut(&self.0.id())
+            .expect("sampling pins its resource");
+        record.host_readers -= 1;
+        if record.host_readers == 0 {
+            let bytes = record.bytes;
+            ledger.stats.host_sampling_bytes -= bytes;
+        }
+    }
+}
+
 impl std::fmt::Debug for ResourceLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("ResourceLease").field(&self.id()).finish()
@@ -805,6 +971,19 @@ impl Drop for UnsubmittedUse {
 }
 
 impl ResourceLease {
+    pub fn host_sample(&self) -> HostSample {
+        let mut ledger = self.0.runtime.0.ledger();
+        let record = ledger
+            .records
+            .get_mut(&self.id())
+            .expect("live resource lease");
+        record.host_readers += 1;
+        if record.host_readers == 1 {
+            let bytes = record.bytes;
+            ledger.stats.host_sampling_bytes += bytes;
+        }
+        HostSample(self.clone())
+    }
     pub(crate) fn check_health(&self) -> Result<(), RenderFailure> {
         self.0.runtime.check_health()
     }

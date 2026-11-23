@@ -76,7 +76,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         self.pending_stage = None;
         self.encode_stage_caches(cache_entries)?;
         let route = self.stage_draw_route(&commands, self.target.format());
-        let packet = self.capture_stage_commands(clear, &commands, route)?;
+        let packet = self.capture_stage_commands(clear, &commands, route, true)?;
         if self.pending_stage.as_ref().is_some_and(
             |p| matches!(&p.content, StageContent::Live(bindings) if bindings.reads_stage3d),
         ) {
@@ -92,9 +92,18 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         clear: Color,
         commands: &CommandList,
         route: StageDrawRoute,
+        queued: bool,
     ) -> Result<FramePacket, RenderFailure> {
         let prepared =
             PreparedSnapshot::capture_for_device(commands, Some(self.packet_key.device))?;
+        let payload = if queued {
+            Some(self.descriptors.runtime.reserve_payload(
+                crate::gpu_runtime::PayloadKind::Frame,
+                prepared.packet_bytes(),
+            )?)
+        } else {
+            None
+        };
         self.packet_key.packet = self.packet_key.packet.checked_add(1).ok_or_else(|| {
             RenderFailure::new(
                 RenderFailureKind::Internal,
@@ -114,6 +123,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             content: StageContent::Live(prepared.bindings),
         });
         Ok(FramePacket {
+            payload,
             key: self.packet_key,
             draw,
         })
@@ -143,6 +153,10 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         frame: T::Frame,
         packet: FramePacket,
     ) -> Result<ruffle_render::backend::FrameSubmission, RenderFailure> {
+        let mut payload = packet.payload;
+        if let Some(ticket) = &mut payload {
+            ticket.begin_encoding();
+        }
         let pending = self.pending_stage.take().expect("matched pending stage");
         match pending.content {
             StageContent::Failed(error) => return Err(error),
@@ -566,7 +580,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                     crate::graph_encoder::SurfaceCommands::CachedBitmaps(commands)
                 }
                 StageDrawRoute::Graph => {
-                    let packet = self.capture_stage_commands(clear, &commands, route)?;
+                    let packet = self.capture_stage_commands(clear, &commands, route, false)?;
                     return self.submit_packet_to(frame_output, packet);
                 }
             }

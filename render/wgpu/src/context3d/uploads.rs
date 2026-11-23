@@ -1,7 +1,7 @@
 //! Upload bytes and ordering cross the command boundary. The context retains
 //! destinations only until their uploads have been recorded in its encoder.
 use crate::gpu_resources::{Buffer, CommandEncoder, StagingBelt, Texture};
-use crate::gpu_runtime::{RenderFailure, RenderFailureKind, ResourceId};
+use crate::gpu_runtime::{GpuRuntime, OwnedPayload, RenderFailure, RenderFailureKind, ResourceId};
 use fnv::FnvHashMap;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
@@ -43,10 +43,26 @@ impl UploadLayout {
     ) -> Result<(), RenderFailure> {
         match (self, target) {
             (Self::Buffer { offset }, UploadTarget::Buffer(buffer)) => {
-                if let Some(length) = NonZeroU64::new(data.len() as u64) {
-                    belt.write_buffer(encoder, buffer, offset, length)?
-                        .slice(..data.len())
-                        .copy_from_slice(data);
+                let bytes = data.len() as u64;
+                if !offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+                    || !bytes.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+                    || offset
+                        .checked_add(bytes)
+                        .is_none_or(|end| end > buffer.size())
+                {
+                    return Err(RenderFailure::new(
+                        RenderFailureKind::Validation,
+                        "invalid Stage3D buffer upload range",
+                    ));
+                }
+                let page = belt.page_size();
+                let mut position = offset;
+                for chunk in data.chunks(page as usize) {
+                    encoder.flush_uploads_if_needed(page)?;
+                    let length = NonZeroU64::new(chunk.len() as u64).expect("nonempty chunk");
+                    belt.write_buffer(encoder, buffer, position, length)?
+                        .copy_from_slice(chunk);
+                    position += length.get();
                 }
             }
             (Self::Texture { layer, size, bgra }, UploadTarget::Texture(texture)) => {
@@ -83,6 +99,7 @@ struct UploadPacket {
     destination: ResourceId,
     layout: UploadLayout,
     data: Box<[u8]>,
+    payload: OwnedPayload,
 }
 
 struct Binding {
@@ -90,8 +107,8 @@ struct Binding {
     remaining: usize,
 }
 
-#[derive(Default)]
 pub(super) struct UploadQueue {
+    runtime: GpuRuntime,
     issued: u64,
     applied: u64,
     pending: VecDeque<UploadPacket>,
@@ -100,6 +117,17 @@ pub(super) struct UploadQueue {
 }
 
 impl UploadQueue {
+    pub(super) fn new(runtime: GpuRuntime) -> Self {
+        Self {
+            runtime,
+            issued: 0,
+            applied: 0,
+            pending: Default::default(),
+            bindings: Default::default(),
+            failure: None,
+        }
+    }
+
     pub(super) fn enqueue(
         &mut self,
         target: UploadTarget,
@@ -116,6 +144,15 @@ impl UploadQueue {
             )
         })?;
         let destination = target.id();
+        if destination.device_generation() != self.runtime.generation() {
+            return Err(RenderFailure::new(
+                RenderFailureKind::Validation,
+                "Stage3D upload targets another device",
+            ));
+        }
+        let payload = self
+            .runtime
+            .reserve_payload(crate::gpu_runtime::PayloadKind::Upload, data.len() as u64)?;
         self.bindings
             .entry(destination)
             .or_insert(Binding {
@@ -128,6 +165,7 @@ impl UploadQueue {
             destination,
             layout,
             data: data.into(),
+            payload,
         });
         self.issued = sequence;
         Ok(())
@@ -141,7 +179,8 @@ impl UploadQueue {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
-        while let Some(packet) = self.pending.pop_front() {
+        while let Some(mut packet) = self.pending.pop_front() {
+            packet.payload.begin_encoding();
             let binding = self
                 .bindings
                 .get_mut(&packet.destination)

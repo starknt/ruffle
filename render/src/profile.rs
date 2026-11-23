@@ -312,6 +312,11 @@ pub struct Counters {
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct NativeResources {
+    pub in_flight_bytes: u64,
+    pub host_sampling_bytes: u64,
+    pub queued_upload_bytes: u64,
+    pub queued_frame_bytes: u64,
+    pub encoding_payload_bytes: u64,
     pub device_generation: u64,
     pub logical_bytes: u64,
     pub active_bytes: u64,

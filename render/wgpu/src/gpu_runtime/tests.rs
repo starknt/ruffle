@@ -13,6 +13,23 @@ fn owner(id: u64) -> ResourceOwner {
     ResourceOwner::new(OwnerKind::Movie, id)
 }
 
+#[test]
+fn pending_submission_bytes_charge_overlapping_uses_once_until_the_last_serial() {
+    let gpu = runtime(16);
+    let shared = allocation(&gpu, 8);
+    let old = allocation(&gpu, 4);
+    let bytes = || gpu.diagnostic_snapshot().in_flight_bytes;
+    let first = gpu.register_submission([&shared, &old]).unwrap();
+    let last = gpu.register_submission([&shared]).unwrap();
+    drop(old);
+    assert_eq!(bytes(), 12);
+    assert!(gpu.complete_submission(first));
+    assert_eq!(bytes(), 8);
+    assert!(gpu.complete_submission(last));
+    assert_eq!(bytes(), 0);
+    assert_eq!(gpu.stats().active_bytes, 8);
+}
+
 fn allocation(gpu: &GpuRuntime, bytes: u64) -> ResourceLease {
     gpu.reserve(ResourceKind::Texture, owner(1), bytes)
         .unwrap()

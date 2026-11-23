@@ -136,34 +136,35 @@ pub fn capture_image<R, F: FnOnce(&[u8], u32) -> R>(
     with_rgba: F,
 ) -> Result<R, crate::gpu_runtime::RenderFailure> {
     use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
-    let started = std::time::Instant::now();
-    let deadline = std::time::Duration::from_secs(2);
-    let (sender, receiver) = std::sync::mpsc::channel();
+    let timeout = std::time::Duration::from_secs(2);
+    device.runtime().check_health()?;
+    let failed = device.runtime().health().failure_signal();
+    let (sender, receiver) = crossbeam_channel::bounded(1);
     let buffer_slice = buffer.slice(..dimensions.size());
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.send(result);
+        let _ = sender.try_send(result);
     });
     let result = (|| {
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: index,
-                timeout: Some(deadline),
-            })
-            .map_err(poll_failure)?;
-        receiver
-            .recv_timeout(deadline.saturating_sub(started.elapsed()))
-            .map_err(|error| {
-                RenderFailure::new(
-                    RenderFailureKind::Timeout,
-                    format!("readback callback: {error}"),
-                )
-            })?
-            .map_err(|error| {
-                RenderFailure::new(
-                    RenderFailureKind::MapFailed,
-                    format!("readback map: {error}"),
-                )
-            })?;
+        // Mapping fences the buffer's last use. A later submission on a shared
+        // queue must not extend a synchronous pixel read's wait.
+        if let Some(index) = index {
+            match device.poll(wgpu::PollType::Wait {
+                submission_index: Some(index),
+                timeout: Some(std::time::Duration::ZERO),
+            }) {
+                Ok(_) | Err(wgpu::PollError::Timeout) => (),
+                Err(error) => return Err(poll_failure(error)),
+            }
+        }
+        device.runtime().request_poll(device)?;
+        crossbeam_channel::select_biased! {
+            recv(failed) -> _ => return Err(device.runtime().failure().expect("failed signal")),
+            recv(receiver) -> result => result
+                .map_err(|_| RenderFailure::new(RenderFailureKind::MapFailed, "readback map callback disconnected"))?
+                .map_err(|error| RenderFailure::new(RenderFailureKind::MapFailed, format!("readback map: {error}")))?,
+            default(timeout) => return Err(RenderFailure::new(RenderFailureKind::Timeout, "readback map callback timed out")),
+        }
+        device.runtime().check_health()?;
         let map = buffer_slice.get_mapped_range().map_err(|error| {
             RenderFailure::new(
                 RenderFailureKind::MapFailed,

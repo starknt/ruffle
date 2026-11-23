@@ -164,12 +164,13 @@ impl WgpuContext3D {
                 label: create_debug_label!("Buffer command encoder").as_deref(),
             })?;
 
+        let uploads = UploadQueue::new(descriptors.runtime.clone());
         Ok(Self {
             profile,
             descriptors,
             device,
             buffer_staging_belt,
-            uploads: UploadQueue::default(),
+            uploads,
             _lifetime: operations.create_resource()?,
             operations,
             owned_uploads: std::env::var_os("RUFFLE_OWNED_FRAMES").as_deref() == Some("1".as_ref()),
@@ -209,16 +210,24 @@ impl WgpuContext3D {
         bytes: &[u8],
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
         if self.owned_uploads {
-            self.uploads.enqueue(target, layout, bytes)?;
-            self.flush_uploads()
-        } else {
-            layout.encode(
-                &target,
-                bytes,
-                &mut self.buffer_staging_belt,
-                &mut self.buffer_command_encoder,
-            )
+            match self.uploads.enqueue(target.clone(), layout, bytes) {
+                Ok(()) => return self.flush_uploads(),
+                Err(error)
+                    if error.kind() == crate::gpu_runtime::RenderFailureKind::BudgetExceeded =>
+                {
+                    // Drain predecessors before copying this required write
+                    // directly from the VM into bounded GPU staging pages.
+                    self.flush_uploads()?;
+                }
+                Err(error) => return Err(error),
+            }
         }
+        layout.encode(
+            &target,
+            bytes,
+            &mut self.buffer_staging_belt,
+            &mut self.buffer_command_encoder,
+        )
     }
 
     fn flush_uploads(&mut self) -> Result<(), crate::gpu_runtime::RenderFailure> {

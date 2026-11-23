@@ -251,7 +251,7 @@ impl AsyncReadback {
                 let _ = sender.send(result);
             });
         let _ = index;
-        let _ = descriptors.device.poll(wgpu::PollType::Poll);
+        let _ = descriptors.runtime.request_poll(&descriptors.device);
         Self {
             buffer,
             dimensions,

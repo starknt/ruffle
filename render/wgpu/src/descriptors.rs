@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use wgpu::Backend;
 
 pub struct Descriptors {
+    _progress: Arc<crate::gpu_runtime::GpuProgress>,
     pub runtime: crate::gpu_runtime::GpuRuntime,
     pub wgpu_instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -92,6 +93,7 @@ impl Descriptors {
         let materials = crate::material_cache::MaterialCache::new(&runtime, 128);
         let bitmap_batches = crate::bitmap_batch::BitmapBatchCache::new(&runtime);
         Ok(Self {
+            _progress: runtime.progress_owner(&device)?,
             bitmap_batches,
             direct_bitmap_blends: std::env::var_os("RUFFLE_DIRECT_BITMAP_BLENDS").as_deref()
                 == Some(std::ffi::OsStr::new("1")),

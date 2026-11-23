@@ -12,6 +12,12 @@ pub struct Coverage {
     height: u32,
 }
 impl Coverage {
+    pub fn mask_storage_bytes(&self) -> usize {
+        self.mask
+            .as_ref()
+            .map_or(0, |mask| mask.capacity() * size_of::<u64>())
+    }
+
     pub fn new(region: PixelRegion, width: u32, height: u32) -> Self {
         Self {
             bounds: region,
