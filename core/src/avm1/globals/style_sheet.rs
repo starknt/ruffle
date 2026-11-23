@@ -187,7 +187,7 @@ fn load<'gc>(
     let request = Request::get(url.to_utf8_lossy().into_owned());
 
     let future = crate::loader::load_stylesheet(activation.context, this, request);
-    activation.context.navigator.spawn_future(future);
+    activation.context.spawn_future(future);
 
     Ok(true.into())
 }

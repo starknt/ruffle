@@ -264,7 +264,7 @@ fn spawn_load_var_fetch<'gc>(
 
     let future =
         crate::loader::load_form_into_load_vars(activation.context, loader_object, request);
-    activation.context.navigator.spawn_future(future);
+    activation.context.spawn_future(future);
 
     // Create hidden properties on object.
     let bytes_loaded_string = istr!("_bytesLoaded");

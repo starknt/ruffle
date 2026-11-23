@@ -6,7 +6,7 @@ use crate::avm2::object::{
 };
 use crate::avm2::{Activation as Avm2Activation, Avm2, EventObject as Avm2EventObject};
 use crate::backend::navigator::{
-    ErrorResponse, FetchReason, NavigatorBackend, OwnedFuture, Request,
+    ErrorResponse, FetchReason, OwnedFuture, Request,
 };
 use crate::context::UpdateContext;
 use crate::loader::Error;
@@ -242,7 +242,13 @@ impl<'gc> NetConnections<'gc> {
     pub fn update_connections(context: &mut UpdateContext<'gc>) {
         let player = context.player_handle();
         for (handle, connection) in context.net_connections.connections.iter_mut() {
-            connection.update(handle, context.navigator, &player);
+            if let Some(task) = connection.flush_pending(handle, &player) {
+                if let Some(spawner) = context.task_spawner {
+                    spawner.spawn(task);
+                } else {
+                    context.navigator.spawn_future(task);
+                }
+            }
         }
     }
 
@@ -428,19 +434,16 @@ impl NetConnection<'_> {
         }
     }
 
-    pub fn update(
+    fn flush_pending(
         &mut self,
-        self_handle: NetConnectionHandle,
-        navigator: &mut dyn NavigatorBackend,
+        handle: NetConnectionHandle,
         player: &Arc<Mutex<Player>>,
-    ) {
+    ) -> Option<crate::backend::tasks::PlayerTask> {
         match &mut self.protocol {
-            NetConnectionProtocol::Local => {}
-            NetConnectionProtocol::FlashRemoting(remoting) => {
-                if remoting.has_pending_packet() {
-                    navigator.spawn_future(remoting.flush_queue(self_handle, player.clone()));
-                }
+            NetConnectionProtocol::FlashRemoting(remoting) if remoting.has_pending_packet() => {
+                Some(remoting.flush_queue(handle, player.clone()))
             }
+            _ => None,
         }
     }
 

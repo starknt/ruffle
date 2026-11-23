@@ -579,7 +579,7 @@ fn spawn_xml_fetch<'gc>(
 
     let future =
         crate::loader::load_form_into_load_vars(activation.context, loader_object, request);
-    activation.context.navigator.spawn_future(future);
+    activation.context.spawn_future(future);
 
     Ok(true.into())
 }

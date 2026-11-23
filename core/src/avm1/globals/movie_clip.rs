@@ -1628,7 +1628,7 @@ fn load_movie<'gc>(
             base_clip: activation.base_clip(),
         },
     );
-    activation.context.navigator.spawn_future(future);
+    activation.context.spawn_future(future);
 
     Ok(Value::Undefined)
 }
@@ -1645,7 +1645,7 @@ fn load_variables<'gc>(
     let target = target.object1_or_bare(activation.gc());
     let request = activation.object_into_request(target, url, method);
     let future = crate::loader::load_form_into_object(activation.context, target, request);
-    activation.context.navigator.spawn_future(future);
+    activation.context.spawn_future(future);
 
     Ok(Value::Undefined)
 }

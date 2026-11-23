@@ -101,6 +101,7 @@ pub struct UpdateContext<'gc> {
 
     /// The navigator backend, used by the AVM to make HTTP requests and visit webpages.
     pub navigator: &'gc mut dyn NavigatorBackend,
+    pub(crate) task_spawner: Option<&'gc dyn crate::backend::tasks::TaskSpawner>,
 
     /// The renderer, used by the display objects to draw themselves.
     pub renderer: &'gc mut dyn RenderBackend,
@@ -259,6 +260,14 @@ impl<'gc> HasStringContext<'gc> for UpdateContext<'gc> {
 
 /// Convenience methods for controlling audio.
 impl<'gc> UpdateContext<'gc> {
+    pub fn spawn_future(&mut self, task: crate::backend::tasks::PlayerTask) {
+        if let Some(spawner) = self.task_spawner {
+            spawner.spawn(task);
+        } else {
+            self.navigator.spawn_future(task);
+        }
+    }
+
     pub(crate) fn in_wall_clock_method(&self) -> bool {
         !self.playback.wall_classes.is_empty()
             && self.avm2.call_stack().borrow().wall_clock(

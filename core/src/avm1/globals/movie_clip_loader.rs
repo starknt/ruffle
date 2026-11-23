@@ -74,7 +74,7 @@ fn load_clip<'gc>(
                         base_clip: activation.base_clip(),
                     },
                 );
-                activation.context.navigator.spawn_future(future);
+                activation.context.spawn_future(future);
 
                 return Ok(true.into());
             }

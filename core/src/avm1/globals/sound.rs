@@ -649,7 +649,7 @@ fn load_sound<'gc>(
             Request::get(request_url),
             load_id,
         );
-        activation.context.navigator.spawn_future(future);
+        activation.context.spawn_future(future);
     }
     Ok(Value::Undefined)
 }

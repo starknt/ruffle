@@ -256,7 +256,7 @@ pub fn load<'gc>(
         // FIXME: Set options from the `URLRequest`.
         Request::get(url.to_string()),
     );
-    activation.context.navigator.spawn_future(future);
+    activation.context.spawn_future(future);
     this.set_loading_state(SoundLoadingState::Loading);
 
     Ok(Value::Undefined)

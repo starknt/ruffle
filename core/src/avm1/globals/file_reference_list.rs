@@ -73,7 +73,7 @@ fn browse<'gc>(
             let process =
                 crate::loader::select_multi_file_dialog_avm1(activation.context, this, dialog);
 
-            activation.context.navigator.spawn_future(process);
+            activation.context.spawn_future(process);
             true
         }
         None => false,

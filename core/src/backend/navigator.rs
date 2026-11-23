@@ -9,7 +9,6 @@ use enumset::EnumSetType;
 use indexmap::IndexMap;
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::fmt;
 use std::fmt::Display;
 use std::fs::File;
@@ -17,7 +16,6 @@ use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::rc::Rc;
 use std::time::Duration;
 use swf::avm1::types::SendVarsMethod;
 use url::{ParseError, Url};
@@ -359,68 +357,11 @@ pub trait NavigatorBackend: Any {
     );
 }
 
-pub struct NullExecutor {
-    pool: futures::executor::LocalPool,
-    pending: Rc<Cell<usize>>,
-}
-
-impl NullExecutor {
-    pub fn new() -> Self {
-        Self {
-            pool: futures::executor::LocalPool::new(),
-            pending: Rc::new(Cell::new(0)),
-        }
-    }
-
-    pub fn spawner(&self) -> NullSpawner {
-        NullSpawner {
-            spawner: self.pool.spawner(),
-            pending: self.pending.clone(),
-        }
-    }
-
-    pub fn pending_tasks(&self) -> usize {
-        self.pending.get()
-    }
-
-    pub fn run(&mut self) {
-        self.pool.run_until_stalled();
-    }
-}
-
-impl Default for NullExecutor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub struct NullSpawner {
-    spawner: futures::executor::LocalSpawner,
-    pending: Rc<Cell<usize>>,
-}
+pub use super::tasks::{LocalExecutor as NullExecutor, LocalTaskSpawner as NullSpawner};
 
 impl NullSpawner {
     pub fn spawn_local(&self, future: OwnedFuture<(), Error>) {
-        use futures::task::LocalSpawnExt;
-        self.pending.set(self.pending.get().saturating_add(1));
-        let pending = self.pending.clone();
-        let result = self.spawner.spawn_local(async move {
-            struct PendingGuard(Rc<Cell<usize>>);
-
-            impl Drop for PendingGuard {
-                fn drop(&mut self) {
-                    self.0.set(self.0.get().saturating_sub(1));
-                }
-            }
-
-            let _pending = PendingGuard(pending);
-            if let Err(e) = future.await {
-                tracing::error!("Asynchronous error occurred: {}", e);
-            }
-        });
-        if result.is_err() {
-            self.pending.set(self.pending.get().saturating_sub(1));
-        }
+        super::tasks::TaskSpawner::spawn(self, future);
     }
 }
 
@@ -442,6 +383,10 @@ impl NullNavigatorBackend {
             spawner: executor.spawner(),
             relative_base_path: PathBuf::new(),
         }
+    }
+
+    pub fn for_directory(path: &Path) -> std::io::Result<Self> {
+        Ok(Self { relative_base_path: path.canonicalize()?, ..Self::new() })
     }
 
     pub fn with_base_path(path: &Path, executor: &NullExecutor) -> Result<Self, std::io::Error> {

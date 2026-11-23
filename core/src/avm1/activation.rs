@@ -1304,7 +1304,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                                 base_clip: self.base_clip,
                             },
                         );
-                        self.context.navigator.spawn_future(future);
+                        self.context.spawn_future(future);
                     }
                 }
                 Err(e) => avm_warn!(
@@ -1394,7 +1394,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                     );
                     let future =
                         crate::loader::load_form_into_object(self.context, target_obj, request);
-                    self.context.navigator.spawn_future(future);
+                    self.context.spawn_future(future);
                 }
                 return Ok(FrameControl::Continue);
             }
@@ -1426,7 +1426,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                             base_clip: self.base_clip,
                         },
                     );
-                    self.context.navigator.spawn_future(future);
+                    self.context.spawn_future(future);
                 }
             }
             return Ok(FrameControl::Continue);
@@ -1454,7 +1454,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                             base_clip: self.base_clip,
                         },
                     );
-                    self.context.navigator.spawn_future(future);
+                    self.context.spawn_future(future);
                 }
             }
             return Ok(FrameControl::Continue);

@@ -136,7 +136,7 @@ pub fn load<'gc>(
             load_bytes_info: None,
         },
     );
-    activation.context.navigator.spawn_future(future);
+    activation.context.spawn_future(future);
 
     Ok(Value::Undefined)
 }

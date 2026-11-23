@@ -38,7 +38,7 @@ fn spawn_fetch<'gc>(
             .context
             .load_manager
             .cancellable_read(loader_object, &player, None, future);
-    activation.context.navigator.spawn_future(future);
+    activation.context.spawn_future(future);
     Ok(Value::Undefined)
 }
 

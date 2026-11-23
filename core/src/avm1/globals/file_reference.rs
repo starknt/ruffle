@@ -322,7 +322,7 @@ pub fn browse<'gc>(
         Some(dialog) => {
             let process = crate::loader::select_file_dialog_avm1(activation.context, this, dialog);
 
-            activation.context.navigator.spawn_future(process);
+            activation.context.spawn_future(process);
             true
         }
         None => false,
@@ -381,7 +381,7 @@ pub fn download<'gc>(
                     url_string,
                 );
 
-                activation.context.navigator.spawn_future(process);
+                activation.context.spawn_future(process);
                 true
             }
             None => false,
@@ -432,7 +432,7 @@ pub fn upload<'gc>(
                 file_name,
             );
 
-            activation.context.navigator.spawn_future(process);
+            activation.context.spawn_future(process);
 
             return Ok(true.into());
         }

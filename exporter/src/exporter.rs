@@ -2,10 +2,10 @@ use std::ops::Range;
 use std::panic::catch_unwind;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use image::RgbaImage;
-use ruffle_core::Player;
+use ruffle_core::PlayerSession;
+use ruffle_core::backend::navigator::NullNavigatorBackend;
 use ruffle_core::PlayerBuilder;
 use ruffle_core::backend::locale::DeterministicLocaleBackend;
 use ruffle_core::limits::ExecutionLimit;
@@ -75,7 +75,10 @@ impl Exporter {
 
         let target = TextureTarget::new(&self.descriptors.device, (width, height))
             .map_err(|e| anyhow!(e.to_string()))?;
-        let player = PlayerBuilder::new()
+        let movie_path = swf_path.canonicalize()?;
+        let base = movie_path.parent().ok_or_else(|| anyhow!("Movie has no parent directory"))?;
+        let session = PlayerBuilder::new()
+            .with_navigator(NullNavigatorBackend::for_directory(base)?)
             .with_renderer(
                 WgpuRenderBackend::new(self.descriptors.clone(), target)
                     .map_err(|e| anyhow!(e.to_string()))?,
@@ -83,40 +86,44 @@ impl Exporter {
             .with_locale(DeterministicLocaleBackend::default())
             .with_movie(movie)
             .with_viewport_dimensions(width, height, self.size.scale)
-            .build();
+            .build_session();
 
         Ok(MovieExport {
-            frames: self.frames.capture_range(&player, self.skipframes),
-            player,
+            frames: self.frames.capture_range(session.player(), self.skipframes),
+            session,
             force_play: self.force_play,
         })
     }
 }
 
 pub struct MovieExport {
-    player: Arc<Mutex<Player>>,
+    session: PlayerSession,
     pub frames: Range<u64>,
     force_play: bool,
 }
 
 impl MovieExport {
-    pub fn run_frame(&self) {
+    pub fn run_frame(&mut self) {
+        self.session.poll_tasks();
+        let player = self.session.player();
         if self.force_play {
-            self.player.force_root_clip_play();
+            player.force_root_clip_play();
         }
 
-        self.player
+        player
             .lock()
             .unwrap()
             .preload(&mut ExecutionLimit::none());
 
-        self.player.lock().unwrap().run_frame();
+        player.lock().unwrap().run_frame();
+        self.session.poll_tasks();
     }
 
     pub fn capture_frame(&self) -> Result<RgbaImage> {
+        let player = self.session.player();
         let image = || {
-            self.player.lock().unwrap().render()?;
-            self.player.capture_frame()
+            player.lock().unwrap().render()?;
+            player.capture_frame()
         };
         match catch_unwind(image) {
             Ok(Ok(Some(image))) => Ok(image),

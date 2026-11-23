@@ -323,6 +323,22 @@ enum RunState {
     Stepping,
 }
 
+pub struct PlayerSession {
+    player: Arc<Mutex<Player>>,
+    executor: crate::backend::tasks::LocalExecutor,
+}
+
+impl PlayerSession {
+    /// The handle may be locked by tasks. Release its guard before polling.
+    pub fn player(&self) -> &Arc<Mutex<Player>> {
+        &self.player
+    }
+
+    pub fn poll_tasks(&mut self) {
+        self.executor.run();
+    }
+}
+
 pub struct Player {
     render_epoch: u64,
     snapshots: crate::display_object::snapshot::Cache,
@@ -352,6 +368,7 @@ pub struct Player {
     renderer: Box<dyn RenderBackend>,
     audio: Box<dyn AudioBackend>,
     navigator: Box<dyn NavigatorBackend>,
+    task_spawner: Option<Box<dyn crate::backend::tasks::TaskSpawner>>,
     storage: Box<dyn StorageBackend>,
     log: Box<dyn LogBackend>,
     ui: Box<dyn UiBackend>,
@@ -510,7 +527,7 @@ impl Player {
                 parameters,
                 on_metadata,
             );
-            context.navigator.spawn_future(future);
+            context.spawn_future(future);
         });
     }
 
@@ -2698,6 +2715,7 @@ impl Player {
                 renderer: this.renderer.deref_mut(),
                 audio: this.audio.deref_mut(),
                 navigator: this.navigator.deref_mut(),
+                task_spawner: this.task_spawner.as_deref(),
                 ui: this.ui.deref_mut(),
                 action_queue,
                 gc_context,
@@ -3457,6 +3475,21 @@ impl PlayerBuilder {
 
     /// Builds the player, wiring up the backends and configuring the specified settings.
     pub fn build(self) -> Arc<Mutex<Player>> {
+        self.build_inner(None)
+    }
+
+    /// A headless session owns its executor until the host drops the session.
+    pub fn build_session(self) -> PlayerSession {
+        let executor = crate::backend::tasks::LocalExecutor::new();
+        let player = self.build_with_spawner(executor.spawner());
+        PlayerSession { player, executor }
+    }
+
+    pub fn build_with_spawner(self, spawner: impl crate::backend::tasks::TaskSpawner + 'static) -> Arc<Mutex<Player>> {
+        self.build_inner(Some(Box::new(spawner)))
+    }
+
+    fn build_inner(self, task_spawner: Option<Box<dyn crate::backend::tasks::TaskSpawner>>) -> Arc<Mutex<Player>> {
         use crate::backend::*;
         use ruffle_video::null;
         let audio = self
@@ -3502,6 +3535,7 @@ impl PlayerBuilder {
                 audio,
                 log,
                 navigator,
+                task_spawner,
                 renderer,
                 storage,
                 ui,
@@ -3763,6 +3797,27 @@ pub enum PlayerMode {
 mod tests {
     use super::*;
     use ruffle_render::error::{RenderFailure, RenderFailureKind};
+
+    #[test]
+    fn default_session_retains_tasks_until_the_host_polls() {
+        use std::rc::Rc;
+        let mut session = PlayerBuilder::new().build_session();
+        let player = session.player().clone();
+        let weak = Arc::downgrade(&player);
+        let flag = Rc::new(std::cell::Cell::new(false));
+        let task_flag = flag.clone();
+        player.lock().unwrap().mutate_with_update_context(|context| {
+            context.spawn_future(Box::pin(async move {
+                assert!(weak.upgrade().unwrap().try_lock().is_ok());
+                task_flag.set(true);
+                Ok(())
+            }));
+        });
+        assert_eq!(Rc::strong_count(&flag), 2, "queued task was dropped before polling");
+        assert!(!flag.get());
+        session.poll_tasks();
+        assert!(flag.get());
+    }
 
     #[test]
     fn logical_frame_count_advances_without_rendering() {

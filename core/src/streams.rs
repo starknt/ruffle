@@ -609,7 +609,7 @@ impl<'gc> NetStream<'gc> {
 
             let future = crate::loader::load_netstream(context, self, request);
 
-            context.navigator.spawn_future(future);
+            context.spawn_future(future);
         }
 
         self.0.playing.set(true);

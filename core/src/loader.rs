@@ -1350,7 +1350,7 @@ impl<'gc> MovieLoader<'gc> {
                     }),
                 }
             });
-            uc.navigator.spawn_future(future);
+            uc.spawn_future(future);
             return Ok(());
         }
         let clip = match uc.load_manager.get_loader(handle) {

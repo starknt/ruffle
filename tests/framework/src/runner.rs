@@ -126,7 +126,7 @@ impl TestRunner {
             .setup(builder)?
             .with_movie(movie)
             .with_autoplay(true) //.tick() requires playback
-            .build();
+            .build_with_spawner(executor.spawner());
 
         test.options
             .default_fonts

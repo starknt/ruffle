@@ -820,7 +820,7 @@ impl<'gc> MovieClip<'gc> {
             .preload_progress
             .awaiting_import
             .set(true);
-        context.navigator.spawn_future(fut);
+        context.spawn_future(fut);
 
         Ok(())
     }
@@ -2488,7 +2488,7 @@ impl<'gc> MovieClip<'gc> {
                 Ok(())
             });
 
-            context.navigator.spawn_future(future);
+            context.spawn_future(future);
         } else {
             self.avm1_unload(context);
             self.transform_to_unloaded_state(context);

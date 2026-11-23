@@ -9,7 +9,7 @@ use crate::gui::{FilePicker, MovieView};
 use crate::preferences::GlobalPreferences;
 use crate::{CALLSTACK, RENDER_INFO, SWF_INFO};
 use anyhow::anyhow;
-use ruffle_core::backend::navigator::{OwnedFuture, SocketMode};
+use ruffle_core::backend::navigator::SocketMode;
 use ruffle_core::config::Letterbox;
 use ruffle_core::events::{GamepadButton, KeyCode};
 use ruffle_core::font::DefaultFont;
@@ -217,7 +217,7 @@ impl ActivePlayer {
                 .unwrap_or_else(|| movie_url.clone()),
             opt.player.referer.clone(),
             opt.player.cookie.clone(),
-            future_spawner,
+            future_spawner.clone(),
             opt.proxy.clone(),
             opt.player.upgrade_to_https.unwrap_or_default(),
             opt.socket_allowed.clone(),
@@ -337,7 +337,7 @@ impl ActivePlayer {
             .with_player_runtime(opt.player.player_runtime.unwrap_or_default())
             .with_frame_rate(opt.player.frame_rate)
             .with_avm2_optimizer_enabled(opt.avm2_optimizer_enabled);
-        let player = builder.build();
+        let player = builder.build_with_spawner(future_spawner);
 
         window.set_title(&format!("Ruffle - {readable_name}"));
 
@@ -533,13 +533,14 @@ impl PlayerId {
 pub struct PlayerRunnable(async_task::Runnable<PlayerId>);
 
 /// A bare-bones executor that schedules tasks on the winit event loop.
+#[derive(Clone)]
 struct WinitExecutor {
     event_loop: EventLoopProxy<RuffleEvent>,
     player_id: PlayerId,
 }
 
-impl<E: std::error::Error + 'static> FutureSpawner<E> for WinitExecutor {
-    fn spawn(&self, future: OwnedFuture<(), E>) {
+impl ruffle_core::backend::tasks::TaskSpawner for WinitExecutor {
+    fn try_spawn(&self, future: ruffle_core::backend::tasks::PlayerTask) -> Result<(), ruffle_core::backend::tasks::SpawnError> {
         // Discard any errors.
         let future = async {
             if let Err(e) = future.await {
@@ -562,6 +563,13 @@ impl<E: std::error::Error + 'static> FutureSpawner<E> for WinitExecutor {
         // The future should run in the background.
         task.detach();
         // Immediately schedule the future to be polled for the first time.
-        runnable.schedule();
+        self.event_loop.send_event(RuffleEvent::TaskPoll(PlayerRunnable(runnable)))
+            .map_err(|_| ruffle_core::backend::tasks::SpawnError::shutdown())
+    }
+}
+
+impl FutureSpawner<ruffle_core::loader::Error> for WinitExecutor {
+    fn spawn(&self, future: ruffle_core::backend::tasks::PlayerTask) {
+        ruffle_core::backend::tasks::TaskSpawner::spawn(self, future);
     }
 }

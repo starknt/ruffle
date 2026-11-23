@@ -194,7 +194,7 @@ pub fn browse<'gc>(
         Some(dialog) => {
             let process = crate::loader::select_file_dialog_avm2(activation.context, this, dialog);
 
-            activation.context.navigator.spawn_future(process);
+            activation.context.spawn_future(process);
             true
         }
         None => false,
@@ -275,7 +275,7 @@ pub fn save_internal<'gc>(
         Some(dialog) => {
             let process = crate::loader::save_file_dialog(activation.context, this, dialog, data);
 
-            activation.context.navigator.spawn_future(process);
+            activation.context.spawn_future(process);
         }
         None => return Err(make_error_2174(activation)),
     }

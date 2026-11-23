@@ -24,7 +24,7 @@ enum Output<'a> {
 }
 
 fn capture_frames(
-    movie: &MovieExport,
+    movie: &mut MovieExport,
     swf: &Path,
     output: Output<'_>,
     progress: &ExporterProgress,
@@ -121,8 +121,8 @@ fn capture_single_swf(exporter: &Exporter, opt: &Opt) -> Result<()> {
     };
 
     let progress = ExporterProgress::new(opt, 1);
-    let movie = exporter.start_exporting_movie(&opt.swf)?;
-    capture_frames(&movie, &opt.swf, destination, &progress)?;
+    let mut movie = exporter.start_exporting_movie(&opt.swf)?;
+    capture_frames(&mut movie, &opt.swf, destination, &progress)?;
     let count = movie.frames.end - movie.frames.start;
     if count == 1 && opt.silent {
         return Ok(());
@@ -146,7 +146,7 @@ fn capture_multiple_swfs(exporter: &Exporter, opt: &Opt, output: &Path) -> Resul
 
     let export_file = |entry: &DirEntry| -> Result<()> {
         let file = entry.path();
-        let movie = exporter.start_exporting_movie(file)?;
+        let mut movie = exporter.start_exporting_movie(file)?;
         let single = movie.frames.end - movie.frames.start == 1;
         let relative = file.strip_prefix(&opt.swf)?;
         let destination = output.join(relative.with_extension(if single { "png" } else { "" }));
@@ -154,9 +154,9 @@ fn capture_multiple_swfs(exporter: &Exporter, opt: &Opt, output: &Path) -> Resul
             if let Some(parent) = destination.parent() {
                 create_dir_all(parent)?;
             }
-            capture_frames(&movie, file, Output::File(&destination), &progress)
+            capture_frames(&mut movie, file, Output::File(&destination), &progress)
         } else {
-            capture_frames(&movie, file, Output::Directory(&destination), &progress)
+            capture_frames(&mut movie, file, Output::Directory(&destination), &progress)
         }
     };
     // A bad input should not suppress valid siblings or turn a partial export into success.
