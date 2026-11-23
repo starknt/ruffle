@@ -97,11 +97,12 @@ fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         displaced.x / filter_args.source_width,
         displaced.y / filter_args.source_height,
     );
-    let out_of_bounds = displaced_uv.x < 0.0 || displaced_uv.x > 1.0 || displaced_uv.y < 0.0 || displaced_uv.y > 1.0;
+    let outside = (displaced_uv < vec2<f32>(0.0)) | (displaced_uv > vec2<f32>(1.0));
+    let out_of_bounds = any(outside);
 
-    // 0 wrap is already taken care of by the sampler, we can ignore it here
     if (filter_args.mode == 1u) { // clamp
-        displaced_uv = saturate(displaced_uv);
+        // The repeating sampler blends the same two edge texels at 0 and 1.
+        displaced_uv = select(displaced_uv, vec2<f32>(0.0), outside);
     } else if (filter_args.mode == 2u && out_of_bounds) { // ignore
         displaced_uv = in.uv;
     }
