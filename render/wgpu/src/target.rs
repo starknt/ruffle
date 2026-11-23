@@ -59,10 +59,131 @@ pub trait RenderTarget: Debug + 'static {
     ) -> Result<wgpu::SubmissionIndex, Error>;
 }
 
+enum Acquisition {
+    Frame(wgpu::SurfaceTexture, bool),
+    Reconfigure,
+    Lost,
+    Skip,
+}
+
+fn surface_acquisition(status: wgpu::CurrentSurfaceTexture) -> Result<Acquisition, Error> {
+    use wgpu::CurrentSurfaceTexture as Status;
+    Ok(match status {
+        Status::Success(frame) => Acquisition::Frame(frame, false),
+        Status::Suboptimal(frame) => Acquisition::Frame(frame, true),
+        Status::Outdated => Acquisition::Reconfigure,
+        Status::Lost => Acquisition::Lost,
+        Status::Timeout | Status::Occluded => Acquisition::Skip,
+        Status::Validation => {
+            return Err(Error::new(
+                RenderFailureKind::Validation,
+                "surface acquisition failed",
+            ));
+        }
+    })
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    #[test]
+    fn a_lost_surface_requests_a_new_window_target_on_a_healthy_device() {
+        assert!(matches!(
+            surface_acquisition(wgpu::CurrentSurfaceTexture::Lost).unwrap(),
+            Acquisition::Lost
+        ));
+        assert!(matches!(
+            surface_acquisition(wgpu::CurrentSurfaceTexture::Outdated).unwrap(),
+            Acquisition::Reconfigure
+        ));
+        assert!(matches!(
+            surface_acquisition(wgpu::CurrentSurfaceTexture::Occluded).unwrap(),
+            Acquisition::Skip
+        ));
+    }
+}
+
+/// A window owns surface recreation. Device health is reported independently.
+#[derive(Debug)]
+pub struct PresentationSurface {
+    surface: Option<wgpu::Surface<'static>>,
+    config: wgpu::SurfaceConfiguration,
+    needs_configure: bool,
+}
+
+impl PresentationSurface {
+    pub fn new(
+        surface: wgpu::Surface<'static>,
+        config: wgpu::SurfaceConfiguration,
+        device: &crate::gpu_resources::Device,
+    ) -> Result<Self, Error> {
+        device.configure_surface(&surface, &config)?;
+        Ok(Self {
+            surface: Some(surface),
+            config,
+            needs_configure: false,
+        })
+    }
+
+    pub fn needs_recreation(&self) -> bool {
+        self.surface.is_none()
+    }
+
+    /// Release the native surface before its platform window is destroyed.
+    pub fn detach(&mut self) {
+        self.surface = None;
+    }
+
+    pub fn config(&self) -> &wgpu::SurfaceConfiguration {
+        &self.config
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.config.width = width;
+        self.config.height = height;
+        self.needs_configure = true;
+    }
+
+    pub fn acquire(
+        &mut self,
+        device: &crate::gpu_resources::Device,
+    ) -> Result<Option<wgpu::SurfaceTexture>, Error> {
+        device.runtime().check_health()?;
+        let Some(surface) = &self.surface else {
+            return Ok(None);
+        };
+        if self.needs_configure {
+            device.configure_surface(surface, &self.config)?;
+            self.needs_configure = false;
+        }
+        self.finish_acquire(surface.get_current_texture())
+    }
+
+    fn finish_acquire(
+        &mut self,
+        status: wgpu::CurrentSurfaceTexture,
+    ) -> Result<Option<wgpu::SurfaceTexture>, Error> {
+        match surface_acquisition(status)? {
+            Acquisition::Frame(frame, suboptimal) => {
+                self.needs_configure = suboptimal;
+                Ok(Some(frame))
+            }
+            Acquisition::Lost => {
+                self.detach();
+                Ok(None)
+            }
+            Acquisition::Reconfigure => {
+                self.needs_configure = true;
+                Ok(None)
+            }
+            Acquisition::Skip => Ok(None),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SwapChainTarget {
-    window_surface: wgpu::Surface<'static>,
-    surface_config: wgpu::SurfaceConfiguration,
+    window_surface: PresentationSurface,
     device: crate::gpu_resources::Device,
 }
 
@@ -83,6 +204,12 @@ impl RenderTargetFrame for SwapChainTargetFrame {
 }
 
 impl SwapChainTarget {
+    /// On a deferred acquisition the owner can supply its current native
+    /// window through `WgpuRenderBackend::recreate_surface_unsafe`.
+    pub fn needs_recreation(&self) -> bool {
+        self.window_surface.needs_recreation()
+    }
+
     pub fn new(
         surface: wgpu::Surface<'static>,
         adapter: &wgpu::Adapter,
@@ -143,10 +270,8 @@ impl SwapChainTarget {
                 vec![format, linear_format]
             },
         };
-        device.configure_surface(&surface, &surface_config)?;
         Ok(Self {
-            surface_config,
-            window_surface: surface,
+            window_surface: PresentationSurface::new(surface, surface_config, device)?,
             device: device.clone(),
         })
     }
@@ -157,57 +282,31 @@ impl RenderTarget for SwapChainTarget {
 
     fn resize(
         &mut self,
-        device: &crate::gpu_resources::Device,
+        _device: &crate::gpu_resources::Device,
         width: u32,
         height: u32,
     ) -> Result<(), Error> {
-        self.surface_config.width = width;
-        self.surface_config.height = height;
-        device.configure_surface(&self.window_surface, &self.surface_config)?;
-
+        self.window_surface.resize(width, height);
         Ok(())
     }
 
     fn format(&self) -> wgpu::TextureFormat {
-        remove_srgb(self.surface_config.format)
+        remove_srgb(self.window_surface.config().format)
     }
 
     fn width(&self) -> u32 {
-        self.surface_config.width
+        self.window_surface.config().width
     }
 
     fn height(&self) -> u32 {
-        self.surface_config.height
+        self.window_surface.config().height
     }
 
     fn get_next_texture(&mut self) -> Result<Option<Self::Frame>, Error> {
-        let texture = match self.window_surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
-            // The texture is still usable - no reason to waste an already
-            // acquired frame. Ideally the surface should also be reconfigured
-            // before the next acquire; we don't currently do that (matching
-            // pre-wgpu-29 behavior, which never checked the suboptimal flag).
-            wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => surface_texture,
-            wgpu::CurrentSurfaceTexture::Lost => {
-                return Err(Error::new(RenderFailureKind::DeviceLost, "surface lost"));
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(Error::new(
-                    RenderFailureKind::Validation,
-                    "surface acquisition failed",
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.device
-                    .configure_surface(&self.window_surface, &self.surface_config)?;
-                return Ok(None);
-            }
-            state => {
-                tracing::debug!("Couldn't acquire surface texture: {:?}", state);
-                return Ok(None);
-            }
+        let Some(texture) = self.window_surface.acquire(&self.device)? else {
+            return Ok(None);
         };
-        let view_format = remove_srgb(self.surface_config.format);
+        let view_format = remove_srgb(self.window_surface.config().format);
 
         let tracked = self.device.import_texture(
             texture.texture.clone(),

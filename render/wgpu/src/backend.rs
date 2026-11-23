@@ -164,12 +164,22 @@ impl WgpuRenderBackend<SwapChainTarget> {
         window: wgpu::SurfaceTargetUnsafe,
         size: (u32, u32),
     ) -> Result<(), Error> {
+        self.stage_frame = None;
+        self.invalidate_stage_packets()?;
         let descriptors = &self.descriptors;
         let surface = unsafe { descriptors.wgpu_instance.create_surface_unsafe(window)? };
-        self.stage_frame = None;
-        self.target =
+        let target =
             SwapChainTarget::new(surface, &descriptors.adapter, size, &descriptors.device)?;
-        self.invalidate_stage_packets()?;
+        let stage = Surface::new(
+            descriptors,
+            self.surface.quality(),
+            size.0,
+            size.1,
+            target.format(),
+        )?;
+        self.target = target;
+        self.surface = stage;
+        self.texture_pool = TexturePool::new(self.budget.clone());
         Ok(())
     }
 }

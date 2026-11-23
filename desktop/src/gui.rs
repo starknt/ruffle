@@ -5,6 +5,7 @@ mod locale;
 mod menu_bar;
 mod movie;
 mod picker;
+mod presentation;
 mod theme;
 mod widgets;
 
