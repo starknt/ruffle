@@ -93,11 +93,9 @@ impl RenderBackend for TestRenderer {
         _clear: Color,
         _commands: CommandList,
         _cache_entries: Vec<BitmapCacheEntry>,
-    ) -> Result<(), ruffle_render::error::RenderFailure> {
+    ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
         self.health.check()?;
-        let output = (|| {})();
-        self.health.check()?;
-        Ok(output)
+        Ok(ruffle_render::backend::FrameOutcome::NoOutput)
     }
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, Error> {
         self.registrations += 1;

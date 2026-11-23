@@ -605,9 +605,11 @@ impl ApplicationHandler<RuffleEvent> for App {
         enter_runtime!(self);
 
         match (&mut self.main_window, event) {
-            (Some(main_window), RuffleEvent::TaskPoll(task)) => main_window.player.poll(task),
+            (Some(main_window), RuffleEvent::TaskPoll(id)) => main_window.player.poll(id),
 
-            (Some(main_window), RuffleEvent::OnMetadata(swf_header)) => {
+            (Some(main_window), RuffleEvent::OnMetadata(id, swf_header))
+                if main_window.player.is_current(id) =>
+            {
                 main_window.on_metadata(swf_header)
             }
 

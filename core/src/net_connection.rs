@@ -241,11 +241,7 @@ impl<'gc> NetConnections<'gc> {
         let player = context.player_handle();
         for (handle, connection) in context.net_connections.connections.iter_mut() {
             if let Some(task) = connection.flush_pending(handle, &player) {
-                if let Some(spawner) = context.task_spawner {
-                    spawner.spawn(task);
-                } else {
-                    context.navigator.spawn_future(task);
-                }
+                context.task_spawner.spawn(task);
             }
         }
     }

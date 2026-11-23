@@ -103,7 +103,7 @@ pub struct UpdateContext<'gc> {
     pub navigator: &'gc mut dyn NavigatorBackend,
     pub(crate) resources: &'gc crate::loader::resource::Resources,
     pub(crate) spoofed_url: Option<&'gc str>,
-    pub(crate) task_spawner: Option<&'gc dyn crate::backend::tasks::TaskSpawner>,
+    pub(crate) task_spawner: &'gc dyn crate::backend::tasks::TaskSpawner,
 
     /// The renderer, used by the display objects to draw themselves.
     pub renderer: &'gc mut dyn RenderBackend,
@@ -264,11 +264,7 @@ impl<'gc> HasStringContext<'gc> for UpdateContext<'gc> {
 /// Convenience methods for controlling audio.
 impl<'gc> UpdateContext<'gc> {
     pub fn spawn_future(&mut self, task: crate::backend::tasks::PlayerTask) {
-        if let Some(spawner) = self.task_spawner {
-            spawner.spawn(task);
-        } else {
-            self.navigator.spawn_future(task);
-        }
+        self.task_spawner.spawn(task);
     }
 
     pub(crate) fn in_wall_clock_method(&self) -> bool {
@@ -388,6 +384,7 @@ impl<'gc> UpdateContext<'gc> {
     /// should use `replace_root_movie`.
     pub fn set_root_movie(&mut self, movie: SwfMovieData) {
         self.load_manager.cancel_root_read();
+        self.navigator.set_root_url(movie.url());
         if !self.forced_frame_rate {
             *self.frame_rate = movie.frame_rate().into();
         }

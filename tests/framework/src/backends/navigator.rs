@@ -4,9 +4,10 @@ use async_channel::{Receiver, Sender};
 use percent_encoding::percent_decode_str;
 use ruffle_core::backend::log::LogBackend;
 use ruffle_core::backend::navigator::{
-    ErrorResponse, NavigationMethod, NavigatorBackend, NullExecutor, NullSpawner, OwnedFuture,
-    Request, SuccessResponse, async_return, create_fetch_error,
+    ErrorResponse, NavigationMethod, NavigatorBackend, OwnedFuture, Request, SuccessResponse,
+    async_return, create_fetch_error,
 };
+use ruffle_core::backend::tasks::{LocalExecutor, LocalTaskSpawner, TaskSpawner};
 use ruffle_core::indexmap::IndexMap;
 use ruffle_core::loader::Error;
 use ruffle_core::socket::{ConnectionState, SocketAction, SocketHandle};
@@ -77,7 +78,7 @@ impl SuccessResponse for TestResponse {
 /// These are formatted as query params, rather than domains/whole URLs, so that real/real-invalid
 /// URLs can be used in Flash Player when writing tests
 pub struct TestNavigatorBackend {
-    spawner: NullSpawner,
+    spawner: LocalTaskSpawner,
     relative_base_path: VfsPath,
     socket_events: Option<Vec<SocketEvent>>,
     log: Option<TestLogBackend>,
@@ -86,7 +87,7 @@ pub struct TestNavigatorBackend {
 impl TestNavigatorBackend {
     pub fn new(
         path: VfsPath,
-        executor: &NullExecutor,
+        executor: &LocalExecutor,
         socket_events: Option<Vec<SocketEvent>>,
         log: Option<TestLogBackend>,
     ) -> Result<Self, std::io::Error> {
@@ -265,10 +266,6 @@ impl NavigatorBackend for TestNavigatorBackend {
         }
     }
 
-    fn spawn_future(&mut self, future: OwnedFuture<(), Error>) {
-        self.spawner.spawn_local(future);
-    }
-
     fn pre_process_url(&self, url: Url) -> Url {
         url
     }
@@ -288,7 +285,7 @@ impl NavigatorBackend for TestNavigatorBackend {
         }
 
         if let Some(events) = self.socket_events.clone() {
-            self.spawn_future(Box::pin(async move {
+            self.spawner.spawn(Box::pin(async move {
                 sender
                     .try_send(SocketAction::Connect(handle, ConnectionState::Connected))
                     .expect("working channel send");

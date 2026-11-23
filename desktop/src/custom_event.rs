@@ -4,7 +4,7 @@ use ruffle_core::events::PlayerNotification;
 use ruffle_frontend_utils::content::ContentDescriptor;
 
 use crate::gui::DialogDescriptor;
-use crate::player::{LaunchOptions, PlayerRunnable};
+use crate::player::{LaunchOptions, PlayerId};
 
 pub enum OpenType {
     File,
@@ -14,10 +14,10 @@ pub enum OpenType {
 /// User-defined events.
 pub enum RuffleEvent {
     /// Indicates that a task is ready to be polled.
-    TaskPoll(PlayerRunnable),
+    TaskPoll(PlayerId),
 
     /// Indicates that an asynchronous SWF metadata load has been completed.
-    OnMetadata(ruffle_core::swf::HeaderExt),
+    OnMetadata(PlayerId, ruffle_core::swf::HeaderExt),
 
     /// The user requested to pick and then open a file.
     BrowseAndOpen(Box<LaunchOptions>, OpenType),

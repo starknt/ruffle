@@ -7,7 +7,6 @@ use image::RgbaImage;
 use ruffle_core::PlayerBuilder;
 use ruffle_core::PlayerSession;
 use ruffle_core::backend::locale::DeterministicLocaleBackend;
-use ruffle_core::backend::navigator::NullNavigatorBackend;
 use ruffle_core::limits::ExecutionLimit;
 use ruffle_core::tag_utils::movie_from_path;
 use ruffle_render_wgpu::backend::{
@@ -75,12 +74,7 @@ impl Exporter {
 
         let target = TextureTarget::new(&self.descriptors.device, (width, height))
             .map_err(|e| anyhow!(e.to_string()))?;
-        let movie_path = swf_path.canonicalize()?;
-        let base = movie_path
-            .parent()
-            .ok_or_else(|| anyhow!("Movie has no parent directory"))?;
         let session = PlayerBuilder::new()
-            .with_navigator(NullNavigatorBackend::for_directory(base)?)
             .with_renderer(
                 WgpuRenderBackend::new(self.descriptors.clone(), target)
                     .map_err(|e| anyhow!(e.to_string()))?,
@@ -121,8 +115,7 @@ impl MovieExport {
     pub fn capture_frame(&self) -> Result<RgbaImage> {
         let player = self.session.player();
         let image = || {
-            if player.lock().unwrap().render_with_outcome()? != ruffle_core::FrameOutcome::Submitted
-            {
+            if player.lock().unwrap().render()? != ruffle_core::FrameOutcome::Submitted {
                 return Ok(None);
             }
             player.capture_frame()

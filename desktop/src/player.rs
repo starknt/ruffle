@@ -10,12 +10,15 @@ use crate::preferences::GlobalPreferences;
 use crate::{CALLSTACK, RENDER_INFO, SWF_INFO};
 use anyhow::anyhow;
 use ruffle_core::backend::navigator::SocketMode;
+use ruffle_core::backend::tasks::{
+    LocalExecutor, LocalTaskSpawner, PlayerTask, SpawnError, TaskSpawner,
+};
 use ruffle_core::config::Letterbox;
 use ruffle_core::events::{GamepadButton, KeyCode};
 use ruffle_core::font::DefaultFont;
 use ruffle_core::{LoadBehavior, Player, PlayerBuilder, PlayerEvent};
 use ruffle_frontend_utils::backends::audio::CpalAudioBackend;
-use ruffle_frontend_utils::backends::navigator::{ExternalNavigatorBackend, FutureSpawner};
+use ruffle_frontend_utils::backends::navigator::ExternalNavigatorBackend;
 use ruffle_frontend_utils::bundle::source::BundleSourceError;
 use ruffle_frontend_utils::bundle::{Bundle, BundleError};
 use ruffle_frontend_utils::content::{ContentDescriptor, PlayingContent};
@@ -109,6 +112,7 @@ impl From<&GlobalPreferences> for LaunchOptions {
 /// which may be lost when this Player is closed (dropped)
 struct ActivePlayer {
     id: PlayerId,
+    tasks: LocalExecutor,
     player: Arc<Mutex<Player>>,
 
     #[cfg(target_os = "linux")]
@@ -203,7 +207,9 @@ impl ActivePlayer {
             }
         };
 
-        let future_spawner = WinitExecutor {
+        let tasks = LocalExecutor::new();
+        let future_spawner = WinitSpawner {
+            tasks: tasks.spawner(),
             event_loop: event_loop.clone(),
             player_id,
         };
@@ -344,7 +350,7 @@ impl ActivePlayer {
         SWF_INFO.with(|i| *i.borrow_mut() = Some(readable_name));
 
         let on_metadata = move |swf_header: &ruffle_core::swf::HeaderExt| {
-            let _ = event_loop.send_event(RuffleEvent::OnMetadata(swf_header.clone()));
+            let _ = event_loop.send_event(RuffleEvent::OnMetadata(player_id, swf_header.clone()));
         };
 
         {
@@ -416,6 +422,7 @@ impl ActivePlayer {
 
         Self {
             id: player_id,
+            tasks,
             player,
             #[cfg(target_os = "linux")]
             _gamemode_session: crate::dbus::GameModeSession::new(gamemode_enable),
@@ -501,14 +508,15 @@ impl PlayerController {
         false
     }
 
-    pub fn poll(&self, task: PlayerRunnable) {
-        // Only run the task if it matches our current player;
-        // otherwise it is stale, and should be cancelled (which
-        // happens implicitly on drop).
-        if let Some(player) = &self.player
-            && *task.0.metadata() == player.id
+    pub fn is_current(&self, id: PlayerId) -> bool {
+        self.player.as_ref().is_some_and(|player| player.id == id)
+    }
+
+    pub fn poll(&mut self, id: PlayerId) {
+        if let Some(player) = &mut self.player
+            && player.id == id
         {
-            task.0.run();
+            player.tasks.run();
         }
     }
 }
@@ -516,7 +524,7 @@ impl PlayerController {
 /// A unique identifier for a given `Player` instance.
 /// Used to track which player any currently executing future is bound to.
 #[derive(Copy, Clone, Eq, PartialEq)]
-struct PlayerId(i64);
+pub struct PlayerId(i64);
 
 impl PlayerId {
     fn new() -> Self {
@@ -529,51 +537,21 @@ impl PlayerId {
     }
 }
 
-/// A `Player`-bound future that is currently running.
-pub struct PlayerRunnable(async_task::Runnable<PlayerId>);
-
-/// A bare-bones executor that schedules tasks on the winit event loop.
 #[derive(Clone)]
-struct WinitExecutor {
+struct WinitSpawner {
+    tasks: LocalTaskSpawner,
     event_loop: EventLoopProxy<RuffleEvent>,
     player_id: PlayerId,
 }
 
-impl ruffle_core::backend::tasks::TaskSpawner for WinitExecutor {
-    fn try_spawn(
-        &self,
-        future: ruffle_core::backend::tasks::PlayerTask,
-    ) -> Result<(), ruffle_core::backend::tasks::SpawnError> {
-        // Discard any errors.
-        let future = async {
-            if let Err(e) = future.await {
-                tracing::error!("Async error: {}", e);
-            }
-        };
-
+impl TaskSpawner for WinitSpawner {
+    fn try_spawn(&self, future: PlayerTask) -> Result<(), SpawnError> {
         let event_loop = self.event_loop.clone();
-        let scheduler = move |task| {
-            let event = RuffleEvent::TaskPoll(PlayerRunnable(task));
-            if event_loop.send_event(event).is_err() {
-                tracing::error!("Couldn't schedule task - event loop is closed");
-            }
-        };
-
-        let (runnable, task) = async_task::Builder::new()
-            .metadata(self.player_id)
-            .spawn_local(|_| future, scheduler);
-
-        // The future should run in the background.
-        task.detach();
-        // Immediately schedule the future to be polled for the first time.
-        self.event_loop
-            .send_event(RuffleEvent::TaskPoll(PlayerRunnable(runnable)))
-            .map_err(|_| ruffle_core::backend::tasks::SpawnError::shutdown())
-    }
-}
-
-impl FutureSpawner<ruffle_core::loader::Error> for WinitExecutor {
-    fn spawn(&self, future: ruffle_core::backend::tasks::PlayerTask) {
-        ruffle_core::backend::tasks::TaskSpawner::spawn(self, future);
+        let id = self.player_id;
+        self.tasks.try_spawn_with_wake(future, move || {
+            event_loop
+                .send_event(RuffleEvent::TaskPoll(id))
+                .map_err(|_| SpawnError::shutdown())
+        })
     }
 }

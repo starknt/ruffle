@@ -12,10 +12,8 @@ use std::borrow::Cow;
 use std::fmt;
 use std::fmt::Display;
 use std::fs::File;
-use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::time::Duration;
 use swf::avm1::types::SendVarsMethod;
 use url::{ParseError, Url};
@@ -257,12 +255,13 @@ pub struct ErrorResponse {
     pub error: Error,
 }
 
-/// Type alias for pinned, boxed, and owned futures that output a falliable
-/// result of type `Result<T, E>`.
-pub type OwnedFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + 'static>>;
+pub use super::tasks::OwnedFuture;
 
 /// The host interface for URL navigation, resource loading, and sockets.
 pub trait NavigatorBackend: Any {
+    /// A root movie has been installed. File-backed hosts resolve relative requests against it.
+    fn set_root_url(&mut self, _url: &str) {}
+
     /// Cause a browser navigation to a given URL.
     ///
     /// The URL given may be any URL scheme a browser can support. This may not
@@ -324,13 +323,6 @@ pub trait NavigatorBackend: Any {
     /// fetch may return a different URL, e.g. considering redirections.
     fn resolve_url(&self, url: &str) -> Result<Url, ParseError>;
 
-    /// Arrange for a future to be run at some point in the... well, future.
-    ///
-    /// This function must be called to ensure a future is actually computed.
-    /// The future must output an empty value and not hold any stack references
-    /// which would cause it to become invalidated.
-    fn spawn_future(&mut self, future: OwnedFuture<(), Error>);
-
     /// Handle any context specific pre-processing
     ///
     /// Changing http -> https for example. This function may alter any part of the
@@ -357,56 +349,17 @@ pub trait NavigatorBackend: Any {
     );
 }
 
-pub use super::tasks::{LocalExecutor as NullExecutor, LocalTaskSpawner as NullSpawner};
-
-impl NullSpawner {
-    pub fn spawn_local(&self, future: OwnedFuture<(), Error>) {
-        super::tasks::TaskSpawner::spawn(self, future);
-    }
+/// A file-only navigator used by native headless sessions.
+#[derive(Default)]
+pub struct FileNavigator {
+    root_url: Option<Url>,
 }
 
-/// A navigator for local files.
-///
-/// The NullNavigatorBackend includes a trivial executor that holds owned
-/// futures and runs them to completion, blockingly.
-pub struct NullNavigatorBackend {
-    spawner: NullSpawner,
-
-    /// The base path for all relative fetches.
-    relative_base_path: PathBuf,
-}
-
-impl NullNavigatorBackend {
-    pub fn new() -> Self {
-        let executor = NullExecutor::new();
-        Self {
-            spawner: executor.spawner(),
-            relative_base_path: PathBuf::new(),
-        }
+impl NavigatorBackend for FileNavigator {
+    fn set_root_url(&mut self, url: &str) {
+        self.root_url = Url::parse(url).ok();
     }
 
-    pub fn for_directory(path: &Path) -> std::io::Result<Self> {
-        Ok(Self {
-            relative_base_path: path.canonicalize()?,
-            ..Self::new()
-        })
-    }
-
-    pub fn with_base_path(path: &Path, executor: &NullExecutor) -> Result<Self, std::io::Error> {
-        Ok(Self {
-            spawner: executor.spawner(),
-            relative_base_path: path.canonicalize()?,
-        })
-    }
-}
-
-impl Default for NullNavigatorBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NavigatorBackend for NullNavigatorBackend {
     fn navigate_to_url(
         &self,
         _url: &str,
@@ -416,15 +369,11 @@ impl NavigatorBackend for NullNavigatorBackend {
     }
 
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
-        fetch_path(self, "NullNavigatorBackend", request.url(), None)
+        fetch_path(self, "FileNavigator", request.url(), None)
     }
 
     fn resolve_url(&self, url: &str) -> Result<Url, ParseError> {
-        resolve_url_with_relative_base_path(self, self.relative_base_path.clone(), url)
-    }
-
-    fn spawn_future(&mut self, future: OwnedFuture<(), Error>) {
-        self.spawner.spawn_local(future);
+        Url::options().base_url(self.root_url.as_ref()).parse(url)
     }
 
     fn pre_process_url(&self, url: Url) -> Url {
@@ -482,13 +431,7 @@ pub fn create_specific_fetch_error<ErrorType: Display>(
     }
 }
 
-// The following functions are implementations used in multiple places.
-// To avoid duplicated code, they are placed here as public functions.
-
-/// This is the resolve implementation for the TestNavigatorBackend and the
-/// NullNavigatorBackend.
-///
-/// It resolves the given URL with the given relative base path.
+/// Resolve a URL relative to a local base directory and apply the navigator URL policy.
 pub fn resolve_url_with_relative_base_path<NavigatorType: NavigatorBackend>(
     navigator: &NavigatorType,
     base_path: PathBuf,
@@ -520,7 +463,7 @@ pub fn resolve_url_with_relative_base_path<NavigatorType: NavigatorBackend>(
     }
 }
 
-/// This is the fetch implementation for NullNavigatorBackend.
+/// This is the fetch implementation for FileNavigator.
 ///
 /// It tries to fetch the given URL as a local path and read and return
 /// its content. It returns an ErrorResponse if the URL is not valid, not
@@ -659,32 +602,5 @@ pub fn get_encoding(content_type: &str) -> Option<&'static Encoding> {
         Encoding::for_label(encoding_string.as_bytes())
     } else {
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::NullExecutor;
-    use crate::loader::Error;
-    use futures::channel::oneshot;
-
-    #[test]
-    fn null_executor_reports_pending_tasks_until_completion() {
-        let mut executor = NullExecutor::new();
-        let spawner = executor.spawner();
-        let (sender, receiver) = oneshot::channel::<()>();
-
-        spawner.spawn_local(Box::pin(async move {
-            let _ = receiver.await;
-            Ok::<(), Error>(())
-        }));
-
-        assert_eq!(executor.pending_tasks(), 1);
-        executor.run();
-        assert_eq!(executor.pending_tasks(), 1);
-
-        sender.send(()).unwrap();
-        executor.run();
-        assert_eq!(executor.pending_tasks(), 0);
     }
 }

@@ -4,7 +4,7 @@ use std::time::Instant;
 
 mod policy;
 pub(crate) use policy::HostPlayback;
-pub use policy::{ModuleRule, PlaybackPolicy};
+pub use policy::PlaybackPolicy;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]

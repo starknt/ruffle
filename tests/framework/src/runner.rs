@@ -19,7 +19,7 @@ use crate::test::Test;
 use anyhow::{Result, anyhow};
 use ruffle_core::FloatDuration;
 use ruffle_core::backend::locale::DeterministicLocaleBackend;
-use ruffle_core::backend::navigator::NullExecutor;
+use ruffle_core::backend::tasks::LocalExecutor;
 use ruffle_core::limits::ExecutionLimit;
 use ruffle_core::tag_utils::SwfMovieData;
 use ruffle_core::{Player, PlayerBuilder};
@@ -46,7 +46,7 @@ pub struct TestRunner {
     options: TestOptions,
     player: Arc<Mutex<Player>>,
     injector: InputInjector,
-    executor: NullExecutor,
+    executor: LocalExecutor,
     frame_time: FloatDuration,
     frame_time_duration: Duration,
     log: TestLogBackend,
@@ -75,7 +75,7 @@ impl TestRunner {
             ));
         }
 
-        let executor = NullExecutor::new();
+        let executor = LocalExecutor::new();
 
         let frame_time_millis = if let Some(tick_rate) = test.options.tick_rate {
             tick_rate

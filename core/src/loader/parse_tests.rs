@@ -13,6 +13,37 @@ fn movie_bytes() -> Vec<u8> {
 }
 
 #[test]
+fn headless_session_fetches_sibling_resources_from_the_installed_root() {
+    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tests/tests/swfs/avm1/asnew/test.swf")
+        .canonicalize()
+        .unwrap();
+    let mut session = PlayerBuilder::new().build();
+    session.lock().unwrap().fetch_root_movie(
+        Url::from_file_path(&file).unwrap().into(),
+        vec![],
+        Box::new(|_| {}),
+    );
+    session.poll_tasks();
+    let response = session
+        .lock()
+        .unwrap()
+        .fetch(Request::get("output.txt".into()), FetchReason::UrlLoader);
+    let body = futures::executor::block_on(async {
+        response
+            .await
+            .map_err(|response| response.error)?
+            .body()
+            .await
+    })
+    .unwrap();
+    assert_eq!(
+        body,
+        std::fs::read(file.with_file_name("output.txt")).unwrap()
+    );
+}
+
+#[test]
 fn a_replaced_root_load_cannot_deliver_metadata_or_install_its_movie() {
     use std::cell::RefCell;
     use std::rc::Rc;

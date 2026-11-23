@@ -158,6 +158,7 @@ impl WgpuRenderBackend<SwapChainTarget> {
     ) -> Result<(), Error> {
         let descriptors = &self.descriptors;
         let surface = unsafe { descriptors.wgpu_instance.create_surface_unsafe(window)? };
+        self.stage_frame = None;
         self.target =
             SwapChainTarget::new(surface, &descriptors.adapter, size, &descriptors.device)?;
         Ok(())
@@ -666,6 +667,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         &mut self,
         dimensions: ViewportDimensions,
     ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.stage_frame = None;
         self.preparation_generation.invalidate();
         self.descriptors.runtime.check_health()?;
         if dimensions.width > self.descriptors.limits.max_texture_dimension_2d
@@ -848,18 +850,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         Ok(self.stage_frame.is_some())
     }
 
-    fn submit_frame(
-        &mut self,
-        clear: Color,
-        commands: CommandList,
-        cache_entries: Vec<BitmapCacheEntry>,
-    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
-        self.submit_frame_with_outcome(clear, commands, cache_entries)
-            .map(|_| ())
+    fn discard_frame(&mut self) {
+        self.stage_frame = None;
     }
 
     #[instrument(level = "debug", skip_all)]
-    fn submit_frame_with_outcome(
+    fn submit_frame(
         &mut self,
         clear: Color,
         commands: CommandList,

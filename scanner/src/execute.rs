@@ -6,7 +6,6 @@ use crate::logging::{LOCAL_LOGGER, ScanLogBackend, ThreadLocalScanLogger};
 use ruffle_core::FloatDuration;
 use ruffle_core::PlayerBuilder;
 use ruffle_core::backend::locale::DeterministicLocaleBackend;
-use ruffle_core::backend::navigator::NullNavigatorBackend;
 use ruffle_core::limits::ExecutionLimit;
 use ruffle_core::swf::{decompress_swf, parse_swf};
 use ruffle_core::tag_utils::movie_from_path;
@@ -17,12 +16,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 fn execute_swf(file: &Path) {
-    let base_path = file.parent().unwrap();
     let movie = movie_from_path(file, None).unwrap();
     let frame_time = FloatDuration::from_millis(1000.0 / movie.frame_rate().to_f64());
     let mut session = PlayerBuilder::new()
         .with_log(ScanLogBackend::new())
-        .with_navigator(NullNavigatorBackend::for_directory(base_path).unwrap())
         .with_locale(DeterministicLocaleBackend::default())
         .with_max_execution_duration(Duration::from_secs(300))
         .with_movie(movie)

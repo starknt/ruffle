@@ -69,13 +69,11 @@ pub trait NavigatorInterface: Clone + Send + 'static {
     ) -> impl std::future::Future<Output = bool> + Send;
 }
 
-pub trait FutureSpawner<Err> {
-    fn spawn(&self, future: OwnedFuture<(), Err>);
-}
+use ruffle_core::backend::tasks::TaskSpawner;
 
 /// Loads resources on the native host and opens links through its system browser.
-pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterface> {
-    /// Sink for tasks sent to us through `spawn_future`.
+pub struct ExternalNavigatorBackend<F: TaskSpawner, I: NavigatorInterface> {
+    /// Schedules transport-owned asset preloads on the host event loop.
     future_spawner: F,
 
     /// The url to use for all relative fetches.
@@ -98,7 +96,7 @@ pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterfa
     interface: I,
 }
 
-impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F, I> {
+impl<F: TaskSpawner, I: NavigatorInterface> ExternalNavigatorBackend<F, I> {
     /// Scope public whole-body reuse and connection limits to this navigator.
     pub fn configure_buffered_assets(&mut self, allow: fn(&Url) -> bool) -> AssetScheduler {
         let scheduler = AssetScheduler::new(allow);
@@ -206,7 +204,7 @@ impl<F: FutureSpawner<Error>, I: NavigatorInterface> ExternalNavigatorBackend<F,
     }
 }
 
-impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
+impl<F: TaskSpawner + 'static, I: NavigatorInterface> NavigatorBackend
     for ExternalNavigatorBackend<F, I>
 {
     fn navigate_to_url(
@@ -384,10 +382,6 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
             Ok(url) => Ok(self.pre_process_url(url)),
             Err(error) => Err(error),
         }
-    }
-
-    fn spawn_future(&mut self, future: OwnedFuture<(), Error>) {
-        self.future_spawner.spawn(future);
     }
 
     fn pre_process_url(&self, mut url: Url) -> Url {
@@ -613,9 +607,13 @@ mod tests {
 
     struct TestFutureSpawner;
 
-    impl<E: 'static> FutureSpawner<E> for TestFutureSpawner {
-        fn spawn(&self, future: OwnedFuture<(), E>) {
+    impl TaskSpawner for TestFutureSpawner {
+        fn try_spawn(
+            &self,
+            future: ruffle_core::backend::tasks::PlayerTask,
+        ) -> Result<(), ruffle_core::backend::tasks::SpawnError> {
             task::spawn_local(future);
+            Ok(())
         }
     }
 

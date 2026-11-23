@@ -293,12 +293,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-task"
-version = "4.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
-
-[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4757,7 +4751,6 @@ dependencies = [
  "anyhow",
  "ashpd",
  "async-channel",
- "async-task",
  "bytemuck",
  "chrono",
  "clap",

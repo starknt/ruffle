@@ -136,22 +136,15 @@ pub trait RenderBackend: Any {
         Ok(true)
     }
 
-    fn submit_frame_with_outcome(
-        &mut self,
-        clear: swf::Color,
-        commands: CommandList,
-        cache_entries: Vec<BitmapCacheEntry>,
-    ) -> Result<FrameOutcome, RenderFailure> {
-        self.submit_frame(clear, commands, cache_entries)?;
-        Ok(FrameOutcome::Submitted)
-    }
+    /// Release any reserved output if display traversal encounters a terminal error.
+    fn discard_frame(&mut self) {}
 
     fn submit_frame(
         &mut self,
         clear: swf::Color,
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
-    ) -> Result<(), RenderFailure>;
+    ) -> Result<FrameOutcome, RenderFailure>;
 
     fn create_empty_texture(
         &mut self,

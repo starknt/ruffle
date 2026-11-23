@@ -287,7 +287,7 @@ mod test {
             _clear: Color,
             _commands: CommandList,
             _cache_entries: Vec<BitmapCacheEntry>,
-        ) -> Result<(), crate::error::RenderFailure> {
+        ) -> Result<crate::backend::FrameOutcome, crate::error::RenderFailure> {
             unimplemented!()
         }
         fn create_empty_texture(

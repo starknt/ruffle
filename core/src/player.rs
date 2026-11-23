@@ -328,6 +328,14 @@ pub struct PlayerSession {
     executor: crate::backend::tasks::LocalExecutor,
 }
 
+impl std::ops::Deref for PlayerSession {
+    type Target = Mutex<Player>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.player
+    }
+}
+
 impl PlayerSession {
     /// The handle may be locked by tasks. Release its guard before polling.
     pub fn player(&self) -> &Arc<Mutex<Player>> {
@@ -368,7 +376,7 @@ pub struct Player {
     renderer: Box<dyn RenderBackend>,
     audio: Box<dyn AudioBackend>,
     navigator: Box<dyn NavigatorBackend>,
-    task_spawner: Option<Box<dyn crate::backend::tasks::TaskSpawner>>,
+    task_spawner: Box<dyn crate::backend::tasks::TaskSpawner>,
     storage: Box<dyn StorageBackend>,
     log: Box<dyn LogBackend>,
     ui: Box<dyn UiBackend>,
@@ -591,20 +599,6 @@ impl Player {
         }
     }
 
-    pub fn install_module_check(
-        &mut self,
-        rules: &'static [crate::playback::ModuleRule],
-        verify: fn(&[u8], &[&str]) -> bool,
-    ) {
-        self.host_playback.install_module_check(rules, verify);
-        if !self.host_playback.allows_acceleration() {
-            self.set_playback_rate(crate::playback::PlaybackRate::Normal);
-        }
-    }
-    pub fn unverified_module(&self) -> Option<(&'static crate::playback::ModuleRule, bool)> {
-        self.host_playback.unverified_module()
-    }
-
     pub fn set_realtime_avm2_classes(&mut self, classes: &'static [(&'static str, &'static str)]) {
         self.host_playback.wall_classes = classes;
     }
@@ -681,6 +675,7 @@ impl Player {
 
     fn check_render_health(&mut self) -> Result<(), ruffle_render::error::RenderFailure> {
         if let Err(error) = self.renderer.health().check() {
+            self.renderer.discard_frame();
             self.set_is_playing(false);
             self.needs_render = false;
             return Err(error);
@@ -2461,11 +2456,7 @@ impl Player {
     }
 
     #[instrument(level = "debug", skip_all)]
-    pub fn render(&mut self) -> Result<(), ruffle_render::error::RenderFailure> {
-        self.render_with_outcome().map(|_| ())
-    }
-
-    pub fn render_with_outcome(
+    pub fn render(
         &mut self,
     ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
         self.check_render_health()?;
@@ -2548,9 +2539,9 @@ impl Player {
         });
 
         self.check_render_health()?;
-        let outcome =
-            self.renderer
-                .submit_frame_with_outcome(background_color, commands, cache_draws)?;
+        let outcome = self
+            .renderer
+            .submit_frame(background_color, commands, cache_draws)?;
         self.check_render_health()?;
         self.needs_render = outcome == ruffle_render::backend::FrameOutcome::Deferred;
         Ok(outcome)
@@ -2748,7 +2739,7 @@ impl Player {
                 navigator: this.navigator.deref_mut(),
                 resources: &this.resources,
                 spoofed_url: this.spoofed_url.as_deref(),
-                task_spawner: this.task_spawner.as_deref(),
+                task_spawner: this.task_spawner.as_ref(),
                 ui: this.ui.deref_mut(),
                 action_queue,
                 gc_context,
@@ -3458,8 +3449,8 @@ impl PlayerBuilder {
     }
 
     /// Builds the player, wiring up the backends and configuring the specified settings.
-    pub fn build(self) -> Arc<Mutex<Player>> {
-        self.build_inner(None)
+    pub fn build(self) -> PlayerSession {
+        self.build_session()
     }
 
     /// A headless session owns its executor until the host drops the session.
@@ -3473,13 +3464,6 @@ impl PlayerBuilder {
         self,
         spawner: impl crate::backend::tasks::TaskSpawner + 'static,
     ) -> Arc<Mutex<Player>> {
-        self.build_inner(Some(Box::new(spawner)))
-    }
-
-    fn build_inner(
-        self,
-        task_spawner: Option<Box<dyn crate::backend::tasks::TaskSpawner>>,
-    ) -> Arc<Mutex<Player>> {
         use crate::backend::*;
         use ruffle_video::null;
         let audio = self
@@ -3490,7 +3474,7 @@ impl PlayerBuilder {
             .unwrap_or_else(|| Box::new(log::NullLogBackend::new()));
         let navigator = self
             .navigator
-            .unwrap_or_else(|| Box::new(navigator::NullNavigatorBackend::new()));
+            .unwrap_or_else(|| Box::new(navigator::FileNavigator::default()));
         let renderer = self.renderer.unwrap_or_else(|| {
             Box::new(NullRenderer::new(ViewportDimensions {
                 width: self.viewport_width,
@@ -3525,7 +3509,7 @@ impl PlayerBuilder {
                 audio,
                 log,
                 navigator,
-                task_spawner,
+                task_spawner: Box::new(spawner),
                 renderer,
                 storage,
                 ui,
@@ -3792,7 +3776,7 @@ mod tests {
     #[test]
     fn default_session_retains_tasks_until_the_host_polls() {
         use std::rc::Rc;
-        let mut session = PlayerBuilder::new().build_session();
+        let mut session = PlayerBuilder::new().build();
         let player = session.player().clone();
         let weak = Arc::downgrade(&player);
         let flag = Rc::new(std::cell::Cell::new(false));
@@ -3818,21 +3802,32 @@ mod tests {
     }
 
     #[test]
+    fn rendering_a_headless_session_reports_no_output_and_finishes_the_redraw() {
+        let session = PlayerBuilder::new().build();
+        let mut player = session.lock().unwrap();
+        assert!(player.needs_render());
+        assert_eq!(
+            player.render().unwrap(),
+            ruffle_render::backend::FrameOutcome::NoOutput
+        );
+        assert!(!player.needs_render());
+    }
+
+    #[test]
     fn replacing_host_eligibility_while_accelerated_restores_normal_time() {
-        use crate::playback::{ModuleRule, PlaybackRate};
+        use crate::playback::{PlaybackPolicy, PlaybackRate};
+        struct Ineligible;
+        impl PlaybackPolicy for Ineligible {
+            fn allows_acceleration(&self) -> bool {
+                false
+            }
+        }
         let session = PlayerBuilder::new().build_session();
         let mut player = session.player().lock().unwrap();
         player.set_sample_time(Duration::from_millis(750));
         player.set_playback_rate(PlaybackRate::Double);
         assert_eq!(player.playback_rate(), PlaybackRate::Double);
-        player.install_module_check(
-            &[ModuleRule {
-                namespace: "example",
-                class: "Unseen",
-                fingerprints: &[],
-            }],
-            |_, _| false,
-        );
+        player.set_playback_policy(std::rc::Rc::new(Ineligible));
         assert_eq!(player.playback_rate(), PlaybackRate::Normal);
         assert_eq!(player.playback_time_ms(), 750.0);
     }
