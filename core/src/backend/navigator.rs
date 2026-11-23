@@ -1,4 +1,4 @@
-//! Browser-related platform functions
+//! URL navigation, resource loading, and sockets.
 
 use crate::loader::Error;
 use crate::socket::{ConnectionState, SocketAction, SocketHandle};
@@ -9,7 +9,6 @@ use enumset::EnumSetType;
 use indexmap::IndexMap;
 use std::any::Any;
 use std::borrow::Cow;
-#[cfg(not(target_family = "wasm"))]
 use std::cell::Cell;
 use std::fmt;
 use std::fmt::Display;
@@ -18,7 +17,6 @@ use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-#[cfg(not(target_family = "wasm"))]
 use std::rc::Rc;
 use std::time::Duration;
 use swf::avm1::types::SendVarsMethod;
@@ -265,7 +263,7 @@ pub struct ErrorResponse {
 /// result of type `Result<T, E>`.
 pub type OwnedFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + 'static>>;
 
-/// A backend interacting with a browser environment.
+/// The host interface for URL navigation, resource loading, and sockets.
 pub trait NavigatorBackend: Any {
     /// Cause a browser navigation to a given URL.
     ///
@@ -333,9 +331,6 @@ pub trait NavigatorBackend: Any {
     /// This function must be called to ensure a future is actually computed.
     /// The future must output an empty value and not hold any stack references
     /// which would cause it to become invalidated.
-    ///
-    /// TODO: For some reason, `wasm_bindgen_futures` wants unpinnable futures.
-    /// This seems highly limiting.
     fn spawn_future(&mut self, future: OwnedFuture<(), Error>);
 
     /// Handle any context specific pre-processing
@@ -364,13 +359,11 @@ pub trait NavigatorBackend: Any {
     );
 }
 
-#[cfg(not(target_family = "wasm"))]
 pub struct NullExecutor {
     pool: futures::executor::LocalPool,
     pending: Rc<Cell<usize>>,
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl NullExecutor {
     pub fn new() -> Self {
         Self {
@@ -401,13 +394,11 @@ impl Default for NullExecutor {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 pub struct NullSpawner {
     spawner: futures::executor::LocalSpawner,
     pending: Rc<Cell<usize>>,
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl NullSpawner {
     pub fn spawn_local(&self, future: OwnedFuture<(), Error>) {
         use futures::task::LocalSpawnExt;
@@ -433,41 +424,7 @@ impl NullSpawner {
     }
 }
 
-#[cfg(target_family = "wasm")]
-pub struct NullExecutor;
-
-#[cfg(target_family = "wasm")]
-impl NullExecutor {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn spawner(&self) -> NullSpawner {
-        NullSpawner
-    }
-
-    pub fn run(&mut self) {}
-
-    pub fn pending_tasks(&self) -> usize {
-        0
-    }
-}
-
-#[cfg(target_family = "wasm")]
-pub struct NullSpawner;
-
-#[cfg(target_family = "wasm")]
-impl NullSpawner {
-    pub fn spawn_local(&self, future: OwnedFuture<(), Error>) {
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = future.await {
-                tracing::error!("Asynchronous error occurred: {}", e);
-            }
-        });
-    }
-}
-
-/// A null implementation for platforms that do not live in a web browser.
+/// A navigator for local files.
 ///
 /// The NullNavigatorBackend includes a trivial executor that holds owned
 /// futures and runs them to completion, blockingly.
@@ -577,29 +534,6 @@ pub fn create_specific_fetch_error<ErrorType: Display>(
     }
 }
 
-// Url doesn't implement from_file_path and to_file_path for WASM targets.
-// Therefore, we need to use cfg to make Ruffle compile for all targets.
-
-#[cfg(any(unix, windows, target_os = "redox"))]
-fn url_from_file_path(path: &Path) -> Result<Url, ()> {
-    Url::from_file_path(path)
-}
-
-#[cfg(not(any(unix, windows, target_os = "redox")))]
-fn url_from_file_path(_path: &Path) -> Result<Url, ()> {
-    Err(())
-}
-
-#[cfg(any(unix, windows, target_os = "redox"))]
-fn url_to_file_path(url: &Url) -> Result<PathBuf, ()> {
-    Url::to_file_path(url)
-}
-
-#[cfg(not(any(unix, windows, target_os = "redox")))]
-fn url_to_file_path(_path: &Url) -> Result<PathBuf, ()> {
-    Err(())
-}
-
 // The following functions are implementations used in multiple places.
 // To avoid duplicated code, they are placed here as public functions.
 
@@ -624,7 +558,7 @@ pub fn resolve_url_with_relative_base_path<NavigatorType: NavigatorBackend>(
         }
     }
 
-    if let Ok(mut base_url) = url_from_file_path(base_path.as_path()) {
+    if let Ok(mut base_url) = Url::from_file_path(base_path.as_path()) {
         // Make sure we have a trailing slash, so that joining a request url like 'data.txt'
         // gets appended, rather than replacing the last component.
         base_url.path_segments_mut().unwrap().push("");
@@ -729,7 +663,7 @@ pub fn fetch_path<NavigatorType: NavigatorBackend>(
         let mut filesystem_url = url.clone();
         filesystem_url.set_query(None);
 
-        match url_to_file_path(&filesystem_url) {
+        match filesystem_url.to_file_path() {
             Ok(path) => path,
             Err(_) => {
                 return async_return(Err(create_specific_fetch_error(
@@ -780,7 +714,7 @@ pub fn get_encoding(content_type: &str) -> Option<&'static Encoding> {
     }
 }
 
-#[cfg(all(test, not(target_family = "wasm")))]
+#[cfg(test)]
 mod tests {
     use super::NullExecutor;
     use crate::loader::Error;

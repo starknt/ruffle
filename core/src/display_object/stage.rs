@@ -140,11 +140,6 @@ pub struct StageData<'gc> {
     /// This setting is currently ignored in Ruffle.
     use_bitmap_downsampling: Cell<bool>,
 
-    /// The window mode of the viewport.
-    ///
-    /// Only used on web to control how the Flash content layers with other content on the page.
-    window_mode: Cell<WindowMode>,
-
     /// Whether objects display a glowing border when they have focus.
     stage_focus_rect: Cell<bool>,
 
@@ -179,7 +174,6 @@ impl<'gc> Stage<'gc> {
                 allow_fullscreen: Cell::new(true),
                 use_bitmap_downsampling: Cell::new(false),
                 view_bounds: Default::default(),
-                window_mode: Default::default(),
                 show_menu: Cell::new(true),
                 stage_focus_rect: Cell::new(true),
                 avm2_object: Lock::new(None),
@@ -450,18 +444,6 @@ impl<'gc> Stage<'gc> {
         self.0.use_bitmap_downsampling.set(value);
     }
 
-    /// Get the stage mode.
-    /// This controls how the content layers with other content on the page.
-    /// Only used on web.
-    pub fn window_mode(self) -> WindowMode {
-        self.0.window_mode.get()
-    }
-
-    /// Sets the window mode.
-    pub fn set_window_mode(self, window_mode: WindowMode) {
-        self.0.window_mode.set(window_mode);
-    }
-
     pub fn view_bounds(self) -> Rectangle<Twips> {
         self.0.view_bounds.get()
     }
@@ -482,7 +464,6 @@ impl<'gc> Stage<'gc> {
         let letterbox = self.0.letterbox.get();
         self.0.scale_mode.get() == StageScaleMode::ShowAll
             && self.0.align.get().is_empty()
-            && self.0.window_mode.get() != WindowMode::Transparent
             && (letterbox == Letterbox::On
                 || (letterbox == Letterbox::Fullscreen && self.is_fullscreen()))
     }
@@ -1212,69 +1193,5 @@ impl FromWStr for StageAlign {
             }
         }
         Ok(align)
-    }
-}
-
-/// The window mode of the Ruffle player.
-///
-/// This setting controls how the Ruffle container is layered and rendered with other content on
-/// the page. This setting is only used on web.
-///
-/// [Apply OBJECT and EMBED tag attributes in Adobe Flash Professional](https://helpx.adobe.com/flash/kb/flash-object-embed-tag-attributes.html)
-#[derive(Default, Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WindowMode {
-    /// The Flash content is rendered in its own window and layering is done with the browser's
-    /// default behavior.
-    ///
-    /// In Ruffle, this mode functions like `WindowMode::Opaque` and will layer the Flash content
-    /// together with other HTML elements.
-    #[default]
-    Window,
-
-    /// The Flash content is layered together with other HTML elements, and the stage color is
-    /// opaque. Content can render above or below Ruffle based on CSS rendering order.
-    Opaque,
-
-    /// The Flash content is layered together with other HTML elements, and the stage color is
-    /// transparent. Content beneath Ruffle will be visible through transparent areas.
-    Transparent,
-
-    /// Request compositing with hardware acceleration when possible.
-    ///
-    /// This mode has no effect in Ruffle and will function like `WindowMode::Opaque`.
-    Gpu,
-
-    /// Request a direct rendering path, bypassing browser compositing when possible.
-    ///
-    /// This mode has no effect in Ruffle and will function like `WindowMode::Opaque`.
-    Direct,
-}
-
-impl Display for WindowMode {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let s = match *self {
-            WindowMode::Window => "window",
-            WindowMode::Opaque => "opaque",
-            WindowMode::Transparent => "transparent",
-            WindowMode::Direct => "direct",
-            WindowMode::Gpu => "gpu",
-        };
-        f.write_str(s)
-    }
-}
-
-impl FromStr for WindowMode {
-    type Err = ParseEnumError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let window_mode = match s.to_ascii_lowercase().as_str() {
-            "window" => WindowMode::Window,
-            "opaque" => WindowMode::Opaque,
-            "transparent" => WindowMode::Transparent,
-            "direct" => WindowMode::Direct,
-            "gpu" => WindowMode::Gpu,
-            _ => return Err(ParseEnumError),
-        };
-        Ok(window_mode)
     }
 }

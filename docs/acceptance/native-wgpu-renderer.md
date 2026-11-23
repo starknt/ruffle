@@ -6,7 +6,7 @@ Status: **Implementation delivered locally; resource-lifetime and native consume
 
 The contract is [the approved native renderer design](../ryugi/specs/2026-11-17-native-wgpu-renderer-design.md). Tasks 1–15 are implemented. Task 16 has final-source build, resource, host, image-comparison, performance and paced lifetime evidence, but remains open for the unmet performance gates and unwaived golden-image/platform gaps below.
 
-WGPU is native-only for desktop and Android, pinned to wgpu 30.0.1. Independent Web/wasm frontends are outside this verification. Controlled GPU resource failures terminate through typed errors; no replay, omitted effects, replacement pixels, reduced resolution or silent device recreation is authorized. OS process OOM survival is outside this contract.
+WGPU is native-only for desktop and Android, pinned to wgpu 30.0.1. Controlled GPU resource failures terminate through typed errors; no replay, omitted effects, replacement pixels, reduced resolution or silent device recreation is authorized. OS process OOM survival is outside this contract.
 
 Frozen renderer source: `624fdb4510c21c94fa9c4854b229452b1a7d2176`. Test-only commit `e7e90c5655` subsequently extends owner/parallel pixel coverage to 320 overlapping shapes; the runtime source is byte-identical. Both adapters pass that expanded test after restoring the 32-shape implementation. Parent integration: `5c360b10d6d1b033a5fab5cee885f9d29784c0c6`. The later report-only commits do not change this tested source. The parent build includes the independent, unstaged 21-line `render_profile.rs` addition, whose SHA256 remains `2d39c29e551ef09eb58a39013b097120cc33f14deed08104bc7b1c2036740fb3`; it is excluded from task commits.
 
@@ -104,7 +104,7 @@ Logical storage estimates, driver allocated/reserved bytes and RSS are reported 
 - NVIDIA worker preparation and CPU P99 performance gates fail in the final matrix; reliable acceptance of this group remains open.
 - Golden-image mismatches and the variable Stage3D counter case above remain unresolved baseline compatibility/fixture limitations. Seven selected cases are ignored.
 - Android ARM64 has compilation evidence only. Android real hardware, Windows/DX12 and macOS/Metal runtime/build acceptance are unavailable; no device recreation/fallback claim covers those gaps.
-- Remaining Web compatibility is deliberately outside scope. Official-server Aola gameplay performance and universal OS-OOM survival are not claimed.
+- Official-server Aola gameplay performance and universal OS-OOM survival are not claimed.
 
 All delivery commits remain on `codex/native-wgpu-renderer`; no merge or push has been performed.
 
@@ -141,7 +141,6 @@ Chronological ledger entries follow; later entries supersede earlier implementat
 - Ruling: Vendor the unmodified published wgpu-hal30.0.1 package plus one native capability correction, applied by both Cargo roots — apitrace proves no glUniformBlockBinding calls although GLSL330 omits explicit bindings; compute extensions incorrectly enabled SHADER_BINDING_LAYOUT — use Naga's actual supports_explicit_locations() predicate, preserving wgpu30.0.1 and shader arithmetic; maintain this small dependency patch until upstream includes it. Provenance and removal condition are in render/wgpu/vendor/wgpu-hal/RUFFLE-PATCH.md.
 - Final: Ruling: Pristine vendored wgpu-hal code remains the upstream published30.0.1 implementation — only the authored capability predicate/provenance/Cargo patch is in review scope — upstream defects remain dependency risk, not a fresh full-vendor audit.
 - Final: Ruling: Preserve the21 independent unstaged parent render_profile.rs lines and exclude them from commits — they are unrelated user work — no review/acceptance claim for those lines.
-- Final: Ruling: Remaining Web compatibility stays unverified — user explicitly requested native-only — this branch cannot be represented as a supported Web renderer.
 - Final: Ruling: Android real-device, DX12 and Metal runtime remain not verified because hardware is unavailable — cross-compilation does not establish runtime behavior — those platforms need future hardware evidence before acceptance.
 - Final: Ruling: OS process OOM survival and exact driver allocation remain outside the contract — checked logical GPU admission and typed failures cannot control OS termination or all driver storage — report allocator/RSS separately without promising universal OOM survival.
 - Final: Ruling: Retain documented baseline-identical Flash failures with unchanged tolerances — exact reference binaries/PNG hashes are preserved and source review does not regenerate them — no claim of full Flash compatibility for those cases.

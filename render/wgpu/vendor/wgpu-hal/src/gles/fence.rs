@@ -29,9 +29,7 @@ pub struct Fence {
 
 impl crate::DynFence for Fence {}
 
-#[cfg(send_sync)]
 unsafe impl Send for Fence {}
-#[cfg(send_sync)]
 unsafe impl Sync for Fence {}
 
 impl Fence {

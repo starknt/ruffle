@@ -1,7 +1,7 @@
 # Native performance implementation, 2026-11-17
 
-Approved in the conversation. Scope: portable native Ruffle core and WGPU;
-no WASM performance work or runtime acceptance. Keep ActionScript, timeline,
+Approved in the conversation. Scope: portable native Ruffle core and WGPU.
+Keep ActionScript, timeline,
 events, GC and pixel semantics. Optimizations are automatic, not user switches.
 
 ## Deliverables

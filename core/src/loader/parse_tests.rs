@@ -92,7 +92,6 @@ fn stale_load_bytes_parse_error_does_not_fail_a_new_loader_generation() {
     });
 }
 
-#[cfg(not(target_family = "wasm"))]
 #[test]
 fn worker_returns_shared_bytes_before_main_thread_installation() {
     let (_, movie) = futures::executor::block_on(prepare_swf_movie(
@@ -123,7 +122,6 @@ fn swz(bytes: &[u8]) -> Vec<u8> {
     tlv(0x30, &tlv(0xa0, &signed))
 }
 
-#[cfg(not(target_family = "wasm"))]
 #[test]
 fn worker_returns_inner_swf_without_requiring_main_thread_swz_extraction() {
     let bytes = movie_bytes();
@@ -142,7 +140,6 @@ fn worker_returns_inner_swf_without_requiring_main_thread_swz_extraction() {
     assert_eq!(movie.unwrap().compressed_len(), swz(&bytes).len());
 }
 
-#[cfg(not(target_family = "wasm"))]
 #[test]
 fn worker_parse_yields_before_work_can_run_on_a_single_thread_pool() {
     use std::future::Future;
@@ -167,7 +164,6 @@ fn worker_parse_yields_before_work_can_run_on_a_single_thread_pool() {
     assert!(futures::executor::block_on(future).unwrap().1.is_some());
 }
 
-#[cfg(not(target_family = "wasm"))]
 #[test]
 fn inline_and_worker_preparation_preserve_bytes_metadata_and_shared_storage() {
     use ruffle_common::sandbox::SandboxType;
@@ -185,7 +181,7 @@ fn inline_and_worker_preparation_preserve_bytes_metadata_and_shared_storage() {
             info,
         ))
         .unwrap();
-        let (inline_body, inline) = prepare_swf_movie_inline(body, url, origin, info).unwrap();
+        let (inline_body, inline) = prepare_swf_movie_data(body, url, origin, info).unwrap();
         let (worker, inline) = (worker.unwrap(), inline.unwrap());
         assert_eq!(worker_body, inline_body);
         assert!(worker_body.is_empty());
@@ -200,7 +196,6 @@ fn inline_and_worker_preparation_preserve_bytes_metadata_and_shared_storage() {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 #[test]
 fn worker_preserves_non_movie_payload_and_rejects_malformed_swf() {
     let image = b"GIF89a fixture".to_vec();

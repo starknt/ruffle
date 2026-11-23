@@ -46,7 +46,6 @@ pub struct AdapterContext {
     inner: Arc<Mutex<Inner>>,
 }
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(AdapterContext: Send, Sync);
 
 impl AdapterContext {
@@ -187,7 +186,6 @@ pub struct Instance {
     inner: Arc<Mutex<Inner>>,
 }
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(Instance: Send, Sync);
 
 fn load_gl_func(name: &str, module: Option<Foundation::HMODULE>) -> *const c_void {

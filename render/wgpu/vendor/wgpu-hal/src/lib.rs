@@ -94,7 +94,7 @@
 //! The `wgpu-hal` crate has a partial implementation based on the following
 //! platform graphics API:
 //!
-//! - The GL backend is available anywhere OpenGL, OpenGL ES, or WebGL are
+//! - The GL backend is available anywhere OpenGL or OpenGL ES is
 //!   available. See the [`gles`] module documentation for details.
 //!
 //! [`gles`]: gles/index.html
@@ -238,12 +238,15 @@
     unused_qualifications
 )]
 
+#[cfg(target_family = "wasm")]
+compile_error!("Ruffle wgpu-hal supports native targets only");
+
 extern crate alloc;
 #[allow(unused_extern_crates)]
 extern crate naga_types as nt;
 extern crate wgpu_types as wgt;
 // Each of these backends needs `std` in some fashion; usually `std::thread` functions.
-#[cfg(any(dx12, gles_with_std, metal, vulkan))]
+#[cfg(any_backend)]
 #[macro_use]
 extern crate std;
 
@@ -308,7 +311,6 @@ use core::{
 use bitflags::bitflags;
 use raw_window_handle::DisplayHandle;
 use thiserror::Error;
-use wgt::WasmNotSendSync;
 
 cfg_if::cfg_if! {
     if #[cfg(supports_ptr_atomics)] {
@@ -348,7 +350,7 @@ pub struct DropGuard {
     callback: Option<DropCallback>,
 }
 
-#[cfg(all(any(gles, vulkan, metal), any(native, Emscripten)))]
+#[cfg(any(gles, vulkan, metal))]
 impl DropGuard {
     fn from_option(callback: Option<DropCallback>) -> Option<Self> {
         callback.map(Self::new)
@@ -592,7 +594,7 @@ impl InstanceError {
 ///
 /// The api can either be used through generics (through use of this trait and associated
 /// types) or dynamically through using the `Dyn*` traits.
-pub trait Api: Clone + fmt::Debug + Sized + WasmNotSendSync + 'static {
+pub trait Api: Clone + fmt::Debug + Sized + Send + Sync + 'static {
     const VARIANT: wgt::Backend;
 
     type Instance: DynInstance + Instance<A = Self>;
@@ -654,7 +656,7 @@ pub trait Api: Clone + fmt::Debug + Sized + WasmNotSendSync + 'static {
     type AccelerationStructure: DynAccelerationStructure + 'static;
 }
 
-pub trait Instance: Sized + WasmNotSendSync {
+pub trait Instance: Sized + Send + Sync {
     type A: Api;
 
     unsafe fn init(desc: &InstanceDescriptor<'_>) -> Result<Self, InstanceError>;
@@ -663,14 +665,13 @@ pub trait Instance: Sized + WasmNotSendSync {
         display_handle: raw_window_handle::RawDisplayHandle,
         window_handle: raw_window_handle::RawWindowHandle,
     ) -> Result<<Self::A as Api>::Surface, InstanceError>;
-    /// `surface_hint` is only used by the GLES backend targeting WebGL2
     unsafe fn enumerate_adapters(
         &self,
         surface_hint: Option<&<Self::A as Api>::Surface>,
     ) -> Vec<ExposedAdapter<Self::A>>;
 }
 
-pub trait Surface: WasmNotSendSync {
+pub trait Surface: Send + Sync {
     type A: Api;
 
     /// Configure `self` to use `device`.
@@ -777,7 +778,7 @@ pub trait Surface: WasmNotSendSync {
     unsafe fn discard_texture(&self, texture: <Self::A as Api>::SurfaceTexture);
 }
 
-pub trait Adapter: WasmNotSendSync {
+pub trait Adapter: Send + Sync {
     type A: Api;
 
     unsafe fn open(
@@ -898,7 +899,7 @@ pub trait Adapter: WasmNotSendSync {
 ///
 /// [validation]: index.html#validation-is-the-calling-codes-responsibility-not-wgpu-hals
 /// [`Texture`]: Api::Texture
-pub trait Device: WasmNotSendSync {
+pub trait Device: Send + Sync {
     type A: Api;
 
     /// Creates a new buffer.
@@ -1214,7 +1215,7 @@ pub trait Device: WasmNotSendSync {
     fn check_if_oom(&self) -> Result<(), DeviceError>;
 }
 
-pub trait Queue: WasmNotSendSync {
+pub trait Queue: Send + Sync {
     type A: Api;
 
     /// Submit `command_buffers` for execution on GPU.
@@ -1381,7 +1382,7 @@ pub trait Queue: WasmNotSendSync {
 /// It is the user's responsibility to meet this requirements. This
 /// allows `CommandEncoder` implementations to keep their state
 /// tracking to a minimum.
-pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
+pub trait CommandEncoder: Send + Sync + fmt::Debug {
     type A: Api;
 
     /// Begin encoding a new command buffer.
@@ -1464,20 +1465,6 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
         regions: T,
     ) where
         T: Iterator<Item = BufferCopy>;
-
-    /// Copy from an external image to an internal texture.
-    /// Works with a single array layer.
-    /// Note: `dst` current usage has to be `wgt::TextureUses::COPY_DST`.
-    /// Note: the copy extent is in physical size (rounded to the block size)
-    #[cfg(webgl)]
-    unsafe fn copy_external_image_to_texture<T>(
-        &mut self,
-        src: &wgt::CopyExternalImageSourceInfo,
-        dst: &<Self::A as Api>::Texture,
-        dst_premultiplication: bool,
-        regions: T,
-    ) where
-        T: Iterator<Item = TextureCopy>;
 
     /// Copy from one texture to another.
     /// Works with a single array layer.

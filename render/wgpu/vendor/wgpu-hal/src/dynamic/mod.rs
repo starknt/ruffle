@@ -18,8 +18,6 @@ use core::{
     fmt,
 };
 
-use wgt::WasmNotSendSync;
-
 use crate::{
     AccelerationStructureAABBs, AccelerationStructureEntries, AccelerationStructureInstances,
     AccelerationStructureTriangleIndices, AccelerationStructureTriangleTransform,
@@ -28,7 +26,7 @@ use crate::{
 };
 
 /// Base trait for all resources, allows downcasting via [`Any`].
-pub trait DynResource: Any + WasmNotSendSync + 'static {
+pub trait DynResource: Any + Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }

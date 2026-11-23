@@ -1266,7 +1266,7 @@ impl<'gc> EditText<'gc> {
         };
 
         // If the font can't be found or has no glyph information, use the "device font" instead.
-        // We're cheating a bit and not actually rendering text using the OS/web.
+        // We're cheating a bit and not actually rendering text using the OS.
         // Instead, we embed an SWF version of Noto Sans to use as the "device font", and render
         // it the same as any other SWF outline text.
         if let Some((text, _tf, font, params)) =

@@ -18,7 +18,7 @@ Please follow our [test guidelines](https://github.com/ruffle-rs/ruffle/blob/mas
 to make a SWF test which should fail before this PR, and pass after it. This
 helps us protect against breaking your changes in the future.
 
-If applicable, add unit tests or web integration tests, but don't test SWF
+If applicable, add unit or integration tests, but don't test SWF
 behavior with unit tests. Describe what you added!
 
 Note that in most cases, it's obligatory to add a SWF test for every

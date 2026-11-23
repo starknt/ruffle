@@ -427,7 +427,7 @@ pub(super) fn run_pixelbender_shader_impl(
         NonZeroU64::new(std::mem::size_of::<f32>() as u64 * 4).unwrap(),
     )?;
 
-    // This would ideally be a single f32, but web requires at least 16 bytes
+    // Match the vec4 uniform emitted by the Pixel Bender compiler.
     zeroed_out_of_range_mode_slice.copy_from_slice(bytemuck::cast_slice(&[match mode {
         // When a Shader is run via a ShaderJob, out-of-range texture sample coordinates
         // seem to be clamped to the edge of the texture (despite what the docs describe)

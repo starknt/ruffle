@@ -37,8 +37,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Some SWFS have a large amount of recursion (particularly
     // around `goto`s). Increase the stack size on Windows
-    // accommodate this (the default on Linux is high enough). We
-    // do the same thing for wasm in web/build.rs.
+    // to accommodate this (the default on Linux is high enough).
     let target = std::env::var("TARGET").expect("TARGET not set");
 
     if target.contains("windows") {

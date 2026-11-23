@@ -41,7 +41,7 @@ We love new contributors! You can contribute to Ruffle in several ways:
 
 ### Test your favorite Flash content
 
-Try out your favorite SWF content in Ruffle and see how it works! Follow the instructions on the [Using Ruffle](https://github.com/ruffle-rs/ruffle/wiki/Using-Ruffle) page to get Ruffle for your desired platform. You can run the SWF through the desktop player, the web demo, or try the extension on live websites.
+Try out your favorite SWF content in Ruffle and see how it works! Follow the instructions on the [Using Ruffle](https://github.com/ruffle-rs/ruffle/wiki/Using-Ruffle) page to get Ruffle for your desired platform. Run the SWF in the native desktop player.
 
 If you encounter specific issues with content, please follow the guidelines on filing an issue.
 
@@ -118,7 +118,7 @@ This allows you to see Ruffle's representation of the objects on the Stage.
 When filing an issue, if possible, please include:
 
 * A clear description of the problem.
-* The platform you are testing on (web, desktop, OS).
+* The operating system you are testing on.
 * A link/attachment to the SWF demonstrating the issue, if possible.
 * Screenshots if the issue is a visible problem.
 * Bonus points for including the correct output from the official Flash Player.
@@ -299,13 +299,13 @@ If you are adding a new test, commit both your SWF source (`.fla` and/or `.as` f
 Here is a sample commit message:
 
 ```
-web: Fix incorrect rendering of gradients (close #23)
+render: Fix incorrect rendering of gradients (close #23)
 ```
 
 * If applicable, prefix the first line with a tag indicating the relevant area of changes:
     * `core:`
     * `desktop:`
-    * `web:`
+    * `render:`
     * `avm1:`
     * `avm2:`
     * `docs:`
@@ -320,7 +320,7 @@ web: Fix incorrect rendering of gradients (close #23)
 
 ## Pull Requests
 
-Pull requests are the primary way to contribute code to Ruffle. Pull requests should be made against the latest `master` branch. Your pull request should not contain merges; you should always rebase when bringing the latest changes into your branch from the `master` branch. If there are merge conflicts, or if your commit history is messy, please rebase onto the latest master. [`git rebase -i`](https://thoughtbot.com/blog/git-interactive-rebase-squash-amend-rewriting-history#interactive-rebase) is a great way to clean up your pull request.
+Pull requests are the primary way to contribute code to Ruffle. Pull requests should be made against the latest `main` branch. Your pull request should not contain merges; you should always rebase when bringing the latest changes into your branch from the `main` branch. If there are merge conflicts, or if your commit history is messy, please rebase onto the latest `main`. [`git rebase -i`](https://thoughtbot.com/blog/git-interactive-rebase-squash-amend-rewriting-history#interactive-rebase) is a great way to clean up your pull request.
 
 Remember to use the provided template when filing a Pull Request.
 

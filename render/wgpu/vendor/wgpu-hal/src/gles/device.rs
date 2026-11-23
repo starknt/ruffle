@@ -13,7 +13,7 @@ use arrayvec::ArrayVec;
 use glow::HasContext;
 use naga::FastHashMap;
 
-use super::{conv, lock, MaybeMutex, PrivateCapabilities};
+use super::{conv, lock, PrivateCapabilities};
 use crate::auxil::map_naga_stage;
 use crate::TlasInstance;
 
@@ -129,7 +129,6 @@ impl super::Device {
     /// - `name` must be a texture
     /// - If `drop_callback` is [`None`], wgpu-hal will take ownership of the texture. If
     ///   `drop_callback` is [`Some`], the texture must be valid until the callback is called.
-    #[cfg(any(native, Emscripten))]
     pub unsafe fn texture_from_raw(
         &self,
         name: NonZeroU32,
@@ -156,7 +155,6 @@ impl super::Device {
     /// - `name` must be a renderbuffer
     /// - If `drop_callback` is [`None`], wgpu-hal will take ownership of the renderbuffer. If
     ///   `drop_callback` is [`Some`], the renderbuffer must be valid until the callback is called.
-    #[cfg(any(native, Emscripten))]
     pub unsafe fn texture_from_raw_renderbuffer(
         &self,
         name: NonZeroU32,
@@ -189,7 +187,6 @@ impl super::Device {
     /// - If `drop_callback` is [`None`], wgpu-hal will take ownership of the buffer and
     ///   call `glDeleteBuffers` on it. If `drop_callback` is [`Some`], the buffer must
     ///   remain valid until the callback is invoked.
-    #[cfg(any(native, Emscripten))]
     pub unsafe fn buffer_from_raw(
         &self,
         name: NonZeroU32,
@@ -233,7 +230,7 @@ impl super::Device {
             target,
             size: desc.size,
             map_flags,
-            map_state: Arc::new(MaybeMutex::new(super::BufferMapState {
+            map_state: Arc::new(std::sync::Mutex::new(super::BufferMapState {
                 mapped: false,
                 data: None,
                 offset_of_current_mapping: 0,
@@ -246,7 +243,7 @@ impl super::Device {
         gl: &glow::Context,
         shader: &str,
         naga_stage: naga::ShaderStage,
-        #[cfg_attr(target_arch = "wasm32", allow(unused))] label: Option<&str>,
+        label: Option<&str>,
     ) -> Result<glow::Shader, crate::PipelineError> {
         let target = match naga_stage {
             naga::ShaderStage::Vertex => glow::VERTEX_SHADER,
@@ -261,7 +258,6 @@ impl super::Device {
         };
 
         let raw = unsafe { gl.create_shader(target) }.unwrap();
-        #[cfg(native)]
         if gl.supports_debug() {
             let name = raw.0.get();
             unsafe { gl.object_label(glow::SHADER, name, label) };
@@ -400,7 +396,7 @@ impl super::Device {
         gl: &glow::Context,
         shaders: ArrayVec<ShaderStage<'a>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
         layout: &super::PipelineLayout,
-        #[cfg_attr(target_arch = "wasm32", allow(unused))] label: Option<&str>,
+        label: Option<&str>,
         multiview_mask: Option<NonZeroU32>,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
         let mut program_stages = ArrayVec::new();
@@ -462,7 +458,7 @@ impl super::Device {
         gl: &glow::Context,
         shaders: ArrayVec<ShaderStage<'a>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
         layout: &super::PipelineLayout,
-        #[cfg_attr(target_arch = "wasm32", allow(unused))] label: Option<&str>,
+        label: Option<&str>,
         multiview_mask: Option<NonZeroU32>,
         glsl_version: naga::back::glsl::Version,
         private_caps: PrivateCapabilities,
@@ -472,7 +468,6 @@ impl super::Device {
             naga::back::glsl::Version::Desktop(version) => format!("{version}"),
         };
         let program = unsafe { gl.create_program() }.unwrap();
-        #[cfg(native)]
         if let Some(label) = label {
             if private_caps.contains(PrivateCapabilities::DEBUG_FNS) {
                 let name = program.0.get();
@@ -622,14 +617,10 @@ impl crate::Device for super::Device {
             glow::ARRAY_BUFFER
         };
 
-        let emulate_map = self
+        let emulate_map = !self
             .shared
-            .workarounds
-            .contains(super::Workarounds::EMULATE_BUFFER_MAP)
-            || !self
-                .shared
-                .private_caps
-                .contains(PrivateCapabilities::BUFFER_ALLOCATION);
+            .private_caps
+            .contains(PrivateCapabilities::BUFFER_ALLOCATION);
 
         if emulate_map && desc.usage.intersects(wgt::BufferUses::MAP_WRITE) {
             return Ok(super::Buffer {
@@ -637,7 +628,7 @@ impl crate::Device for super::Device {
                 target,
                 size: desc.size,
                 map_flags: 0,
-                map_state: Arc::new(MaybeMutex::new(super::BufferMapState {
+                map_state: Arc::new(std::sync::Mutex::new(super::BufferMapState {
                     mapped: false,
                     data: Some(vec![0; desc.size as usize]),
                     offset_of_current_mapping: 0,
@@ -716,7 +707,6 @@ impl crate::Device for super::Device {
         }
         //TODO: do we need `glow::MAP_UNSYNCHRONIZED_BIT`?
 
-        #[cfg(native)]
         if let Some(label) = desc.label {
             if self
                 .shared
@@ -741,7 +731,7 @@ impl crate::Device for super::Device {
             target,
             size: desc.size,
             map_flags,
-            map_state: Arc::new(MaybeMutex::new(super::BufferMapState {
+            map_state: Arc::new(std::sync::Mutex::new(super::BufferMapState {
                 mapped: false,
                 data,
                 offset_of_current_mapping: 0,
@@ -906,7 +896,6 @@ impl crate::Device for super::Device {
                 };
             }
 
-            #[cfg(native)]
             if let Some(label) = desc.label {
                 if self
                     .shared
@@ -1074,7 +1063,6 @@ impl crate::Device for super::Device {
                 };
             }
 
-            #[cfg(native)]
             if let Some(label) = desc.label {
                 if self
                     .shared
@@ -1114,9 +1102,6 @@ impl crate::Device for super::Device {
                 super::TextureInner::Texture { raw, .. } => {
                     unsafe { gl.delete_texture(raw) };
                 }
-                #[cfg(webgl)]
-                super::TextureInner::ExternalFramebuffer { .. } => {}
-                #[cfg(native)]
                 super::TextureInner::ExternalNativeFramebuffer { .. } => {}
             }
         }
@@ -1232,7 +1217,6 @@ impl crate::Device for super::Device {
             };
         }
 
-        #[cfg(native)]
         if let Some(label) = desc.label {
             if self
                 .shared
@@ -1680,7 +1664,6 @@ impl crate::Device for super::Device {
     }
     unsafe fn destroy_pipeline_cache(&self, _: super::PipelineCache) {}
 
-    #[cfg_attr(target_arch = "wasm32", allow(unused))]
     unsafe fn create_query_set(
         &self,
         desc: &wgt::QuerySetDescriptor<crate::Label>,
@@ -1736,7 +1719,6 @@ impl crate::Device for super::Device {
         &self,
         fence: &super::Fence,
     ) -> Result<crate::FenceValue, crate::DeviceError> {
-        #[cfg_attr(target_arch = "wasm32", allow(clippy::needless_borrow))]
         Ok(fence.get_latest(&self.shared.context.lock()))
     }
     unsafe fn wait(
@@ -1750,22 +1732,14 @@ impl crate::Device for super::Device {
         }
 
         let gl = &self.shared.context.lock();
-        // MAX_CLIENT_WAIT_TIMEOUT_WEBGL is:
-        // - 1s in Gecko https://searchfox.org/mozilla-central/rev/754074e05178e017ef6c3d8e30428ffa8f1b794d/dom/canvas/WebGLTypes.h#1386
-        // - 0 in WebKit https://github.com/WebKit/WebKit/blob/4ef90d4672ca50267c0971b85db403d9684508ea/Source/WebCore/html/canvas/WebGL2RenderingContext.cpp#L110
-        // - 0 in Chromium https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc;l=112;drc=a3cb0ac4c71ec04abfeaed199e5d63230eca2551
-        let timeout_ns = if cfg!(any(webgl, Emscripten)) {
-            0
-        } else {
-            timeout
-                .map(|t| t.as_nanos().min(u32::MAX as u128) as u32)
-                .unwrap_or(u32::MAX)
-        };
+        let timeout_ns = timeout
+            .map(|t| t.as_nanos().min(u32::MAX as u128) as u32)
+            .unwrap_or(u32::MAX);
         fence.wait(gl, wait_value, timeout_ns)
     }
 
     unsafe fn start_graphics_debugger_capture(&self) -> bool {
-        #[cfg(all(native, feature = "renderdoc"))]
+        #[cfg(feature = "renderdoc")]
         return unsafe {
             self.render_doc
                 .start_frame_capture(self.shared.context.raw_context(), ptr::null_mut())
@@ -1774,7 +1748,7 @@ impl crate::Device for super::Device {
         false
     }
     unsafe fn stop_graphics_debugger_capture(&self) {
-        #[cfg(all(native, feature = "renderdoc"))]
+        #[cfg(feature = "renderdoc")]
         unsafe {
             self.render_doc
                 .end_frame_capture(ptr::null_mut(), ptr::null_mut())
@@ -1817,7 +1791,5 @@ impl crate::Device for super::Device {
     }
 }
 
-#[cfg(send_sync)]
 unsafe impl Sync for super::Device {}
-#[cfg(send_sync)]
 unsafe impl Send for super::Device {}

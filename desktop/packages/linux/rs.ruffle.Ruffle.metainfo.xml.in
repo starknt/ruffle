@@ -12,12 +12,6 @@
     <launchable type="desktop-id">rs.ruffle.Ruffle.desktop</launchable>
     <description>
         <p>
-            Ruffle is a Flash Player emulator written in Rust.
-            Leveraging the safety guarantees of Rust, we can confidently avoid all
-            the security pitfalls that Flash had a reputation for.
-            Ruffle puts Flash back on the web, where it belongs!
-        </p>
-        <p>
             This application lets you run Flash content on your computer without a browser in-between,
             and take full advantage of your GPU and system resources to get those extra frames when playing intense games.
         </p>

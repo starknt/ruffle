@@ -815,8 +815,7 @@ cfg_if::cfg_if! {
     if #[cfg(all(target_vendor = "apple", feature = "metal"))] {
         type Api = hal::api::Metal;
     }
-    // Wasm + Vulkan
-    else if #[cfg(all(not(target_arch = "wasm32"), feature = "vulkan"))] {
+    else if #[cfg(feature = "vulkan")] {
         type Api = hal::api::Vulkan;
     }
     // Windows + DX12

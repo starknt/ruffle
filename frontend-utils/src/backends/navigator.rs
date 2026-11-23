@@ -73,8 +73,7 @@ pub trait FutureSpawner<Err> {
     fn spawn(&self, future: OwnedFuture<(), Err>);
 }
 
-/// Implementation of `NavigatorBackend` for non-web environments that can call
-/// out to a web browser.
+/// Loads resources on the native host and opens links through its system browser.
 pub struct ExternalNavigatorBackend<F: FutureSpawner<Error>, I: NavigatorInterface> {
     /// Sink for tasks sent to us through `spawn_future`.
     future_spawner: F,

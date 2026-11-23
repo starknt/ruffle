@@ -82,10 +82,6 @@ pub struct Avm1<'gc> {
     /// is raised. This defaults to 256 but can be changed per movie.
     max_recursion_depth: u16,
 
-    /// Whether a Mouse listener has been registered.
-    /// Used to prevent scrolling on web.
-    has_mouse_listener: bool,
-
     /// The list of all movie clips in execution order.
     clip_exec_list: Option<MovieClip<'gc>>,
 
@@ -124,7 +120,6 @@ impl<'gc> Avm1<'gc> {
             registers: [Value::Undefined; 4],
             halted: false,
             max_recursion_depth: 255,
-            has_mouse_listener: false,
             clip_exec_list: None,
 
             #[cfg(feature = "avm_debug")]
@@ -325,19 +320,7 @@ impl<'gc> Avm1<'gc> {
             .and_then(|v| v.coerce_to_object_or_bare(&mut activation))
             .unwrap();
 
-        let has_listener =
-            broadcast_internal(broadcaster, args, method, &mut activation).unwrap_or(false);
-        drop(activation);
-
-        if &broadcaster_name == b"Mouse" {
-            context.avm1.has_mouse_listener = has_listener;
-        }
-    }
-
-    /// Returns true if the `Mouse` object has a listener registered.
-    /// Used to prevent mouse wheel scrolling on web.
-    pub fn has_mouse_listener(&self) -> bool {
-        self.has_mouse_listener
+        let _ = broadcast_internal(broadcaster, args, method, &mut activation);
     }
 
     /// Halts the AVM, preventing execution of any further actions.

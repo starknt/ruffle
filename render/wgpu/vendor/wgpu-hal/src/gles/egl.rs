@@ -23,11 +23,7 @@ const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
 const EGL_GL_COLORSPACE_KHR: u32 = 0x309D;
 const EGL_GL_COLORSPACE_SRGB_KHR: u32 = 0x3089;
 
-#[cfg(not(Emscripten))]
 type EglInstance = khronos_egl::DynamicInstance<khronos_egl::EGL1_4>;
-
-#[cfg(Emscripten)]
-type EglInstance = khronos_egl::Instance<khronos_egl::Static>;
 
 type EglLabel = *const ffi::c_void;
 
@@ -346,9 +342,7 @@ struct Inner {
     srgb_kind: SrgbFrameBufferKind,
 }
 
-#[cfg(send_sync)]
 unsafe impl Send for Inner {}
-#[cfg(send_sync)]
 unsafe impl Sync for Inner {}
 
 // Different calls to `eglGetPlatformDisplay` may return the same `Display`, making it a global
@@ -610,29 +604,27 @@ impl Inner {
 
         // Testing if context can be binded without surface
         // and creating dummy pbuffer surface if not.
-        let pbuffer = if version >= (1, 5)
-            || display_extensions.contains("EGL_KHR_surfaceless_context")
-            || cfg!(Emscripten)
-        {
-            log::debug!("\tEGL context: +surfaceless");
-            None
-        } else {
-            let attributes = [
-                khronos_egl::WIDTH,
-                1,
-                khronos_egl::HEIGHT,
-                1,
-                khronos_egl::NONE,
-            ];
-            egl.create_pbuffer_surface(display, config, &attributes)
-                .map(Some)
-                .map_err(|e| {
-                    crate::InstanceError::with_source(
-                        String::from("error in create_pbuffer_surface"),
-                        e,
-                    )
-                })?
-        };
+        let pbuffer =
+            if version >= (1, 5) || display_extensions.contains("EGL_KHR_surfaceless_context") {
+                log::debug!("\tEGL context: +surfaceless");
+                None
+            } else {
+                let attributes = [
+                    khronos_egl::WIDTH,
+                    1,
+                    khronos_egl::HEIGHT,
+                    1,
+                    khronos_egl::NONE,
+                ];
+                egl.create_pbuffer_surface(display, config, &attributes)
+                    .map(Some)
+                    .map_err(|e| {
+                        crate::InstanceError::with_source(
+                            String::from("error in create_pbuffer_surface"),
+                            e,
+                        )
+                    })?
+            };
 
         Ok(Self {
             egl: EglContext {
@@ -715,7 +707,6 @@ impl Instance {
     }
 }
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(Instance: Send, Sync);
 
 impl crate::Instance for Instance {
@@ -725,11 +716,6 @@ impl crate::Instance for Instance {
         use raw_window_handle::RawDisplayHandle as Rdh;
 
         profiling::scope!("Init OpenGL (EGL) Backend");
-        #[cfg(Emscripten)]
-        let egl_result: Result<EglInstance, khronos_egl::Error> =
-            Ok(khronos_egl::Instance::new(khronos_egl::Static));
-
-        #[cfg(not(Emscripten))]
         let egl_result = if cfg!(windows) {
             unsafe {
                 khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
@@ -760,11 +746,7 @@ impl crate::Instance for Instance {
             client_ext_str.split_whitespace().collect::<Vec<_>>()
         );
 
-        #[cfg(not(Emscripten))]
         let egl1_5 = egl.upcast::<khronos_egl::EGL1_5>();
-
-        #[cfg(Emscripten)]
-        let egl1_5: Option<&Arc<EglInstance>> = Some(&egl);
 
         let (display, wsi_kind) = match (desc.display.map(|d| d.as_raw()), egl1_5) {
             (Some(Rdh::Wayland(wayland_display_handle)), Some(egl))
@@ -847,10 +829,6 @@ impl crate::Instance for Instance {
                 log::debug!(
                     "No (or unknown) windowing system ({x:?}) present. Using surfaceless platform"
                 );
-                #[allow(
-                    clippy::unnecessary_literal_unwrap,
-                    reason = "this is only a literal on Emscripten"
-                )]
                 // TODO: This extension is also supported on EGL 1.4 with EGL_EXT_platform_base: https://registry.khronos.org/EGL/extensions/MESA/EGL_MESA_platform_surfaceless.txt
                 let egl = egl1_5.expect("Failed to get EGL 1.5 for surfaceless");
                 let display = unsafe {
@@ -964,8 +942,6 @@ impl crate::Instance for Instance {
                 }
             }
             (Rwh::Wayland(_), _) => {}
-            #[cfg(Emscripten)]
-            (Rwh::Web(_), _) => {}
             other => {
                 return Err(crate::InstanceError::new(format!(
                     "unsupported window: {other:?}"
@@ -1272,8 +1248,6 @@ impl crate::Surface for Surface {
                         wl_window = Some(window);
                         window.cast()
                     }
-                    #[cfg(Emscripten)]
-                    (WindowKind::Unknown, Rwh::Web(handle)) => handle.id as *mut ffi::c_void,
                     (WindowKind::Unknown, Rwh::Win32(handle)) => {
                         handle.hwnd.get() as *mut ffi::c_void
                     }
@@ -1333,11 +1307,7 @@ impl crate::Surface for Surface {
                 }
                 attributes.push(khronos_egl::ATTRIB_NONE as i32);
 
-                #[cfg(not(Emscripten))]
                 let egl1_5 = self.egl.instance.upcast::<khronos_egl::EGL1_5>();
-
-                #[cfg(Emscripten)]
-                let egl1_5: Option<&Arc<EglInstance>> = Some(&self.egl.instance);
 
                 // Careful, we can still be in 1.4 version even if `upcast` succeeds
                 let raw_result = match egl1_5 {

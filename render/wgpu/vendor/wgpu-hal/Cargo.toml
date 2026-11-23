@@ -43,7 +43,6 @@ targets = [
     "x86_64-unknown-linux-gnu",
     "x86_64-apple-darwin",
     "x86_64-pc-windows-msvc",
-    "wasm32-unknown-unknown",
 ]
 
 [package.metadata.cargo-machete]
@@ -82,25 +81,20 @@ dx12 = [
     "windows/Win32_System_Threading",
     "windows/Win32_UI_WindowsAndMessaging",
 ]
-fragile-send-sync-non-atomic-wasm = ["wgpu-types/fragile-send-sync-non-atomic-wasm"]
 gles = [
     "dep:arrayvec",
     "dep:bytemuck",
     "dep:glow",
     "dep:glutin_wgl_sys",
-    "dep:js-sys",
     "dep:khronos-egl",
     "dep:libloading",
     "dep:ndk-sys",
     "dep:objc2",
     "dep:parking_lot",
     "dep:profiling",
-    "dep:wasm-bindgen",
     "dep:wayland-sys",
-    "dep:web-sys",
     "dep:windows-result",
     "naga/glsl-out",
-    "wgpu-types/web",
     "windows-result/std",
     "windows/Win32_Graphics_Gdi",
     "windows/Win32_Graphics_OpenGL",
@@ -269,30 +263,7 @@ features = ["android-native-activity"]
 [build-dependencies.cfg_aliases]
 version = "0.2.2"
 
-[target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies.js-sys]
-version = "0.3.104"
-optional = true
-default-features = true
-
-[target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies.wasm-bindgen]
-version = "0.2.127"
-optional = true
-default-features = false
-
-[target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies.web-sys]
-version = "0.3.104"
-features = [
-    "default",
-    "Window",
-    "HtmlCanvasElement",
-    "WebGl2RenderingContext",
-    "OffscreenCanvas",
-    "VideoFrame",
-]
-optional = true
-default-features = false
-
-[target.'cfg(all(unix, not(target_vendor = "apple"), not(target_family = "wasm")))'.dependencies.drm]
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies.drm]
 version = "0.15"
 optional = true
 
@@ -305,7 +276,7 @@ default-features = false
 version = "1.10"
 optional = true
 
-[target.'cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "visionos", target_env = "ohos")))'.dev-dependencies.glutin]
+[target.'cfg(not(any(target_os = "ios", target_os = "visionos", target_env = "ohos")))'.dev-dependencies.glutin]
 version = "0.32"
 features = [
     "egl",
@@ -315,7 +286,7 @@ features = [
 ]
 default-features = false
 
-[target.'cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "visionos", target_env = "ohos")))'.dev-dependencies.glutin-winit]
+[target.'cfg(not(any(target_os = "ios", target_os = "visionos", target_env = "ohos")))'.dev-dependencies.glutin-winit]
 version = "0.5"
 features = [
     "egl",
@@ -325,30 +296,30 @@ features = [
 ]
 default-features = false
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.ash]
+[dependencies.ash]
 version = "0.38"
 optional = true
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.gpu-allocator]
+[dependencies.gpu-allocator]
 version = "0.28"
 features = ["hashbrown"]
 optional = true
 default-features = false
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.khronos-egl]
+[dependencies.khronos-egl]
 version = "6"
 features = ["dynamic"]
 optional = true
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.libloading]
+[dependencies.libloading]
 version = "0.8"
 optional = true
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.renderdoc-sys]
+[dependencies.renderdoc-sys]
 version = "1"
 optional = true
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.smallvec]
+[dependencies.smallvec]
 version = "1.14"
 features = ["union"]
 optional = true
@@ -364,18 +335,6 @@ optional = true
 
 [target.'cfg(target_os = "android")'.dependencies.ndk-sys]
 version = "0.6"
-optional = true
-
-[target.'cfg(target_os = "emscripten")'.dependencies.khronos-egl]
-version = "6"
-features = [
-    "static",
-    "no-pkg-config",
-]
-optional = true
-
-[target.'cfg(target_os = "emscripten")'.dependencies.libloading]
-version = "0.8"
 optional = true
 
 [target.'cfg(target_vendor = "apple")'.dependencies.block2]
@@ -538,5 +497,4 @@ level = "warn"
 priority = 0
 check-cfg = [
     'cfg(feature, values("cargo-clippy"))',
-    "cfg(web_sys_unstable_apis)",
 ]

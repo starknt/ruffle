@@ -26,17 +26,9 @@ Default delivery is local staged commits, without a push or merge.
 
 ## Native boundary
 
-Keep wgpu 30.0.1. Remove WGPU's canvas entry point, wasm branches/dependencies,
-browser backend and webgl feature. Select native std/parking_lot/wgsl/naga-ir,
-Vulkan/DX12/Metal/GLES features explicitly. Preserve native GL/GLES and negotiate
-adapter capabilities; a GLES requirement is not removed merely because an API
-uses the word WebGL. Make native methods/futures unconditional and reject wasm
-explicitly at the WGPU crate boundary.
-
-Remove WGPU registrations/dependencies/features from the Web frontend to avoid
-dangling Cargo feature references. Keep independent canvas/WebGL source and
-unrelated wasm code. Mechanically adapt shared interfaces when necessary, but
-remaining Web build/runtime compatibility is explicitly unverified. No wasm gate.
+Keep wgpu 30.0.1 and explicitly enable std, parking_lot, wgsl, naga-ir and the
+Vulkan, DX12, Metal and GL/GLES backends. Negotiate limits for native adapters,
+including GLES 3.0. Both the renderer and its host interfaces target native platforms.
 
 ## Device runtime, accounting and policy
 
@@ -220,4 +212,4 @@ acceptance remain incomplete, even if draw counts or a single FPS run look bette
 
 Final whole-branch fresh review and verification report are required. The initial
 design received a fresh builder check with no remaining implementation-blocking
-questions. Remaining Web compatibility is deliberately not an acceptance claim.
+questions.

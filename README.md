@@ -2,23 +2,19 @@
   <a href="https://ruffle.rs"><img alt="Ruffle" src="https://ruffle.rs/logo.svg" /></a>
 </p>
 <p align="center">
-  <a href="https://github.com/ruffle-rs/ruffle/actions"><img alt="Rust Build Status" src="https://img.shields.io/github/actions/workflow/status/ruffle-rs/ruffle/test_rust.yml?label=Rust%20Build&logo=github&branch=master" /></a>
-  <a href="https://github.com/ruffle-rs/ruffle/actions/workflows/test_web.yml"><img alt="Web Build Status" src="https://img.shields.io/github/actions/workflow/status/ruffle-rs/ruffle/test_web.yml?label=Web%20Build&logo=github&branch=master" /></a>
+  <a href="https://github.com/starknt/ruffle/actions/workflows/test_rust.yml"><img alt="Rust Build Status" src="https://img.shields.io/github/actions/workflow/status/starknt/ruffle/test_rust.yml?label=Rust%20Build&logo=github&branch=main" /></a>
   <a href="https://discord.gg/ruffle"><img alt="Ruffle Discord" src="https://img.shields.io/discord/610531541889581066?label=&color=7389d8&labelColor=6a7ec2&logoColor=ffffff&logo=discord" /></a>
   <a href="https://crowdin.com/project/ruffle"><img alt="Ruffle translations" src="https://badges.crowdin.net/ruffle/localized.svg" /></a>
   <br />
-  <a href="https://addons.mozilla.org/en-US/firefox/addon/ruffle_rs/"><img alt="Firefox Extension" src="https://img.shields.io/amo/v/ruffle_rs?logo=firefoxbrowser&logoColor=white&label=firefox" /></a>
-  <a href="https://chromewebstore.google.com/detail/ruffle-flash-emulator/donbcfbmhbcapadipfkeojnmajbakjdc"><img alt="Chrome Extension" src="https://img.shields.io/chrome-web-store/v/donbcfbmhbcapadipfkeojnmajbakjdc?logo=googlechrome&logoColor=white&label=chrome" /></a>
   <a href="https://flathub.org/apps/rs.ruffle.Ruffle"><img alt="Ruffle Flathub" src="https://img.shields.io/flathub/v/rs.ruffle.Ruffle?color=007acc&logo=flathub" /></a>
-  <a href="https://www.npmjs.com/package/@ruffle-rs/ruffle"><img alt="Ruffle npm" src="https://img.shields.io/npm/v/@ruffle-rs/ruffle?color=007acc&logo=npm" /></a>
   <a href="https://aur.archlinux.org/packages/ruffle-nightly-bin"><img alt="Ruffle AUR" src="https://img.shields.io/aur/version/ruffle-nightly-bin?logo=archlinux" /></a>
   <br />
-  <strong><a href="https://ruffle.rs">website</a> | <a href="https://ruffle.rs/demo">demo</a> | <a href="https://github.com/ruffle-rs/ruffle/releases">nightly builds</a> | <a href="https://github.com/ruffle-rs/ruffle/wiki">wiki</a></strong>
+  <strong><a href="https://ruffle.rs">website</a> | <a href="https://github.com/ruffle-rs/ruffle/releases">nightly builds</a> | <a href="https://github.com/ruffle-rs/ruffle/wiki">wiki</a></strong>
 </p>
 
 # Ruffle
 
-Ruffle is an Adobe Flash Player emulator written in the Rust programming language. Ruffle targets both the desktop and the web using WebAssembly.
+Ruffle is an Adobe Flash Player emulator written in the Rust programming language. This fork targets native desktop and Android hosts.
 
 ## Table of Contents
 * [Project status](#project-status)
@@ -29,7 +25,6 @@ Ruffle is an Adobe Flash Player emulator written in the Rust programming languag
   * [Desktop](#desktop)
     * [Build](#build)
     * [macOS](#macos)
-  * [Web or Extension](#web-or-extension)
   * [Android](#android)
   * [Scanner](#scanner)
   * [Exporter](#exporter)
@@ -45,9 +40,7 @@ Ruffle supports ActionScript 1, 2 and 3 pretty well, but it's still not finished
 
 ## Using Ruffle
 
-The easiest way to try out Ruffle is to visit the [web demo page](https://ruffle.rs/demo/), then click the "Select File" button to load a SWF file of your choice.
-
-[Nightly builds](https://ruffle.rs/downloads#nightly-releases) of Ruffle are available for desktop and web platforms.
+Open a SWF with the desktop player, or run `cargo run --release -p ruffle_desktop -- path/to/movie.swf`.
 
 For more detailed instructions, see our [wiki page](https://github.com/ruffle-rs/ruffle/wiki/Using-Ruffle).
 
@@ -101,13 +94,6 @@ Ruffle desktop can be built from our [Homebrew Tap](https://github.com/ruffle-rs
 
 _Note: because it is HEAD-only, you'll need to run `brew upgrade --fetch-HEAD ruffle` each time you want to update._
 
-### Web or Extension
-
-Follow [the instructions in the web directory](web/README.md#building-from-source) for building
-either the web or browser extension version of Ruffle.
-
-This project is tested with BrowserStack.
-
 ### Android
 
 Follow the [instructions](https://github.com/ruffle-rs/ruffle-android/blob/main/CONTRIBUTING.md#building-from-source) in the `ruffle-android` project for building the Android application of Ruffle.
@@ -133,8 +119,7 @@ This currently requires hardware acceleration, but can be run headless (with no 
 - `core` - core emulator and common code
 - `swf` - SWF and ActionScript parser
 - `desktop` - desktop client (uses `wgpu-rs`)
-- `web` - web client and browser extension (uses `wasm-bindgen`)
-- `render` - various rendering backends for both desktop and web
+- `render` - shared rendering code and the native wgpu backend
 - `video` - video decoding backends
 - `flv` - Flash Video decoder
 - `wstr` - a Flash-compatible implementation of strings

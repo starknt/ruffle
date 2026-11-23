@@ -274,7 +274,6 @@ Ruffle depends on third-party libraries with compatible licenses.
 | [color_quant](https://github.com/image-rs/color_quant.git) | [MIT](#MIT) | Copyright (c) 2016 PistonDevelopers  |
 | [combine](https://github.com/Marwes/combine) | [MIT](#MIT) | Copyright (c) 2015 Markus Westerlind  |
 | [console](https://github.com/mitsuhiko/console) | [MIT](#MIT) | Copyright (c) 2017 Armin Ronacher <armin.ronacher@active-4.com>  |
-| [console_error_panic_hook](https://github.com/rustwasm/console_error_panic_hook) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2018 Nick Fitzgerald  |
 | [console_log](https://github.com/iamcodemaker/console_log) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2018 Matthew Nicholson  |
 | [const_fn](https://github.com/taiki-e/const_fn) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) Taiki Endo <te316e89@gmail.com> |
 | [constant_time_eq](https://github.com/cesarb/constant_time_eq) | [CC0-1.0](#CC0-10) | Copyright (c) Cesar Eduardo Barros <cesarb@cesarb.eti.br> |
@@ -536,10 +535,6 @@ Ruffle depends on third-party libraries with compatible licenses.
 | [spirv_cross](https://github.com/grovesNL/spirv_cross) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) Joshua Groves <josh@joshgroves.com> |
 | [spirv_headers](https://github.com/gfx-rs/rspirv) | [Apache-2.0](#Apache-20) | Copyright (c) Lei Zhang <antiagainst@gmail.com> |
 | [standback](https://github.com/jhpratt/standback) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2020 Jacob Pratt  |
-| [stdweb](https://github.com/koute/stdweb) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2017 Jan Bujak  |
-| [stdweb-derive](https://github.com/koute/stdweb) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2017 Jan Bujak  |
-| [stdweb-internal-macros](https://github.com/koute/stdweb) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2017 Jan Bujak  |
-| [stdweb-internal-runtime](https://github.com/koute/stdweb) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2017 Jan Bujak  |
 | [storage-map](https://github.com/kvark/storage-map) | [Apache-2.0](#Apache-20) | Copyright (c) Dzmitry Malyshau <kvarkus@gmail.com> |
 | [strength_reduce](http://github.com/ejmahler/strength_reduce) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) Elliott Mahler <join.together@gmail.com> |
 | [strsim](https://github.com/dguo/strsim-rs) | [MIT](#MIT) | Copyright (c) 2015 Danny Guo Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>  |
@@ -590,13 +585,10 @@ Ruffle depends on third-party libraries with compatible licenses.
 | [walkdir](https://github.com/BurntSushi/walkdir) | [MIT](#MIT)/[Unlicense](#Unlicense) | Copyright (c) 2015 Andrew Gallant  |
 | [wasi](https://github.com/bytecodealliance/wasi) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) The Cranelift Project Developers |
 | [wasm-bindgen](https://github.com/rustwasm/wasm-bindgen) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2014 Alex Crichton  |
-| [wasm-bindgen-backend](https://github.com/rustwasm/wasm-bindgen/tree/master/crates/backend) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2014 Alex Crichton  |
 | [wasm-bindgen-futures](https://github.com/rustwasm/wasm-bindgen/tree/master/crates/futures) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2014 Alex Crichton  |
 | [wasm-bindgen-macro](https://github.com/rustwasm/wasm-bindgen/tree/master/crates/macro) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2014 Alex Crichton  |
 | [wasm-bindgen-macro-support](https://github.com/rustwasm/wasm-bindgen/tree/master/crates/macro-support) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2014 Alex Crichton  |
 | [wasm-bindgen-shared](https://github.com/rustwasm/wasm-bindgen/tree/master/crates/shared) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2014 Alex Crichton  |
-| [wasm-bindgen-test](https://github.com/rustwasm/wasm-bindgen) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2014 Alex Crichton  |
-| [wasm-bindgen-test-macro](https://github.com/rustwasm/wasm-bindgen) | [Apache-2.0](#Apache-20)/[MIT](#MIT) | Copyright (c) 2014 Alex Crichton  |
 | [wayland-client](https://github.com/smithay/wayland-rs) | [MIT](#MIT) | Copyright (c) 2015 Victor Berger  |
 | [wayland-commons](https://github.com/smithay/wayland-rs) | [MIT](#MIT) | Copyright (c) 2015 Victor Berger  |
 | [wayland-cursor](https://github.com/smithay/wayland-rs) | [MIT](#MIT) | Copyright (c) 2015 Victor Berger  |

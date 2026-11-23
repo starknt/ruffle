@@ -32,7 +32,7 @@ use crate::context_menu::{
 use crate::display_object::Avm2MousePick;
 use crate::display_object::{
     EditText, GotoInfo, InteractiveObject, Stage, StageAlign, StageDisplayState, StageScaleMode,
-    StopOrPlay, TInteractiveObject, WindowMode,
+    StopOrPlay, TInteractiveObject,
 };
 use crate::events::GamepadButton;
 use crate::events::PlayerNotification;
@@ -80,9 +80,8 @@ use std::ops::{Deref, DerefMut};
 use std::rc::{Rc, Weak as RcWeak};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::instrument;
-use web_time::Instant;
 
 #[cfg(feature = "default_font")]
 pub const FALLBACK_DEVICE_FONT: &[u8] = include_bytes!("../assets/notosans.subset.ttf.gz");
@@ -1202,7 +1201,6 @@ impl Player {
         };
 
         if play_audio {
-            // Allow auto-play after user gesture for web backends.
             self.audio.play();
         } else {
             self.audio.pause();
@@ -1313,15 +1311,6 @@ impl Player {
     pub fn set_quality(&mut self, quality: StageQuality) {
         self.mutate_with_update_context(|context| {
             context.stage.set_quality(context, quality);
-        })
-    }
-
-    pub fn set_window_mode(&mut self, window_mode: &str) {
-        self.mutate_with_update_context(|context| {
-            let stage = context.stage;
-            if let Ok(window_mode) = WindowMode::from_str(window_mode) {
-                stage.set_window_mode(window_mode);
-            }
         })
     }
 
@@ -2502,12 +2491,7 @@ impl Player {
                     .draw_debug_rects(&mut render_context, gc_root.dynamic_root);
             }
 
-            background_color =
-                if stage.window_mode() != WindowMode::Transparent || stage.is_fullscreen() {
-                    stage.background_color().unwrap_or(Color::WHITE)
-                } else {
-                    Color::from_rgba(0)
-                };
+            background_color = stage.background_color().unwrap_or(Color::WHITE);
 
             let commands = render_context.commands;
 
@@ -2920,12 +2904,6 @@ impl Player {
         self.mutate_with_update_context(|context| {
             NetConnections::update_connections(context);
         })
-    }
-
-    /// Returns whether this player consumes mouse wheel events.
-    /// Used by web to prevent scrolling.
-    pub fn should_prevent_scrolling(&mut self) -> bool {
-        self.mutate_with_update_context(|context| context.avm1.has_mouse_listener())
     }
 
     pub fn set_external_interface_provider(

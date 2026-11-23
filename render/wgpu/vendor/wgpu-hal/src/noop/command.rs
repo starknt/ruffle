@@ -88,18 +88,6 @@ impl crate::CommandEncoder for CommandBuffer {
         });
     }
 
-    #[cfg(webgl)]
-    unsafe fn copy_external_image_to_texture<T>(
-        &mut self,
-        src: &wgt::CopyExternalImageSourceInfo,
-        dst: &Resource,
-        dst_premultiplication: bool,
-        regions: T,
-    ) where
-        T: Iterator<Item = crate::TextureCopy>,
-    {
-    }
-
     unsafe fn copy_texture_to_texture<T>(
         &mut self,
         src: &Resource,

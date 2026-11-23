@@ -125,8 +125,6 @@ pub trait UiBackend: Any {
     fn set_fullscreen(&mut self, is_full: bool) -> Result<(), FullscreenError>;
 
     /// Displays a message about an error during root movie download.
-    /// In particular, on web this can be a CORS error, which we can sidestep
-    /// by providing a direct .swf link instead.
     fn display_root_movie_download_failed_message(
         &self,
         _invalid_swf: bool,

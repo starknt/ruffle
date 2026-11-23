@@ -1,7 +1,7 @@
 //! Per-player instrumentation. A host scopes synchronous AVM/renderer work to its own
 //! session. Allocation guards retain the owning counters across GC and delayed drops.
+use std::time::Instant;
 use std::{cell::RefCell, rc::Rc};
-use web_time::Instant;
 
 macro_rules! work_counters {
     ($($name:ident),* $(,)?) => {

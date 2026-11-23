@@ -2,7 +2,7 @@
 
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
-use crate::avm2::error::{make_error_2017, make_error_2018};
+use crate::avm2::error::make_error_2017;
 use crate::avm2::function::FunctionArgs;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
@@ -15,13 +15,6 @@ pub fn set_clipboard<'gc>(
     _this: Value<'gc>,
     args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
-    // The following restrictions only apply to the plugin.
-    // TODO: Check the type of event that triggered the function call.
-    #[cfg(target_family = "wasm")]
-    if false {
-        return Err(crate::avm2::error::make_error_2176(activation));
-    }
-
     let new_content = args.get_string_non_null(activation, 0, "text")?;
     activation
         .context
@@ -37,10 +30,6 @@ pub fn exit<'gc>(
     _args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_method!(activation, "flash.system.System", "exit");
-
-    if cfg!(target_family = "wasm") {
-        return Err(make_error_2018(activation));
-    }
 
     let movie = activation.caller_movie_or_root();
     if !matches!(movie.sandbox_type(), SandboxType::LocalTrusted) {

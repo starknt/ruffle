@@ -2,9 +2,9 @@ name: Test Rust
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -47,9 +47,6 @@ jobs:
         with:
           filters: |
             src:
-              - '!web/package.json'
-              - '!web/package-lock.json'
-              - '!web/packages/**'
               - '!**/*.md'
 
   build:
@@ -92,7 +89,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "desktop"
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo nextest
         uses: taiki-e/install-action@v2
@@ -235,11 +232,6 @@ jobs:
             --exclude exporter
             --exclude ruffle_scanner
             --exclude ruffle_frontend_utils
-            --exclude ruffle_render_canvas
-            --exclude ruffle_render_webgl
-            --exclude ruffle_web
-            --exclude ruffle_web_common
-            --exclude ruffle_web_safari
             --exclude build_playerglobal
         run: cargo llvm-cov --no-report ${{ env.LLVM_COV_TEST_OPTS }} ${LLVM_COV_EXCLUDE}
 

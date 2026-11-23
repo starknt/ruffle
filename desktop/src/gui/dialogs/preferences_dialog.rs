@@ -768,7 +768,7 @@ fn find_available_graphics_backends(window: Option<Arc<winit::window::Window>>) 
     // backend selection uses, so the two paths can't disagree about which
     // backends are usable (the EGL platform is chosen from it, for example).
     let instance = create_wgpu_instance(
-        wgpu::Backends::all(),
+        wgpu::Instance::enabled_backend_features(),
         wgpu::BackendOptions::default(),
         window.map(|window| Box::new(window) as Box<dyn wgpu::wgt::WgpuHasDisplayHandle>),
     );

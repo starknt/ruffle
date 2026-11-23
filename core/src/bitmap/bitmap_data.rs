@@ -568,7 +568,7 @@ mod wrapper {
     use ruffle_render::commands::CommandHandler;
     use ruffle_render::error::RenderFailure;
     use std::cell::Ref;
-    use web_time::Instant;
+    use std::time::Instant;
 
     #[cfg(feature = "egui")]
     use super::DirtyState;

@@ -59,13 +59,9 @@ pub fn get_player_type<'gc>(
     _args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
     // TODO: When should "External" be returned?
-    let player_type = if cfg!(target_family = "wasm") {
-        "PlugIn"
-    } else {
-        match activation.context.avm2.player_runtime {
-            PlayerRuntime::FlashPlayer => "StandAlone",
-            PlayerRuntime::AIR => "Desktop",
-        }
+    let player_type = match activation.context.avm2.player_runtime {
+        PlayerRuntime::FlashPlayer => "StandAlone",
+        PlayerRuntime::AIR => "Desktop",
     };
 
     Ok(AvmString::new_utf8(activation.gc(), player_type).into())

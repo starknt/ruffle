@@ -10,8 +10,7 @@ use crate::string::AvmString;
 use gc_arena::Collect;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::time::Duration;
-use web_time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 mod event_hash_tests {

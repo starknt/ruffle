@@ -630,9 +630,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -767,16 +765,6 @@ dependencies = [
  "libc",
  "unicode-width",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "console_error_panic_hook"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
-dependencies = [
- "cfg-if",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -2109,11 +2097,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -2218,36 +2204,6 @@ dependencies = [
  "log",
  "regex-automata",
  "regex-syntax",
-]
-
-[[package]]
-name = "gloo-net"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6420f887c48417e9e86c6cf61274eb231830cccc100e49613f7952e269a1fe1"
-dependencies = [
- "futures-channel",
- "futures-core",
- "futures-sink",
- "gloo-utils",
- "http",
- "js-sys",
- "pin-project",
- "thiserror 2.0.18",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "gloo-utils"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4202275d95a142fa209a1e35e91c250a710c5600731372cd3464a39ed01573d6"
-dependencies = [
- "js-sys",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
@@ -2873,7 +2829,6 @@ checksum = "6aae1df220ece3c0ada96b8153459b67eebe9ae9212258bb0134ae60416fdf76"
 dependencies = [
  "libc",
  "libloading",
- "pkg-config",
 ]
 
 [[package]]
@@ -4793,8 +4748,6 @@ dependencies = [
  "ttf-parser",
  "unicode-segmentation",
  "url",
- "wasm-bindgen-futures",
- "web-time",
 ]
 
 [[package]]
@@ -4947,37 +4900,7 @@ dependencies = [
  "swf 0.4.0",
  "thiserror 2.0.18",
  "tracing",
- "wasm-bindgen",
- "web-time",
  "wgpu",
-]
-
-[[package]]
-name = "ruffle_render_canvas"
-version = "0.7.1"
-dependencies = [
- "js-sys",
- "log",
- "ruffle_render",
- "ruffle_web_common",
- "swf 0.4.0",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
-name = "ruffle_render_webgl"
-version = "0.7.1"
-dependencies = [
- "bytemuck",
- "js-sys",
- "log",
- "ruffle_render",
- "ruffle_web_common",
- "swf 0.4.0",
- "thiserror 2.0.18",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
@@ -5081,7 +5004,6 @@ version = "0.7.1"
 dependencies = [
  "bzip2",
  "hex",
- "js-sys",
  "libloading",
  "reqwest",
  "ruffle_render",
@@ -5093,10 +5015,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
- "tracing-subscriber",
- "tracing-wasm",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
@@ -5115,58 +5033,6 @@ dependencies = [
  "slotmap",
  "swf 0.4.0",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "ruffle_web"
-version = "0.7.1"
-dependencies = [
- "async-channel",
- "base64 0.23.1",
- "chrono",
- "console_error_panic_hook",
- "futures",
- "futures-util",
- "getrandom 0.3.4",
- "getrandom 0.4.3",
- "gloo-net",
- "js-sys",
- "rfd",
- "ruffle_core",
- "ruffle_render",
- "ruffle_render_canvas",
- "ruffle_render_webgl",
- "ruffle_video_external",
- "ruffle_web_common",
- "serde",
- "serde-wasm-bindgen",
- "slotmap",
- "thiserror 2.0.18",
- "tracing",
- "tracing-log",
- "tracing-subscriber",
- "tracing-wasm",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-streams",
- "web-sys",
- "zip",
-]
-
-[[package]]
-name = "ruffle_web_common"
-version = "0.7.1"
-dependencies = [
- "tracing",
- "wasm-bindgen",
-]
-
-[[package]]
-name = "ruffle_web_safari"
-version = "0.7.1"
-dependencies = [
- "objc2 0.6.5",
 ]
 
 [[package]]
@@ -5431,17 +5297,6 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
-]
-
-[[package]]
-name = "serde-wasm-bindgen"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
-dependencies = [
- "js-sys",
- "serde",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -6270,7 +6125,6 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
- "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -6348,17 +6202,6 @@ dependencies = [
  "tracing-core",
  "tracing-subscriber",
  "tracy-client",
-]
-
-[[package]]
-name = "tracing-wasm"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4575c663a174420fa2d78f4108ff68f65bf2fbb7dd89f33749b6e826b3626e07"
-dependencies = [
- "tracing",
- "tracing-subscriber",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -6760,19 +6603,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-streams"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
-dependencies = [
- "futures-util",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "wayland-backend"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6990,7 +6820,6 @@ dependencies = [
  "thiserror 2.0.18",
  "wgpu-core-deps-apple",
  "wgpu-core-deps-emscripten",
- "wgpu-core-deps-wasm",
  "wgpu-core-deps-windows-linux-android",
  "wgpu-hal",
  "wgpu-naga-bridge",
@@ -7011,15 +6840,6 @@ name = "wgpu-core-deps-emscripten"
 version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98b86cf4abf524a902dd35f18ca6a3f08fc2ae9847c8f10b48e30491b1f0b86"
-dependencies = [
- "wgpu-hal",
-]
-
-[[package]]
-name = "wgpu-core-deps-wasm"
-version = "30.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d260ca2ca8adc654f513a869bf3cac0b47f5b8d3f87803d6942015f8de597aae"
 dependencies = [
  "wgpu-hal",
 ]
@@ -7050,7 +6870,6 @@ dependencies = [
  "glutin_wgl_sys",
  "gpu-allocator",
  "hashbrown 0.17.1",
- "js-sys",
  "khronos-egl",
  "libc",
  "libloading",
@@ -7077,9 +6896,7 @@ dependencies = [
  "smallvec",
  "static_assertions",
  "thiserror 2.0.18",
- "wasm-bindgen",
  "wayland-sys",
- "web-sys",
  "wgpu-naga-bridge",
  "wgpu-types",
  "windows 0.62.2",

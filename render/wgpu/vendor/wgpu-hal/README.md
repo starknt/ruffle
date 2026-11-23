@@ -96,7 +96,7 @@ platform graphics APIs:
 The `wgpu_hal` crate has a partial implementation based on the following
 platform graphics API:
 
-- The GL backend is available anywhere OpenGL, OpenGL ES, or WebGL are
+- The GL backend is available anywhere OpenGL or OpenGL ES is
   available. See the [`gles`] module documentation for details.
 
 [`gles`]: gles/index.html

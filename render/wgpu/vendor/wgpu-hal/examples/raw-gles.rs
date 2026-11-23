@@ -1,21 +1,9 @@
 //! This example shows interop with raw GLES contexts -
 //! the ability to hook up wgpu-hal to an existing context and draw into it.
-//!
-//! Emscripten build:
-//! 1. install emsdk
-//! 2. build this example with cargo:
-//!    EMCC_CFLAGS="-g -s ERROR_ON_UNDEFINED_SYMBOLS=0 --no-entry -s FULL_ES3=1" cargo build --example raw-gles --target wasm32-unknown-emscripten
-//! 3. copy raw-gles.em.html into target directory and open it in browser:
-//!    cp wgpu-hal/examples/raw-gles.em.html target/wasm32-unknown-emscripten/debug/examples
 
 extern crate wgpu_hal as hal;
 
-#[cfg(not(any(
-    target_arch = "wasm32",
-    target_os = "ios",
-    target_os = "visionos",
-    target_env = "ohos"
-)))]
+#[cfg(not(any(target_os = "ios", target_os = "visionos", target_env = "ohos")))]
 fn main() {
     use std::ffi::CString;
 
@@ -259,71 +247,12 @@ fn main() {
         .expect("Couldn't run event loop");
 }
 
-#[cfg(target_os = "emscripten")]
-fn main() {
-    env_logger::init();
-
-    println!("Initializing external GL context");
-    let egl = khronos_egl::Instance::new(khronos_egl::Static);
-    let display = unsafe { egl.get_display(khronos_egl::DEFAULT_DISPLAY) }.unwrap();
-    egl.initialize(display)
-        .expect("unable to initialize display");
-
-    let attributes = [
-        khronos_egl::RED_SIZE,
-        8,
-        khronos_egl::GREEN_SIZE,
-        8,
-        khronos_egl::BLUE_SIZE,
-        8,
-        khronos_egl::NONE,
-    ];
-
-    let config = egl
-        .choose_first_config(display, &attributes)
-        .unwrap()
-        .expect("unable to choose config");
-    let surface = unsafe {
-        let window = std::ptr::null_mut::<std::ffi::c_void>();
-        egl.create_window_surface(display, config, window, None)
-    }
-    .expect("unable to create surface");
-
-    let context_attributes = [khronos_egl::CONTEXT_CLIENT_VERSION, 3, khronos_egl::NONE];
-
-    let gl_context = egl
-        .create_context(display, config, None, &context_attributes)
-        .expect("unable to create context");
-    egl.make_current(display, Some(surface), Some(surface), Some(gl_context))
-        .expect("can't make context current");
-
-    println!("Hooking up to wgpu-hal");
-    let exposed = unsafe {
-        <hal::api::Gles as hal::Api>::Adapter::new_external(|name| {
-            egl.get_proc_address(name)
-                .map_or(std::ptr::null(), |p| p as *const _)
-        })
-    }
-    .expect("GL adapter can't be initialized");
-
-    fill_screen(&exposed, 640, 400);
-}
-
-#[cfg(any(
-    all(target_arch = "wasm32", not(target_os = "emscripten")),
-    target_os = "ios",
-    target_os = "visionos",
-    target_env = "ohos"
-))]
+#[cfg(any(target_os = "ios", target_os = "visionos", target_env = "ohos"))]
 fn main() {
     eprintln!("This example is not supported on this platform")
 }
 
-#[cfg(not(any(
-    all(target_arch = "wasm32", not(target_os = "emscripten")),
-    target_os = "ios",
-    target_os = "visionos"
-)))]
+#[cfg(not(any(target_os = "ios", target_os = "visionos")))]
 fn fill_screen(exposed: &hal::ExposedAdapter<hal::api::Gles>, width: u32, height: u32) {
     use hal::{Adapter as _, CommandEncoder as _, Device as _, Queue as _};
 

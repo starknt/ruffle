@@ -1,5 +1,4 @@
 use alloc::sync::Arc;
-use alloc::vec;
 use core::sync::atomic::Ordering;
 
 use arrayvec::ArrayVec;
@@ -100,8 +99,6 @@ impl super::Queue {
         }
 
         unsafe { gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None) };
-        let mut current_index_buffer = self.current_index_buffer.lock();
-        *current_index_buffer = None;
     }
 
     unsafe fn set_attachment(
@@ -126,20 +123,9 @@ impl super::Queue {
             }
             super::TextureInner::DefaultRenderbuffer => panic!("Unexpected default RBO"),
             super::TextureInner::Texture { raw, target } => {
-                let num_layers = view.array_layers.end - view.array_layers.start;
-                if num_layers > 1 {
-                    #[cfg(webgl)]
-                    unsafe {
-                        gl.framebuffer_texture_multiview_ovr(
-                            fbo_target,
-                            attachment,
-                            Some(raw),
-                            view.mip_levels.start as i32,
-                            view.array_layers.start as i32,
-                            num_layers as i32,
-                        )
-                    };
-                } else if is_layered_target(target) {
+                // This backend exposes single-view render attachments.
+                debug_assert_eq!(view.array_layers.len(), 1);
+                if is_layered_target(target) {
                     let layer = if target == glow::TEXTURE_3D {
                         depth_slice.unwrap() as i32
                     } else {
@@ -178,11 +164,6 @@ impl super::Queue {
                     };
                 }
             }
-            #[cfg(webgl)]
-            super::TextureInner::ExternalFramebuffer { ref inner } => unsafe {
-                gl.bind_external_framebuffer(glow::FRAMEBUFFER, inner);
-            },
-            #[cfg(native)]
             super::TextureInner::ExternalNativeFramebuffer { ref inner } => unsafe {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(*inner));
             },
@@ -193,7 +174,7 @@ impl super::Queue {
         &self,
         gl: &glow::Context,
         command: &C,
-        #[cfg_attr(target_arch = "wasm32", allow(unused))] data_bytes: &[u8],
+        data_bytes: &[u8],
         queries: &[glow::Query],
     ) {
         match *command {
@@ -337,43 +318,21 @@ impl super::Queue {
                 ref range,
             } => match dst.raw {
                 Some(buffer) => {
-                    // When `INDEX_BUFFER_ROLE_CHANGE` isn't available, we can't copy into the
-                    // index buffer from the zero buffer. This would fail in Chrome with the
-                    // following message:
-                    //
-                    // > Cannot copy into an element buffer destination from a non-element buffer
-                    // > source
-                    //
-                    // Instead, we'll upload zeroes into the buffer.
-                    let can_use_zero_buffer = self
-                        .shared
-                        .private_caps
-                        .contains(PrivateCapabilities::INDEX_BUFFER_ROLE_CHANGE)
-                        || dst_target != glow::ELEMENT_ARRAY_BUFFER;
-
-                    if can_use_zero_buffer {
-                        unsafe { gl.bind_buffer(glow::COPY_READ_BUFFER, Some(self.zero_buffer)) };
-                        unsafe { gl.bind_buffer(dst_target, Some(buffer)) };
-                        let mut dst_offset = range.start;
-                        while dst_offset < range.end {
-                            let size = (range.end - dst_offset).min(super::ZERO_BUFFER_SIZE as u64);
-                            unsafe {
-                                gl.copy_buffer_sub_data(
-                                    glow::COPY_READ_BUFFER,
-                                    dst_target,
-                                    0,
-                                    dst_offset as i32,
-                                    size as i32,
-                                )
-                            };
-                            dst_offset += size;
-                        }
-                    } else {
-                        unsafe { gl.bind_buffer(dst_target, Some(buffer)) };
-                        let zeroes = vec![0u8; (range.end - range.start) as usize];
+                    unsafe { gl.bind_buffer(glow::COPY_READ_BUFFER, Some(self.zero_buffer)) };
+                    unsafe { gl.bind_buffer(dst_target, Some(buffer)) };
+                    let mut dst_offset = range.start;
+                    while dst_offset < range.end {
+                        let size = (range.end - dst_offset).min(super::ZERO_BUFFER_SIZE as u64);
                         unsafe {
-                            gl.buffer_sub_data_u8_slice(dst_target, range.start as i32, &zeroes)
+                            gl.copy_buffer_sub_data(
+                                glow::COPY_READ_BUFFER,
+                                dst_target,
+                                0,
+                                dst_offset as i32,
+                                size as i32,
+                            )
                         };
+                        dst_offset += size;
                     }
                 }
                 None => {
@@ -385,25 +344,11 @@ impl super::Queue {
             },
             C::CopyBufferToBuffer {
                 ref src,
-                src_target,
                 ref dst,
-                dst_target,
                 copy,
             } => {
                 let copy_src_target = glow::COPY_READ_BUFFER;
-                let is_index_buffer_only_element_dst = !self
-                    .shared
-                    .private_caps
-                    .contains(PrivateCapabilities::INDEX_BUFFER_ROLE_CHANGE)
-                    && dst_target == glow::ELEMENT_ARRAY_BUFFER
-                    || src_target == glow::ELEMENT_ARRAY_BUFFER;
-
-                // WebGL not allowed to copy data from other targets to element buffer and can't copy element data to other buffers
-                let copy_dst_target = if is_index_buffer_only_element_dst {
-                    glow::ELEMENT_ARRAY_BUFFER
-                } else {
-                    glow::COPY_WRITE_BUFFER
-                };
+                let copy_dst_target = glow::COPY_WRITE_BUFFER;
                 let size = copy.size.get() as usize;
                 match (src.raw, dst.raw) {
                     (Some(ref src), Some(ref dst)) => {
@@ -452,242 +397,7 @@ impl super::Queue {
                     }
                 }
                 unsafe { gl.bind_buffer(copy_src_target, None) };
-                if is_index_buffer_only_element_dst {
-                    unsafe {
-                        gl.bind_buffer(
-                            glow::ELEMENT_ARRAY_BUFFER,
-                            *self.current_index_buffer.lock(),
-                        )
-                    };
-                } else {
-                    unsafe { gl.bind_buffer(copy_dst_target, None) };
-                }
-            }
-            #[cfg(webgl)]
-            C::CopyExternalImageToTexture {
-                ref src,
-                dst,
-                dst_target,
-                dst_format,
-                dst_premultiplication,
-                ref copy,
-            } => {
-                const UNPACK_FLIP_Y_WEBGL: u32 =
-                    web_sys::WebGl2RenderingContext::UNPACK_FLIP_Y_WEBGL;
-                const UNPACK_PREMULTIPLY_ALPHA_WEBGL: u32 =
-                    web_sys::WebGl2RenderingContext::UNPACK_PREMULTIPLY_ALPHA_WEBGL;
-
-                unsafe {
-                    if src.flip_y {
-                        gl.pixel_store_bool(UNPACK_FLIP_Y_WEBGL, true);
-                    }
-                    if dst_premultiplication {
-                        gl.pixel_store_bool(UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
-                    }
-                }
-
-                unsafe { gl.bind_texture(dst_target, Some(dst)) };
-                let format_desc = self.shared.describe_texture_format(dst_format);
-                if is_layered_target(dst_target) {
-                    let z_offset = get_z_offset(dst_target, &copy.dst_base);
-
-                    match src.source {
-                        wgt::ExternalImageSource::ImageBitmap(ref b) => unsafe {
-                            gl.tex_sub_image_3d_with_image_bitmap(
-                                dst_target,
-                                copy.dst_base.mip_level as i32,
-                                copy.dst_base.origin.x as i32,
-                                copy.dst_base.origin.y as i32,
-                                z_offset as i32,
-                                copy.size.width as i32,
-                                copy.size.height as i32,
-                                copy.size.depth as i32,
-                                format_desc.external,
-                                format_desc.data_type,
-                                b,
-                            );
-                        },
-                        wgt::ExternalImageSource::HTMLImageElement(ref i) => unsafe {
-                            gl.tex_sub_image_3d_with_html_image_element(
-                                dst_target,
-                                copy.dst_base.mip_level as i32,
-                                copy.dst_base.origin.x as i32,
-                                copy.dst_base.origin.y as i32,
-                                z_offset as i32,
-                                copy.size.width as i32,
-                                copy.size.height as i32,
-                                copy.size.depth as i32,
-                                format_desc.external,
-                                format_desc.data_type,
-                                i,
-                            );
-                        },
-                        wgt::ExternalImageSource::HTMLVideoElement(ref v) => unsafe {
-                            gl.tex_sub_image_3d_with_html_video_element(
-                                dst_target,
-                                copy.dst_base.mip_level as i32,
-                                copy.dst_base.origin.x as i32,
-                                copy.dst_base.origin.y as i32,
-                                z_offset as i32,
-                                copy.size.width as i32,
-                                copy.size.height as i32,
-                                copy.size.depth as i32,
-                                format_desc.external,
-                                format_desc.data_type,
-                                v,
-                            );
-                        },
-                        #[cfg(not(web_sys_unstable_apis))]
-                        wgt::ExternalImageSource::VideoFrame(_) => {
-                            unimplemented!("web_sys_unstable_apis is needed for glow")
-                        }
-                        #[cfg(web_sys_unstable_apis)]
-                        wgt::ExternalImageSource::VideoFrame(ref v) => unsafe {
-                            gl.tex_sub_image_3d_with_video_frame(
-                                dst_target,
-                                copy.dst_base.mip_level as i32,
-                                copy.dst_base.origin.x as i32,
-                                copy.dst_base.origin.y as i32,
-                                z_offset as i32,
-                                copy.size.width as i32,
-                                copy.size.height as i32,
-                                copy.size.depth as i32,
-                                format_desc.external,
-                                format_desc.data_type,
-                                v,
-                            )
-                        },
-                        wgt::ExternalImageSource::ImageData(ref i) => unsafe {
-                            gl.tex_sub_image_3d_with_image_data(
-                                dst_target,
-                                copy.dst_base.mip_level as i32,
-                                copy.dst_base.origin.x as i32,
-                                copy.dst_base.origin.y as i32,
-                                z_offset as i32,
-                                copy.size.width as i32,
-                                copy.size.height as i32,
-                                copy.size.depth as i32,
-                                format_desc.external,
-                                format_desc.data_type,
-                                i,
-                            );
-                        },
-                        wgt::ExternalImageSource::HTMLCanvasElement(ref c) => unsafe {
-                            gl.tex_sub_image_3d_with_html_canvas_element(
-                                dst_target,
-                                copy.dst_base.mip_level as i32,
-                                copy.dst_base.origin.x as i32,
-                                copy.dst_base.origin.y as i32,
-                                z_offset as i32,
-                                copy.size.width as i32,
-                                copy.size.height as i32,
-                                copy.size.depth as i32,
-                                format_desc.external,
-                                format_desc.data_type,
-                                c,
-                            );
-                        },
-                        wgt::ExternalImageSource::OffscreenCanvas(_) => unreachable!(),
-                    }
-                } else {
-                    let dst_target = get_2d_target(dst_target, copy.dst_base.array_layer);
-
-                    match src.source {
-                        wgt::ExternalImageSource::ImageBitmap(ref b) => unsafe {
-                            gl.tex_sub_image_2d_with_image_bitmap_and_width_and_height(
-                                dst_target,
-                                copy.dst_base.mip_level as i32,
-                                copy.dst_base.origin.x as i32,
-                                copy.dst_base.origin.y as i32,
-                                copy.size.width as i32,
-                                copy.size.height as i32,
-                                format_desc.external,
-                                format_desc.data_type,
-                                b,
-                            );
-                        },
-                        wgt::ExternalImageSource::HTMLImageElement(ref i) => unsafe {
-                            gl.tex_sub_image_2d_with_html_image_and_width_and_height(
-                                dst_target,
-                                copy.dst_base.mip_level as i32,
-                                copy.dst_base.origin.x as i32,
-                                copy.dst_base.origin.y as i32,
-                                copy.size.width as i32,
-                                copy.size.height as i32,
-                                format_desc.external,
-                                format_desc.data_type,
-                                i,
-                            )
-                        },
-                        wgt::ExternalImageSource::HTMLVideoElement(ref v) => unsafe {
-                            gl.tex_sub_image_2d_with_html_video_and_width_and_height(
-                                dst_target,
-                                copy.dst_base.mip_level as i32,
-                                copy.dst_base.origin.x as i32,
-                                copy.dst_base.origin.y as i32,
-                                copy.size.width as i32,
-                                copy.size.height as i32,
-                                format_desc.external,
-                                format_desc.data_type,
-                                v,
-                            )
-                        },
-                        #[cfg(not(web_sys_unstable_apis))]
-                        wgt::ExternalImageSource::VideoFrame(_) => {
-                            unimplemented!("web_sys_unstable_apis is needed for glow")
-                        }
-                        #[cfg(web_sys_unstable_apis)]
-                        wgt::ExternalImageSource::VideoFrame(ref v) => unsafe {
-                            gl.tex_sub_image_2d_with_video_frame_and_width_and_height(
-                                dst_target,
-                                copy.dst_base.mip_level as i32,
-                                copy.dst_base.origin.x as i32,
-                                copy.dst_base.origin.y as i32,
-                                copy.size.width as i32,
-                                copy.size.height as i32,
-                                format_desc.external,
-                                format_desc.data_type,
-                                v,
-                            )
-                        },
-                        wgt::ExternalImageSource::ImageData(ref i) => unsafe {
-                            gl.tex_sub_image_2d_with_image_data_and_width_and_height(
-                                dst_target,
-                                copy.dst_base.mip_level as i32,
-                                copy.dst_base.origin.x as i32,
-                                copy.dst_base.origin.y as i32,
-                                copy.size.width as i32,
-                                copy.size.height as i32,
-                                format_desc.external,
-                                format_desc.data_type,
-                                i,
-                            );
-                        },
-                        wgt::ExternalImageSource::HTMLCanvasElement(ref c) => unsafe {
-                            gl.tex_sub_image_2d_with_html_canvas_and_width_and_height(
-                                dst_target,
-                                copy.dst_base.mip_level as i32,
-                                copy.dst_base.origin.x as i32,
-                                copy.dst_base.origin.y as i32,
-                                copy.size.width as i32,
-                                copy.size.height as i32,
-                                format_desc.external,
-                                format_desc.data_type,
-                                c,
-                            )
-                        },
-                        wgt::ExternalImageSource::OffscreenCanvas(_) => unreachable!(),
-                    }
-                }
-
-                unsafe {
-                    if src.flip_y {
-                        gl.pixel_store_bool(UNPACK_FLIP_Y_WEBGL, false);
-                    }
-                    if dst_premultiplication {
-                        gl.pixel_store_bool(UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-                    }
-                }
+                unsafe { gl.bind_buffer(copy_dst_target, None) };
             }
             C::CopyTextureToTexture {
                 src,
@@ -995,8 +705,6 @@ impl super::Queue {
             }
             C::SetIndexBuffer(buffer) => {
                 unsafe { gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(buffer)) };
-                let mut current_index_buffer = self.current_index_buffer.lock();
-                *current_index_buffer = Some(buffer);
             }
             C::BeginQuery(query, target) => {
                 unsafe { gl.begin_query(target, query) };
@@ -1974,7 +1682,5 @@ impl crate::Queue for super::Queue {
     }
 }
 
-#[cfg(send_sync)]
 unsafe impl Sync for super::Queue {}
-#[cfg(send_sync)]
 unsafe impl Send for super::Queue {}

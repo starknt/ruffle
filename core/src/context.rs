@@ -52,8 +52,7 @@ use ruffle_render::transform::TransformStack;
 use ruffle_video::backend::VideoBackend;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
-use web_time::Instant;
+use std::time::{Duration, Instant};
 
 /// `UpdateContext` holds shared data that is used by the various subsystems of Ruffle.
 /// `Player` creates this when it begins a tick and passes it through the call stack to

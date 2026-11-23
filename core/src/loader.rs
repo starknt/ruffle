@@ -51,8 +51,7 @@ use slotmap::{SlotMap, new_key_type};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use swf::read::{extract_swz, read_compression_type};
 use thiserror::Error;
 use url::{ParseError, Url, form_urlencoded};
@@ -691,10 +690,7 @@ async fn wait_for_full_response(
     }
 }
 
-/// Prepare SWF bytes without holding the player lock. Native builds use the
-/// shared rayon pool; WASM keeps the same async shape with a synchronous
-/// fallback because browser workers cannot access the core parser directly.
-#[cfg(not(target_family = "wasm"))]
+/// Prepare SWF bytes on the shared rayon pool without holding the player lock.
 async fn prepare_swf_movie(
     body: Vec<u8>,
     url: String,
@@ -738,15 +734,6 @@ fn prepare_swf_movie_data(
     Ok((Vec::new(), Some(movie)))
 }
 
-fn prepare_swf_movie_inline(
-    body: Vec<u8>,
-    url: String,
-    loader_url: Option<String>,
-    load_bytes_info: Option<LoadBytesInfo>,
-) -> Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error> {
-    prepare_swf_movie_data(body, url, loader_url, load_bytes_info)
-}
-
 fn use_inline_movie_parse(url: &str) -> bool {
     url.starts_with("file:") || url.starts_with("data:") || url.starts_with("ruffle:")
 }
@@ -762,21 +749,11 @@ async fn prepare_swf_movie_for_url(
 ) {
     let started = Instant::now();
     let result = if use_inline_movie_parse(&url) {
-        prepare_swf_movie_inline(body, url, loader_url, load_bytes_info)
+        prepare_swf_movie_data(body, url, loader_url, load_bytes_info)
     } else {
         prepare_swf_movie(body, url, loader_url, load_bytes_info).await
     };
     (result, started.elapsed().as_nanos() as u64)
-}
-
-#[cfg(target_family = "wasm")]
-async fn prepare_swf_movie(
-    body: Vec<u8>,
-    url: String,
-    loader_url: Option<String>,
-    load_bytes_info: Option<LoadBytesInfo>,
-) -> Result<(Vec<u8>, Option<SwfMovieData>), swf::error::Error> {
-    prepare_swf_movie_inline(body, url, loader_url, load_bytes_info)
 }
 
 /// The completion status of a `Loader` loading a movie.
@@ -1455,7 +1432,7 @@ pub fn load_root_movie<'gc>(
             .unwrap_or(swf_url);
 
         let parsed = if use_inline_movie_parse(&spoofed_or_swf_url) {
-            prepare_swf_movie_inline(body, spoofed_or_swf_url, None, None)
+            prepare_swf_movie_data(body, spoofed_or_swf_url, None, None)
         } else {
             prepare_swf_movie(body, spoofed_or_swf_url, None, None).await
         };
@@ -1907,7 +1884,6 @@ pub fn load_sound_avm1<'gc>(
 
 /// Kick off a synchronous AVM1 audio load.
 /// This will block execution until the sound has been loaded.
-#[cfg(not(target_family = "wasm"))]
 pub fn load_sound_avm1_blocking<'gc>(
     uc: &mut UpdateContext<'gc>,
     sound_object: Object<'gc>,
@@ -2933,16 +2909,7 @@ impl<'gc> MovieLoader<'gc> {
     /// supported content.
     ///
     /// swf_url is always the final URL obtained after any redirects.
-    fn load_error_swf(mc: MovieClip<'gc>, uc: &mut UpdateContext<'gc>, mut swf_url: String) {
-        // If a local URL is fetched using the flash plugin, the _url property
-        // won't be changed => It keeps being the parent SWF URL.
-        if cfg!(target_family = "wasm")
-            && let Ok(url) = Url::parse(&swf_url)
-            && url.scheme() == "file"
-        {
-            swf_url = mc.movie().url().to_string();
-        };
-
+    fn load_error_swf(mc: MovieClip<'gc>, uc: &mut UpdateContext<'gc>, swf_url: String) {
         let error_movie = SwfMovie::new(uc.gc(), SwfMovieData::error_movie(swf_url));
         // This also sets total_frames correctly
         mc.replace_with_movie(uc, Some(error_movie), true, None);

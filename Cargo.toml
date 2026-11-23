@@ -6,8 +6,6 @@ members = [
     "desktop",
     "swf",
     "flv",
-    "web",
-    "web/packages/extension/safari",
     "wstr",
     "scanner",
 
@@ -17,12 +15,10 @@ members = [
     "frontend-utils",
 
     "render",
-    "render/canvas",
     "render/naga-agal",
     "render/pixel_bender",
     "render/pixel_bender/assembly_tests",
     "render/wgpu",
-    "render/webgl",
 
     "video",
     "video/software",
@@ -64,7 +60,7 @@ naga = { version = "30.0.1", features = ["wgsl-out"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "dx12", "metal", "gles", "wgsl"] }
 egui = "0.36.1"
 egui_extras = { version = "0.36.1", default-features = false }
-egui-wgpu = "0.36.1"
+egui-wgpu = { version = "0.36.1", default-features = false, features = ["macos-window-resize-jitter-fix"] }
 egui-winit = "0.36.1"
 clap = { version = "4.6.1", features = ["derive"] }
 clap_complete = "4.6"
@@ -80,8 +76,6 @@ enum-map = "2.7.3"
 flate2 = "1.1.9"
 futures = "0.3.32"
 image = { version = "0.25.10", default-features = false }
-js-sys = "0.3.97"
-web-sys = "0.3.97"
 log = "0.4"
 num-derive = "0.4.2"
 num-traits = "0.2.19"
@@ -90,8 +84,6 @@ thiserror = "2.0.18"
 url = "2.5.8"
 quick-xml = "0.37.5"
 regress = { git = "https://github.com/ruffle-rs/regras3", rev = "6d48179d6bd448f2cc66b76352c9f048dde968d1" }
-# Make sure to match wasm-bindgen-cli version to this everywhere.
-wasm-bindgen = "=0.2.127"
 walkdir = "2.5.0"
 tokio = "1.52.3"
 rfd = { version = "0.17.2", default-features = false, features = ["wayland", "xdg-portal"] }
@@ -118,7 +110,6 @@ hashbrown = "0.17.1"
 fluent-templates = "0.15.1"
 lzma-rs = "0.3.0"
 tempfile = "3.27.0"
-tracing-wasm = "0.2.1"
 rascal = "0.3.5"
 jpegxr = { git = "https://github.com/ruffle-rs/jpegxr", rev = "86cc1749d493288f53d7290ac3eb7082c475b5d9" }
 
@@ -184,16 +175,6 @@ opt-level = 3
 
 [profile.dev.package.nihav_duck]
 opt-level = 3
-
-# TODO: Set rustflags here instead of in tools/build_wasm.ts, when that
-# feature becomes stable. See: https://github.com/rust-lang/cargo/issues/10271
-# Until then, these custom profiles let cargo keep the build cache alive
-# across "dual-wasm" builds, separating it for the two .wasm modules.
-[profile.web-wasm-mvp]
-inherits = "release"
-
-[profile.web-wasm-extensions]
-inherits = "release"
 
 [profile.ci]
 inherits = "release"

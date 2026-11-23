@@ -11,7 +11,6 @@ version.workspace = true
 workspace = true
 
 [dependencies]
-web-time = "1.1.0"
 ruffle_wstr = { path = "../wstr" }
 swf = { path = "../swf"}
 pixel_bender = { path = "pixel_bender"}
@@ -24,7 +23,6 @@ smallvec = { workspace = true }
 lyon = { version = "1.0.1", optional = true }
 lyon_geom = "1.0.6"
 thiserror = { workspace = true }
-wasm-bindgen = { workspace = true, optional = true }
 enum-map = { workspace = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 clap = { workspace = true, optional = true }
@@ -45,7 +43,7 @@ optional = true
 
 [dependencies.jpeg-decoder]
 version = "0.3.2"
-default-features = false # can't use rayon on web
+default-features = false
 
 [dev-dependencies]
 approx = { workspace = true }
@@ -54,7 +52,6 @@ approx = { workspace = true }
 default = []
 lifecycle_counts = []
 tessellator = ["lyon"]
-web = ["wasm-bindgen"]
 wgpu = ["dep:wgpu"]
 serde = ["dep:serde"]
 jpegxr = ["dep:jpegxr", "image/tiff"]

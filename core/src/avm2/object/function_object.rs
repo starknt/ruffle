@@ -16,8 +16,7 @@ use gc_arena::barrier::unlock;
 use gc_arena::{Collect, Gc, GcWeak, Mutation, lock::Lock};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_macros::istr;
-use std::time::Duration;
-use web_time::Instant;
+use std::time::{Duration, Instant};
 
 const SLOW_METHOD: Duration = Duration::from_millis(20);
 

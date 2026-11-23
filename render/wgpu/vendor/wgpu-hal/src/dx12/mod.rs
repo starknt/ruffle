@@ -1192,7 +1192,6 @@ pub struct Sampler {
 
 impl crate::DynSampler for Sampler {}
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(Sampler: Send, Sync);
 
 #[derive(Debug)]

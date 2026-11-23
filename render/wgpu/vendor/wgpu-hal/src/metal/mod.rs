@@ -402,7 +402,6 @@ struct AdapterShared {
     presentation_timer: time::PresentationTimer,
 }
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(AdapterShared: Send, Sync);
 
 impl AdapterShared {
@@ -460,7 +459,6 @@ pub struct Adapter {
     shared: Arc<AdapterShared>,
 }
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(Adapter: Send, Sync);
 
 #[derive(Debug)]
@@ -469,7 +467,6 @@ pub struct Queue {
     timestamp_period: f32,
 }
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(Queue: Send, Sync);
 
 impl Queue {
@@ -915,7 +912,6 @@ pub struct Sampler {
 
 impl crate::DynSampler for Sampler {}
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(Sampler: Send, Sync);
 
 impl Sampler {
@@ -1110,7 +1106,6 @@ pub struct PassthroughShader {
     pub num_workgroups: HashMap<String, (u32, u32, u32)>,
 }
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(PassthroughShader: Send, Sync);
 
 #[derive(Debug)]
@@ -1216,7 +1211,6 @@ pub struct RenderPipeline {
     )>,
 }
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(RenderPipeline: Send, Sync);
 
 impl crate::DynRenderPipeline for RenderPipeline {}
@@ -1227,7 +1221,6 @@ pub struct ComputePipeline {
     cs_info: PipelineStageInfo,
 }
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(ComputePipeline: Send, Sync);
 
 impl crate::DynComputePipeline for ComputePipeline {}

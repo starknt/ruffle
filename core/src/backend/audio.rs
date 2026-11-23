@@ -36,8 +36,8 @@ mod decoders {
 }
 
 use crate::swf::{CharacterId, SoundInfo};
+use std::time::Duration;
 use thiserror::Error;
-use web_time::Duration;
 
 new_key_type! {
     pub struct SoundHandle;

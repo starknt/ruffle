@@ -108,8 +108,7 @@ pub const SHADER_INT_PARAMETERS_INDEX: u32 = 4;
 // A parameter controlling whether or not we produce transparent black (zero)
 // for textures samples with out-of-range coordinates. This is a vec4f
 // uniform - when it's 0.0, we use the default clamping behavior, and produce
-// transparent black when it's any other value. This would ideally be a single
-// f32, but web requires a minimum of 16 bytes.
+// transparent black when it's any other value. The host uploads a 16-byte vector.
 //
 // Note - https://www.mcjones.org/paul/PixelBenderReference.pdf
 // claims that coordinates outside the range are 'transparent black'.

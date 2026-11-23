@@ -37,7 +37,6 @@ url = { workspace = true }
 percent-encoding = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
-web-time = "1.1.0"
 encoding_rs = { workspace = true }
 rand = { workspace = true, features = ["std", "sys_rng"] }
 serde = { workspace = true }
@@ -60,6 +59,7 @@ egui_extras = { workspace = true, default-features = false, optional = true }
 png = { workspace = true, optional = true }
 flv-rs = { path = "../flv" }
 async-channel = { workspace = true }
+futures = { workspace = true }
 jpegxr = { workspace = true, optional = true }
 image = { workspace = true, features = ["tiff"] }
 enum-map = { workspace = true }
@@ -72,12 +72,6 @@ chardetng = "0.1.17"
 tracy-client = { version = "0.18.4", optional = true, default-features = false }
 itertools = "0.14.0"
 rayon = { workspace = true }
-
-[target.'cfg(not(target_family = "wasm"))'.dependencies.futures]
-workspace = true
-
-[target.'cfg(target_family = "wasm")'.dependencies.wasm-bindgen-futures]
-version = "0.4.70"
 
 [features]
 # Anonymous lifecycle traversal diagnostics; no default instrumentation.

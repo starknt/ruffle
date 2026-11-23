@@ -104,7 +104,6 @@ impl<'gc> SwfMovieWeak<'gc> {
 }
 
 /// The tag stream and, for a shareable movie, the exact FWS returned by LoaderInfo.bytes.
-#[cfg(not(target_family = "wasm"))]
 #[derive(Debug)]
 struct Mapping {
     file: std::fs::File,
@@ -112,7 +111,6 @@ struct Mapping {
 }
 // The unlinked temporary file is private. Nothing writes to it after construction.
 // Both the read-only source and private VM mappings retain the file content.
-#[cfg(not(target_family = "wasm"))]
 impl Mapping {
     fn new(bytes: &[u8]) -> std::io::Result<Self> {
         use std::io::Write;
@@ -127,7 +125,6 @@ impl Mapping {
 pub struct MovieBytes {
     file: Vec<u8>,
     tags_offset: usize,
-    #[cfg(not(target_family = "wasm"))]
     mapping: Option<Arc<Mapping>>,
 }
 impl From<Vec<u8>> for MovieBytes {
@@ -135,7 +132,6 @@ impl From<Vec<u8>> for MovieBytes {
         Self {
             file,
             tags_offset: 0,
-            #[cfg(not(target_family = "wasm"))]
             mapping: None,
         }
     }
@@ -148,14 +144,12 @@ impl std::ops::Deref for MovieBytes {
 }
 impl MovieBytes {
     pub fn file(&self) -> &[u8] {
-        #[cfg(not(target_family = "wasm"))]
         if let Some(m) = &self.mapping {
             return &m.view;
         }
         &self.file
     }
     fn share_pages(&mut self) {
-        #[cfg(not(target_family = "wasm"))]
         if self.file.len() >= 64 * 1024
             && let Ok(m) = Mapping::new(&self.file)
         {
@@ -164,7 +158,6 @@ impl MovieBytes {
         }
     }
     pub fn private_pages(&self) -> Option<PrivatePages> {
-        #[cfg(not(target_family = "wasm"))]
         if let Some(m) = &self.mapping {
             return unsafe { memmap2::MmapOptions::new().map_copy(&m.file) }
                 .ok()
@@ -174,10 +167,7 @@ impl MovieBytes {
     }
 }
 #[derive(Debug)]
-pub struct PrivatePages(
-    #[cfg(not(target_family = "wasm"))] memmap2::MmapMut,
-    #[cfg(target_family = "wasm")] Vec<u8>,
-);
+pub struct PrivatePages(memmap2::MmapMut);
 impl std::ops::Deref for PrivatePages {
     type Target = [u8];
     fn deref(&self) -> &[u8] {

@@ -262,7 +262,6 @@ pub struct FontMetrics {
 
     /// The distance between the bottom of any one glyph and the top of
     /// another, in EM-square coordinates.
-    #[allow(dead_code)] // Web build falsely claims it's unused
     pub leading: i16,
 }
 

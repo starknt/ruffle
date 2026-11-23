@@ -88,7 +88,7 @@ use ruffle_render::bitmap::{BitmapInfo, PixelSnapping};
 use ruffle_render::blend::ExtendedBlendMode;
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
 use ruffle_render::filters::Filter;
-pub use stage::{Stage, StageAlign, StageDisplayState, StageScaleMode, WindowMode};
+pub use stage::{Stage, StageAlign, StageDisplayState, StageScaleMode};
 pub use text::{Text, TextSnapshot};
 pub use text_line::TextLine;
 pub use video::Video;

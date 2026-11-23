@@ -1,6 +1,6 @@
 //! The simulation clock belongs to one player. Network and AVM execution watchdogs use wall time.
 use std::cell::Cell;
-use web_time::Instant;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]

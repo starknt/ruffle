@@ -346,44 +346,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
     ) where
         T: Iterator<Item = crate::BufferCopy>,
     {
-        let (src_target, dst_target) = if src.target == dst.target {
-            (glow::COPY_READ_BUFFER, glow::COPY_WRITE_BUFFER)
-        } else {
-            (src.target, dst.target)
-        };
         for copy in regions {
             self.cmd_buffer.commands.push(C::CopyBufferToBuffer {
                 src: src.clone(),
-                src_target,
                 dst: dst.clone(),
-                dst_target,
                 copy,
             })
-        }
-    }
-
-    #[cfg(webgl)]
-    unsafe fn copy_external_image_to_texture<T>(
-        &mut self,
-        src: &wgt::CopyExternalImageSourceInfo,
-        dst: &super::Texture,
-        dst_premultiplication: bool,
-        regions: T,
-    ) where
-        T: Iterator<Item = crate::TextureCopy>,
-    {
-        let (dst_raw, dst_target) = dst.inner.as_native();
-        for copy in regions {
-            self.cmd_buffer
-                .commands
-                .push(C::CopyExternalImageToTexture {
-                    src: src.clone(),
-                    dst: dst_raw,
-                    dst_target,
-                    dst_format: dst.format,
-                    dst_premultiplication,
-                    copy,
-                })
         }
     }
 
@@ -522,12 +490,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
             .color_attachments
             .iter()
             .filter_map(|at| at.as_ref())
-            .any(|at| match at.target.view.inner {
-                #[cfg(webgl)]
-                super::TextureInner::ExternalFramebuffer { .. } => true,
-                #[cfg(native)]
-                super::TextureInner::ExternalNativeFramebuffer { .. } => true,
-                _ => false,
+            .any(|at| {
+                matches!(
+                    at.target.view.inner,
+                    super::TextureInner::ExternalNativeFramebuffer { .. }
+                )
             });
 
         if rendering_to_external_framebuffer && desc.color_attachments.len() != 1 {

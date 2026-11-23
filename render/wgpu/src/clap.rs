@@ -40,7 +40,9 @@ impl FromStr for GraphicsBackend {
 impl From<GraphicsBackend> for wgpu::Backends {
     fn from(backend: GraphicsBackend) -> Self {
         match backend {
-            GraphicsBackend::Default => wgpu::Backends::PRIMARY,
+            GraphicsBackend::Default => {
+                wgpu::Backends::PRIMARY & wgpu::Instance::enabled_backend_features()
+            }
             GraphicsBackend::Vulkan => wgpu::Backends::VULKAN,
             GraphicsBackend::Metal => wgpu::Backends::METAL,
             GraphicsBackend::Dx12 => wgpu::Backends::DX12,

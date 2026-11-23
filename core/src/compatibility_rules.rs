@@ -114,9 +114,7 @@ impl CompatibilityRules {
                     )],
                     domain_block_rules: vec![],
                 },
-                // Replaces fpdownload.adobe.com with Ruffle's CDN. fpdownload.adobe.com hosts SWZ files
-                // which do not work on web due to CORS (and the reliability of fpdownload.adobe.com is
-                // questionable).
+                // Fetch shared runtime libraries from the Ruffle mirror.
                 RuleSet {
                     name: "fpdownload".to_string(),
                     domain_rewrite_rules: vec![

@@ -41,7 +41,7 @@ These should be set for the current mesh being rendered.
 # Gradient
 ## Group 2: Texture transforms
 Index 1 is a storage buffer when supported by the device, or a uniform buffer otherwise.
-Storage buffers are more efficient and waste less memory, but are not as widely supported (ie WebGL)
+Storage buffers are more efficient and waste less memory, but require adapter support.
 
 | Index | Type               | Description                           | Availability |
 |:-----:|--------------------|:--------------------------------------|--------------|

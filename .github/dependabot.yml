@@ -1,21 +1,5 @@
 version: 2
 updates:
-  - package-ecosystem: "npm"
-    directory: "/web/"
-    versioning-strategy: increase
-    schedule:
-      interval: "weekly"
-    groups:
-      npm-minor:
-        patterns:
-          - "*"
-        update-types:
-          - "minor"
-          - "patch"
-    labels:
-      - "T-chore"
-      - "A-deps"
-
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -36,12 +20,6 @@ updates:
         - "naga"
         - "egui*"
         - "raw-window-handle"
-      wasm-bindgen:
-        patterns:
-        - "wasm-bindgen"
-        - "js-sys"
-        - "web-sys"
-        - "wasm-bindgen-futures"
       cargo-minor:
         patterns:
           - "*"

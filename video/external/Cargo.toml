@@ -27,21 +27,5 @@ bzip2 = { version = "0.6.1", features = ["static"], optional = true }
 tempfile = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 
-# Needed for WebCodecs:
-js-sys = { workspace = true, optional = true }
-wasm-bindgen = { workspace = true, optional = true }
-tracing-subscriber = { workspace = true, features = ["registry"], optional = true }
-tracing-wasm = { workspace = true, optional = true }
-
-[dependencies.web-sys]
-workspace = true
-optional = true
-features = [
-    "CodecState", "DomException", "DomRectReadOnly", "EncodedVideoChunk",
-    "EncodedVideoChunkInit", "EncodedVideoChunkType", "PlaneLayout", "VideoDecoder",
-    "VideoDecoderConfig", "VideoDecoderInit", "VideoFrame", "VideoPixelFormat",
-]
-
 [features]
 openh264 = ["libloading", "reqwest", "hex", "bzip2", "tempfile", "sha2"]
-webcodecs = ["web-sys", "js-sys", "wasm-bindgen", "tracing-subscriber", "tracing-wasm"]

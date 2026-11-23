@@ -626,24 +626,21 @@ fn load_sound<'gc>(
         // Local files are loaded synchronously on the FP desktop projector;
         // that is, execution is paused until the load has completed.
         // TODO: This check should probably be implemented into `NavigatorBackend`.
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let is_blocking = activation
-                .context
-                .navigator
-                .resolve_url(&request_url)
-                .ok()
-                .is_some_and(|resolved| resolved.scheme() == "file");
+        let is_blocking = activation
+            .context
+            .navigator
+            .resolve_url(&request_url)
+            .ok()
+            .is_some_and(|resolved| resolved.scheme() == "file");
 
-            if is_blocking {
-                let _ = crate::loader::load_sound_avm1_blocking(
-                    activation.context,
-                    this,
-                    Request::get(request_url),
-                    load_id,
-                );
-                return Ok(Value::Undefined);
-            }
+        if is_blocking {
+            let _ = crate::loader::load_sound_avm1_blocking(
+                activation.context,
+                this,
+                Request::get(request_url),
+                load_id,
+            );
+            return Ok(Value::Undefined);
         }
 
         let future = crate::loader::load_sound_avm1(

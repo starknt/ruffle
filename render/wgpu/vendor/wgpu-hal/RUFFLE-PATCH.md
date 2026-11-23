@@ -3,6 +3,9 @@
 Vendored from the crates.io `wgpu-hal` 30.0.1 package (upstream commit
 `40f4a34ebaf56f9a046231f54125ad046239d3f3`). Keep its MIT/Apache-2.0 licenses and version.
 
+The fork uses native window handles, GL/GLES contexts and thread-safe resources.
+Its GLES backend supports EGL and WGL. Keep these native paths when updating the vendor.
+
 `src/gles/adapter.rs` derives
 `SHADER_BINDING_LAYOUT` from Naga's `Version::supports_explicit_locations()`.
 A desktop GL 3.3 driver may advertise compute extensions while Naga emits GLSL
@@ -12,8 +15,8 @@ leaves every uniform block/sampler at binding 0 and renders blank images.
 Regression: `surface::tests::native_gl_renders_geometry_and_uploaded_bitmaps_with_exact_pixels`
 in `render/wgpu/src/surface/tests.rs`, explicitly run with `--ignored` on native GL.
 The original crate fails exact red/blue pixels; this patch must pass without
-changing shader arithmetic, pixel tolerances or GPU backends. Remove this vendor
-patch when an adopted upstream version includes the same capability correction.
+changing shader arithmetic, pixel tolerances or GPU backends. Retire this capability
+correction when an adopted upstream version includes it.
 
 On Linux NVIDIA Vulkan, `RUFFLE_VK_POOL_TRIM=reset` requests a release reset
 after the device has retired high-use command pools and returned to lighter

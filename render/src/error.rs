@@ -108,10 +108,6 @@ pub enum Error {
     #[error("Empty GIF")]
     EmptyGif,
 
-    #[cfg(feature = "web")]
-    #[error("Javascript error")]
-    JavascriptError(wasm_bindgen::JsValue),
-
     #[error("Unknown handle {0:?}")]
     UnknownHandle(BitmapHandle),
 

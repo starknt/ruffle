@@ -30,7 +30,7 @@ def get_current_day_id():
 
 
 def get_max_day_id():
-    # This is the maximum value allowed in the extension's manifest.
+    # The four-part Windows product version uses 16-bit components.
     # It will work till 2065, but then we can just change the format.
     return '65535'
 
@@ -174,12 +174,6 @@ def bump(release_type):
         version4 = f'{next_planned_version}.{get_current_day_id()}'
     else:
         raise Exception(f'Unsupported release type: {release_type}')
-
-    npm_dir = f'{REPO_DIR}/web'
-    run_command(['npm', 'install', 'workspace-version'], cwd=npm_dir)
-    run_command(['npm', 'version', '--no-git-tag-version', version], cwd=npm_dir)
-    run_command(['./node_modules/workspace-version/dist/index.js'], cwd=npm_dir)
-    run_command(['npm', 'install', '--package-lock-only'], cwd=npm_dir)
 
     github_output('current-version', current_version)
     github_output('version', version)

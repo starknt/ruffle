@@ -40,7 +40,7 @@ into the vertex data.
 
 ### Old path
 
-In GLES-3.0 and WebGL2, vertex buffer layout is provided
+In GLES 3.0, vertex buffer layout is provided
 together with the actual buffer binding.
 We invalidate the attributes on the vertex buffer change, and re-bind them.
 
@@ -80,12 +80,8 @@ we don't bother with that combination.
 */
 
 ///cbindgen:ignore
-#[cfg(not(any(windows, webgl)))]
+#[cfg(not(windows))]
 mod egl;
-#[cfg(Emscripten)]
-mod emscripten;
-#[cfg(webgl)]
-mod web;
 #[cfg(windows)]
 mod wgl;
 
@@ -98,15 +94,10 @@ mod queue;
 
 pub use fence::Fence;
 
-#[cfg(not(any(windows, webgl)))]
+#[cfg(not(windows))]
 pub use self::egl::{AdapterContext, AdapterContextLock};
-#[cfg(not(any(windows, webgl)))]
+#[cfg(not(windows))]
 pub use self::egl::{Instance, Surface};
-
-#[cfg(webgl)]
-pub use self::web::AdapterContext;
-#[cfg(webgl)]
-pub use self::web::{Instance, Surface};
 
 #[cfg(windows)]
 use self::wgl::AdapterContext;
@@ -211,9 +202,6 @@ bitflags::bitflags! {
         const MEMORY_BARRIERS = 1 << 3;
         /// Vertex buffer layouts separate from the data.
         const VERTEX_BUFFER_LAYOUT = 1 << 4;
-        /// Indicates that buffers used as `GL_ELEMENT_ARRAY_BUFFER` may be created / initialized / used
-        /// as other targets, if not present they must not be mixed with other targets.
-        const INDEX_BUFFER_ROLE_CHANGE = 1 << 5;
         /// Supports `glGetBufferSubData`
         const GET_BUFFER_SUB_DATA = 1 << 7;
         /// Supports `f16` color buffers
@@ -263,8 +251,6 @@ bitflags::bitflags! {
         // (https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/4972/diffs?diff_id=75888#22f5d1004713c9bbf857988c7efb81631ab88f99_323_327)
         // seems to indicate all skylake models are effected.
         const MESA_I915_SRGB_SHADER_CLEAR = 1 << 0;
-        /// Buffer map must emulated because it is not supported natively
-        const EMULATE_BUFFER_MAP = 1 << 1;
     }
 }
 
@@ -341,7 +327,7 @@ pub struct Adapter {
 pub struct Device {
     shared: Arc<AdapterShared>,
     main_vao: glow::VertexArray,
-    #[cfg(all(native, feature = "renderdoc"))]
+    #[cfg(feature = "renderdoc")]
     render_doc: crate::auxil::renderdoc::RenderDoc,
     counters: Arc<wgt::HalCounters>,
 }
@@ -373,7 +359,6 @@ pub struct Queue {
     zero_buffer: glow::Buffer,
     temp_query_results: Mutex<Vec<u64>>,
     draw_buffer_count: AtomicU8,
-    current_index_buffer: Mutex<Option<glow::Buffer>>,
 }
 
 impl Drop for Queue {
@@ -395,7 +380,7 @@ pub struct Buffer {
     /// Buffer mapping state.
     ///
     /// If locked concurrently with the GL context, the GL context should be locked first.
-    map_state: Arc<MaybeMutex<BufferMapState>>,
+    map_state: Arc<std::sync::Mutex<BufferMapState>>,
     /// Set when the buffer wraps an externally-owned GL name created via
     /// [`Device::buffer_from_raw`](crate::gles::Device::buffer_from_raw).
     ///
@@ -413,7 +398,6 @@ struct BufferMapState {
     offset_of_current_mapping: wgt::BufferAddress,
 }
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(Buffer: Send, Sync);
 
 impl crate::DynBuffer for Buffer {}
@@ -428,27 +412,15 @@ pub enum TextureInner {
         raw: glow::Texture,
         target: BindTarget,
     },
-    #[cfg(webgl)]
-    /// Render to a `WebGLFramebuffer`
-    ///
-    /// This is a web feature
-    ExternalFramebuffer {
-        inner: web_sys::WebGlFramebuffer,
-    },
-    #[cfg(native)]
     /// Render to a `glow::NativeFramebuffer`
     /// Useful when the framebuffer to draw to
     /// has a non-zero framebuffer ID
-    ///
-    /// This is a native feature
     ExternalNativeFramebuffer {
         inner: glow::NativeFramebuffer,
     },
 }
 
-#[cfg(send_sync)]
 unsafe impl Sync for TextureInner {}
-#[cfg(send_sync)]
 unsafe impl Send for TextureInner {}
 
 impl TextureInner {
@@ -458,9 +430,6 @@ impl TextureInner {
                 panic!("Unexpected renderbuffer");
             }
             Self::Texture { raw, target } => (raw, target),
-            #[cfg(webgl)]
-            Self::ExternalFramebuffer { .. } => panic!("Unexpected external framebuffer"),
-            #[cfg(native)]
             Self::ExternalNativeFramebuffer { .. } => panic!("unexpected external framebuffer"),
         }
     }
@@ -513,7 +482,7 @@ impl Texture {
     /// Returns the `target`, whether the image is 3d and whether the image is a cubemap.
     fn get_info_from_desc(desc: &TextureDescriptor) -> u32 {
         match desc.dimension {
-            // WebGL (1 and 2) as well as some GLES versions do not have 1D textures, so we are
+            // Some GLES versions do not have 1D textures, so we are
             // doing `TEXTURE_2D` instead
             wgt::TextureDimension::D1 => glow::TEXTURE_2D,
             wgt::TextureDimension::D2 => {
@@ -728,9 +697,7 @@ struct ImmediateDesc {
     size_bytes: u32,
 }
 
-#[cfg(send_sync)]
 unsafe impl Sync for ImmediateDesc {}
-#[cfg(send_sync)]
 unsafe impl Send for ImmediateDesc {}
 
 /// For each texture in the pipeline layout, store the index of the only
@@ -746,9 +713,7 @@ struct PipelineInner {
     clip_distance_count: u32,
 }
 
-#[cfg(send_sync)]
 unsafe impl Sync for PipelineInner {}
-#[cfg(send_sync)]
 unsafe impl Send for PipelineInner {}
 
 #[derive(Clone, Debug)]
@@ -808,7 +773,6 @@ pub struct RenderPipeline {
 
 impl crate::DynRenderPipeline for RenderPipeline {}
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(RenderPipeline: Send, Sync);
 
 #[derive(Debug)]
@@ -823,7 +787,6 @@ pub struct RayTracingPipeline {}
 
 impl crate::DynRayTracingPipeline for RayTracingPipeline {}
 
-#[cfg(send_sync)]
 static_assertions::assert_impl_all!(ComputePipeline: Send, Sync);
 
 #[derive(Debug)]
@@ -943,19 +906,8 @@ enum Command {
     },
     CopyBufferToBuffer {
         src: Buffer,
-        src_target: BindTarget,
         dst: Buffer,
-        dst_target: BindTarget,
         copy: crate::BufferCopy,
-    },
-    #[cfg(webgl)]
-    CopyExternalImageToTexture {
-        src: wgt::CopyExternalImageSourceInfo,
-        dst: glow::Texture,
-        dst_target: BindTarget,
-        dst_format: wgt::TextureFormat,
-        dst_premultiplication: bool,
-        copy: crate::TextureCopy,
     },
     CopyTextureToTexture {
         src: glow::Texture,
@@ -1017,10 +969,6 @@ enum Command {
     ClearColorI(u32, [i32; 4]),
     ClearDepth(f32),
     ClearStencil(u32),
-    // Clearing both the depth and stencil buffer individually appears to
-    // result in the stencil buffer failing to clear, atleast in WebGL.
-    // It is also more efficient to emit a single command instead of two for
-    // this.
     ClearDepthAndStencil(f32, u32),
     BufferBarrier(glow::Buffer, wgt::BufferUses),
     TextureBarrier(wgt::TextureUses),
@@ -1115,9 +1063,7 @@ impl fmt::Debug for CommandBuffer {
     }
 }
 
-#[cfg(send_sync)]
 unsafe impl Sync for CommandBuffer {}
-#[cfg(send_sync)]
 unsafe impl Send for CommandBuffer {}
 
 //TODO: we would have something like `Arc<typed_arena::Arena>`
@@ -1139,12 +1085,9 @@ impl fmt::Debug for CommandEncoder {
     }
 }
 
-#[cfg(send_sync)]
 unsafe impl Sync for CommandEncoder {}
-#[cfg(send_sync)]
 unsafe impl Send for CommandEncoder {}
 
-#[cfg(not(webgl))]
 fn gl_debug_message_callback(source: u32, gltype: u32, id: u32, severity: u32, message: &str) {
     let source_str = match source {
         glow::DEBUG_SOURCE_API => "API",
@@ -1191,25 +1134,6 @@ fn gl_debug_message_callback(source: u32, gltype: u32, id: u32, severity: u32, m
     }
 }
 
-// If we are using `std`, then use `Mutex` to provide `Send` and `Sync`
-cfg_if::cfg_if! {
-    if #[cfg(gles_with_std)] {
-        type MaybeMutex<T> = std::sync::Mutex<T>;
-
-        fn lock<T>(mutex: &MaybeMutex<T>) -> std::sync::MutexGuard<'_, T> {
-            mutex.lock().unwrap()
-        }
-    } else {
-        // It should be impossible for any build configuration to trigger this error
-        // It is intended only as a guard against changes elsewhere causing the use of
-        // `RefCell` here to become unsound.
-        #[cfg(all(send_sync, not(feature = "fragile-send-sync-non-atomic-wasm")))]
-        compile_error!("cannot provide non-fragile Send+Sync without std");
-
-        type MaybeMutex<T> = core::cell::RefCell<T>;
-
-        fn lock<T>(mutex: &MaybeMutex<T>) -> core::cell::RefMut<'_, T> {
-            mutex.borrow_mut()
-        }
-    }
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap()
 }

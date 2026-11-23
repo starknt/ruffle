@@ -8,11 +8,6 @@ use wgt::AstcChannel;
 use crate::auxil::db;
 use crate::gles::ShaderClearProgram;
 
-// https://webgl2fundamentals.org/webgl/lessons/webgl-data-textures.html
-
-const GL_UNMASKED_VENDOR_WEBGL: u32 = 0x9245;
-const GL_UNMASKED_RENDERER_WEBGL: u32 = 0x9246;
-
 impl super::Adapter {
     pub fn get_glsl_version(&self) -> naga::back::glsl::Version {
         self.shared.shading_language_version
@@ -21,51 +16,11 @@ impl super::Adapter {
     /// Note that this function is intentionally lenient in regards to parsing,
     /// and will try to recover at least the first two version numbers without
     /// resulting in an `Err`.
-    /// # Notes
-    /// `WebGL 2` version returned as `OpenGL ES 3.0`
-    fn parse_version(mut src: &str) -> Result<(u8, u8), crate::InstanceError> {
-        let webgl_sig = "WebGL ";
-        // According to the WebGL specification
-        // VERSION  WebGL<space>1.0<space><vendor-specific information>
-        // SHADING_LANGUAGE_VERSION WebGL<space>GLSL<space>ES<space>1.0<space><vendor-specific information>
-        let is_webgl = src.starts_with(webgl_sig);
-        if is_webgl {
-            let pos = src.rfind(webgl_sig).unwrap_or(0);
-            src = &src[pos + webgl_sig.len()..];
-        } else {
-            let es_sig = " ES ";
-            match src.rfind(es_sig) {
-                Some(pos) => {
-                    src = &src[pos + es_sig.len()..];
-                }
-                None => {
-                    return Err(crate::InstanceError::new(format!(
-                        "OpenGL version {src:?} does not contain 'ES'"
-                    )));
-                }
-            }
-        };
-
-        let glsl_es_sig = "GLSL ES ";
-        let is_glsl = match src.find(glsl_es_sig) {
-            Some(pos) => {
-                src = &src[pos + glsl_es_sig.len()..];
-                true
-            }
-            None => false,
-        };
-
-        Self::parse_full_version(src).map(|(major, minor)| {
-            (
-                // Return WebGL 2.0 version as OpenGL ES 3.0
-                if is_webgl && !is_glsl {
-                    major + 1
-                } else {
-                    major
-                },
-                minor,
-            )
-        })
+    fn parse_version(src: &str) -> Result<(u8, u8), crate::InstanceError> {
+        let (_, version) = src.rsplit_once(" ES ").ok_or_else(|| {
+            crate::InstanceError::new(format!("OpenGL version {src:?} does not contain 'ES'"))
+        })?;
+        Self::parse_full_version(version)
     }
 
     /// According to the OpenGL specification, the version information is
@@ -200,26 +155,8 @@ impl super::Adapter {
         let gl = context.lock();
         let extensions = gl.supported_extensions();
 
-        let (vendor_const, renderer_const) = if extensions.contains("WEBGL_debug_renderer_info") {
-            // emscripten doesn't enable "WEBGL_debug_renderer_info" extension by default. so, we do it manually.
-            // See https://github.com/gfx-rs/wgpu/issues/3245 for context
-            #[cfg(Emscripten)]
-            if unsafe {
-                super::emscripten::enable_extension(c"WEBGL_debug_renderer_info".to_str().unwrap())
-            } {
-                (GL_UNMASKED_VENDOR_WEBGL, GL_UNMASKED_RENDERER_WEBGL)
-            } else {
-                (glow::VENDOR, glow::RENDERER)
-            }
-            // glow already enables WEBGL_debug_renderer_info on wasm32-unknown-unknown target by default.
-            #[cfg(not(Emscripten))]
-            (GL_UNMASKED_VENDOR_WEBGL, GL_UNMASKED_RENDERER_WEBGL)
-        } else {
-            (glow::VENDOR, glow::RENDERER)
-        };
-
-        let vendor = unsafe { gl.get_parameter_string(vendor_const) };
-        let renderer = unsafe { gl.get_parameter_string(renderer_const) };
+        let vendor = unsafe { gl.get_parameter_string(glow::VENDOR) };
+        let renderer = unsafe { gl.get_parameter_string(glow::RENDERER) };
         let version = unsafe { gl.get_parameter_string(glow::VERSION) };
         log::debug!("Vendor: {vendor}");
         log::debug!("Renderer: {renderer}");
@@ -287,10 +224,7 @@ impl super::Adapter {
             } else {
                 let (sl_major, sl_minor) = Self::parse_version(&sl_version).ok()?;
                 let value = sl_major as u16 * 100 + sl_minor as u16 * 10;
-                naga::back::glsl::Version::Embedded {
-                    version: value,
-                    is_webgl: cfg!(any(webgl, Emscripten)),
-                }
+                naga::back::glsl::Version::new_gles(value)
             }
         };
 
@@ -420,16 +354,11 @@ impl super::Adapter {
         }
         downlevel_flags.set(
             wgt::DownlevelFlags::BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED,
-            !(cfg!(any(webgl, Emscripten)) || is_angle),
+            !is_angle,
         );
-        // see https://registry.khronos.org/webgl/specs/latest/2.0/#BUFFER_OBJECT_BINDING
-        downlevel_flags.set(
-            wgt::DownlevelFlags::UNRESTRICTED_INDEX_BUFFER,
-            !cfg!(any(webgl, Emscripten)),
-        );
-        downlevel_flags.set(
-            wgt::DownlevelFlags::UNRESTRICTED_EXTERNAL_TEXTURE_COPIES,
-            !cfg!(any(webgl, Emscripten)),
+        downlevel_flags.insert(
+            wgt::DownlevelFlags::UNRESTRICTED_INDEX_BUFFER
+                | wgt::DownlevelFlags::UNRESTRICTED_EXTERNAL_TEXTURE_COPIES,
         );
         downlevel_flags.set(
             wgt::DownlevelFlags::FULL_DRAW_INDEX_UINT32,
@@ -446,7 +375,7 @@ impl super::Adapter {
         }
 
         // Desktop GL: norm16 is core since GL 3.0/3.1; we minimum-version
-        // to GL 3.3, so always on. GLES/WebGL2: needs `EXT_texture_norm16`.
+        // to GL 3.3, so always on. GLES: needs `EXT_texture_norm16`.
         let supports_16bit_norm = if es_ver.is_some() {
             extensions.contains("GL_EXT_texture_norm16")
                 || extensions.contains("EXT_texture_norm16")
@@ -466,7 +395,7 @@ impl super::Adapter {
         // variants as image-unit formats, so one gate covers UNORM and SNORM.
         // Paths:
         //   * Desktop:  core in GL 4.2+; on 3.3..=4.1 via `GL_ARB_shader_image_load_store`.
-        //   * GLES/WebGL2: only via `GL_NV_image_formats` - the ES 3.1/3.2 core
+        //   * GLES: only via `GL_NV_image_formats` - the ES 3.1/3.2 core
         //     Table 8.27 omits these formats, and `GL_EXT_texture_norm16` does not
         //     extend Table 8.27 (NV_image_formats itself depends on EXT_texture_norm16
         //     for the norm16 entries, so an ES driver exposing NV_image_formats
@@ -505,10 +434,6 @@ impl super::Adapter {
                 && vertex_shader_storage_textures != 0,
         );
         features.set(
-            wgt::Features::MULTIVIEW,
-            extensions.contains("OVR_multiview2") || extensions.contains("GL_OVR_multiview2"),
-        );
-        features.set(
             wgt::Features::DUAL_SOURCE_BLENDING,
             extensions.contains("GL_EXT_blend_func_extended")
                 || extensions.contains("GL_ARB_blend_func_extended"),
@@ -542,15 +467,7 @@ impl super::Adapter {
             "GL_EXT_texture_compression_rgtc",
             "GL_EXT_texture_compression_bptc",
         ];
-        let webgl_bcn_exts = [
-            "WEBGL_compressed_texture_s3tc",
-            "WEBGL_compressed_texture_s3tc_srgb",
-            "EXT_texture_compression_rgtc",
-            "EXT_texture_compression_bptc",
-        ];
-        let bcn_exts = if cfg!(any(webgl, Emscripten)) {
-            &webgl_bcn_exts[..]
-        } else if es_ver.is_some() {
+        let bcn_exts = if es_ver.is_some() {
             &gles_bcn_exts[..]
         } else {
             &gl_bcn_exts[..]
@@ -563,40 +480,14 @@ impl super::Adapter {
             wgt::Features::TEXTURE_COMPRESSION_BC_SLICED_3D,
             bcn_exts.iter().all(|&ext| extensions.contains(ext)), // BC guaranteed Sliced 3D
         );
-        let has_etc = if cfg!(any(webgl, Emscripten)) {
-            extensions.contains("WEBGL_compressed_texture_etc")
-        } else {
-            es_ver.is_some() || extensions.contains("GL_ARB_ES3_compatibility")
-        };
+        let has_etc = es_ver.is_some() || extensions.contains("GL_ARB_ES3_compatibility");
         features.set(wgt::Features::TEXTURE_COMPRESSION_ETC2, has_etc);
 
         // `OES_texture_compression_astc` provides 2D + 3D, LDR + HDR support
-        if extensions.contains("WEBGL_compressed_texture_astc")
-            || extensions.contains("GL_OES_texture_compression_astc")
-        {
-            #[cfg(webgl)]
-            {
-                if context
-                    .glow_context
-                    .compressed_texture_astc_supports_ldr_profile()
-                {
-                    features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC);
-                    features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC_SLICED_3D);
-                }
-                if context
-                    .glow_context
-                    .compressed_texture_astc_supports_hdr_profile()
-                {
-                    features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC_HDR);
-                }
-            }
-
-            #[cfg(any(native, Emscripten))]
-            {
-                features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC);
-                features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC_SLICED_3D);
-                features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC_HDR);
-            }
+        if extensions.contains("GL_OES_texture_compression_astc") {
+            features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC);
+            features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC_SLICED_3D);
+            features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC_HDR);
         } else {
             features.set(
                 wgt::Features::TEXTURE_COMPRESSION_ASTC,
@@ -661,12 +552,8 @@ impl super::Adapter {
             supported((3, 1), (4, 3)) || extensions.contains("GL_ARB_vertex_attrib_binding"),
         );
         private_caps.set(
-            super::PrivateCapabilities::INDEX_BUFFER_ROLE_CHANGE,
-            !cfg!(any(webgl, Emscripten)),
-        );
-        private_caps.set(
             super::PrivateCapabilities::GET_BUFFER_SUB_DATA,
-            cfg!(any(webgl, Emscripten)) || full_ver.is_some(),
+            full_ver.is_some(),
         );
         let color_buffer_float = extensions.contains("GL_EXT_color_buffer_float")
             || extensions.contains("GL_ARB_color_buffer_float")
@@ -917,11 +804,6 @@ impl super::Adapter {
 
         let mut workarounds = super::Workarounds::empty();
 
-        workarounds.set(
-            super::Workarounds::EMULATE_BUFFER_MAP,
-            cfg!(any(webgl, Emscripten)),
-        );
-
         let r = renderer.to_lowercase();
         // Check for Mesa sRGB clear bug. See
         // [`super::PrivateCapabilities::MESA_I915_SRGB_SHADER_CLEAR`].
@@ -942,9 +824,6 @@ impl super::Adapter {
         let max_samples = unsafe { gl.get_parameter_i32(glow::MAX_SAMPLES) };
 
         // Drop the GL guard so we can move the context into AdapterShared
-        // ( on Wasm the gl handle is just a ref so we tell clippy to allow
-        // dropping the ref )
-        #[cfg_attr(target_arch = "wasm32", allow(dropping_references))]
         drop(gl);
 
         Some(crate::ExposedAdapter {
@@ -1119,7 +998,7 @@ impl crate::Adapter for super::Adapter {
             device: super::Device {
                 shared: Arc::clone(&self.shared),
                 main_vao,
-                #[cfg(all(native, feature = "renderdoc"))]
+                #[cfg(feature = "renderdoc")]
                 render_doc: Default::default(),
                 counters: Default::default(),
             },
@@ -1134,7 +1013,6 @@ impl crate::Adapter for super::Adapter {
                 zero_buffer,
                 temp_query_results: Mutex::new(Vec::new()),
                 draw_buffer_count: AtomicU8::new(1),
-                current_index_buffer: Mutex::new(None),
             },
         })
     }
@@ -1156,7 +1034,7 @@ impl crate::Adapter for super::Adapter {
             } else if max_samples >= 8 {
                 Tfc::MULTISAMPLE_X2 | Tfc::MULTISAMPLE_X4 | Tfc::MULTISAMPLE_X8
             } else {
-                // The lowest supported level in GLE3.0/WebGL2 is 4X
+                // The lowest supported level in GLES 3.0 is 4X
                 // (see GL_MAX_SAMPLES in https://registry.khronos.org/OpenGL-Refpages/es3.0/html/glGet.xhtml).
                 // On some platforms, like iOS Safari, `get_parameter_i32(MAX_SAMPLES)` returns 0,
                 // so we always fall back to supporting 4x here.
@@ -1337,11 +1215,6 @@ impl crate::Adapter for super::Adapter {
         &self,
         surface: &super::Surface,
     ) -> Option<crate::SurfaceCapabilities> {
-        #[cfg(webgl)]
-        if self.shared.context.webgl2_context != surface.webgl2_context {
-            return None;
-        }
-
         if surface.presentable {
             // There is no extended-range or wide-gamut path in the GLES
             // backend; everything is presented as sRGB.
@@ -1351,13 +1224,11 @@ impl crate::Adapter for super::Adapter {
             };
             let mut formats = vec![
                 format_caps(wgt::TextureFormat::Rgba8Unorm),
-                #[cfg(native)]
                 format_caps(wgt::TextureFormat::Bgra8Unorm),
             ];
             if surface.supports_srgb() {
                 formats.extend([
                     format_caps(wgt::TextureFormat::Rgba8UnormSrgb),
-                    #[cfg(native)]
                     format_caps(wgt::TextureFormat::Bgra8UnormSrgb),
                 ])
             }
@@ -1433,9 +1304,7 @@ impl super::AdapterShared {
     }
 }
 
-#[cfg(send_sync)]
 unsafe impl Sync for super::Adapter {}
-#[cfg(send_sync)]
 unsafe impl Send for super::Adapter {}
 
 #[cfg(test)]
@@ -1459,15 +1328,6 @@ mod tests {
         assert_eq!(
             Adapter::parse_version("OpenGL ES GLSL ES 3.20").unwrap(),
             (3, 2)
-        );
-        assert_eq!(
-            // WebGL 2.0 should parse as OpenGL ES 3.0
-            Adapter::parse_version("WebGL 2.0 (OpenGL ES 3.0 Chromium)").unwrap(),
-            (3, 0)
-        );
-        assert_eq!(
-            Adapter::parse_version("WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)").unwrap(),
-            (3, 0)
         );
     }
 }

@@ -1249,15 +1249,7 @@ pub struct ClearColor {
 
 fn convert_texture_format(input: Context3DTextureFormat) -> wgpu::TextureFormat {
     match input {
-        // Some of these formats are unsupported by wgpu to various degrees:
-        // * Bgra doesn't exist in webgl
-        //
-        // Instead, we just use Rgba8Unorm, which is the closest thing we have.
-        // When we implement Texture.uploadFromByteArray, we'll need to convert
-        // the user-supplied data to Rgba8Unorm.
-        //
-        // The Rgba8Unorm format stores more data for each channel, so this
-        // will result in (hopefully minor) rendering differences.
+        // The native Stage3D backend represents both BGRA formats as RGBA8.
         Context3DTextureFormat::Bgra => TextureFormat::Rgba8Unorm,
         Context3DTextureFormat::BgraPacked => TextureFormat::Rgba8Unorm,
         // Wgpu doesn't have 'Rgb8Unorm', so we use 'Rgba8Unorm' instead.

@@ -637,7 +637,8 @@ fn select_wgpu_backend(
     preferred_backends: wgpu::Backends,
     window: &Arc<Window>,
 ) -> anyhow::Result<(wgpu::Instance, wgpu::Backends)> {
-    for backend in preferred_backends.iter() {
+    let available = wgpu::Instance::enabled_backend_features();
+    for backend in available & preferred_backends {
         if let Some(instance) = try_wgpu_backend(backend, window.clone()) {
             tracing::info!(
                 "Using preferred backend {}",
@@ -652,7 +653,7 @@ fn select_wgpu_backend(
         format_list(&get_backend_names(preferred_backends), "or")
     );
 
-    for backend in wgpu::Backends::all() - preferred_backends {
+    for backend in available - preferred_backends {
         if let Some(instance) = try_wgpu_backend(backend, window.clone()) {
             tracing::info!(
                 "Using fallback backend {}",

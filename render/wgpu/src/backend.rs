@@ -2027,7 +2027,7 @@ pub async fn request_adapter_and_device(
 async fn request_device(
     adapter: &wgpu::Adapter,
 ) -> Result<(wgpu::Device, wgpu::Queue), wgpu::RequestDeviceError> {
-    // We start off with the lowest limits we actually need - basically GL-ES 3.0
+    // This wgpu preset also matches native GLES 3.0, which lacks compute and storage buffers.
     let mut limits = wgpu::Limits::downlevel_webgl2_defaults();
     // Then we increase parts of it to the maximum supported by the adapter, to take advantage of
     // more powerful hardware or capabilities
