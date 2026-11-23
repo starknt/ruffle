@@ -34,7 +34,7 @@ impl AscConfig {
 }
 
 pub fn run_asc(config: AscConfig) -> anyhow::Result<()> {
-    let asc_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("asc.jar");
+    let asc_path = PathBuf::from(env!("OUT_DIR")).join("asc.jar");
 
     let mut cli_args: Vec<String> = vec![
         "-classpath".to_string(),
