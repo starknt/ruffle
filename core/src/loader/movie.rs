@@ -98,32 +98,53 @@ impl MovieBudgets {
         }
     }
 
+    pub(super) async fn reserve_before_fetch(&self, address: &str) -> Option<OwnedSemaphorePermit> {
+        // The native file navigator reads the complete file before yielding
+        // its response. Network headers and budgeted asset-cache hits may proceed
+        // concurrently, then reserve their movie input before consuming the body.
+        if address.starts_with("file:") {
+            Some(self.input.reserve(None).await)
+        } else {
+            None
+        }
+    }
+
     pub(super) async fn read(
         &self,
         response: Box<dyn super::SuccessResponse>,
+        reservation: Option<OwnedSemaphorePermit>,
     ) -> Result<MovieInput, Error> {
-        let reservation = self.input.reserve(response.buffered_body_len()).await;
+        let mut reservation = match reservation {
+            Some(reservation) => reservation,
+            None => self.input.reserve(response.buffered_body_len()).await,
+        };
+        let bytes = response.body().await?;
+        let held = reservation
+            .split(self.input.units(Some(bytes.len())) as usize)
+            .ok_or_else(|| Error::FetchError("Movie body exceeded its buffered length".into()))?;
         Ok(MovieInput {
-            bytes: response.body().await?.into(),
-            _reservation: reservation,
+            bytes: bytes.into(),
+            _reservation: held,
         })
     }
 
     pub(super) async fn fetch(
         &self,
+        address: &str,
         fetch: super::OwnedFuture<Box<dyn super::SuccessResponse>, super::ErrorResponse>,
     ) -> Result<(MovieInput, String, u16, bool), super::ErrorResponse> {
+        let reservation = self.reserve_before_fetch(address).await;
         let response = fetch.await?;
         let url = response.url().into_owned();
         let status = response.status();
         let redirected = response.redirected();
-        let input = self
-            .read(response)
-            .await
-            .map_err(|error| super::ErrorResponse {
-                url: url.clone(),
-                error,
-            })?;
+        let input =
+            self.read(response, reservation)
+                .await
+                .map_err(|error| super::ErrorResponse {
+                    url: url.clone(),
+                    error,
+                })?;
         Ok((input, url, status, redirected))
     }
 }
@@ -384,5 +405,64 @@ mod tests {
         assert_eq!(input.bytes.as_ref(), vec![2; PAGE_BYTES]);
         drop(input);
         assert_eq!(budget.input.permits.available_permits(), 1);
+    }
+
+    #[test]
+    fn local_file_fetch_waits_for_credit_before_the_navigator_buffers_its_body() {
+        let budget = MovieBudgets::new(1, 1);
+        let held = futures::executor::block_on(budget.snapshot(bytes::Bytes::from_static(b"held")));
+        let started = Arc::new(AtomicBool::new(false));
+        let flag = started.clone();
+        let address = "file:///items.swf";
+        let fetch = Box::pin(async move {
+            flag.store(true, Ordering::SeqCst);
+            Err(super::super::ErrorResponse {
+                url: address.to_owned(),
+                error: Error::FetchError("test read error".to_owned()),
+            })
+        });
+        let mut next = Box::pin(budget.fetch(address, fetch));
+        assert!(next.as_mut().now_or_never().is_none());
+        assert!(!started.load(Ordering::SeqCst));
+        drop(held);
+        assert!(futures::executor::block_on(next).is_err());
+        assert!(started.load(Ordering::SeqCst));
+        assert_eq!(budget.input.permits.available_permits(), 1);
+    }
+
+    #[test]
+    fn local_file_fetch_returns_unused_pages_when_the_actual_size_is_known() {
+        use crate::backend::navigator::{FileNavigator, NavigatorBackend, Request};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.swf");
+        std::fs::write(&path, b"small").unwrap();
+        let url = url::Url::from_file_path(path).unwrap();
+        let budget = MovieBudgets::new(3, 1);
+        let fetch = FileNavigator::default().fetch_root(Request::get(url.to_string()));
+        let (input, ..) = futures::executor::block_on(budget.fetch(url.as_str(), fetch))
+            .map_err(|response| response.error)
+            .unwrap();
+        assert_eq!(input.bytes.as_ref(), b"small");
+        assert_eq!(budget.input.permits.available_permits(), 2);
+        drop(input);
+        assert_eq!(budget.input.permits.available_permits(), 3);
+    }
+
+    #[test]
+    fn http_fetch_can_receive_headers_while_movie_input_credit_is_exhausted() {
+        let budget = MovieBudgets::new(1, 1);
+        let _held = futures::executor::block_on(budget.snapshot(bytes::Bytes::new()));
+        let address = "https://example.test/movie.swf";
+        let fetch = Box::pin(async move {
+            Err(super::super::ErrorResponse {
+                url: address.to_owned(),
+                error: Error::FetchError("test network error".to_owned()),
+            })
+        });
+        assert!(matches!(
+            budget.fetch(address, fetch).now_or_never(),
+            Some(Err(_))
+        ));
     }
 }

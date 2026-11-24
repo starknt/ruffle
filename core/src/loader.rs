@@ -442,11 +442,11 @@ impl<'gc> LoadManager<'gc> {
                 .unwrap()
                 .navigator()
                 .resolve_url(request.url());
-            let preparation =
-                Preparation::for_url(address.as_ref().map_or("", Url::as_str), &budgets).await;
+            let address = address.as_ref().map_or("", Url::as_str);
+            let preparation = Preparation::for_url(address, &budgets).await;
             let fetch = player.lock().unwrap().fetch(request, FetchReason::LoadSwf);
 
-            match budgets.fetch(fetch).await {
+            match budgets.fetch(address, fetch).await {
                 // TODO: In some cases, if the fetched url is a directory,
                 // FP will ignore it and continue to execute the movie.
                 Ok((body, url, _status, _redirected)) => {
@@ -1048,7 +1048,7 @@ impl<'gc> MovieLoader<'gc> {
 
             let preparation = Preparation::for_url(&address, &budgets).await;
             let fetch = player.lock().unwrap().fetch(request, FetchReason::LoadSwf);
-            let response = budgets.fetch(fetch).await;
+            let response = budgets.fetch(&address, fetch).await;
             match response {
                 Ok((body, url, status, redirected)) => {
                     let body_len = body.bytes.len();
@@ -1439,9 +1439,13 @@ pub fn load_root_movie(
     let load = async move {
         let prepared = async {
             let preparation = Preparation::for_url(&address, &budgets).await;
+            let reservation = budgets.reserve_before_fetch(&address).await;
             let response = fetch.await.map_err(|e| (false, e.error))?;
             let url = spoofed.unwrap_or_else(|| response.url().into_owned());
-            let input = budgets.read(response).await.map_err(|e| (true, e))?;
+            let input = budgets
+                .read(response, reservation)
+                .await
+                .map_err(|e| (true, e))?;
             let (content, _, delivery) =
                 preparation.prepare(input, &budgets, url, None, None).await;
             content
