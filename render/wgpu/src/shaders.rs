@@ -26,9 +26,9 @@ pub struct Shaders {
 }
 
 impl Shaders {
-    pub fn new(
+    pub(crate) fn new(
         device: &crate::gpu_resources::Device,
-        bitmap_array: bool,
+        bindings: crate::capabilities::BitmapBindings,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let max_transforms = transforms_per_draw(&device.limits());
         let color_shader = make_shader(
@@ -43,10 +43,11 @@ impl Shaders {
             include_str!("../shaders/bitmap.wgsl"),
             max_transforms,
         )?;
-        let bitmap_sampling = if bitmap_array {
-            include_str!("../shaders/bitmap_batch_binding_array.wgsl")
-        } else {
-            include_str!("../shaders/bitmap_batch_explicit.wgsl")
+        use crate::capabilities::BitmapBindings;
+        let bitmap_sampling = match bindings {
+            BitmapBindings::Array => include_str!("../shaders/bitmap_batch_binding_array.wgsl"),
+            BitmapBindings::Layers => include_str!("../shaders/bitmap_batch_layers.wgsl"),
+            _ => include_str!("../shaders/bitmap_batch_explicit.wgsl"),
         };
         let bitmap_batch_shader = make_shader_with_extensions(
             device,
@@ -56,7 +57,7 @@ impl Shaders {
                 include_str!("../shaders/bitmap_batch.wgsl")
             ),
             max_transforms,
-            if bitmap_array {
+            if bindings == BitmapBindings::Array {
                 "enable wgpu_binding_array;"
             } else {
                 ""

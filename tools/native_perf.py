@@ -83,6 +83,10 @@ def summarize(path):
                        for key in {key for r in frames for key in r.get('work', {})}},
         'computeFilterFrames': sum(r.get('work', {}).get('compute_filter_passes', 0) > 0 for r in frames),
         'bitmapArrayFrames': sum(r.get('work', {}).get('bitmap_binding_array_batches', 0) > 0 for r in frames),
+        'bitmapLayerFrames': sum(r.get('work', {}).get('bitmap_layer_batches', 0) > 0 for r in frames),
+        'bitmapIndirectFrames': sum(r.get('work', {}).get('bitmap_indirect_draws', 0) > 0 for r in frames),
+        'bitmapCullFrames': sum(r.get('work', {}).get('bitmap_cull_batches', 0) > 0 for r in frames),
+        'bitmapCountFrames': sum(r.get('work', {}).get('bitmap_count_batches', 0) > 0 for r in frames),
     }
 
 
@@ -149,10 +153,28 @@ def compare_filter_paths(baseline, candidate, phase):
     return compare(baseline, candidate, phase)
 
 
-def compare_bitmap_paths(baseline, candidate, phase):
+def compare_bitmap_paths(baseline, candidate, phase, path='array'):
+    if path == 'layers':
+        if (any(r.get('bitmapArrayFrames') != r['frames'] or r.get('bitmapLayerFrames') != 0 for r in baseline)
+                or any(r.get('bitmapLayerFrames') != r['frames'] or r.get('bitmapArrayFrames') != 0 for r in candidate)):
+            raise ValueError('layer comparison requires binding arrays and layered textures on every measured frame')
+        return compare(baseline, candidate, phase)
     if (any(run.get('bitmapArrayFrames') != 0 for run in baseline)
             or any(run.get('bitmapArrayFrames') != run['frames'] for run in candidate)):
         raise ValueError('binding array comparison requires the selected path on every measured frame')
+    return compare(baseline, candidate, phase)
+
+
+def compare_bitmap_draws(baseline, candidate, phase, mode):
+    for runs, selected in ((baseline, 'direct-control'), (candidate, mode)):
+        for run in runs:
+            for counter, enabled in (
+                ('bitmapIndirectFrames', selected in ('indirect', 'cull', 'count')),
+                ('bitmapCullFrames', selected in ('cull', 'count')),
+                ('bitmapCountFrames', selected == 'count'),
+            ):
+                if run.get(counter) != (run['frames'] if enabled else 0):
+                    raise ValueError(f'{selected} comparison has incomplete {counter}')
     return compare(baseline, candidate, phase)
 
 
@@ -186,10 +208,14 @@ def main():
                             help='compare fragment with opt-in compute in the same binary')
     experiment.add_argument('--compare-bitmap-bindings', action='store_true',
                             help='compare sixteen explicit textures with the optional binding array')
+    experiment.add_argument('--compare-bitmap-layers', action='store_true',
+                            help='compare the binding array with ordered GPU copies to texture layers')
+    experiment.add_argument('--compare-bitmap-draw', choices=['indirect', 'cull', 'count'],
+                            help='compare GPU-generated ordered draws to direct draws on an identical device')
     parser.add_argument('--profile-off', action='store_true',
                         help='disable measurement instrumentation in both binaries')
     args = parser.parse_args()
-    if ((args.compare_compute_filters or args.compare_bitmap_bindings)
+    if ((args.compare_compute_filters or args.compare_bitmap_bindings or args.compare_bitmap_layers or args.compare_bitmap_draw)
             and (not args.baseline.samefile(args.candidate) or args.control or args.profile_off)):
         parser.error('path comparisons need the same executable and enabled target measurements')
     args.output.mkdir(parents=True, exist_ok=False)
@@ -202,6 +228,10 @@ def main():
         metadata['filterPaths'] = {'baseline': 'fragment', 'candidate': 'compute'}
     if args.compare_bitmap_bindings:
         metadata['bitmapBindings'] = {'baseline': 'explicit-on-array-device', 'candidate': 'array'}
+    if args.compare_bitmap_layers:
+        metadata['bitmapBindings'] = {'baseline': 'array', 'candidate': 'layers'}
+    if args.compare_bitmap_draw:
+        metadata['bitmapDraw'] = {'baseline': 'direct-control', 'candidate': args.compare_bitmap_draw}
     isolate_shader_cache = sys.platform.startswith('linux') and args.backend in ('vulkan', 'gl')
     metadata['shaderDiskCache'] = 'empty-per-process' if isolate_shader_cache else 'system'
     (args.output/'builds.json').write_text(json.dumps(metadata, indent=2)+'\n')
@@ -220,16 +250,23 @@ def main():
                     if args.compare_compute_filters:
                         env = dict(os.environ if env is None else env,
                                    RUFFLE_COMPUTE_FILTERS='1' if label == 'candidate' else '0')
-                    elif args.compare_bitmap_bindings:
+                    elif args.compare_bitmap_bindings or args.compare_bitmap_layers:
                         env = dict(os.environ if env is None else env,
-                                   RUFFLE_BITMAP_BINDINGS='array' if label == 'candidate' else 'explicit-on-array-device')
+                                   RUFFLE_BITMAP_BINDINGS=metadata['bitmapBindings'][label])
+                    elif args.compare_bitmap_draw:
+                        env = dict(os.environ if env is None else env,
+                                   RUFFLE_BITMAP_DRAW=metadata['bitmapDraw'][label])
                     subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=3600, env=env)
                 runs[label].append(summarize(path))
             print(f'{case}: pair {pair+1}/{args.pairs} complete', flush=True)
         if args.compare_compute_filters:
             comparison = compare_filter_paths(runs['baseline'], runs['candidate'], args.phase)
-        elif args.compare_bitmap_bindings:
-            comparison = compare_bitmap_paths(runs['baseline'], runs['candidate'], args.phase)
+        elif args.compare_bitmap_bindings or args.compare_bitmap_layers:
+            comparison = compare_bitmap_paths(runs['baseline'], runs['candidate'], args.phase,
+                                              metadata['bitmapBindings']['candidate'])
+        elif args.compare_bitmap_draw:
+            comparison = compare_bitmap_draws(runs['baseline'], runs['candidate'], args.phase,
+                                              args.compare_bitmap_draw)
         else:
             comparison = compare(runs['baseline'], runs['candidate'], args.phase, args.control)
         report[case] = {'runs':runs, 'comparison': comparison}

@@ -15,10 +15,75 @@ pub(crate) fn compute_filters_requested() -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BitmapDraw {
+    Direct,
+    Control,
+    Indirect,
+    Cull,
+    Count,
+}
+
+impl BitmapDraw {
+    pub(crate) fn requested() -> Self {
+        match std::env::var_os("RUFFLE_BITMAP_DRAW").as_deref() {
+            Some(v) if v == "indirect" => Self::Indirect,
+            Some(v) if v == "cull" => Self::Cull,
+            Some(v) if v == "count" => Self::Count,
+            Some(v) if v == "direct-control" => Self::Control,
+            _ => Self::Direct,
+        }
+    }
+
+    fn can_request(self, adapter: &Adapter) -> bool {
+        self != Self::Direct
+            && adapter.get_info().backend == wgpu::Backend::Vulkan
+            && adapter
+                .get_downlevel_capabilities()
+                .flags
+                .contains(DownlevelFlags::INDIRECT_EXECUTION | DownlevelFlags::COMPUTE_SHADERS)
+            && adapter.limits().max_storage_buffers_per_shader_stage >= 2
+    }
+
+    pub(crate) fn granted(adapter: &Adapter, device: &Device) -> Self {
+        let mode = Self::requested();
+        let limits = device.limits();
+        if !mode.can_request(adapter)
+            || mode == Self::Control
+            || limits.max_storage_buffers_per_shader_stage < 2
+            || limits.max_storage_buffer_binding_size < 65536
+            || limits.max_compute_invocations_per_workgroup == 0
+            || limits.max_compute_workgroup_size_x == 0
+            || limits.max_compute_workgroup_size_y == 0
+            || limits.max_compute_workgroup_size_z == 0
+            || limits.max_compute_workgroups_per_dimension == 0
+        {
+            return Self::Direct;
+        }
+        if mode.culls()
+            && !device
+                .features()
+                .contains(Features::INDIRECT_FIRST_INSTANCE)
+            || mode == Self::Count
+                && !device
+                    .features()
+                    .contains(Features::MULTI_DRAW_INDIRECT_COUNT)
+        {
+            return Self::Direct;
+        }
+        mode
+    }
+
+    pub(crate) fn culls(self) -> bool {
+        matches!(self, Self::Cull | Self::Count)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BitmapBindings {
     Explicit,
     ExplicitOnArrayDevice,
     Array,
+    Layers,
 }
 
 impl BitmapBindings {
@@ -33,6 +98,7 @@ impl BitmapBindings {
         match setting {
             None if cfg!(target_os = "linux") && backend == wgpu::Backend::Vulkan => Self::Array,
             Some(value) if value == "array" => Self::Array,
+            Some(value) if value == "layers" => Self::Layers,
             Some(value) if value == "explicit-on-array-device" => Self::ExplicitOnArrayDevice,
             _ => Self::Explicit,
         }
@@ -57,8 +123,10 @@ pub fn device_descriptor(
     let available = adapter.limits();
     let array_size = crate::layouts::BITMAP_BATCH_TEXTURES as u32;
     // A paired explicit control negotiates the same device as the candidate.
-    let arrays = BitmapBindings::for_adapter(adapter) != BitmapBindings::Explicit
-        && BitmapBindings::supported(adapter.features(), &available);
+    let arrays = matches!(
+        BitmapBindings::for_adapter(adapter),
+        BitmapBindings::Array | BitmapBindings::Layers | BitmapBindings::ExplicitOnArrayDevice
+    ) && BitmapBindings::supported(adapter.features(), &available);
     let (mut wanted, mut limits) = match usage {
         NativeGpuUse::Standalone => {
             let mut baseline = Limits::downlevel_webgl2_defaults()
@@ -99,6 +167,23 @@ pub fn device_descriptor(
             available,
         ),
     };
+    if BitmapDraw::requested().can_request(adapter) {
+        let available = adapter.limits();
+        // Match both sides of an experiment, including the optional count path.
+        wanted |= Features::INDIRECT_FIRST_INSTANCE | Features::MULTI_DRAW_INDIRECT_COUNT;
+        limits.max_storage_buffers_per_shader_stage =
+            limits.max_storage_buffers_per_shader_stage.max(2);
+        limits.max_storage_buffer_binding_size = limits
+            .max_storage_buffer_binding_size
+            .max(65536.min(available.max_storage_buffer_binding_size));
+        limits.max_compute_invocations_per_workgroup =
+            limits.max_compute_invocations_per_workgroup.max(1);
+        limits.max_compute_workgroup_size_x = limits.max_compute_workgroup_size_x.max(1);
+        limits.max_compute_workgroup_size_y = limits.max_compute_workgroup_size_y.max(1);
+        limits.max_compute_workgroup_size_z = limits.max_compute_workgroup_size_z.max(1);
+        limits.max_compute_workgroups_per_dimension =
+            available.max_compute_workgroups_per_dimension;
+    }
     if arrays {
         wanted |= BitmapBindings::ARRAY_FEATURES;
         limits.max_binding_array_elements_per_shader_stage = limits

@@ -59,12 +59,12 @@ struct State {
     entries: LruCache<Key, (Arc<Binding>, u64)>,
 }
 pub(crate) struct BitmapBatchCache {
-    pub(crate) binding_array: bool,
+    pub(crate) mode: crate::capabilities::BitmapBindings,
     state: Arc<Mutex<State>>,
     scheduler: ResourceScheduler,
 }
 impl BitmapBatchCache {
-    pub fn new(runtime: &GpuRuntime, binding_array: bool) -> Self {
+    pub fn new(runtime: &GpuRuntime, mode: crate::capabilities::BitmapBindings) -> Self {
         let state = Arc::new(Mutex::new(State {
             entries: LruCache::new(NonZeroUsize::new(64).unwrap()),
         }));
@@ -73,7 +73,7 @@ impl BitmapBatchCache {
         Self {
             state,
             scheduler,
-            binding_array,
+            mode,
         }
     }
     pub fn get_or_create(
@@ -106,7 +106,7 @@ impl BitmapBatchCache {
             }
         }
         let array_views;
-        let mut entries: Vec<_> = if self.binding_array {
+        let mut entries: Vec<_> = if self.mode == crate::capabilities::BitmapBindings::Array {
             array_views = views.each_ref().map(|view| view.raw());
             vec![wgpu::BindGroupEntry {
                 binding: 0,

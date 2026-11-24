@@ -22,6 +22,36 @@ class NativePerfTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             compare_bitmap_paths(before, after, 'gpu')
 
+    def test_layers_must_run_on_every_frame_against_the_adopted_bitmap_array(self):
+        from native_perf import compare_bitmap_paths
+        before, after = NativeWgpuAcceptanceTest().paired()
+        for run in before:
+            run.update(bitmapArrayFrames=run['frames'], bitmapLayerFrames=0)
+        for run in after:
+            run.update(completedFrameMs=9., gpuP95Ms=1.6, bitmapArrayFrames=0, bitmapLayerFrames=run['frames'])
+        self.assertTrue(compare_bitmap_paths(before, after, 'gpu', 'layers')['accepted'])
+        before[2]['bitmapArrayFrames'] -= 1
+        with self.assertRaises(ValueError):
+            compare_bitmap_paths(before, after, 'gpu', 'layers')
+
+    def test_indirect_comparison_requires_the_selected_dispatch_each_frame(self):
+        from native_perf import compare_bitmap_draws
+        for mode in ['indirect', 'cull', 'count']:
+            with self.subTest(mode=mode):
+                before, after = NativeWgpuAcceptanceTest().paired()
+                for run in before + after:
+                    run.update(bitmapIndirectFrames=0, bitmapCullFrames=0, bitmapCountFrames=0)
+                for run in after:
+                    run.update(completedFrameMs=9., gpuP95Ms=1.6, bitmapIndirectFrames=run['frames'])
+                    if mode in ('cull', 'count'):
+                        run['bitmapCullFrames'] = run['frames']
+                    if mode == 'count':
+                        run['bitmapCountFrames'] = run['frames']
+                self.assertTrue(compare_bitmap_draws(before, after, 'gpu', mode)['accepted'])
+                after[-1]['bitmapIndirectFrames'] -= 1
+                with self.assertRaises(ValueError):
+                    compare_bitmap_draws(before, after, 'gpu', mode)
+
     def test_compute_comparison_requires_the_opt_in_dispatch_on_every_measured_frame(self):
         from native_perf import compare_filter_paths
         before, after = NativeWgpuAcceptanceTest().paired()

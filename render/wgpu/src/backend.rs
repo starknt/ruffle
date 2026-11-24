@@ -47,14 +47,9 @@ pub const DEFAULT_IMMUTABLE_BITMAP_CACHE_LIMIT: u64 = 256 * 1024 * 1024;
 
 /// Creates a wgpu instance with Ruffle's required configuration.
 ///
-/// This disables indirect call validation because wgpu's validation runs a compute
-/// shader that uses `array<u32>`, which requires the `DYNAMIC_ARRAY_SIZE` feature.
-/// However, wgpu runs this shader without first checking if the device supports
-/// that feature, causing device creation to fail on GPUs that lack it.
-/// Since Ruffle doesn't use indirect draws, disabling this validation has no
-/// functional impact.
-///
-/// See <https://github.com/gfx-rs/wgpu/issues/8799>
+/// Native bitmap indirect experiments enable wgpu's argument validation. The
+/// ordinary path retains compatibility with GL drivers that cannot compile the
+/// validation shader. See <https://github.com/gfx-rs/wgpu/issues/8799>.
 pub fn create_wgpu_instance(
     backends: wgpu::Backends,
     backend_options: wgpu::BackendOptions,
@@ -64,11 +59,17 @@ pub fn create_wgpu_instance(
         Some(display) => wgpu::InstanceDescriptor::new_with_display_handle(display),
         None => wgpu::InstanceDescriptor::new_without_display_handle(),
     };
+    let mut flags = wgpu::InstanceFlags::default()
+        .difference(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL)
+        .with_env();
+    if backends.intersects(wgpu::Backends::VULKAN)
+        && crate::capabilities::BitmapDraw::requested() != crate::capabilities::BitmapDraw::Direct
+    {
+        flags.insert(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+    }
     wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
-        flags: wgpu::InstanceFlags::default()
-            .difference(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL)
-            .with_env(),
+        flags,
         backend_options,
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds {
             for_resource_creation: Some(90),

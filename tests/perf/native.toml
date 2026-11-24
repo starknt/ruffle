@@ -19,6 +19,10 @@ name = "ordered_bitmaps"
 path = "../tests/swfs/native_perf/ordered_bitmaps"
 
 [[case]]
+name = "ordered_bitmaps_sparse"
+path = "../tests/swfs/native_perf/ordered_bitmaps_sparse"
+
+[[case]]
 name = "portrait_particles"
 path = "../tests/swfs/native_perf/portrait_particles"
 

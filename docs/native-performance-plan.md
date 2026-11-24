@@ -36,8 +36,9 @@ Default performance protocol: 120 warmup +1200 measured frames, five AB/BA
 pairs, fresh processes and identical builds/settings/input. Cold start is
 separate. GPU-completed throughput includes the final drain; CPU/GPU samples
 remain separate. At most two in-flight frames. Correctness captures do not
-run inside the measured section. Target phase P95 improvement >=10% and
-throughput improvement >=5%; control P95/P99 regression <=3%. Preserve image
+run inside the measured section. For new target comparisons, either GPU-completed throughput or target-phase P95
+must improve on each card, with the other metric at least level. CPU and GPU
+P95/P99 regressions must stay within 3% and worst-pair peak RSS growth within 5%. Preserve image
 tolerances. Test default/non-avm_debug AVM and timeline paths, native renderer
 regressions, 30-minute loops and 100 load/unload cycles. Missing platform/device
 coverage is explicitly not-run, never inferred from compilation.

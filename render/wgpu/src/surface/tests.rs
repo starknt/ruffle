@@ -312,6 +312,65 @@ fn measurement_counts_mask_passes_not_mask_inputs() {
 
 #[test]
 #[ignore = "requires a real native adapter"]
+fn adjacent_bitmap_updates_and_unequal_extents_keep_the_source_pixels() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (8, 4)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    renderer.set_quality(StageQuality::Low).unwrap();
+    let pixels = |width: u32, rgba: [u8; 4]| {
+        Bitmap::new(
+            width,
+            2,
+            BitmapFormat::Rgba,
+            rgba.repeat(width as usize * 2),
+        )
+    };
+    let red = [255, 0, 0, 255];
+    let blue = [0, 0, 255, 255];
+    let green = [0, 255, 0, 255];
+    let first = renderer.register_bitmap(pixels(2, red)).unwrap();
+    for (width, update) in [(2, false), (2, true), (3, true)] {
+        if update {
+            renderer
+                .update_texture(&first, pixels(2, blue), PixelRegion::for_pixel(0, 0))
+                .unwrap();
+        }
+        let second = renderer.register_bitmap(pixels(width, green)).unwrap();
+        let mut commands = CommandList::new();
+        for (handle, x, w) in [(first.clone(), 0, 2), (second, 3, width)] {
+            let mut transform = Transform::default();
+            transform.matrix.tx = swf::Twips::from_pixels_i32(x);
+            commands.render_bitmap(
+                handle,
+                transform,
+                false,
+                PixelSnapping::Never,
+                PixelRegion::for_whole_size(w, 2),
+            );
+        }
+        let metrics = ruffle_render::profile::RenderMetrics::default();
+        let _scope = ruffle_render::profile::enter(Some(&metrics));
+        renderer
+            .submit_frame(Color::WHITE, commands, vec![])
+            .unwrap();
+        let image = renderer.capture_frame().unwrap().unwrap();
+        assert_eq!(image.get_pixel(0, 0).0, if update { blue } else { red });
+        assert_eq!(image.get_pixel(1, 1).0, red);
+        assert_eq!(image.get_pixel(2, 0).0, [255; 4]);
+        assert_eq!(image.get_pixel(3 + width - 1, 0).0, green);
+        if descriptors.bitmap_batches.mode == crate::capabilities::BitmapBindings::Layers {
+            assert_eq!(
+                metrics.snapshot().work.bitmap_layer_batches,
+                u64::from(width == 2)
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a real native adapter"]
 fn adjacent_bitmap_textures_batch_without_reordering_translucent_pixels() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
     use ruffle_render::transform::Transform;
@@ -371,7 +430,11 @@ fn adjacent_bitmap_textures_batch_without_reordering_translucent_pixels() {
                                     matrix: Matrix {
                                         a: 3.5,
                                         d: 3.0,
-                                        tx: Twips::from_pixels(1.25 + f64::from(i % 8) * 4.0),
+                                        tx: Twips::from_pixels(if count == 37 && i % 3 == 1 {
+                                            -80.
+                                        } else {
+                                            1.25 + f64::from(i % 8) * 4.0
+                                        }),
                                         ty: Twips::from_pixels(2.5 + f64::from(i / 8) * 4.0),
                                         ..Matrix::IDENTITY
                                     },
@@ -406,7 +469,33 @@ fn adjacent_bitmap_textures_batch_without_reordering_translucent_pixels() {
                                 "two bounded bitmap batches and one transparent rectangle"
                             );
                             let work = metrics.snapshot().work;
+                            if matches!(
+                                std::env::var("RUFFLE_BITMAP_DRAW").as_deref(),
+                                Ok("indirect" | "cull" | "count")
+                            ) && descriptors.adapter.get_info().backend == wgpu::Backend::Vulkan
+                                && descriptors
+                                    .adapter
+                                    .features()
+                                    .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE)
+                            {
+                                assert_eq!(
+                                    work.entries()
+                                        .find(|(k, _)| *k == "bitmap_indirect_draws")
+                                        .map_or(0, |(_, n)| n),
+                                    2,
+                                    "the nonzero first instance must survive real indirect submission"
+                                );
+                            }
                             let setting = std::env::var_os("RUFFLE_BITMAP_BINDINGS");
+                            let expect_layers = setting.as_deref() == Some("layers".as_ref())
+                                && descriptors.device.limits().max_texture_array_layers >= 16;
+                            assert_eq!(
+                                work.entries()
+                                    .find(|(name, _)| *name == "bitmap_layer_batches")
+                                    .map_or(0, |(_, n)| n),
+                                if expect_layers { 2 } else { 0 },
+                                "actual material and sample path for layered textures"
+                            );
                             let backend = descriptors.adapter.get_info().backend;
                             let automatic = setting.is_none()
                                 && cfg!(target_os = "linux")
@@ -1239,7 +1328,7 @@ fn bounded_compositing_matches_full_target_pixels() {
     }
 }
 
-fn gpu() -> Arc<Descriptors> {
+pub(super) fn gpu() -> Arc<Descriptors> {
     gpu_with_watermark(None)
 }
 

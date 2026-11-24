@@ -5,7 +5,7 @@ use ruffle_render::{matrix3d::Matrix3D, perspective_projection::PerspectiveProje
 #[derive(Debug)]
 pub struct Globals {
     bind_group: crate::gpu_resources::BindGroup,
-    _buffer: crate::gpu_resources::Buffer,
+    pub(crate) buffer: crate::gpu_resources::Buffer,
 }
 
 #[repr(C)]
@@ -83,10 +83,7 @@ impl Globals {
             }],
         })?;
 
-        Ok(Self {
-            bind_group,
-            _buffer: buffer,
-        })
+        Ok(Self { bind_group, buffer })
     }
 
     pub fn bind_group(&self) -> &crate::gpu_resources::BindGroup {

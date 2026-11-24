@@ -302,6 +302,25 @@ impl RenderPass<'_> {
     pub fn draw_indexed(&mut self, indices: Range<u32>, base_vertex: i32, instances: Range<u32>) {
         self.raw.draw_indexed(indices, base_vertex, instances);
     }
+    pub fn draw_indexed_indirect(&mut self, buffer: &Buffer, offset: u64) {
+        self.uses.retain(buffer.raw());
+        self.raw.draw_indexed_indirect(buffer, offset);
+    }
+    pub fn multi_draw_indexed_indirect(&mut self, buffer: &Buffer, offset: u64, count: u32) {
+        self.uses.retain(buffer.raw());
+        self.raw.multi_draw_indexed_indirect(buffer, offset, count);
+    }
+    pub fn multi_draw_indexed_indirect_count(
+        &mut self,
+        buffer: &Buffer,
+        offset: u64,
+        count_offset: u64,
+        max_count: u32,
+    ) {
+        self.uses.retain(buffer.raw());
+        self.raw
+            .multi_draw_indexed_indirect_count(buffer, offset, buffer, count_offset, max_count);
+    }
     pub fn set_stencil_reference(&mut self, value: u32) {
         if self.state.stencil == Some(value) {
             return;

@@ -2,6 +2,7 @@ mod batches;
 pub mod buffers;
 mod chunk;
 mod commands;
+pub(crate) mod indirect;
 pub mod mask;
 mod prepared_draws;
 pub mod target;
@@ -248,7 +249,12 @@ impl Surface {
                         needs_stencil,
                         chunk_buffer_builder,
                     } => {
-                        chunk::batch_bitmap_textures(&mut chunk, descriptors)?;
+                        chunk::batch_bitmap_textures(
+                            &mut chunk,
+                            descriptors,
+                            draw_encoder,
+                            texture_pool,
+                        )?;
                         target.restore_multisample_regions(descriptors, draw_encoder)?;
                         chunk_buffer_builder.copy_to(
                             staging_belt,
@@ -256,6 +262,15 @@ impl Surface {
                             draw_encoder,
                             chunk_buffers,
                         )?;
+                        if descriptors.bitmap_draw != crate::capabilities::BitmapDraw::Direct {
+                            indirect::prepare(
+                                &mut chunk,
+                                descriptors,
+                                draw_encoder,
+                                chunk_buffers,
+                                target.globals(),
+                            )?;
+                        }
                         ruffle_render::profile::work(|w| {
                             w.render_passes += 1;
                             w.pass_pixels += u64::from(target.width()) * u64::from(target.height());

@@ -39,6 +39,7 @@ pub enum DrawCommand {
     },
     RenderTextureBatch {
         _textures: Vec<PoolOrArcTexture>,
+        indirect: Option<super::indirect::Draw>,
         binds: crate::gpu_resources::BindGroup,
         draw_offsets: DrawOffsets,
     },
@@ -147,12 +148,87 @@ impl DrawCommand {
     }
 }
 
+/// Copy small compatible sources into consecutive array layers in draw order.
+fn bitmap_layers(
+    run: &[DrawCommand],
+    first_instance: u32,
+    sampler: &crate::gpu_resources::Sampler,
+    descriptors: &crate::Descriptors,
+    encoder: &mut crate::gpu_resources::CommandEncoder,
+    pool: &mut crate::buffer_pool::TexturePool,
+) -> Result<
+    Option<(PoolOrArcTexture, crate::gpu_resources::BindGroup)>,
+    crate::gpu_runtime::RenderFailure,
+> {
+    let source = |i: usize| run[i].bitmap_input().unwrap().0.texture();
+    let size = source(0).size();
+    let format = source(0).format();
+    let count = crate::layouts::BITMAP_BATCH_TEXTURES as u32;
+    // These experiments pack small conventional bitmaps. Render targets or differing
+    // extents keep their original ordered single-image draws.
+    if size.width > 256
+        || size.height > 256
+        || size.depth_or_array_layers != 1
+        || !matches!(
+            format,
+            wgpu::TextureFormat::Rgba8Unorm
+                | wgpu::TextureFormat::Rgba8UnormSrgb
+                | wgpu::TextureFormat::Bgra8Unorm
+                | wgpu::TextureFormat::Bgra8UnormSrgb
+        )
+        || (0..run.len()).any(|i| {
+            let texture = source(i);
+            texture.size() != size
+                || texture.format() != format
+                || texture.sample_count() != 1
+                || !texture.usage().contains(wgpu::TextureUsages::COPY_SRC)
+        })
+    {
+        return Ok(None);
+    }
+    let storage = pool.get_texture(
+        descriptors,
+        wgpu::Extent3d {
+            depth_or_array_layers: count,
+            ..size
+        },
+        wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        format,
+        1,
+    )?;
+    for i in 0..run.len() {
+        let mut destination = storage.0.as_image_copy();
+        destination.origin.z = (first_instance + i as u32) % count;
+        encoder.copy_texture_to_texture(source(i).as_image_copy(), destination, size);
+    }
+    let group = descriptors
+        .device
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Adjacent bitmap layers"),
+            layout: &descriptors.bind_layouts.bitmap_batch,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&storage.1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: count,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })?;
+    Ok(Some((PoolOrArcTexture::Pool(storage), group)))
+}
+
 /// Fixed-size, adjacent bitmap runs. Only one-instance quads with identical
 /// geometry and sampler are combined; all other commands remain barriers.
 pub(super) fn batch_bitmap_textures(
     commands: &mut Vec<DrawCommand>,
     descriptors: &crate::Descriptors,
+    encoder: &mut crate::gpu_resources::CommandEncoder,
+    texture_pool: &mut crate::buffer_pool::TexturePool,
 ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+    use crate::capabilities::BitmapBindings;
     use crate::layouts::BITMAP_BATCH_TEXTURES as N;
     let mut input = std::mem::take(commands).into_iter().peekable();
     let mut counts =
@@ -219,26 +295,46 @@ pub(super) fn batch_bitmap_textures(
             commands.extend(run);
             continue;
         }
+        let layers = if descriptors.bitmap_batches.mode == BitmapBindings::Layers {
+            let Some(layers) = bitmap_layers(
+                &run,
+                offsets.instances.start,
+                &sampler,
+                descriptors,
+                encoder,
+                texture_pool,
+            )?
+            else {
+                commands.extend(run);
+                continue;
+            };
+            Some(layers)
+        } else {
+            None
+        };
         if let Some(work) = &mut counts {
             work.bitmap_batch_runs += 1;
             work.bitmap_batched_instances += run.len() as u64;
             work.bitmap_binding_array_batches +=
-                u64::from(descriptors.bitmap_batches.binding_array);
+                u64::from(descriptors.bitmap_batches.mode == BitmapBindings::Array);
+            work.bitmap_layer_batches += u64::from(layers.is_some());
         }
         // The first instance may start anywhere in a chunk's uniform window.
         // Populate each binding once, using the first image for unused slots.
-        let views = std::array::from_fn(|slot| {
-            let index = (slot + N - offsets.instances.start as usize % N) % N;
-            run.get(index)
-                .unwrap_or(&run[0])
-                .bitmap_input()
-                .unwrap()
-                .0
-                .view()
-                .clone()
+        let views = layers.is_none().then(|| {
+            std::array::from_fn(|slot| {
+                let index = (slot + N - offsets.instances.start as usize % N) % N;
+                run.get(index)
+                    .unwrap_or(&run[0])
+                    .bitmap_input()
+                    .unwrap()
+                    .0
+                    .view()
+                    .clone()
+            })
         });
         let mut sources = smallvec::SmallVec::<[_; N]>::new();
-        let mut textures = Vec::with_capacity(run.len());
+        let mut textures = Vec::with_capacity(run.len() + usize::from(layers.is_some()));
         for command in run {
             let DrawCommand::RenderTexture {
                 _texture: Some(texture),
@@ -251,15 +347,21 @@ pub(super) fn batch_bitmap_textures(
             textures.push(texture);
             sources.push(source);
         }
-        let binds = descriptors.bitmap_batches.get_or_create(
-            &descriptors.device,
-            &descriptors.bind_layouts.bitmap_batch,
-            &views,
-            &sampler,
-            &sources,
-        )?;
+        let binds = if let Some((storage, group)) = layers {
+            textures.push(storage);
+            group
+        } else {
+            descriptors.bitmap_batches.get_or_create(
+                &descriptors.device,
+                &descriptors.bind_layouts.bitmap_batch,
+                views.as_ref().expect("explicit batch texture views"),
+                &sampler,
+                &sources,
+            )?
+        };
         commands.push(DrawCommand::RenderTextureBatch {
             _textures: textures,
+            indirect: None,
             binds,
             draw_offsets: offsets,
         });
@@ -341,6 +443,7 @@ impl<'encoder> CommandRenderer<'encoder> {
             ),
             DrawCommand::RenderTextureBatch {
                 binds,
+                indirect,
                 draw_offsets,
                 ..
             } => {
@@ -355,7 +458,18 @@ impl<'encoder> CommandRenderer<'encoder> {
                     },
                 );
                 self.set_material(render_pass, binds);
-                self.draw(render_pass, draw_offsets);
+                if let Some(indirect) = indirect {
+                    self.bind_geometry(render_pass, draw_offsets);
+                    indirect.encode(render_pass);
+                    if let Some(work) = &mut self.work {
+                        work.bitmap_indirect_draws += 1;
+                        work.bitmap_cull_batches += u64::from(indirect.mode.culls());
+                        work.bitmap_count_batches +=
+                            u64::from(indirect.mode == crate::capabilities::BitmapDraw::Count);
+                    }
+                } else {
+                    self.draw(render_pass, draw_offsets);
+                }
             }
             DrawCommand::DrawColor { draw_offsets } => self.draw_color(render_pass, draw_offsets),
             DrawCommand::DrawLine { draw_offsets } => self.draw_lines(render_pass, draw_offsets),
@@ -402,7 +516,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         }
     }
 
-    pub fn draw(
+    fn bind_geometry(
         &mut self,
         render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         draw_offsets: &'encoder DrawOffsets,
@@ -434,7 +548,14 @@ impl<'encoder> CommandRenderer<'encoder> {
             );
             self.current_index_buffer = Some(&draw_offsets.index_buffer);
         }
+    }
 
+    fn draw(
+        &mut self,
+        render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
+        draw_offsets: &'encoder DrawOffsets,
+    ) {
+        self.bind_geometry(render_pass, draw_offsets);
         render_pass.draw_indexed(
             draw_offsets.indices.clone(),
             0,

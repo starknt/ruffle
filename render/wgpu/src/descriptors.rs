@@ -31,6 +31,8 @@ pub struct Descriptors {
     pub shaders: Shaders,
     pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), Arc<Pipelines>>>,
     pub filters: Filters,
+    pub(crate) bitmap_draw: crate::capabilities::BitmapDraw,
+    pub(crate) bitmap_indirect: crate::surface::indirect::Pipeline,
     pub(crate) bitmap_batches: crate::bitmap_batch::BitmapBatchCache,
     pub(crate) direct_bitmap_blends: bool,
     pub(crate) blend_inputs: Option<Arc<crate::blend_inputs::BlendInputs>>,
@@ -86,20 +88,32 @@ impl Descriptors {
         let limits = device.limits();
         let capabilities = crate::capabilities::NativeCapabilities::granted(&adapter, &device);
         use crate::capabilities::BitmapBindings;
-        let bitmap_array = BitmapBindings::for_adapter(&adapter) == BitmapBindings::Array
-            && BitmapBindings::supported(device.features(), &limits);
-        let bind_layouts = BindLayouts::new(&persistent_device, bitmap_array)?;
+        let bindings = match BitmapBindings::for_adapter(&adapter) {
+            BitmapBindings::Array if BitmapBindings::supported(device.features(), &limits) => {
+                BitmapBindings::Array
+            }
+            BitmapBindings::Layers
+                if limits.max_texture_array_layers
+                    >= crate::layouts::BITMAP_BATCH_TEXTURES as u32 =>
+            {
+                BitmapBindings::Layers
+            }
+            _ => BitmapBindings::Explicit,
+        };
+        let bind_layouts = BindLayouts::new(&persistent_device, bindings)?;
         let bitmap_samplers = BitmapSamplers::new(&persistent_device)?;
-        let shaders = Shaders::new(&persistent_device, bitmap_array)?;
+        let shaders = Shaders::new(&persistent_device, bindings)?;
         let quad = Quad::new(&persistent_device)?;
         let filters = Filters::new(&persistent_device)?;
         let backend = adapter.get_info().backend;
 
         runtime.check_health()?;
         let materials = crate::material_cache::MaterialCache::new(&runtime, 128);
-        let bitmap_batches = crate::bitmap_batch::BitmapBatchCache::new(&runtime, bitmap_array);
+        let bitmap_batches = crate::bitmap_batch::BitmapBatchCache::new(&runtime, bindings);
         Ok(Self {
             _progress: runtime.progress_owner(&device)?,
+            bitmap_draw: crate::capabilities::BitmapDraw::granted(&adapter, &device),
+            bitmap_indirect: Default::default(),
             bitmap_batches,
             direct_bitmap_blends: std::env::var_os("RUFFLE_DIRECT_BITMAP_BLENDS").as_deref()
                 == Some(std::ffi::OsStr::new("1")),
