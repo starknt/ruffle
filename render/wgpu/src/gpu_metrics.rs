@@ -4,6 +4,7 @@ use ruffle_render::profile::GpuSample;
 
 pub fn sample_queries(queries: &[GpuTimerQueryResult]) -> Option<GpuSample> {
     let mut frame = None;
+    let mut stage_end: Option<f64> = None;
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     let mut phases = std::collections::BTreeMap::<String, u64>::new();
@@ -39,6 +40,9 @@ pub fn sample_queries(queries: &[GpuTimerQueryResult]) -> Option<GpuSample> {
                 return None;
             }
             frame = Some(id);
+            if let Some(time) = &query.time {
+                stage_end = Some(stage_end.map_or(time.end, |end| end.max(time.end)));
+            }
         }
         if let Some(time) = &query.time {
             if !time.start.is_finite() || !time.end.is_finite() || time.end < time.start {
@@ -55,6 +59,7 @@ pub fn sample_queries(queries: &[GpuTimerQueryResult]) -> Option<GpuSample> {
     Some(GpuSample {
         frame,
         nanos: ((hi - lo) * 1e9) as u64,
+        stage_end_ns: stage_end.map(|end| (end * 1e9).round() as u64),
         phases: phases.into_iter().collect(),
     })
 }
@@ -78,6 +83,7 @@ mod tests {
         let sample = sample_queries(&[query("Draw to CAB", 1., 2.), stage]).unwrap();
         assert_eq!(sample.frame, Some(42));
         assert_eq!(sample.nanos, 5_000_000_000);
+        assert_eq!(sample.stage_end_ns, Some(6_000_000_000));
         assert!(sample.phases.contains(&("Shape".into(), 2_000_000_000)));
         assert!(sample.phases.contains(&("Stage".into(), 4_000_000_000)));
         assert!(sample_queries(&[query("Stage 42", f64::NAN, 3.)]).is_none());

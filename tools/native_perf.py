@@ -41,6 +41,17 @@ def summarize(path):
         raise ValueError('invalid GPU timestamp duration')
     if len({r['frameId'] for r in gpu}) != len(gpu):
         raise ValueError('duplicate GPU frame identity')
+    # GPU reports can arrive late. Compare the stage ends on one device clock
+    # in source frame order, so idle time between submissions counts.
+    ends = [r.get('stageEndNs') for r in sorted(gpu, key=lambda r: r['frameId'])]
+    if any(end is not None and (type(end) is not int or end < 0) for end in ends):
+        raise ValueError('invalid GPU stage completion timestamp')
+    gaps = []
+    if len(ends) == len(frames) and all(end is not None for end in ends):
+        gaps = sorted(b-a for a,b in zip(ends, ends[1:]))
+        if gaps and gaps[0] <= 0:
+            raise ValueError('non-increasing GPU stage completion timestamp')
+    low_count = (len(gaps)+99)//100
     gpu_phases = {}
     for record in gpu:
         seen = set()
@@ -68,6 +79,9 @@ def summarize(path):
         'paceFps': session.get('paceFps'),
         'profilingEnabled': session.get('profilingEnabled', True),
         'frames': len(frames), 'completedFrameMs': summary['completedNs']/len(frames)/1e6,
+        'frameIntervalP95Ms': percentile(gaps, .95)/1e6 if gaps else None,
+        'onePercentLowFps': 1e9*low_count/sum(gaps[-low_count:]) if gaps else None,
+        'intervalCount': len(gaps), 'lowIntervalCount': low_count,
         'cpuP95Ms': percentile([r['cpuNs']/1e6 for r in frames], .95),
         'cpuP99Ms': percentile([r['cpuNs']/1e6 for r in frames], .99),
         'gpuP95Ms': percentile([r['ns']/1e6 for r in gpu], .95),
@@ -136,14 +150,26 @@ def compare(baseline, candidate, phase, control=False):
         phases = [(b.get(field, {}).get(name), c.get(field, {}).get(name)) for b,c in zip(baseline,candidate)]
         improvement = None if any(not b or c is None or not math.isfinite(c) or c < 0 for b,c in phases) else median(1-c/b for b,c in phases)
     stable = rss <= .05 and max(p95, p99, gpu95, gpu99) <= .03
+    complete_intervals = all(
+        run.get('intervalCount') == run['frames'] - 1
+        and run.get('lowIntervalCount') == (run['frames'] - 1 + 99) // 100
+        for run in runs
+    )
+    def pacing_change(key):
+        if not complete_intervals or any(type(r.get(key)) not in (float,int) or not math.isfinite(r[key]) or r[key] <= 0 for r in runs):
+            return None
+        return median(ratios(key))
+    interval = pacing_change('frameIntervalP95Ms')
+    low = pacing_change('onePercentLowFps')
     if control:
-        accepted = stable and median(ratios('completedFrameMs')) <= .03
+        accepted = interval is not None and low is not None and stable and median(ratios('completedFrameMs')) <= .03
     else:
-        accepted = (stable and improvement is not None and min(throughput, improvement) >= 0
-                    and max(throughput, improvement) > 0)
+        accepted = (improvement is not None and interval is not None and low is not None
+                    and throughput > 0 and interval < 0 and low > 0)
     return {'accepted': accepted, 'throughputGain':throughput, 'cpuP95Regression':p95,
             'cpuP99Regression':p99, 'gpuP95Regression':gpu95, 'gpuP99Regression':gpu99,
-            'peakRssGrowth':rss, 'phase':phase, 'phaseP95Gain':improvement}
+            'peakRssGrowth':rss, 'phase':phase, 'phaseP95Gain':improvement,
+            'frameIntervalP95Regression':interval, 'onePercentLowGain':low}
 
 
 def compare_filter_paths(baseline, candidate, phase):

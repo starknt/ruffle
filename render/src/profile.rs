@@ -100,6 +100,8 @@ work_counters!(
 pub struct GpuSample {
     pub frame: Option<u64>,
     pub nanos: u64,
+    /// End of the stage query on this device's GPU clock, including gaps between frames.
+    pub stage_end_ns: Option<u64>,
     /// Inclusive named query durations. Nested names must not be summed as total frame time.
     pub phases: Vec<(String, u64)>,
 }
@@ -468,6 +470,7 @@ pub fn record_gpu(nanos: u64, frame: Option<u64>) {
     record_gpu_sample(GpuSample {
         frame,
         nanos,
+        stage_end_ns: None,
         phases: Vec::new(),
     });
 }

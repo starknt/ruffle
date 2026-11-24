@@ -152,6 +152,27 @@ class NativePerfTest(unittest.TestCase):
             self.assertEqual(phases['Filter chain'], .009)
             self.assertIsNone(phases['BlurFilter'])
 
+    def test_gpu_completion_pacing_includes_idle_time_and_orders_samples_by_source_frame(self):
+        with tempfile.TemporaryDirectory() as d:
+            path=self.trace(d, frames=201)
+            rows=[json.loads(line) for line in path.read_text().splitlines()]
+            end=1_000_000
+            gpu=[]
+            for index in range(201):
+                end += (30_000_000 if index==199 else 50_000_000 if index==200 else 10_000_000)
+                gpu.append(dict(event='gpu',frameId=index+1,ns=1_000_000,stageEndNs=end))
+            rows.extend(reversed(gpu))
+            path.write_text('\n'.join(map(json.dumps, rows)))
+            result=summarize(path)
+            self.assertEqual((result['frameIntervalP95Ms'],result['onePercentLowFps']), (10,25))
+            self.assertEqual((result['intervalCount'],result['lowIntervalCount']), (200,2))
+            del gpu[0]['stageEndNs']
+            path.write_text('\n'.join(map(json.dumps, rows)))
+            self.assertIsNone(summarize(path)['onePercentLowFps'])
+            gpu[0]['stageEndNs']=gpu[1]['stageEndNs']
+            path.write_text('\n'.join(map(json.dumps, rows)))
+            with self.assertRaises(ValueError): summarize(path)
+
     def test_duplicate_or_invalid_named_timestamp_is_rejected(self):
         for phases in [[['BlurFilter', 1], ['BlurFilter', 2]], [['BlurFilter', -1]],
                        [['BlurFilter', True]], [['BlurFilter', float('nan')]]]:
@@ -162,12 +183,14 @@ class NativePerfTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     summarize(path)
 
-    def test_rss_gate_is_not_relaxed_for_a_faster_candidate(self):
+    def test_qualified_frame_improvements_report_their_memory_cost(self):
         baseline, candidate = NativeWgpuAcceptanceTest().paired()
         for run in candidate:
             run.update(completedFrameMs=8, cpuP95Ms=6, cpuP99Ms=7, peakRssBytes=106,
                        phaseP95Ms={'preparation': 3})
-        self.assertFalse(compare(baseline, candidate, 'preparation')['accepted'])
+        result = compare(baseline, candidate, 'preparation')
+        self.assertTrue(result['accepted'])
+        self.assertAlmostEqual(result['peakRssGrowth'], .06)
 
 class NativeWgpuAcceptanceTest(unittest.TestCase):
     def paired(self, **changes):
@@ -178,9 +201,11 @@ class NativeWgpuAcceptanceTest(unittest.TestCase):
                     workloadSha256='0' * 64, gpuCoverage=1.0,
                     completedFrameMs=10., cpuP95Ms=8., cpuP99Ms=9.,
                     gpuP95Ms=8., gpuP99Ms=9., peakRssBytes=100,
+                    frameIntervalP95Ms=10., onePercentLowFps=80.,
+                    intervalCount=1199, lowIntervalCount=12,
                     phaseP95Ms={'preparation': 4.})
         before = [dict(base, runId=f'b{i}') for i in range(5)]
-        after = [dict(base, runId=f'c{i}', **changes) for i in range(5)]
+        after = [dict(base, runId=f'c{i}') | {'frameIntervalP95Ms': 9.99, 'onePercentLowFps': 80.01} | changes for i in range(5)]
         return before, after
 
     def test_small_positive_paired_gains_qualify(self):
@@ -188,12 +213,34 @@ class NativeWgpuAcceptanceTest(unittest.TestCase):
         for run in after:
             run.update(completedFrameMs=9.99, gpuP95Ms=7.99)
         self.assertTrue(compare(before, after, 'gpu')['accepted'])
-        for frame_ms, gpu_ms, accepted in [(10., 7.99, True), (9.99, 8., True),
+        for frame_ms, gpu_ms, accepted in [(10., 7.99, False), (9.99, 8., True),
                                             (10., 8., False), (10.01, 7.99, False)]:
             with self.subTest(frame_ms=frame_ms, gpu_ms=gpu_ms):
                 for run in after:
                     run.update(completedFrameMs=frame_ms, gpuP95Ms=gpu_ms)
                 self.assertEqual(compare(before, after, 'gpu')['accepted'], accepted)
+
+    def test_promotion_requires_faster_completion_smoother_frames_and_higher_one_percent_low(self):
+        before, after = self.paired()
+        for run in after:
+            run.update(completedFrameMs=9.99, gpuP95Ms=12., peakRssBytes=120)
+        result=compare(before, after, 'gpu')
+        self.assertTrue(result['accepted'])
+        self.assertGreater(result['onePercentLowGain'], 0)
+        for key in ('frameIntervalP95Ms','onePercentLowFps'):
+            for value in (None,before[0][key]):
+                with self.subTest(key=key,value=value):
+                    rows=[dict(run) for run in after]
+                    for run in rows: run[key]=value
+                    self.assertFalse(compare(before, rows, 'gpu')['accepted'])
+
+    def test_tail_must_cover_every_pair_of_source_frames(self):
+        before, after = self.paired(completedFrameMs=9.9)
+        for field in ('intervalCount', 'lowIntervalCount'):
+            with self.subTest(field=field):
+                incomplete = [dict(run) for run in after]
+                incomplete[0][field] -= 1
+                self.assertFalse(compare(before, incomplete, 'gpu')['accepted'])
 
     def test_missing_gpu_samples_cannot_pass_a_fast_cpu_result(self):
         before, after = self.paired()
@@ -219,7 +266,9 @@ class NativeWgpuAcceptanceTest(unittest.TestCase):
         self.assertTrue(compare(before, after, 'gpu')['accepted'])
         for run in after:
             run.update(gpuP95Ms=8.1, gpuP99Ms=9., phaseP95Ms={'renderBackend': 1.})
-        self.assertFalse(compare(before, after, 'gpu')['accepted'])
+        result = compare(before, after, 'gpu')
+        self.assertTrue(result['accepted'])
+        self.assertLess(result['phaseP95Gain'], 0)
 
     def test_named_gpu_gate_uses_shader_time_and_rejects_missing_queries(self):
         before, after = self.paired()
