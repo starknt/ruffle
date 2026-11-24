@@ -87,16 +87,12 @@ pub(crate) enum BitmapBindings {
 }
 
 impl BitmapBindings {
-    pub(crate) fn for_adapter(adapter: &Adapter) -> Self {
-        Self::select(
-            std::env::var_os("RUFFLE_BITMAP_BINDINGS").as_deref(),
-            adapter.get_info().backend,
-        )
+    pub(crate) fn requested() -> Self {
+        Self::select(std::env::var_os("RUFFLE_BITMAP_BINDINGS").as_deref())
     }
 
-    fn select(setting: Option<&std::ffi::OsStr>, backend: wgpu::Backend) -> Self {
+    fn select(setting: Option<&std::ffi::OsStr>) -> Self {
         match setting {
-            None if cfg!(target_os = "linux") && backend == wgpu::Backend::Vulkan => Self::Array,
             Some(value) if value == "array" => Self::Array,
             Some(value) if value == "layers" => Self::Layers,
             Some(value) if value == "explicit-on-array-device" => Self::ExplicitOnArrayDevice,
@@ -124,7 +120,7 @@ pub fn device_descriptor(
     let array_size = crate::layouts::BITMAP_BATCH_TEXTURES as u32;
     // A paired explicit control negotiates the same device as the candidate.
     let arrays = matches!(
-        BitmapBindings::for_adapter(adapter),
+        BitmapBindings::requested(),
         BitmapBindings::Array | BitmapBindings::Layers | BitmapBindings::ExplicitOnArrayDevice
     ) && BitmapBindings::supported(adapter.features(), &available);
     let (mut wanted, mut limits) = match usage {
@@ -278,27 +274,19 @@ mod bitmap_binding_tests {
     use super::*;
 
     #[test]
-    fn validated_native_backend_selects_arrays_unless_explicitly_disabled() {
-        use wgpu::Backend;
-        let default = BitmapBindings::select(None, Backend::Vulkan);
-        assert_eq!(default == BitmapBindings::Array, cfg!(target_os = "linux"));
+    fn native_backends_use_explicit_bindings_unless_arrays_are_requested() {
+        assert_eq!(BitmapBindings::select(None), BitmapBindings::Explicit);
         assert_eq!(
-            BitmapBindings::select(None, Backend::Gl),
+            BitmapBindings::select(Some("array".as_ref())),
+            BitmapBindings::Array
+        );
+        assert_eq!(
+            BitmapBindings::select(Some("explicit".as_ref())),
             BitmapBindings::Explicit
         );
-        for backend in [Backend::Vulkan, Backend::Gl] {
-            assert_eq!(
-                BitmapBindings::select(Some("array".as_ref()), backend),
-                BitmapBindings::Array
-            );
-            assert_eq!(
-                BitmapBindings::select(Some("explicit".as_ref()), backend),
-                BitmapBindings::Explicit
-            );
-            assert_eq!(
-                BitmapBindings::select(Some("explicit-on-array-device".as_ref()), backend),
-                BitmapBindings::ExplicitOnArrayDevice
-            );
-        }
+        assert_eq!(
+            BitmapBindings::select(Some("explicit-on-array-device".as_ref())),
+            BitmapBindings::ExplicitOnArrayDevice
+        );
     }
 }

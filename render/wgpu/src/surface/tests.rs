@@ -496,12 +496,7 @@ fn adjacent_bitmap_textures_batch_without_reordering_translucent_pixels() {
                                 if expect_layers { 2 } else { 0 },
                                 "actual material and sample path for layered textures"
                             );
-                            let backend = descriptors.adapter.get_info().backend;
-                            let automatic = setting.is_none()
-                                && cfg!(target_os = "linux")
-                                && backend == wgpu::Backend::Vulkan;
-                            let selected =
-                                automatic || setting.as_deref() == Some("array".as_ref());
+                            let selected = setting.as_deref() == Some("array".as_ref());
                             let available = crate::capabilities::BitmapBindings::supported(
                                 descriptors.adapter.features(),
                                 &descriptors.adapter.limits(),

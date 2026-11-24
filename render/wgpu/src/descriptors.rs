@@ -88,7 +88,7 @@ impl Descriptors {
         let limits = device.limits();
         let capabilities = crate::capabilities::NativeCapabilities::granted(&adapter, &device);
         use crate::capabilities::BitmapBindings;
-        let bindings = match BitmapBindings::for_adapter(&adapter) {
+        let bindings = match BitmapBindings::requested() {
             BitmapBindings::Array if BitmapBindings::supported(device.features(), &limits) => {
                 BitmapBindings::Array
             }
