@@ -85,16 +85,19 @@ impl Descriptors {
         let queue = device.queue();
         let limits = device.limits();
         let capabilities = crate::capabilities::NativeCapabilities::granted(&adapter, &device);
-        let bind_layouts = BindLayouts::new(&persistent_device)?;
+        use crate::capabilities::BitmapBindings;
+        let bitmap_array = BitmapBindings::for_adapter(&adapter) == BitmapBindings::Array
+            && BitmapBindings::supported(device.features(), &limits);
+        let bind_layouts = BindLayouts::new(&persistent_device, bitmap_array)?;
         let bitmap_samplers = BitmapSamplers::new(&persistent_device)?;
-        let shaders = Shaders::new(&persistent_device)?;
+        let shaders = Shaders::new(&persistent_device, bitmap_array)?;
         let quad = Quad::new(&persistent_device)?;
         let filters = Filters::new(&persistent_device)?;
         let backend = adapter.get_info().backend;
 
         runtime.check_health()?;
         let materials = crate::material_cache::MaterialCache::new(&runtime, 128);
-        let bitmap_batches = crate::bitmap_batch::BitmapBatchCache::new(&runtime);
+        let bitmap_batches = crate::bitmap_batch::BitmapBatchCache::new(&runtime, bitmap_array);
         Ok(Self {
             _progress: runtime.progress_owner(&device)?,
             bitmap_batches,

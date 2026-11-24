@@ -68,6 +68,10 @@ measured frames, five fresh AB/BA pairs, complete GPU frame coverage and RSS.
 `--phase gpu` is the GPU target gate; `--phase preparation --case worker_prepare`
 is the worker gate. `--control` also rejects GPU P95/P99 or completed frame-time
 regressions over3%. Any pair whose total process peak RSS grows over5% fails.
+An optimization qualifies when its paired median throughput or target P95 improves,
+the other is stable or better, and the CPU, GPU and memory controls pass.
+Use `--compare-bitmap-bindings --case ordered_bitmaps --phase gpu` to compare
+explicit slots and binding arrays with the same device features and executable.
 Absent, orphan or duplicate GPU identities never become zero-time measurements.
 
 `nativeNs.preparation` measures owner-thread CPU preparation and joining, excluding

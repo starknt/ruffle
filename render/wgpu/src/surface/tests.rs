@@ -405,6 +405,44 @@ fn adjacent_bitmap_textures_batch_without_reordering_translucent_pixels() {
                                 3,
                                 "two bounded bitmap batches and one transparent rectangle"
                             );
+                            let work = metrics.snapshot().work;
+                            let setting = std::env::var_os("RUFFLE_BITMAP_BINDINGS");
+                            let backend = descriptors.adapter.get_info().backend;
+                            let automatic = setting.is_none()
+                                && cfg!(target_os = "linux")
+                                && backend == wgpu::Backend::Vulkan;
+                            let selected =
+                                automatic || setting.as_deref() == Some("array".as_ref());
+                            let available = crate::capabilities::BitmapBindings::supported(
+                                descriptors.adapter.features(),
+                                &descriptors.adapter.limits(),
+                            );
+                            assert_eq!(
+                                work.bitmap_binding_array_batches,
+                                if selected && available { 2 } else { 0 },
+                                "expected the selected bitmap path to encode these two batches",
+                            );
+                            for (key, expected) in [
+                                ("bitmap_batch_runs", 2),
+                                ("bitmap_batched_instances", 32),
+                                ("bitmap_split_capacity", 1),
+                                ("bitmap_run_chunk_end", 1),
+                            ] {
+                                assert_eq!(
+                                    work.entries().find(|(name, _)| *name == key).map(|v| v.1),
+                                    Some(expected),
+                                    "{key}"
+                                );
+                            }
+                        }
+                        if !reference && count == 37 {
+                            let work = metrics.snapshot().work;
+                            for key in ["bitmap_split_sampler", "bitmap_split_mask"] {
+                                assert!(
+                                    work.entries().any(|(name, value)| name == key && value > 0),
+                                    "{key}"
+                                );
+                            }
                         }
                         let image = renderer.capture_frame().unwrap().unwrap();
                         assert_eq!(image.get_pixel(63, 39).0, [255, 255, 255, 255]);

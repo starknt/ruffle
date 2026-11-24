@@ -15,6 +15,10 @@ name = "blur_color_matrix"
 path = "../tests/swfs/native_perf/blur_color_matrix"
 
 [[case]]
+name = "ordered_bitmaps"
+path = "../tests/swfs/native_perf/ordered_bitmaps"
+
+[[case]]
 name = "portrait_particles"
 path = "../tests/swfs/native_perf/portrait_particles"
 

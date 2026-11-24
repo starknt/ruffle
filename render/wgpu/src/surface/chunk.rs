@@ -155,6 +155,8 @@ pub(super) fn batch_bitmap_textures(
 ) -> Result<(), crate::gpu_runtime::RenderFailure> {
     use crate::layouts::BITMAP_BATCH_TEXTURES as N;
     let mut input = std::mem::take(commands).into_iter().peekable();
+    let mut counts =
+        ruffle_render::profile::enabled().then(ruffle_render::profile::RenderWork::default);
     while let Some(first) = input.next() {
         let Some((_, sampler, offsets)) = first.bitmap_input() else {
             commands.push(first);
@@ -164,19 +166,50 @@ pub(super) fn batch_bitmap_textures(
         let mut offsets = offsets.clone();
         let mut run = smallvec::SmallVec::<[DrawCommand; N]>::new();
         run.push(first);
-        while run.len() < N {
-            let Some((_, next_sampler, next_offsets)) =
-                input.peek().and_then(DrawCommand::bitmap_input)
-            else {
+        loop {
+            let Some(next) = input.peek() else {
+                if let Some(work) = &mut counts {
+                    work.bitmap_run_chunk_end += 1;
+                }
                 break;
             };
-            if *next_sampler != sampler
-                || next_offsets.instances.start != offsets.instances.end
+            let Some((_, next_sampler, next_offsets)) = next.bitmap_input() else {
+                if let Some(work) = &mut counts {
+                    match next {
+                        DrawCommand::SetMask(_) | DrawCommand::RenderAlphaMask { .. } => {
+                            work.bitmap_split_mask += 1
+                        }
+                        DrawCommand::RenderTexture { blend_mode, .. }
+                            if *blend_mode != TrivialBlend::Normal =>
+                        {
+                            work.bitmap_split_blend += 1
+                        }
+                        _ => work.bitmap_split_command += 1,
+                    }
+                }
+                break;
+            };
+            if *next_sampler != sampler {
+                if let Some(work) = &mut counts {
+                    work.bitmap_split_sampler += 1;
+                }
+                break;
+            }
+            if next_offsets.instances.start != offsets.instances.end
                 || next_offsets.vertex_buffer != offsets.vertex_buffer
                 || next_offsets.index_buffer != offsets.index_buffer
                 || next_offsets.vertices != offsets.vertices
                 || next_offsets.indices != offsets.indices
             {
+                if let Some(work) = &mut counts {
+                    work.bitmap_split_geometry += 1;
+                }
+                break;
+            }
+            if run.len() == N {
+                if let Some(work) = &mut counts {
+                    work.bitmap_split_capacity += 1;
+                }
                 break;
             }
             offsets.instances.end = next_offsets.instances.end;
@@ -185,6 +218,12 @@ pub(super) fn batch_bitmap_textures(
         if run.len() == 1 {
             commands.extend(run);
             continue;
+        }
+        if let Some(work) = &mut counts {
+            work.bitmap_batch_runs += 1;
+            work.bitmap_batched_instances += run.len() as u64;
+            work.bitmap_binding_array_batches +=
+                u64::from(descriptors.bitmap_batches.binding_array);
         }
         // The first instance may start anywhere in a chunk's uniform window.
         // Populate each binding once, using the first image for unused slots.
@@ -224,6 +263,9 @@ pub(super) fn batch_bitmap_textures(
             binds,
             draw_offsets: offsets,
         });
+    }
+    if let Some(counts) = counts {
+        ruffle_render::profile::work(|w| w.add(counts));
     }
     Ok(())
 }

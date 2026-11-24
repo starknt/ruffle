@@ -14,13 +14,52 @@ pub(crate) fn compute_filters_requested() -> bool {
     std::env::var_os("RUFFLE_COMPUTE_FILTERS").as_deref() == Some("1".as_ref())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BitmapBindings {
+    Explicit,
+    ExplicitOnArrayDevice,
+    Array,
+}
+
+impl BitmapBindings {
+    pub(crate) fn for_adapter(adapter: &Adapter) -> Self {
+        Self::select(
+            std::env::var_os("RUFFLE_BITMAP_BINDINGS").as_deref(),
+            adapter.get_info().backend,
+        )
+    }
+
+    fn select(setting: Option<&std::ffi::OsStr>, backend: wgpu::Backend) -> Self {
+        match setting {
+            None if cfg!(target_os = "linux") && backend == wgpu::Backend::Vulkan => Self::Array,
+            Some(value) if value == "array" => Self::Array,
+            Some(value) if value == "explicit-on-array-device" => Self::ExplicitOnArrayDevice,
+            _ => Self::Explicit,
+        }
+    }
+
+    const ARRAY_FEATURES: Features = Features::TEXTURE_BINDING_ARRAY
+        .union(Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING);
+
+    pub(crate) fn supported(features: Features, limits: &Limits) -> bool {
+        let count = crate::layouts::BITMAP_BATCH_TEXTURES as u32;
+        features.contains(Self::ARRAY_FEATURES)
+            && limits.max_binding_array_elements_per_shader_stage >= count
+            && limits.max_sampled_textures_per_shader_stage >= count
+    }
+}
+
 /// Preserve each host's supported limit profile while selecting optional features in one place.
 pub fn device_descriptor(
     adapter: &Adapter,
     usage: NativeGpuUse,
 ) -> wgpu::DeviceDescriptor<'static> {
     let available = adapter.limits();
-    let (mut wanted, limits) = match usage {
+    let array_size = crate::layouts::BITMAP_BATCH_TEXTURES as u32;
+    // A paired explicit control negotiates the same device as the candidate.
+    let arrays = BitmapBindings::for_adapter(adapter) != BitmapBindings::Explicit
+        && BitmapBindings::supported(adapter.features(), &available);
+    let (mut wanted, mut limits) = match usage {
         NativeGpuUse::Standalone => {
             let mut baseline = Limits::downlevel_webgl2_defaults()
                 .using_resolution(available.clone())
@@ -60,6 +99,12 @@ pub fn device_descriptor(
             available,
         ),
     };
+    if arrays {
+        wanted |= BitmapBindings::ARRAY_FEATURES;
+        limits.max_binding_array_elements_per_shader_stage = limits
+            .max_binding_array_elements_per_shader_stage
+            .max(array_size);
+    }
     wanted |= Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | Features::FLOAT32_FILTERABLE;
     wgpu::DeviceDescriptor {
         label: Some(match usage {
@@ -139,6 +184,36 @@ impl NativeCapabilities {
             shader_f16: features.contains(Features::SHADER_F16),
             subgroups: features.contains(Features::SUBGROUP),
             pipeline_cache: features.contains(Features::PIPELINE_CACHE),
+        }
+    }
+}
+
+#[cfg(test)]
+mod bitmap_binding_tests {
+    use super::*;
+
+    #[test]
+    fn validated_native_backend_selects_arrays_unless_explicitly_disabled() {
+        use wgpu::Backend;
+        let default = BitmapBindings::select(None, Backend::Vulkan);
+        assert_eq!(default == BitmapBindings::Array, cfg!(target_os = "linux"));
+        assert_eq!(
+            BitmapBindings::select(None, Backend::Gl),
+            BitmapBindings::Explicit
+        );
+        for backend in [Backend::Vulkan, Backend::Gl] {
+            assert_eq!(
+                BitmapBindings::select(Some("array".as_ref()), backend),
+                BitmapBindings::Array
+            );
+            assert_eq!(
+                BitmapBindings::select(Some("explicit".as_ref()), backend),
+                BitmapBindings::Explicit
+            );
+            assert_eq!(
+                BitmapBindings::select(Some("explicit-on-array-device".as_ref()), backend),
+                BitmapBindings::ExplicitOnArrayDevice
+            );
         }
     }
 }

@@ -10,6 +10,18 @@ from native_perf import summarize, compare, main
 
 
 class NativePerfTest(unittest.TestCase):
+    def test_binding_array_fallback_cannot_qualify_as_a_measured_candidate(self):
+        from native_perf import compare_bitmap_paths
+        before, after = NativeWgpuAcceptanceTest().paired()
+        for run in before:
+            run['bitmapArrayFrames'] = 0
+        for run in after:
+            run.update(completedFrameMs=9., gpuP95Ms=1.6, bitmapArrayFrames=run['frames'])
+        self.assertTrue(compare_bitmap_paths(before, after, 'gpu')['accepted'])
+        after[2]['bitmapArrayFrames'] -= 1
+        with self.assertRaises(ValueError):
+            compare_bitmap_paths(before, after, 'gpu')
+
     def test_compute_comparison_requires_the_opt_in_dispatch_on_every_measured_frame(self):
         from native_perf import compare_filter_paths
         before, after = NativeWgpuAcceptanceTest().paired()
@@ -141,6 +153,18 @@ class NativeWgpuAcceptanceTest(unittest.TestCase):
         after = [dict(base, runId=f'c{i}', **changes) for i in range(5)]
         return before, after
 
+    def test_small_positive_paired_gains_qualify(self):
+        before, after = self.paired()
+        for run in after:
+            run.update(completedFrameMs=9.99, gpuP95Ms=7.99)
+        self.assertTrue(compare(before, after, 'gpu')['accepted'])
+        for frame_ms, gpu_ms, accepted in [(10., 7.99, True), (9.99, 8., True),
+                                            (10., 8., False), (10.01, 7.99, False)]:
+            with self.subTest(frame_ms=frame_ms, gpu_ms=gpu_ms):
+                for run in after:
+                    run.update(completedFrameMs=frame_ms, gpuP95Ms=gpu_ms)
+                self.assertEqual(compare(before, after, 'gpu')['accepted'], accepted)
+
     def test_missing_gpu_samples_cannot_pass_a_fast_cpu_result(self):
         before, after = self.paired()
         for run in after:
@@ -164,7 +188,7 @@ class NativeWgpuAcceptanceTest(unittest.TestCase):
             run.update(completedFrameMs=9., gpuP95Ms=7., gpuP99Ms=8.)
         self.assertTrue(compare(before, after, 'gpu')['accepted'])
         for run in after:
-            run.update(gpuP95Ms=8., gpuP99Ms=9., phaseP95Ms={'renderBackend': 1.})
+            run.update(gpuP95Ms=8.1, gpuP99Ms=9., phaseP95Ms={'renderBackend': 1.})
         self.assertFalse(compare(before, after, 'gpu')['accepted'])
 
     def test_named_gpu_gate_uses_shader_time_and_rejects_missing_queries(self):

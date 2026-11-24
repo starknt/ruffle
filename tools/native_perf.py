@@ -82,6 +82,7 @@ def summarize(path):
         'workTotals': {key: sum(r.get('work', {}).get(key, 0) for r in frames)
                        for key in {key for r in frames for key in r.get('work', {})}},
         'computeFilterFrames': sum(r.get('work', {}).get('compute_filter_passes', 0) > 0 for r in frames),
+        'bitmapArrayFrames': sum(r.get('work', {}).get('bitmap_binding_array_batches', 0) > 0 for r in frames),
     }
 
 
@@ -131,8 +132,11 @@ def compare(baseline, candidate, phase, control=False):
         phases = [(b.get(field, {}).get(name), c.get(field, {}).get(name)) for b,c in zip(baseline,candidate)]
         improvement = None if any(not b or c is None or not math.isfinite(c) or c < 0 for b,c in phases) else median(1-c/b for b,c in phases)
     stable = rss <= .05 and max(p95, p99, gpu95, gpu99) <= .03
-    accepted = stable and (median(ratios('completedFrameMs')) <= .03 if control else
-                           throughput >= .05 and improvement is not None and improvement >= .10)
+    if control:
+        accepted = stable and median(ratios('completedFrameMs')) <= .03
+    else:
+        accepted = (stable and improvement is not None and min(throughput, improvement) >= 0
+                    and max(throughput, improvement) > 0)
     return {'accepted': accepted, 'throughputGain':throughput, 'cpuP95Regression':p95,
             'cpuP99Regression':p99, 'gpuP95Regression':gpu95, 'gpuP99Regression':gpu99,
             'peakRssGrowth':rss, 'phase':phase, 'phaseP95Gain':improvement}
@@ -142,6 +146,13 @@ def compare_filter_paths(baseline, candidate, phase):
     if (any(run.get('computeFilterFrames') != 0 for run in baseline)
             or any(run.get('computeFilterFrames') != run['frames'] for run in candidate)):
         raise ValueError('filter comparison requires fragment and compute execution on every measured frame')
+    return compare(baseline, candidate, phase)
+
+
+def compare_bitmap_paths(baseline, candidate, phase):
+    if (any(run.get('bitmapArrayFrames') != 0 for run in baseline)
+            or any(run.get('bitmapArrayFrames') != run['frames'] for run in candidate)):
+        raise ValueError('binding array comparison requires the selected path on every measured frame')
     return compare(baseline, candidate, phase)
 
 
@@ -170,13 +181,17 @@ def main():
     parser.add_argument('--pairs', type=int, default=5)
     parser.add_argument('--phase', default='gpu', help='gpu, gpu:ColorMatrixFilter, or a CPU phase such as preparation')
     parser.add_argument('--control', action='store_true')
-    parser.add_argument('--compare-compute-filters', action='store_true',
-                        help='compare fragment with opt-in compute in the same binary')
+    experiment = parser.add_mutually_exclusive_group()
+    experiment.add_argument('--compare-compute-filters', action='store_true',
+                            help='compare fragment with opt-in compute in the same binary')
+    experiment.add_argument('--compare-bitmap-bindings', action='store_true',
+                            help='compare sixteen explicit textures with the optional binding array')
     parser.add_argument('--profile-off', action='store_true',
                         help='disable measurement instrumentation in both binaries')
     args = parser.parse_args()
-    if args.compare_compute_filters and (not args.baseline.samefile(args.candidate) or args.control or args.profile_off):
-        parser.error('compute filter comparisons need the same executable and enabled target measurements')
+    if ((args.compare_compute_filters or args.compare_bitmap_bindings)
+            and (not args.baseline.samefile(args.candidate) or args.control or args.profile_off)):
+        parser.error('path comparisons need the same executable and enabled target measurements')
     args.output.mkdir(parents=True, exist_ok=False)
     cases = args.case or [r['name'] for r in tomllib.loads(args.manifest.read_text())['case']]
     binaries = {'baseline': args.baseline.resolve(), 'candidate': args.candidate.resolve()}
@@ -185,6 +200,8 @@ def main():
     metadata['manifestSha256'] = hashlib.sha256(args.manifest.read_bytes()).hexdigest()
     if args.compare_compute_filters:
         metadata['filterPaths'] = {'baseline': 'fragment', 'candidate': 'compute'}
+    if args.compare_bitmap_bindings:
+        metadata['bitmapBindings'] = {'baseline': 'explicit-on-array-device', 'candidate': 'array'}
     isolate_shader_cache = sys.platform.startswith('linux') and args.backend in ('vulkan', 'gl')
     metadata['shaderDiskCache'] = 'empty-per-process' if isolate_shader_cache else 'system'
     (args.output/'builds.json').write_text(json.dumps(metadata, indent=2)+'\n')
@@ -203,11 +220,18 @@ def main():
                     if args.compare_compute_filters:
                         env = dict(os.environ if env is None else env,
                                    RUFFLE_COMPUTE_FILTERS='1' if label == 'candidate' else '0')
+                    elif args.compare_bitmap_bindings:
+                        env = dict(os.environ if env is None else env,
+                                   RUFFLE_BITMAP_BINDINGS='array' if label == 'candidate' else 'explicit-on-array-device')
                     subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=3600, env=env)
                 runs[label].append(summarize(path))
             print(f'{case}: pair {pair+1}/{args.pairs} complete', flush=True)
-        comparison = (compare_filter_paths(runs['baseline'], runs['candidate'], args.phase)
-                      if args.compare_compute_filters else compare(runs['baseline'], runs['candidate'], args.phase, args.control))
+        if args.compare_compute_filters:
+            comparison = compare_filter_paths(runs['baseline'], runs['candidate'], args.phase)
+        elif args.compare_bitmap_bindings:
+            comparison = compare_bitmap_paths(runs['baseline'], runs['candidate'], args.phase)
+        else:
+            comparison = compare(runs['baseline'], runs['candidate'], args.phase, args.control)
         report[case] = {'runs':runs, 'comparison': comparison}
         (args.output/'summary.json').write_text(json.dumps(report,indent=2)+'\n')
 

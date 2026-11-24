@@ -28,6 +28,7 @@ pub struct Shaders {
 impl Shaders {
     pub fn new(
         device: &crate::gpu_resources::Device,
+        bitmap_array: bool,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let max_transforms = transforms_per_draw(&device.limits());
         let color_shader = make_shader(
@@ -42,11 +43,24 @@ impl Shaders {
             include_str!("../shaders/bitmap.wgsl"),
             max_transforms,
         )?;
-        let bitmap_batch_shader = make_shader(
+        let bitmap_sampling = if bitmap_array {
+            include_str!("../shaders/bitmap_batch_binding_array.wgsl")
+        } else {
+            include_str!("../shaders/bitmap_batch_explicit.wgsl")
+        };
+        let bitmap_batch_shader = make_shader_with_extensions(
             device,
             "bitmap_batch.wgsl",
-            include_str!("../shaders/bitmap_batch.wgsl"),
+            &format!(
+                "{bitmap_sampling}\n{}",
+                include_str!("../shaders/bitmap_batch.wgsl")
+            ),
             max_transforms,
+            if bitmap_array {
+                "enable wgpu_binding_array;"
+            } else {
+                ""
+            },
         )?;
         let copy_shader = make_shader(
             device,
@@ -127,11 +141,22 @@ fn make_shader(
     source: &str,
     max_transforms: u64,
 ) -> Result<crate::gpu_resources::ShaderModule, crate::gpu_runtime::RenderFailure> {
+    make_shader_with_extensions(device, name, source, max_transforms, "")
+}
+
+fn make_shader_with_extensions(
+    device: &crate::gpu_resources::Device,
+    name: &str,
+    source: &str,
+    max_transforms: u64,
+    extensions: &str,
+) -> Result<crate::gpu_resources::ShaderModule, crate::gpu_runtime::RenderFailure> {
     let common = include_str!("../shaders/common.wgsl");
     Ok(device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: create_debug_label!("Shader {name}").as_deref(),
         source: wgpu::ShaderSource::Wgsl(
-            format!("{common}\nconst max_transforms = {max_transforms};\n{source}").into(),
+            format!("{extensions}\n{common}\nconst max_transforms = {max_transforms};\n{source}")
+                .into(),
         ),
     })?)
 }
