@@ -35,7 +35,10 @@ impl AsRef<[u8]> for SocketWrite {
 pub struct SocketOutput {
     sender: Sender<SocketWrite>,
     budget: SocketWriteBudget,
+    xml_backlog: std::sync::Weak<std::sync::Mutex<xml::Backlog>>,
 }
+
+mod xml;
 
 #[derive(Clone)]
 pub struct SocketWriteBudget {
@@ -56,7 +59,14 @@ impl SocketWriteBudget {
 impl SocketOutput {
     pub fn channel(budget: SocketWriteBudget) -> (Self, Receiver<SocketWrite>) {
         let (sender, receiver) = async_channel::unbounded();
-        (Self { sender, budget }, receiver)
+        (
+            Self {
+                sender,
+                budget,
+                xml_backlog: Default::default(),
+            },
+            receiver,
+        )
     }
 
     /// A synchronous Flash flush must leave the buffer available on failure.

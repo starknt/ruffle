@@ -83,6 +83,8 @@ pub struct Sockets<'gc> {
     sender: SocketActionSender,
     #[collect(require_static)]
     output_budget: SocketWriteBudget,
+    #[collect(require_static)]
+    temporary_directory: Option<std::path::PathBuf>,
 }
 
 impl<'gc> Sockets<'gc> {
@@ -94,6 +96,7 @@ impl<'gc> Sockets<'gc> {
             receiver,
             sender,
             output_budget: SocketWriteBudget::new(SOCKET_QUEUE_BYTES),
+            temporary_directory: None,
         }
     }
 
@@ -176,12 +179,37 @@ impl<'gc> Sockets<'gc> {
             .try_write(buffer)
     }
 
-    pub fn fail_xml_write(&self, handle: SocketHandle) {
-        if let Some(socket) = self.sockets.get(handle)
-            && socket.sender.close()
+    pub fn set_temporary_directory(&mut self, directory: std::path::PathBuf) {
+        self.temporary_directory = Some(directory);
+    }
+
+    pub(crate) fn send_xml(
+        &mut self,
+        handle: SocketHandle,
+        buffer: &mut Vec<u8>,
+    ) -> Option<crate::backend::tasks::PlayerTask> {
+        let socket = self.sockets.get_mut(handle)?;
+        let drain = match socket
+            .sender
+            .write_xml(buffer, self.temporary_directory.as_deref())
         {
-            self.sender.notify_close(handle);
-        }
+            Ok(drain) => drain?,
+            Err(error) => {
+                tracing::warn!("XMLSocket send failed: {error}");
+                if socket.sender.close() {
+                    self.sender.notify_close(handle);
+                }
+                return None;
+            }
+        };
+        let events = self.sender.clone();
+        Some(Box::pin(async move {
+            if let Err(error) = drain.await {
+                events.notify_close(handle);
+                return Err(error.into());
+            }
+            Ok(())
+        }))
     }
 
     pub fn close_all(&mut self) {
@@ -498,6 +526,48 @@ mod tests {
         drop(writing);
         a.try_write(&mut vec![2]).unwrap();
         assert_eq!(reader.try_recv().unwrap().as_ref(), [2]);
+    }
+
+    #[test]
+    fn pressured_xml_writes_drain_in_order_after_close_on_a_second_socket() {
+        use futures::FutureExt;
+        let budget = super::SocketWriteBudget::new(64);
+        let (first, slow) = super::SocketOutput::channel(budget.clone());
+        let (mut xml, receiver) = super::SocketOutput::channel(budget);
+        first.try_write(&mut vec![1; 64]).unwrap();
+        let writing = slow.try_recv().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut message = vec![b'a'; 100];
+        message.push(0);
+        let mut drain = xml
+            .write_xml(&mut message, Some(dir.path()))
+            .unwrap()
+            .unwrap();
+        assert!(drain.as_mut().now_or_never().is_none());
+        assert!(
+            xml.write_xml(&mut b"b\0c\0".to_vec(), Some(dir.path()))
+                .unwrap()
+                .is_none()
+        );
+        drop(xml);
+        assert!(receiver.try_recv().is_err());
+        drop(writing);
+        let (delivered, finished) = futures::executor::block_on(async {
+            futures::join!(
+                async {
+                    let mut bytes = Vec::new();
+                    while let Ok(part) = receiver.recv().await {
+                        bytes.extend_from_slice(part.as_ref());
+                    }
+                    bytes
+                },
+                drain
+            )
+        });
+        finished.unwrap();
+        let mut expected = vec![b'a'; 100];
+        expected.extend_from_slice(b"\0b\0c\0");
+        assert_eq!(delivered, expected);
     }
 
     #[test]

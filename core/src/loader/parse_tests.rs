@@ -249,7 +249,7 @@ fn prepared_movie_is_installed_without_reparsing_transport_bytes() {
             200,
             false,
             None,
-            Some(prepared),
+            Some(PreparedContent::Movie(prepared)),
             1,
             0,
         );
@@ -404,7 +404,7 @@ fn worker_preserves_non_movie_payload_and_rejects_malformed_swf() {
         None,
     ))
     .unwrap();
-    assert!(matches!(content, PreparedContent::Other(body) if body == image));
+    assert!(matches!(content, PreparedContent::Image {source, pixels: Err(_)} if source == image));
     for bytes in [b"FWS\x08\0\0\0\0".to_vec(), swz(b"FWS\x08\0\0\0\0")] {
         assert!(
             futures::executor::block_on(prepare_swf_movie(

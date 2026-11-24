@@ -33,7 +33,6 @@ use crate::backend::ui::{
     DialogResultFuture, FileDialogResult, MultiDialogResultFuture, MultiFileDialogResult,
 };
 use crate::bitmap::bitmap_data::BitmapData;
-use crate::bitmap::bitmap_data::Color;
 use crate::context::{ActionQueue, ActionType, UpdateContext};
 use crate::display_object::{
     DisplayObject, MovieClip, MovieClipHandle, TDisplayObject, TDisplayObjectContainer,
@@ -159,6 +158,10 @@ impl fmt::Display for ContentType {
 }
 
 impl ContentType {
+    fn is_image(self) -> bool {
+        matches!(self, Self::Gif | Self::Jpeg | Self::JpegXr | Self::Png)
+    }
+
     fn sniff(data: &[u8]) -> ContentType {
         if read_compression_type(data).is_ok() {
             ContentType::Swf
@@ -1106,8 +1109,8 @@ impl<'gc> MovieLoader<'gc> {
                         )?;
                     } else {
                         Self::on_success(
-                            player, handle, generation, loader_url, prepared, url, status,
-                            redirected, elapsed,
+                            player, handle, generation, loader_url, prepared, body_len, url,
+                            status, redirected, elapsed,
                         )?;
                     }
                 }
@@ -1225,32 +1228,28 @@ impl<'gc> MovieLoader<'gc> {
         generation: u64,
         loader_url: Option<String>,
         content: PreparedContent,
+        body_len: usize,
         url: String,
         status: u16,
         redirected: bool,
         parse_duration_ns: u64,
     ) -> Result<(), Error> {
-        let (bytes, movie, len) = match content {
-            PreparedContent::Movie(movie) => {
-                let len = movie.compressed_len();
-                (bytes::Bytes::new(), Some(movie), len)
-            }
-            PreparedContent::Other(bytes) => {
-                let len = bytes.len();
-                (bytes, None, len)
-            }
+        let (bytes, prepared) = match content {
+            PreparedContent::Movie(_) => (bytes::Bytes::new(), Some(content)),
+            PreparedContent::Image { ref source, .. } => (source.clone(), Some(content)),
+            PreparedContent::Other(bytes) => (bytes, None),
         };
         player.mutate_with_update_context(|uc| {
             MovieLoader::movie_loader_data(
                 handle,
                 uc,
                 &bytes,
-                len,
+                body_len,
                 url,
                 status,
                 redirected,
                 loader_url,
-                movie,
+                prepared,
                 generation,
                 parse_duration_ns,
             )
@@ -1357,6 +1356,7 @@ impl<'gc> MovieLoader<'gc> {
                         generation,
                         Some(loader_url),
                         content,
+                        len,
                         generated_url,
                         0,
                         false,
@@ -2183,11 +2183,12 @@ impl<'gc> MovieLoader<'gc> {
         status: u16,
         redirected: bool,
         loader_url: Option<String>,
-        prepared: Option<SwfMovieData>,
+        prepared: Option<PreparedContent>,
         generation: u64,
         parse_duration_ns: u64,
     ) -> Result<(), Error> {
-        let sniffed_type = if prepared.is_some() && ContentType::sniff(data) == ContentType::Unknown
+        let sniffed_type = if matches!(prepared, Some(PreparedContent::Movie(_)))
+            && ContentType::sniff(data) == ContentType::Unknown
         {
             ContentType::Swf
         } else {
@@ -2273,11 +2274,12 @@ impl<'gc> MovieLoader<'gc> {
             uc.avm2.stage_domain()
         };
 
+        let mut image = None;
         let movie = match sniffed_type {
             ContentType::Swf => {
                 let mut movie = match prepared {
-                    Some(movie) => movie,
-                    None => SwfMovieData::from_data(
+                    Some(PreparedContent::Movie(movie)) => movie,
+                    _ => SwfMovieData::from_data(
                         data,
                         url.clone(),
                         loader_url.clone(),
@@ -2295,9 +2297,16 @@ impl<'gc> MovieLoader<'gc> {
                 movie
             }
             ContentType::Gif | ContentType::Jpeg | ContentType::JpegXr | ContentType::Png => {
-                let (width, height) =
-                    ruffle_render::utils::decode_define_bits_jpeg_dimensions(data)
-                        .unwrap_or((0, 0));
+                image = match prepared {
+                    Some(PreparedContent::Image { pixels, .. }) => Some(pixels),
+                    _ => None,
+                };
+                let (width, height) = image
+                    .as_ref()
+                    .and_then(|p| p.as_ref().ok())
+                    .map(|p| (p.width, p.height))
+                    .or_else(|| ruffle_render::utils::decode_define_bits_jpeg_dimensions(data).ok())
+                    .unwrap_or((0, 0));
                 SwfMovieData::from_loaded_image(url.clone(), from_bytes, length, width, height)
             }
             ContentType::Unknown => SwfMovieData::error_movie(url.clone()),
@@ -2448,15 +2457,27 @@ impl<'gc> MovieLoader<'gc> {
 
                 // This will construct AVM2-side objects even under AVM1, but it doesn't matter,
                 // since Bitmap and BitmapData never have AVM1-side objects.
-                let bitmap = ruffle_render::utils::decode_define_bits_jpeg(data, None)?;
-
-                let transparency = bitmap.format().supports_transparency();
+                // Local loadBytes exposes its progress during the call. URL loads
+                // and deferred loadBytes already prepared these pixels outside the VM.
+                let pixels = match image.unwrap_or_else(|| movie::ImagePixels::decode(data)) {
+                    Ok(pixels) => pixels,
+                    Err(error) => {
+                        return Self::movie_loader_error(
+                            handle,
+                            activation.context,
+                            &error,
+                            status,
+                            redirected,
+                            url,
+                        );
+                    }
+                };
                 let bitmapdata = BitmapData::new_with_pixels(
                     activation.gc(),
-                    bitmap.width(),
-                    bitmap.height(),
-                    transparency,
-                    bitmap.as_colors().map(Color::from).collect(),
+                    pixels.width,
+                    pixels.height,
+                    pixels.transparency,
+                    pixels.colors,
                 );
 
                 let bitmapdata_avm2 =

@@ -1,12 +1,16 @@
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ruffle_core::backend::audio::{
-    AudioBackend, AudioMixer, DecodeError, RegisterError, SoundHandle, SoundInstanceHandle,
-    SoundStreamInfo, SoundTransform, swf,
+    AudioBackend, AudioMixer, AudioMixerProxy, DecodeError, RegisterError, SoundHandle,
+    SoundInstanceHandle, SoundStreamInfo, SoundTransform, swf,
 };
 use ruffle_core::impl_audio_mixer_backend;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
+use std::time::{Duration, Instant};
+
+mod convert;
+use convert::{MixerFormat, OutputConverter};
 mod pcm;
 use pcm::PcmWorker;
 
@@ -32,77 +36,143 @@ pub enum CpalError {
 }
 
 pub struct CpalAudioBackend {
-    #[expect(dead_code)]
-    device: cpal::Device,
-    config: cpal::StreamConfig,
-    stream: cpal::Stream,
     mixer: AudioMixer,
+    format: MixerFormat,
+    output: Option<DeviceOutput>,
+    preferred_device: Option<String>,
+    next_retry: Instant,
+    playing: bool,
+    simulated: bool,
+    sample_fraction: f64,
+}
+
+struct DeviceOutput {
+    _device: cpal::Device,
+    stream: cpal::Stream,
     worker: PcmWorker,
     errors: Receiver<cpal::StreamError>,
-    sample_fraction: f64,
 }
 
 impl CpalAudioBackend {
     pub fn new(preferred_device_name: Option<&str>) -> Result<Self, CpalError> {
-        // Create CPAL audio device.
-        let host = cpal::default_host();
-        let device =
-            get_suitable_output_device(preferred_device_name, &host).ok_or(CpalError::NoDevices)?;
+        let (device, config) = output_device(preferred_device_name)?;
+        let format = MixerFormat {
+            channels: usize::from(config.channels().min(2)),
+            rate: config.sample_rate().0,
+        };
+        let mixer = AudioMixer::new(format.channels as u8, format.rate);
+        let output = DeviceOutput::open(device, config, &mixer, format, true, false)?;
+        Ok(Self {
+            mixer,
+            format,
+            output: Some(output),
+            preferred_device: preferred_device_name.map(str::to_owned),
+            next_retry: Instant::now(),
+            playing: true,
+            simulated: false,
+            sample_fraction: 0.,
+        })
+    }
 
-        // Create audio stream for device.
-        let config = device
-            .default_output_config()
-            .map_err(CpalError::DefaultStream)?;
-        let sample_format = config.sample_format();
-        let config = cpal::StreamConfig::from(config);
-        let mixer = AudioMixer::new(config.channels as u8, config.sample_rate.0);
+    fn lose_output(&mut self, error: impl std::fmt::Display) {
+        tracing::warn!("Audio output unavailable: {error}");
+        self.output = None;
+        self.next_retry = Instant::now();
+    }
+}
 
-        let proxy = mixer.proxy();
-        let (error_sink, errors) = sync_channel(1);
-        let (stream, worker) = match sample_format {
-            cpal::SampleFormat::F32 => {
-                open_stream(&device, &config, error_sink, 0.0f32, move |b| proxy.mix(b))
-            }
-            cpal::SampleFormat::I16 => {
-                open_stream(&device, &config, error_sink, 0i16, move |b| proxy.mix(b))
-            }
-            cpal::SampleFormat::U16 => {
-                open_stream(&device, &config, error_sink, 32768u16, move |buffer| {
+fn output_device(
+    preferred: Option<&str>,
+) -> Result<(cpal::Device, cpal::SupportedStreamConfig), CpalError> {
+    let device =
+        get_suitable_output_device(preferred, &cpal::default_host()).ok_or(CpalError::NoDevices)?;
+    let config = device.default_output_config()?;
+    Ok((device, config))
+}
+
+impl DeviceOutput {
+    fn open(
+        device: cpal::Device,
+        supported: cpal::SupportedStreamConfig,
+        mixer: &AudioMixer,
+        format: MixerFormat,
+        playing: bool,
+        simulated: bool,
+    ) -> Result<Self, CpalError> {
+        let sample_format = supported.sample_format();
+        let config = supported.config();
+        let (sink, errors) = sync_channel(1);
+        let (stream, mut worker) = match sample_format {
+            cpal::SampleFormat::F32 => open_stream::<f32>(
+                &device,
+                &config,
+                sink,
+                mixer.proxy(),
+                format,
+                AudioMixerProxy::mix,
+            ),
+            cpal::SampleFormat::I16 => open_stream::<i16>(
+                &device,
+                &config,
+                sink,
+                mixer.proxy(),
+                format,
+                AudioMixerProxy::mix,
+            ),
+            cpal::SampleFormat::U16 => open_stream::<u16>(
+                &device,
+                &config,
+                sink,
+                mixer.proxy(),
+                format,
+                |proxy, buffer| {
                     proxy.mix::<i16>(bytemuck::cast_slice_mut(buffer));
                     for sample in buffer {
                         *sample = sample.wrapping_add(32768);
                     }
-                })
-            }
-            _ => return Err(CpalError::UnsupportedSampleFormat(sample_format)),
+                },
+            ),
+            other => return Err(CpalError::UnsupportedSampleFormat(other)),
         }?;
-
-        stream.play().map_err(CpalError::Play)?;
-
+        worker.set_playing(playing);
+        worker.set_simulated(simulated);
+        if playing {
+            stream.play()?;
+        }
         Ok(Self {
-            device,
-            config,
+            _device: device,
+            stream,
             worker,
             errors,
-            sample_fraction: 0.0,
-            stream,
-            mixer,
         })
     }
 }
 
-fn open_stream<T: cpal::SizedSample + Copy + Send + 'static>(
+fn open_stream<T: cpal::SizedSample + cpal::FromSample<f32> + Copy + Send + 'static>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     errors: SyncSender<cpal::StreamError>,
-    silence: T,
-    mix: impl FnMut(&mut [T]) + Send + 'static,
+    mixer: AudioMixerProxy,
+    format: MixerFormat,
+    direct: fn(&AudioMixerProxy, &mut [T]),
 ) -> Result<(cpal::Stream, PcmWorker), CpalError> {
+    let target = MixerFormat {
+        channels: usize::from(config.channels),
+        rate: config.sample_rate.0,
+    };
+    let mut conversion = (target.channels != format.channels || target.rate != format.rate)
+        .then(|| OutputConverter::new(format, target));
     let (worker, mut output) = PcmWorker::start(
-        usize::from(config.channels),
-        config.sample_rate.0,
-        silence,
-        mix,
+        target.channels,
+        target.rate,
+        T::EQUILIBRIUM,
+        move |buffer| {
+            if let Some(converter) = &mut conversion {
+                converter.fill(buffer, |input| mixer.mix(input));
+            } else {
+                direct(&mixer, buffer);
+            }
+        },
     )?;
     let stream = device.build_output_stream(
         config,
@@ -119,18 +189,45 @@ impl AudioBackend for CpalAudioBackend {
     impl_audio_mixer_backend!(mixer);
 
     fn set_simulated_output(&mut self, enabled: bool) {
-        self.worker.set_simulated(enabled);
+        self.simulated = enabled;
+        if let Some(out) = &mut self.output {
+            out.worker.set_simulated(enabled);
+        }
     }
 
     fn tick(&mut self) {
-        if let Ok(error) = self.errors.try_recv() {
-            tracing::error!("Audio stream error: {error}");
+        if let Some(error) = self
+            .output
+            .as_ref()
+            .and_then(|out| out.errors.try_recv().ok())
+        {
+            self.lose_output(error);
+        }
+        if self.output.is_none() && Instant::now() >= self.next_retry {
+            let replacement =
+                output_device(self.preferred_device.as_deref()).and_then(|(device, config)| {
+                    DeviceOutput::open(
+                        device,
+                        config,
+                        &self.mixer,
+                        self.format,
+                        self.playing,
+                        self.simulated,
+                    )
+                });
+            match replacement {
+                Ok(out) => self.output = Some(out),
+                Err(error) => {
+                    tracing::warn!("Could not reopen audio output: {error}");
+                    self.next_retry = Instant::now() + Duration::from_secs(1);
+                }
+            }
         }
     }
     fn advance_simulated_output(&mut self, millis: f64) {
-        let frames = self.sample_fraction + millis * f64::from(self.config.sample_rate.0) / 1000.0;
+        let frames = self.sample_fraction + millis * f64::from(self.format.rate) / 1000.0;
         self.sample_fraction = frames.fract();
-        let channels = usize::from(self.config.channels);
+        let channels = self.format.channels;
         if channels == 0 || channels > 4096 {
             return;
         }
@@ -144,13 +241,23 @@ impl AudioBackend for CpalAudioBackend {
     }
 
     fn play(&mut self) {
-        self.worker.set_playing(true);
-        self.stream.play().expect("Error trying to resume CPAL audio stream. This feature may not be supported by your audio device.");
+        self.playing = true;
+        if let Some(out) = &mut self.output {
+            out.worker.set_playing(true);
+            if let Err(error) = out.stream.play() {
+                self.lose_output(error);
+            }
+        }
     }
 
     fn pause(&mut self) {
-        self.stream.pause().expect("Error trying to pause CPAL audio stream. This feature may not be supported by your audio device.");
-        self.worker.set_playing(false);
+        self.playing = false;
+        if let Some(out) = &mut self.output {
+            out.worker.set_playing(false);
+            if let Err(error) = out.stream.pause() {
+                self.lose_output(error);
+            }
+        }
     }
 }
 
@@ -231,6 +338,7 @@ mod tests {
     #[ignore = "requires a native CPAL output, route to private sinks for device-switch testing"]
     fn native_pcm_position_pauses_resumes_and_finishes_on_the_device_clock() {
         use super::{AudioBackend, CpalAudioBackend, swf};
+        use cpal::traits::DeviceTrait;
         let mut backend = CpalAudioBackend::new(None).unwrap();
         let rate = 44_100usize;
         let samples: Vec<u8> = (0..rate * 2)
@@ -267,6 +375,7 @@ mod tests {
         let start = std::time::Instant::now();
         let mut previous = 0.;
         let mut paused = false;
+        let mut simulated = false;
         while let Some(position) = backend.get_sound_position(instance) {
             assert!(position >= previous);
             previous = position;
@@ -274,18 +383,77 @@ mod tests {
                 start.elapsed() < Duration::from_secs(8),
                 "native audio clock stopped at {position}"
             );
-            if !paused && position >= 650. {
+            if !paused && position >= 900. {
                 backend.pause();
                 let stopped = backend.get_sound_position(instance).unwrap();
+                let (failed_device, errors) = std::sync::mpsc::sync_channel(1);
+                backend.output.as_mut().unwrap().errors = errors;
+                failed_device
+                    .send(cpal::StreamError::DeviceNotAvailable)
+                    .unwrap();
+                backend.tick();
+                assert!(backend.output.is_some());
+                assert!(
+                    matches!(
+                        failed_device.try_send(cpal::StreamError::DeviceNotAvailable),
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_))
+                    ),
+                    "a failed device stream must be replaced on the player thread"
+                );
                 std::thread::sleep(Duration::from_millis(150));
                 assert_eq!(backend.get_sound_position(instance), Some(stopped));
                 backend.play();
                 paused = true;
             }
+            if !simulated && position >= 1250. {
+                backend.set_simulated_output(true);
+                let before = backend.get_sound_position(instance).unwrap();
+                let (device, _) = super::output_device(None).unwrap();
+                let alternate = if backend.format.rate == 44_100 {
+                    48_000
+                } else {
+                    44_100
+                };
+                let config = device
+                    .supported_output_configs()
+                    .unwrap()
+                    .find_map(|range| {
+                        (matches!(
+                            range.sample_format(),
+                            cpal::SampleFormat::F32 | cpal::SampleFormat::I16
+                        ) && range.channels() == 2
+                            && range.min_sample_rate().0 <= alternate
+                            && alternate <= range.max_sample_rate().0)
+                            .then(|| range.with_sample_rate(cpal::SampleRate(alternate)))
+                    })
+                    .expect("the test output must offer both 44.1 and 48 kHz");
+                backend.output = None;
+                backend.output = Some(
+                    super::DeviceOutput::open(
+                        device,
+                        config,
+                        &backend.mixer,
+                        backend.format,
+                        true,
+                        true,
+                    )
+                    .unwrap(),
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                assert_eq!(backend.get_sound_position(instance), Some(before));
+                backend.advance_simulated_output(75.);
+                let advance = backend.get_sound_position(instance).unwrap() - before;
+                assert!(
+                    (73. ..=77.).contains(&advance),
+                    "simulated advance {advance} ms"
+                );
+                backend.set_simulated_output(false);
+                simulated = true;
+            }
             std::thread::sleep(Duration::from_millis(10));
             backend.tick();
         }
-        assert!(paused && previous >= 1500.);
+        assert!(paused && simulated && previous >= 1500.);
         assert!(start.elapsed() >= Duration::from_millis(1700));
     }
 }

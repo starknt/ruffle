@@ -4,14 +4,41 @@ use super::{ContentType, Error, Instant, LoadBytesInfo, SwfMovieData, extract_sw
 
 pub(super) enum PreparedContent {
     Movie(SwfMovieData),
+    Image {
+        source: bytes::Bytes,
+        pixels: Result<ImagePixels, String>,
+    },
     Other(bytes::Bytes),
+}
+
+pub(super) struct ImagePixels {
+    pub width: u32,
+    pub height: u32,
+    pub transparency: bool,
+    pub colors: Vec<crate::bitmap::bitmap_data::Color>,
+}
+
+impl ImagePixels {
+    pub(super) fn decode(source: &[u8]) -> Result<Self, String> {
+        let bitmap = ruffle_render::utils::decode_define_bits_jpeg(source, None)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            width: bitmap.width(),
+            height: bitmap.height(),
+            transparency: bitmap.format().supports_transparency(),
+            colors: bitmap
+                .as_colors()
+                .map(crate::bitmap::bitmap_data::Color::from)
+                .collect(),
+        })
+    }
 }
 
 impl PreparedContent {
     pub(super) fn into_movie(self) -> Result<SwfMovieData, Error> {
         match self {
             Self::Movie(movie) => Ok(movie),
-            Self::Other(bytes) => Err(Error::UnexpectedData(
+            Self::Image { source: bytes, .. } | Self::Other(bytes) => Err(Error::UnexpectedData(
                 ContentType::Swf,
                 ContentType::sniff(&bytes),
             )),
@@ -192,7 +219,16 @@ impl Preparation {
         OwnedSemaphorePermit,
     ) {
         let bytes = &input.bytes;
-        let decoded = if ContentType::sniff(bytes) == ContentType::Swf && bytes.len() >= 8 {
+        let kind = ContentType::sniff(bytes);
+        let decoded = if kind.is_image() {
+            // Decoding and conversion into VM colors briefly coexist. Delivery
+            // retains the original LoaderInfo.bytes as well as the pixels.
+            ruffle_render::utils::decode_define_bits_jpeg_dimensions(bytes)
+                .ok()
+                .and_then(|(w, h)| (w as usize).checked_mul(h as usize))
+                .and_then(|pixels| pixels.checked_mul(8))
+                .and_then(|peak| peak.checked_add(bytes.len()))
+        } else if kind == ContentType::Swf && bytes.len() >= 8 {
             Some(u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize)
         } else if bytes.first() == Some(&0x30) {
             // SWZ wraps the SWF length in a DER envelope.
@@ -202,26 +238,34 @@ impl Preparation {
         };
         let delivery = budget.decoded.reserve(decoded).await;
         let start = Instant::now();
+        // A local URL is ready on this executor poll. Fixed-step playback may
+        // observe the loaded bitmap on this very frame. The player lock is free.
+        let inline =
+            matches!(self, Self::Inline) && (use_inline_movie_parse(&url) || !kind.is_image());
         let work = move || {
             let result = prepare_swf_movie_data(input.bytes, url, loader_url, info);
             drop(input._reservation);
             (result, start.elapsed().as_nanos() as u64, delivery)
         };
-        match self {
-            Self::Inline => work(),
-            Self::Worker(transfer) => {
-                let worker = PREPARATIONS
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("permanent movie pool");
-                run_worker(worker, move || {
-                    let _transfer = transfer;
-                    work()
-                })
-                .await
-            }
+        if inline {
+            return work();
         }
+        let transfer = match self {
+            Self::Inline => None,
+            Self::Worker(permit) => Some(permit),
+        };
+        // Input and delivery credit are already held. A network transfer may
+        // be waiting for that input, so only wait for a decoder at this point.
+        let worker = PREPARATIONS
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("permanent movie pool");
+        run_worker(worker, move || {
+            let _transfer = transfer;
+            work()
+        })
+        .await
     }
 }
 
@@ -264,13 +308,19 @@ pub(super) fn prepare_swf_movie_data(
     load_bytes_info: Option<LoadBytesInfo>,
 ) -> Result<PreparedContent, swf::error::Error> {
     let transport = body.into();
-    let uncompressed = if ContentType::sniff(&transport) == ContentType::Swf {
-        None
-    } else {
+    let uncompressed = if transport.first() == Some(&0x30) {
         extract_swz(&transport).ok()
+    } else {
+        None
     };
     let parse_body = uncompressed.as_deref().unwrap_or(&transport);
-    if ContentType::sniff(parse_body) != ContentType::Swf {
+    let kind = ContentType::sniff(parse_body);
+    if kind.is_image() {
+        let pixels = ImagePixels::decode(parse_body);
+        let source = uncompressed.map_or(transport, bytes::Bytes::from);
+        return Ok(PreparedContent::Image { source, pixels });
+    }
+    if kind != ContentType::Swf {
         return Ok(PreparedContent::Other(transport));
     }
     let movie = SwfMovieData::from_data(parse_body, url, loader_url, load_bytes_info)?
@@ -294,6 +344,64 @@ mod tests {
         sync::atomic::{AtomicBool, Ordering},
         task::Context,
     };
+
+    #[test]
+    fn image_preparation_reserves_decoded_pixels_before_decoding_outside_the_vm() {
+        let png = bytes::Bytes::from_static(include_bytes!(
+            "../../../tests/tests/swfs/avm2/loader_load/test.png"
+        ));
+        let budget = MovieBudgets::new(2, 4);
+        futures::executor::block_on(async {
+            let input = budget.snapshot(png.clone()).await;
+            let (result, _, delivery) = Preparation::Inline
+                .prepare(input, &budget, "file:///image.png".into(), None, None)
+                .await;
+            assert_eq!(delivery.num_permits(), 4, "600 by 400 RGBA delivery");
+            let PreparedContent::Image {
+                source,
+                pixels: Ok(image),
+            } = result.unwrap()
+            else {
+                panic!("expected prepared pixels and original loader bytes")
+            };
+            assert_eq!(source, png);
+            assert_eq!(
+                (image.width, image.height, image.colors.len()),
+                (600, 400, 240000)
+            );
+            assert!(budget.decoded.reserve(Some(1)).now_or_never().is_none());
+            drop(delivery);
+            assert!(budget.decoded.reserve(None).now_or_never().is_some());
+        });
+    }
+
+    #[test]
+    fn admitted_image_finishes_while_other_transfers_wait_for_input() {
+        let budget = MovieBudgets::new(1, 1);
+        let transfers = budget
+            .transfers
+            .clone()
+            .try_acquire_many_owned(MAX_PREPARATIONS as u32)
+            .unwrap();
+        let png = bytes::Bytes::from_static(include_bytes!(
+            "../../../tests/tests/swfs/avm2/loader_load/test.png"
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let ok = futures::executor::block_on(async {
+                let input = budget.snapshot(png).await;
+                let (prepared, _, _) = Preparation::for_bytes(&budget)
+                    .prepare(input, &budget, String::new(), None, None)
+                    .await;
+                matches!(prepared, Ok(PreparedContent::Image { pixels: Ok(_), .. }))
+            });
+            tx.send(ok).unwrap();
+        });
+        let finished = rx.recv_timeout(std::time::Duration::from_secs(3));
+        drop(transfers);
+        worker.join().unwrap();
+        assert_eq!(finished, Ok(true));
+    }
 
     #[test]
     fn movie_preparation_limits_admission_and_releases_cancelled_waiters() {
