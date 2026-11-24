@@ -1,6 +1,6 @@
 use crate::backends::TestLogBackend;
 use crate::util::read_bytes;
-use async_channel::{Receiver, Sender};
+use async_channel::Receiver;
 use percent_encoding::percent_decode_str;
 use ruffle_core::backend::log::LogBackend;
 use ruffle_core::backend::navigator::{
@@ -10,7 +10,9 @@ use ruffle_core::backend::navigator::{
 use ruffle_core::backend::tasks::{LocalExecutor, LocalTaskSpawner, TaskSpawner};
 use ruffle_core::indexmap::IndexMap;
 use ruffle_core::loader::Error;
-use ruffle_core::socket::{ConnectionState, SocketAction, SocketHandle};
+use ruffle_core::socket::{
+    ConnectionState, SocketAction, SocketActionSender, SocketHandle, SocketWrite,
+};
 use ruffle_core::swf::Encoding;
 use ruffle_socket_format::SocketEvent;
 use std::borrow::Cow;
@@ -276,8 +278,8 @@ impl NavigatorBackend for TestNavigatorBackend {
         port: u16,
         _timeout: Duration,
         handle: SocketHandle,
-        receiver: Receiver<Vec<u8>>,
-        sender: Sender<SocketAction>,
+        receiver: Receiver<SocketWrite>,
+        sender: SocketActionSender,
     ) {
         if let Some(log) = &self.log {
             log.avm_trace("Navigator::connect_socket");
@@ -306,15 +308,21 @@ impl NavigatorBackend for TestNavigatorBackend {
                         SocketEvent::Receive { expected } => {
                             match receiver.recv().await {
                                 Ok(val) => {
-                                    if expected != val {
+                                    if expected.as_slice() != val.as_ref() {
                                         panic!("Received data did not match expected data\nExpected: {expected:?}\nActual: {val:?}");
                                     }
                                 }
                                 Err(_) => panic!("Expected client to send data, but connection was closed instead"),
                             }
                         }
+                        SocketEvent::ReceiveRepeated { byte, count } => {
+                            let payload = receiver.recv().await.expect("socket closed before flush");
+                            let bytes = payload.as_ref();
+                            assert_eq!(bytes.len(), count, "flushed byte count");
+                            assert!(bytes.iter().all(|&value| value == byte), "unexpected payload");
+                        }
                         SocketEvent::Send { payload } => {
-                            sender.try_send(SocketAction::Data(handle, payload)).expect("working channel send");
+                            sender.send(SocketAction::Data(handle, payload)).await.expect("working channel send");
                         }
                     }
                 }

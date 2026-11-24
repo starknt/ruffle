@@ -1,9 +1,9 @@
 //! URL navigation, resource loading, and sockets.
 
 use crate::loader::Error;
-use crate::socket::{ConnectionState, SocketAction, SocketHandle};
+use crate::socket::{ConnectionState, SocketAction, SocketActionSender, SocketHandle, SocketWrite};
 use crate::string::WStr;
-use async_channel::{Receiver, Sender};
+use async_channel::Receiver;
 use encoding_rs::Encoding;
 use enumset::EnumSetType;
 use indexmap::IndexMap;
@@ -349,8 +349,8 @@ pub trait NavigatorBackend: Any {
         port: u16,
         timeout: Duration,
         handle: SocketHandle,
-        receiver: Receiver<Vec<u8>>,
-        sender: Sender<SocketAction>,
+        receiver: Receiver<SocketWrite>,
+        sender: SocketActionSender,
     );
 }
 
@@ -408,8 +408,8 @@ impl NavigatorBackend for FileNavigator {
         _port: u16,
         _timeout: Duration,
         handle: SocketHandle,
-        _receiver: Receiver<Vec<u8>>,
-        sender: Sender<SocketAction>,
+        _receiver: Receiver<SocketWrite>,
+        sender: SocketActionSender,
     ) {
         sender
             .try_send(SocketAction::Connect(handle, ConnectionState::Failed))

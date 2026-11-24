@@ -182,7 +182,10 @@ pub fn send<'gc>(
         // The string needs to end with a null byte.
         data.push(0);
 
-        activation.context.sockets.send(handle, data);
+        if let Err(error) = activation.context.sockets.send(handle, &mut data) {
+            tracing::warn!("XMLSocket send failed: {error}");
+            activation.context.sockets.fail_xml_write(handle);
+        }
     }
 
     Ok(Value::Undefined)

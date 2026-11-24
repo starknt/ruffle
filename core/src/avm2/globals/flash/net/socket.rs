@@ -90,7 +90,7 @@ pub fn close<'gc>(
 
     if let Some(socket) = this.as_socket() {
         // We throw an IOError when socket is not open.
-        let handle = socket.handle().ok_or(make_error_2002(activation))?;
+        let handle = socket.handle().ok_or_else(|| make_error_2002(activation))?;
 
         if !activation.context.sockets.is_connected(handle) {
             return Err(make_error_2002(activation));
@@ -219,18 +219,16 @@ pub fn flush<'gc>(
     let this = this.as_object().unwrap();
 
     if let Some(socket) = this.as_socket() {
-        let handle = socket.handle().ok_or(make_error_2002(activation))?;
+        let handle = socket.handle().ok_or_else(|| make_error_2002(activation))?;
         if !activation.context.sockets.is_connected(handle) {
             return Err(make_error_2002(activation));
         }
 
-        let UpdateContext { sockets, .. } = activation.context;
-
-        let mut buffer = socket.write_buffer();
-        let len = buffer.len();
-        let data = buffer.drain(..len).collect::<Vec<_>>();
-
-        sockets.send(handle, data)
+        let result = activation
+            .context
+            .sockets
+            .send(handle, &mut socket.write_buffer());
+        result.map_err(|_| crate::avm2::error::make_error_2031(activation))?;
     }
 
     Ok(Value::Undefined)

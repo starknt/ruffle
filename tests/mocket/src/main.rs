@@ -77,6 +77,19 @@ fn main() -> Result<(), Error> {
                     );
                 }
             }
+            SocketEvent::ReceiveRepeated { byte, count } => {
+                let mut remaining = count;
+                let mut chunk = [0; 4096];
+                while remaining > 0 {
+                    let len = remaining.min(chunk.len());
+                    reader.read_exact(&mut chunk[..len])?;
+                    anyhow::ensure!(
+                        chunk[..len].iter().all(|&v| v == byte),
+                        "Unexpected byte in repeated payload"
+                    );
+                    remaining -= len;
+                }
+            }
             SocketEvent::Send { payload } => {
                 writer.write_all(&payload)?;
             }

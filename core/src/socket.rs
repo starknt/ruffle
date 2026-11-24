@@ -8,13 +8,15 @@ use crate::backend::navigator::NavigatorBackend;
 use crate::context::UpdateContext;
 use crate::string::AvmString;
 
-use async_channel::{Receiver, Sender, unbounded};
 use gc_arena::Collect;
 use ruffle_macros::istr;
 use slotmap::{SlotMap, new_key_type};
-use std::{
-    cell::{Cell, RefCell},
-    time::Duration,
+use std::{cell::Cell, time::Duration};
+
+mod transport;
+pub use transport::{
+    SOCKET_QUEUE_BYTES, SocketActionReceiver, SocketActionSender, SocketOutput, SocketQueueError,
+    SocketWrite, SocketWriteBudget,
 };
 
 new_key_type! {
@@ -32,15 +34,16 @@ enum SocketKind<'gc> {
 #[collect(no_drop)]
 struct Socket<'gc> {
     target: SocketKind<'gc>,
-    sender: RefCell<Sender<Vec<u8>>>,
+    #[collect(require_static)]
+    sender: SocketOutput,
     connected: Cell<bool>,
 }
 
 impl<'gc> Socket<'gc> {
-    fn new(target: SocketKind<'gc>, sender: Sender<Vec<u8>>) -> Self {
+    fn new(target: SocketKind<'gc>, sender: SocketOutput) -> Self {
         Self {
             target,
-            sender: RefCell::new(sender),
+            sender,
             connected: Cell::new(false),
         }
     }
@@ -64,8 +67,8 @@ pub enum SocketAction {
 /// Actions produced by ActionScript callbacks are deferred to the next frame,
 /// matching the previous drain-then-dispatch ordering without retaining a
 /// second Vec of all pending payloads.
-fn socket_action_budget(receiver: &Receiver<SocketAction>) -> usize {
-    receiver.len()
+fn socket_action_budget(receiver: &SocketActionReceiver) -> usize {
+    receiver.ready_count()
 }
 
 /// Manages the collection of Sockets.
@@ -75,19 +78,22 @@ pub struct Sockets<'gc> {
     sockets: SlotMap<SocketHandle, Socket<'gc>>,
 
     #[collect(require_static)]
-    receiver: Receiver<SocketAction>,
+    receiver: SocketActionReceiver,
     #[collect(require_static)]
-    sender: Sender<SocketAction>,
+    sender: SocketActionSender,
+    #[collect(require_static)]
+    output_budget: SocketWriteBudget,
 }
 
 impl<'gc> Sockets<'gc> {
     pub fn empty() -> Self {
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = SocketActionSender::channel(SOCKET_QUEUE_BYTES);
 
         Self {
             sockets: SlotMap::with_key(),
             receiver,
             sender,
+            output_budget: SocketWriteBudget::new(SOCKET_QUEUE_BYTES),
         }
     }
 
@@ -98,7 +104,7 @@ impl<'gc> Sockets<'gc> {
         host: String,
         port: u16,
     ) {
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = SocketOutput::channel(self.output_budget.clone());
 
         let socket = Socket::new(SocketKind::Avm2(target), sender);
         let handle = self.sockets.insert(socket);
@@ -127,7 +133,7 @@ impl<'gc> Sockets<'gc> {
         host: String,
         port: u16,
     ) {
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = SocketOutput::channel(self.output_budget.clone());
 
         let xml_socket = match XmlSocket::cast(target.into()) {
             Some(xml_socket) => xml_socket,
@@ -162,13 +168,19 @@ impl<'gc> Sockets<'gc> {
         }
     }
 
-    pub fn send(&mut self, handle: SocketHandle, data: Vec<u8>) {
-        if let Some(Socket { sender, .. }) = self.sockets.get_mut(handle) {
-            // We use an unbounded socket, so this should only ever error if the channel is closed
-            // (the receiver was dropped)
-            if let Err(e) = sender.borrow().try_send(data) {
-                tracing::error!("Failed to send data to socket: {:?}", e);
-            }
+    pub fn send(&self, handle: SocketHandle, buffer: &mut Vec<u8>) -> Result<(), SocketQueueError> {
+        self.sockets
+            .get(handle)
+            .ok_or(SocketQueueError::Closed)?
+            .sender
+            .try_write(buffer)
+    }
+
+    pub fn fail_xml_write(&self, handle: SocketHandle) {
+        if let Some(socket) = self.sockets.get(handle)
+            && socket.sender.close()
+        {
+            self.sender.notify_close(handle);
         }
     }
 
@@ -431,7 +443,6 @@ fn sanitize_host(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{ConnectionState, SocketAction, SocketHandle, sanitize_host, socket_action_budget};
-    use async_channel::unbounded;
 
     #[test]
     fn truncate_host_at_null() {
@@ -449,8 +460,77 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_socket_writer_retains_credits_until_the_write_finishes() {
+        let budget = super::SocketWriteBudget::new(128);
+        let (send, take) = super::SocketOutput::channel(budget.clone());
+        let (other, _other_reader) = super::SocketOutput::channel(budget);
+        let mut first = vec![1; 128];
+        send.try_write(&mut first).unwrap();
+        assert!(first.is_empty());
+        let writing = take.try_recv().unwrap();
+        let mut second = vec![2; 65];
+        assert!(send.try_write(&mut second).is_err());
+        assert_eq!(second, vec![2; 65]);
+        assert!(other.try_write(&mut second).is_err());
+        assert_eq!(writing.as_ref(), &[1; 128]);
+        drop(writing);
+        send.try_write(&mut second).unwrap();
+        drop(send);
+        assert_eq!(take.try_recv().unwrap().as_ref(), &[2; 65]);
+        assert!(take.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_large_flash_flush_can_retry_and_owns_the_whole_writer_window() {
+        let budget = super::SocketWriteBudget::new(128);
+        let (a, reader) = super::SocketOutput::channel(budget.clone());
+        let (b, other_reader) = super::SocketOutput::channel(budget);
+        a.try_write(&mut vec![1]).unwrap();
+        let mut large = vec![7; 513];
+        assert!(b.try_write(&mut large).is_err());
+        assert_eq!(large, [7; 513]);
+        drop(reader.try_recv().unwrap());
+        b.try_write(&mut large).unwrap();
+        assert!(large.is_empty());
+        let writing = other_reader.try_recv().unwrap();
+        assert!(a.try_write(&mut vec![2]).is_err());
+        assert_eq!(writing.as_ref(), [7; 513]);
+        drop(writing);
+        a.try_write(&mut vec![2]).unwrap();
+        assert_eq!(reader.try_recv().unwrap().as_ref(), [2]);
+    }
+
+    #[test]
+    fn paused_socket_input_resumes_on_delivery_and_wakes_on_session_close() {
+        use futures::FutureExt;
+        let handle = SocketHandle::default();
+        let (events, inbox) = super::SocketActionSender::channel(128);
+        events
+            .try_send(SocketAction::Data(handle, vec![1; 128]))
+            .unwrap();
+        let mut reading = Box::pin(events.send(SocketAction::Data(handle, vec![2; 128])));
+        assert!(reading.as_mut().now_or_never().is_none());
+        events
+            .try_send(SocketAction::Connect(handle, ConnectionState::Failed))
+            .unwrap();
+        assert_eq!(
+            inbox.try_recv().unwrap(),
+            SocketAction::Data(handle, vec![1; 128])
+        );
+        assert!(reading.as_mut().now_or_never().unwrap().is_ok());
+        assert_eq!(
+            inbox.try_recv().unwrap(),
+            SocketAction::Connect(handle, ConnectionState::Failed)
+        );
+        let mut pending = Box::pin(events.send(SocketAction::Data(handle, vec![3; 128])));
+        assert!(pending.as_mut().now_or_never().is_none());
+        drop(inbox);
+        assert!(pending.as_mut().now_or_never().unwrap().is_err());
+    }
+
+    #[test]
     fn socket_action_budget_is_a_frame_snapshot() {
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = super::SocketActionSender::channel(128);
         sender
             .try_send(SocketAction::Connect(
                 SocketHandle::default(),
@@ -462,6 +542,6 @@ mod tests {
             .try_send(SocketAction::Close(SocketHandle::default()))
             .unwrap();
         assert_eq!(budget, 1);
-        assert_eq!(receiver.len(), 2);
+        assert_eq!(receiver.ready_count(), 2);
     }
 }
