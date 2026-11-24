@@ -77,8 +77,9 @@ improvement counts. The report includes the target phase P95, CPU and GPU
 tails and worst paired RSS growth. `--phase gpu` selects whole-frame GPU work,
 and `--phase preparation` selects owner-thread preparation. Historical traces
 without stage end times remain readable and cannot qualify a candidate.
-The separate `--control` regression check retains its 3% timing and 5% RSS
-limits and requires complete interval measurements.
+The separate `--control` regression check applies its 3% tolerance to frame
+interval P95 growth and 1% Low FPS loss as well as its other timing limits.
+It also checks the 5% peak RSS bound and requires complete interval measurements.
 Use `--compare-bitmap-bindings --case ordered_bitmaps --phase gpu` to compare
 explicit slots and binding arrays with the same device features and executable.
 Absent, orphan or duplicate GPU identities never become zero-time measurements.

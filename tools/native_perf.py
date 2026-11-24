@@ -162,7 +162,8 @@ def compare(baseline, candidate, phase, control=False):
     interval = pacing_change('frameIntervalP95Ms')
     low = pacing_change('onePercentLowFps')
     if control:
-        accepted = interval is not None and low is not None and stable and median(ratios('completedFrameMs')) <= .03
+        accepted = (interval is not None and interval <= .03 and low is not None and low >= -.03
+                    and stable and median(ratios('completedFrameMs')) <= .03)
     else:
         accepted = (improvement is not None and interval is not None and low is not None
                     and throughput > 0 and interval < 0 and low > 0)

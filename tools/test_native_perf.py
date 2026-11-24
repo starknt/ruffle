@@ -259,6 +259,14 @@ class NativeWgpuAcceptanceTest(unittest.TestCase):
             run.update(gpuP99Ms=9., completedFrameMs=11.)
         self.assertFalse(compare(before, after, 'gpu', control=True)['accepted'])
 
+    def test_control_rejects_pacing_regressions_even_with_unchanged_gpu_time(self):
+        for key, factor in [('onePercentLowFps', .9), ('frameIntervalP95Ms', 1.1)]:
+            with self.subTest(key=key):
+                before, after = self.paired()
+                for run in after:
+                    run[key] = before[0][key] * factor
+                self.assertFalse(compare(before, after, 'gpu', control=True)['accepted'])
+
     def test_gpu_targets_use_measured_gpu_time(self):
         before, after = self.paired()
         for run in after:
