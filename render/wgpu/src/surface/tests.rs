@@ -4186,6 +4186,19 @@ fn a_shared_device_cannot_resolve_another_sessions_unsubmitted_bitmap_write() {
         .unwrap()
         .unwrap();
     let called = std::cell::Cell::new(false);
+    let direct = other.read_bitmap_region(&target, region, Box::new(|_, _| called.set(true)));
+    assert!(
+        direct.is_err(),
+        "a foreign session read pixels before the producer submitted its write"
+    );
+    let batch = other.read_bitmap_regions_native(&target, region, &[region], &mut |_, _, _, _| {
+        called.set(true);
+        Ok(())
+    });
+    assert!(
+        batch.is_err(),
+        "a foreign session recorded a batched copy of stale pixels"
+    );
     assert!(
         other
             .resolve_sync_handle(token, Box::new(|_, _| called.set(true)))
@@ -4195,6 +4208,16 @@ fn a_shared_device_cannot_resolve_another_sessions_unsubmitted_bitmap_write() {
     assert!(!called.get());
     descriptors.runtime.check_health().unwrap();
     producer
+        .read_bitmap_region(
+            &target,
+            region,
+            Box::new(|bytes, _| {
+                assert_eq!(&bytes[..8], &[255, 0, 0, 255].repeat(2));
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    other
         .read_bitmap_region(
             &target,
             region,

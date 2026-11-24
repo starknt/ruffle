@@ -651,7 +651,16 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
 
     fn finish_bitmap_write(&mut self, handle: &BitmapHandle) -> Result<(), RenderFailure> {
         crate::record_bitmap_write(handle)?;
-        self.active_frame.operations.record()
+        self.active_frame.operations.record()?;
+        let texture = as_texture(handle, &self.descriptors.device)?;
+        texture.access.lock().unwrap().writer =
+            self.active_frame.command_encoder.dirty.then(|| {
+                (
+                    self.active_frame.operations.dependency(),
+                    self.active_frame.command_encoder.raw.pending_bitmap_write(),
+                )
+            });
+        Ok(())
     }
 
     fn preserve_read_before_write(
@@ -667,12 +676,13 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         }
         let texture = as_texture(destination, &self.descriptors.device)?;
         let pending = {
-            let mut weak = texture.pending_read.lock().unwrap();
-            let pending = weak.upgrade();
+            let mut access = texture.access.lock().unwrap();
+            access.check_writer(&self.active_frame.operations)?;
+            let pending = access.reader.upgrade();
             if let Some(read) = &pending {
                 read.dependency.check(&self.active_frame.operations)?;
             }
-            *weak = Default::default();
+            access.reader = Default::default();
             pending
         };
         if let Some(read) = pending {
@@ -1571,7 +1581,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     repeating_nearest: Default::default(),
                     clamped_linear: Default::default(),
                     clamped_nearest: Default::default(),
-                    pending_read: Default::default(),
+                    access: Default::default(),
                     _lifetime: Some(self.active_frame.operations.create_resource()?),
                     version: Default::default(),
                 }))
@@ -1752,7 +1762,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             repeating_nearest: Default::default(),
             clamped_linear: Default::default(),
             clamped_nearest: Default::default(),
-            pending_read: Default::default(),
+            access: Default::default(),
             _lifetime: Some(self.active_frame.operations.create_resource()?),
             version: Default::default(),
         })))
@@ -1779,6 +1789,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     ) -> Result<Option<()>, BitmapError> {
         self.descriptors.runtime.check_health()?;
         let texture = as_texture(handle, &self.descriptors.device)?;
+        texture
+            .access
+            .lock()
+            .unwrap()
+            .check_writer(&self.active_frame.operations)?;
         if region.is_empty()
             || region.x_max > texture.texture.width()
             || region.y_max > texture.texture.height()
@@ -1811,6 +1826,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         visit: ruffle_render::bitmap::BitmapRegionRead<'_>,
     ) -> Result<Option<()>, BitmapError> {
         self.descriptors.runtime.check_health()?;
+        as_texture(handle, &self.descriptors.device)?
+            .access
+            .lock()
+            .unwrap()
+            .check_writer(&self.active_frame.operations)?;
         let copy = crate::CopiedReadback::record_regions(
             handle,
             bounds,

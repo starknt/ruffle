@@ -114,7 +114,7 @@ impl CacheImage {
                 repeating_nearest: Default::default(),
                 clamped_linear: Default::default(),
                 clamped_nearest: Default::default(),
-                pending_read: Default::default(),
+                access: Default::default(),
                 _lifetime: None,
                 version: Default::default(),
             })

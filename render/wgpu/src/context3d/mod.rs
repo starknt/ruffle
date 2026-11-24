@@ -146,7 +146,7 @@ impl WgpuContext3D {
                 clamped_nearest: Default::default(),
                 view: dummy_texture.create_view(&Default::default())?,
                 texture: dummy_texture,
-                pending_read: Default::default(),
+                access: Default::default(),
                 _lifetime: None,
                 version: Default::default(),
             })))
@@ -756,7 +756,7 @@ impl Context3D for WgpuContext3D {
                         repeating_nearest: Default::default(),
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
-                        pending_read: Default::default(),
+                        access: Default::default(),
                         _lifetime: None,
                         version: Default::default(),
                     }));
@@ -769,7 +769,7 @@ impl Context3D for WgpuContext3D {
                         repeating_nearest: Default::default(),
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
-                        pending_read: Default::default(),
+                        access: Default::default(),
                         _lifetime: None,
                         version: Default::default(),
                     }));
@@ -786,7 +786,7 @@ impl Context3D for WgpuContext3D {
                         repeating_nearest: Default::default(),
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
-                        pending_read: Default::default(),
+                        access: Default::default(),
                         _lifetime: None,
                         version: Default::default(),
                     }));
@@ -799,7 +799,7 @@ impl Context3D for WgpuContext3D {
                         repeating_nearest: Default::default(),
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
-                        pending_read: Default::default(),
+                        access: Default::default(),
                         _lifetime: None,
                         version: Default::default(),
                     }));

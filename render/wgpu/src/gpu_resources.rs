@@ -794,6 +794,7 @@ impl Device {
             raw,
             uses,
             debug_groups: Vec::new(),
+            bitmap_writes: None,
             device: self.clone(),
         })
     }
@@ -832,10 +833,16 @@ impl TextureView {
 pub struct CommandEncoder {
     raw: wgpu::CommandEncoder,
     debug_groups: Vec<String>,
+    bitmap_writes: Option<Arc<()>>,
     uses: Arc<Mutex<Recording>>,
     device: Device,
 }
 impl CommandEncoder {
+    /// Bitmap readers on another session can proceed once this encoder is submitted.
+    pub(crate) fn pending_bitmap_write(&mut self) -> Weak<()> {
+        Arc::downgrade(self.bitmap_writes.get_or_insert_with(|| Arc::new(())))
+    }
+
     pub fn transient_bytes(&self) -> u64 {
         self.uses
             .lock()
@@ -889,12 +896,14 @@ impl CommandEncoder {
         Ok(CommandBuffer {
             raw,
             uses: RecordedUses(uses),
+            bitmap_writes: self.bitmap_writes,
             pending,
         })
     }
 }
 pub struct CommandBuffer {
     raw: wgpu::CommandBuffer,
+    bitmap_writes: Option<Arc<()>>,
     uses: RecordedUses,
     pending: Vec<crate::gpu_runtime::UnsubmittedUse>,
 }
@@ -908,6 +917,13 @@ impl Deref for Queue {
         &self.0.0.inner().queue
     }
 }
+fn lock_for_submission(lock: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    let _timer =
+        ruffle_render::profile::native_time(ruffle_render::profile::NativePhase::SubmitLock);
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl Queue {
     fn order(&self) -> &submission_order::SubmissionOrder {
         &self.0.0.inner().submission_order
@@ -969,13 +985,7 @@ impl Queue {
             .commit(&[destination])?;
         self.0
             .scoped(|_| {
-                let _gate = self
-                    .0
-                    .0
-                    .inner()
-                    .submission_gate
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _gate = lock_for_submission(&self.0.0.inner().submission_gate);
                 self.0
                     .0
                     .inner()
@@ -1135,18 +1145,9 @@ impl Queue {
         self.order().wait_pending(self)?;
         self.0
             .scoped(|_| {
-                let _gate = self
-                    .0
-                    .0
-                    .inner()
-                    .submission_gate
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _gate = lock_for_submission(&self.0.0.inner().submission_gate);
                 let shared = self.0.submission_lock();
-                let _shared = shared.as_ref().map(|lock| {
-                    lock.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                });
+                let _shared = shared.as_deref().map(lock_for_submission);
                 let mut retained = std::mem::take(
                     &mut *self
                         .0
@@ -1178,13 +1179,7 @@ impl Queue {
         let deadline = Instant::now() + Duration::from_secs(2);
         let gate = loop {
             self.0.runtime().check_health()?;
-            let gate = self
-                .0
-                .0
-                .inner()
-                .submission_gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let gate = lock_for_submission(&self.0.0.inner().submission_gate);
             let stats = self.0.runtime().stats();
             if stats.submitted - stats.completed < 2 {
                 break gate;
@@ -1198,10 +1193,7 @@ impl Queue {
         self.0
             .scoped(|_| {
                 let shared = self.0.submission_lock();
-                let shared = shared.as_ref().map(|lock| {
-                    lock.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                });
+                let shared = shared.as_deref().map(lock_for_submission);
                 let mut raw = smallvec::SmallVec::<[wgpu::CommandBuffer; 1]>::new();
                 let mut uses = RecordedUses::from_roots(std::mem::take(
                     &mut *self
@@ -1213,7 +1205,9 @@ impl Queue {
                         .unwrap_or_else(std::sync::PoisonError::into_inner),
                 ));
                 let mut pending = Vec::new();
+                let mut bitmap_writes = smallvec::SmallVec::<[Arc<()>; 1]>::new();
                 for command in commands {
+                    bitmap_writes.extend(command.bitmap_writes);
                     pending.extend(command.pending);
                     raw.push(command.raw);
                     if uses.0.is_empty() {
@@ -1225,6 +1219,7 @@ impl Queue {
                 let serial = self.0.runtime().register_recorded_submission(&uses)?;
                 drop(pending);
                 let index = self.raw().submit(raw);
+                drop(bitmap_writes);
                 {
                     let completed = self.0.runtime().stats().completed;
                     let mut pending = self

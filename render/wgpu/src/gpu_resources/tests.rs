@@ -27,6 +27,32 @@ fn device_with_staging_budget(limit: u64, staging: u64) -> Device {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn submit_lock_timing_measures_waiting_for_the_shared_device() {
+    use ruffle_render::profile::{self, NativePhase, RenderMetrics};
+    let device = device(4096);
+    let shared = Arc::new(Mutex::new(()));
+    device.set_submission_lock(shared.clone());
+    let guard = shared.lock().unwrap();
+    let (started, entered) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let metrics = RenderMetrics::default();
+        let _scope = profile::enter(Some(&metrics));
+        started.send(()).unwrap();
+        device.queue().submit([]).unwrap();
+        metrics.snapshot().native_timings[NativePhase::SubmitLock as usize]
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    std::thread::sleep(Duration::from_millis(40));
+    drop(guard);
+    let timing = worker.join().unwrap();
+    assert!(
+        timing.samples > 0 && timing.nanos >= 20_000_000,
+        "{timing:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn native_creation_failures_refund_reserved_storage() {
     let device = device(512);
     let too_large = device.create_buffer(&wgpu::BufferDescriptor {

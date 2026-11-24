@@ -466,10 +466,11 @@ impl QueueSyncHandle {
         // One sync token is issued per write. The next writer orders a copy
         // first only while somebody still holds this version's token.
         if track {
-            *as_texture(&handle, &descriptors.device)?
-                .pending_read
+            as_texture(&handle, &descriptors.device)?
+                .access
                 .lock()
-                .unwrap() = Arc::downgrade(&read);
+                .unwrap()
+                .reader = Arc::downgrade(&read);
         }
         Ok(Self {
             dependency,
@@ -531,6 +532,26 @@ impl QueueSyncHandle {
     }
 }
 
+#[derive(Debug, Default)]
+struct BitmapAccess {
+    reader: std::sync::Weak<VersionedRead>,
+    writer: Option<(render_snapshot::OperationDependency, std::sync::Weak<()>)>,
+}
+
+impl BitmapAccess {
+    fn check_writer(
+        &self,
+        session: &render_snapshot::OperationSequence,
+    ) -> Result<(), gpu_runtime::RenderFailure> {
+        if let Some((operation, encoder)) = &self.writer
+            && encoder.strong_count() != 0
+        {
+            operation.check(session)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct Texture {
     batch_source: crate::bitmap_batch::Source,
@@ -541,7 +562,7 @@ pub struct Texture {
     repeating_nearest: OnceLock<BitmapBinds>,
     clamped_linear: OnceLock<BitmapBinds>,
     clamped_nearest: OnceLock<BitmapBinds>,
-    pending_read: std::sync::Mutex<std::sync::Weak<VersionedRead>>,
+    access: std::sync::Mutex<BitmapAccess>,
     version: std::sync::atomic::AtomicU64,
     _lifetime: Option<render_snapshot::ResourceLifetime>,
 }
