@@ -360,6 +360,8 @@ fn profiler_queries_and_readback_storage_obey_the_device_ledger() {
     assert!(device.runtime().stats().kind_bytes[ResourceKind::ReadbackBuffer as usize] > 0);
     profiler.resolve_queries(&mut encoder);
     profiler.end_frame(&encoder).unwrap();
+    // Its mapping cannot start while the stage worker still owns this encoder.
+    std::thread::sleep(Duration::from_millis(2100));
     device.poll(wgpu::PollType::Poll).unwrap();
     assert!(
         profiler
@@ -367,6 +369,10 @@ fn profiler_queries_and_readback_storage_obey_the_device_ledger() {
             .is_none(),
         "a stage whose encoder is still on the worker queue has no GPU timings"
     );
+    device
+        .runtime()
+        .check_health()
+        .expect("an unsubmitted query is still pending");
     let submission = device.queue().submit([encoder.finish().unwrap()]).unwrap();
     device.runtime().purge_idle_and_cached_resources();
     assert!(

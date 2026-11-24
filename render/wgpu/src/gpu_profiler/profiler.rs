@@ -439,7 +439,6 @@ impl GpuProfiler {
         let query_pools = self.active_frame.query_pools.get_mut();
 
         let mut new_pending_frame = PendingFrame {
-            started: std::time::Instant::now(),
             query_pools: std::mem::take(&mut query_pools.used_pools),
             closed_query_by_parent_handle: HashMap::new(),
             mapped_buffers: Arc::new(AtomicU32::new(0)),
@@ -527,19 +526,8 @@ impl GpuProfiler {
             return None;
         }
         let frame = self.pending_frames.first_mut()?;
-        if frame.started.elapsed() >= std::time::Duration::from_secs(2)
-            && frame.mapped_buffers.load(Ordering::Acquire) != frame.query_pools.len() as u32
-        {
-            self.device
-                .runtime()
-                .fail(crate::gpu_runtime::RenderFailure::new(
-                    crate::gpu_runtime::RenderFailureKind::Timeout,
-                    "GPU profiling readback timed out",
-                ));
-            return None;
-        }
-
-        // We only process if all mappings succeed.
+        // Mapping begins at submission. A nonblocking observation can see a
+        // queued encoder of any age. end_frame bounds an actual drain wait.
         if frame
             .mapped_buffers
             .load(std::sync::atomic::Ordering::Acquire)
@@ -552,7 +540,6 @@ impl GpuProfiler {
             query_pools,
             mut closed_query_by_parent_handle,
             mapped_buffers: _,
-            started: _,
         } = self.pending_frames.remove(0);
 
         let results = {
@@ -994,7 +981,6 @@ struct ActiveFrame {
 }
 
 struct PendingFrame {
-    started: std::time::Instant,
     query_pools: Vec<Arc<QueryPool>>,
     closed_query_by_parent_handle: HashMap<GpuTimerQueryTreeHandle, Vec<GpuProfilerQuery>>,
 
