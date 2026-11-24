@@ -250,7 +250,7 @@ pub fn load_bytes<'gc>(
     activation.context.load_manager.close_read(this);
 
     let arg0 = args.get_object(activation, 0, "data")?;
-    let bytes = arg0.as_bytearray().unwrap().bytes().to_vec();
+    let bytes = arg0.as_bytearray_mut().unwrap().snapshot();
     let context = args.try_get_object(1);
 
     let loader_info = this

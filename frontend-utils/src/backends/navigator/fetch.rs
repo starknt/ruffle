@@ -135,6 +135,14 @@ impl SuccessResponse for Response {
         }
     }
 
+    fn buffered_body_len(&self) -> Option<usize> {
+        match &self.response_body {
+            ResponseBody::Shared(body) => body.as_ref().map(|body| body.len()),
+            ResponseBody::File(Ok(bytes)) => Some(bytes.len()),
+            _ => None,
+        }
+    }
+
     fn expected_length(&self) -> Result<Option<u64>, Error> {
         match &self.response_body {
             ResponseBody::Shared(body) => Ok(body.as_ref().map(|b| b.len() as u64)),

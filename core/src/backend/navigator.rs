@@ -235,6 +235,12 @@ pub trait SuccessResponse {
     /// Use one or the other.
     fn next_chunk(&mut self) -> OwnedFuture<Option<Vec<u8>>, Error>;
 
+    /// Upper bound when the response already owns its complete, immutable body.
+    /// Movie loaders can share their memory allowance between these responses.
+    fn buffered_body_len(&self) -> Option<usize> {
+        None
+    }
+
     /// Estimate the expected length of the response body.
     ///
     /// Returned length may not correspond to the actual length of data

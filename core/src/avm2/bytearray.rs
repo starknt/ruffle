@@ -58,6 +58,7 @@ pub enum ObjectEncoding {
 #[derive(Debug)]
 enum Storage {
     Owned(Vec<u8>),
+    Frozen(bytes::Bytes),
     Movie(std::sync::Arc<ruffle_common::tag_utils::MovieBytes>),
     Private(ruffle_common::tag_utils::PrivatePages, usize),
 }
@@ -65,6 +66,7 @@ impl Clone for Storage {
     fn clone(&self) -> Self {
         match self {
             Self::Movie(m) => Self::Movie(m.clone()),
+            Self::Frozen(bytes) => Self::Frozen(bytes.clone()),
             s => Self::Owned(s.to_vec()),
         }
     }
@@ -74,6 +76,7 @@ impl std::ops::Deref for Storage {
     fn deref(&self) -> &[u8] {
         match self {
             Self::Owned(v) => v,
+            Self::Frozen(bytes) => bytes,
             Self::Movie(m) => m.file(),
             Self::Private(p, n) => &p[..*n],
         }
@@ -81,6 +84,9 @@ impl std::ops::Deref for Storage {
 }
 impl std::ops::DerefMut for Storage {
     fn deref_mut(&mut self) -> &mut [u8] {
+        if let Self::Frozen(bytes) = self {
+            *self = Self::Owned(std::mem::take(bytes).into());
+        }
         if let Self::Movie(m) = self {
             ruffle_render::profile::loader_bytes(2, m.file().len());
             *self = match m.private_pages() {
@@ -98,7 +104,30 @@ impl std::ops::DerefMut for Storage {
         }
     }
 }
+impl AsRef<[u8]> for Storage {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
 impl Storage {
+    /// Capture the complete value without changing the AS cursor. Mutation of
+    /// either side detaches it from the other pending loads of the same value.
+    fn snapshot(&mut self) -> bytes::Bytes {
+        match self {
+            Self::Frozen(bytes) => bytes.clone(),
+            Self::Movie(movie) => bytes::Bytes::from_owner(Self::Movie(movie.clone())),
+            _ => {
+                let previous = std::mem::replace(self, Self::Owned(Vec::new()));
+                let frozen = match previous {
+                    Self::Owned(bytes) => bytes.into(),
+                    mapped => bytes::Bytes::from_owner(mapped),
+                };
+                *self = Self::Frozen(frozen.clone());
+                frozen
+            }
+        }
+    }
+
     fn resize(&mut self, n: usize, fill: u8) {
         if n == self.len() {
             return;
@@ -420,6 +449,10 @@ impl ByteArrayStorage {
     }
 
     #[inline]
+    pub fn snapshot(&mut self) -> bytes::Bytes {
+        self.bytes.snapshot()
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -598,5 +631,20 @@ mod shared_movie_tests {
         left.resize(2 * fws.len(), 0);
         assert_eq!(&left[..3], b"FWS");
         assert_eq!(right.len(), fws.len());
+    }
+    #[test]
+    fn load_bytes_snapshots_share_the_callers_allocation_until_a_write() {
+        let original = vec![7; 256 * 1024];
+        let address = original.as_ptr();
+        let mut bytes = Storage::Owned(original);
+        let first = bytes.snapshot();
+        let second = bytes.snapshot();
+        assert_eq!(address, first.as_ptr());
+        assert_eq!(first.as_ptr(), second.as_ptr());
+        bytes[0] = 23;
+        bytes.resize(1, 0);
+        assert_eq!(first.len(), 256 * 1024);
+        assert_eq!(second[0], 7);
+        assert_eq!(&*bytes, &[23]);
     }
 }
