@@ -3824,6 +3824,83 @@ fn held_frame_packets_share_the_upload_budget_and_release_it_on_drop() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn realtime_packet_pressure_defers_and_oversized_draws_recover_on_a_shared_device() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
+    let descriptors = gpu_with_budgets(None, Some(8192));
+    let make = || {
+        WgpuRenderBackend::with_options(
+            descriptors.clone(),
+            TextureTarget::new(&descriptors.device, (2, 1)).unwrap(),
+            false,
+        )
+        .unwrap()
+    };
+    let (mut renderer, mut other) = (make(), make());
+    let picture = |count| {
+        let mut list = CommandList::new();
+        for _ in 0..count {
+            rect(&mut list, 0., 0., 2., 1., Color::WHITE);
+        }
+        list
+    };
+    let one = std::num::NonZeroU32::new(1).unwrap();
+    let cache = renderer.create_bitmap_cache(one, one).unwrap();
+    let cache_write = ruffle_render::backend::BitmapCacheEntry {
+        handle: cache.clone(),
+        clear: Color::RED,
+        commands: CommandList::new(),
+        filters: vec![],
+    };
+    let blocked = descriptors
+        .runtime
+        .reserve_payload(crate::gpu_runtime::PayloadKind::Frame, 8192)
+        .unwrap();
+    assert!(renderer.prepare_frame().unwrap());
+    assert!(
+        renderer
+            .try_capture_stage_packet(Color::BLACK, picture(1), vec![cache_write])
+            .unwrap()
+            .is_none()
+    );
+    renderer.discard_frame();
+    drop(blocked);
+    renderer
+        .read_bitmap_region(
+            &cache,
+            PixelRegion::for_whole_size(1, 1),
+            Box::new(|bytes, _| assert_eq!(&bytes[..4], &[255, 0, 0, 255])),
+        )
+        .unwrap()
+        .unwrap();
+    let bitmap = other
+        .register_bitmap(Bitmap::new(1, 1, BitmapFormat::Rgba, vec![1, 2, 3, 255]))
+        .unwrap();
+    for count in [200, 1] {
+        assert!(renderer.prepare_frame().unwrap());
+        let packet = renderer
+            .try_capture_stage_packet(Color::BLACK, picture(count), vec![])
+            .unwrap()
+            .unwrap();
+        renderer.submit_stage_packet(packet).unwrap();
+        assert_eq!(
+            renderer.capture_frame().unwrap().unwrap().into_raw(),
+            [255; 8]
+        );
+    }
+    other
+        .read_bitmap_region(
+            &bitmap,
+            PixelRegion::for_whole_size(1, 1),
+            Box::new(|bytes, _| assert_eq!(&bytes[..4], &[1, 2, 3, 255])),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(descriptors.runtime.stats().queued_frame_bytes, 0);
+    descriptors.runtime.check_health().unwrap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn stage_packets_include_reliable_uploads_from_their_context3d() {
     use ruffle_render::backend::{BufferUsage, Context3DCommand, Context3DProfile};
     let descriptors = gpu();

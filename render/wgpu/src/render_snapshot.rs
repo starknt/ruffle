@@ -191,7 +191,7 @@ fn foreign() -> RenderFailure {
 pub struct FramePacket {
     pub(crate) payload: Option<crate::gpu_runtime::OwnedPayload>,
     pub(crate) key: PacketKey,
-    pub(crate) draw: Arc<PacketDraw>,
+    pub(crate) draw: Arc<Option<PacketDraw>>,
 }
 
 #[derive(Clone)]
@@ -560,7 +560,7 @@ impl PreparedSnapshot {
     /// Shared display pages are counted once within a packet. Independent
     /// live packets each reserve enough space to retain their dependencies.
     pub(crate) fn packet_bytes(&self) -> u64 {
-        let mut bytes = size_of::<PacketDraw>() + size_of::<FramePacket>();
+        let mut bytes = size_of::<Option<PacketDraw>>() + size_of::<FramePacket>();
         let mut seen = fnv::FnvHashSet::default();
         let mut pending = vec![self.snapshot.commands.as_ref()];
         while let Some(nodes) = pending.pop() {

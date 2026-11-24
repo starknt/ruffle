@@ -13,7 +13,7 @@ type SavedStage = PoolEntry<
 
 pub(super) struct PendingStage {
     key: PacketKey,
-    draw: std::sync::Weak<PacketDraw>,
+    draw: std::sync::Weak<Option<PacketDraw>>,
     content: StageContent,
 }
 
@@ -78,38 +78,78 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
     ) -> Result<FramePacket, RenderFailure> {
-        self.descriptors.runtime.check_health()?;
-        self.pending_stage = None;
-        self.encode_stage_caches(cache_entries)?;
-        let route = self.stage_draw_route(&commands, self.target.format());
-        let packet = self.capture_stage_commands(clear, &commands, route, true)?;
-        if self.pending_stage.as_ref().is_some_and(
-            |p| matches!(&p.content, StageContent::Live(bindings) if bindings.reads_stage3d),
-        ) {
-            // Context3D submits through an independent encoder. Order the old
-            // pixels on the shared queue before that encoder can reuse its target.
-            self.save_pending_stage(packet.draw.clone(), true)?;
-        }
-        Ok(packet)
+        self.capture_stage(clear, commands, cache_entries, false)?
+            .ok_or_else(|| {
+                RenderFailure::new(
+                    RenderFailureKind::BudgetExceeded,
+                    "owned GPU payload queue is full",
+                )
+            })
     }
 
-    fn capture_stage_commands(
+    /// Realtime callers can retry after transient pressure. If the snapshot would
+    /// never fit, encode it now and keep only the native image until dispatch.
+    pub fn try_capture_stage_packet(
         &mut self,
         clear: Color,
-        commands: &CommandList,
-        route: StageDrawRoute,
-        queued: bool,
-    ) -> Result<FramePacket, RenderFailure> {
+        commands: CommandList,
+        cache_entries: Vec<BitmapCacheEntry>,
+    ) -> Result<Option<FramePacket>, RenderFailure> {
+        self.capture_stage(clear, commands, cache_entries, true)
+    }
+
+    fn capture_stage(
+        &mut self,
+        clear: Color,
+        commands: CommandList,
+        cache_entries: Vec<BitmapCacheEntry>,
+        allow_oversized_draw: bool,
+    ) -> Result<Option<FramePacket>, RenderFailure> {
+        self.descriptors.runtime.check_health()?;
+        self.pending_stage = None;
+        // The VM has already marked these cache entries current. Their writes
+        // stay on the ordered encoder even if the final picture has to wait.
+        self.encode_stage_caches(cache_entries)?;
+        let route = self.stage_draw_route(&commands, self.target.format());
         let prepared =
-            PreparedSnapshot::capture_for_device(commands, Some(self.packet_key.device))?;
-        let payload = if queued {
-            Some(self.descriptors.runtime.reserve_payload(
-                crate::gpu_runtime::PayloadKind::Frame,
-                prepared.packet_bytes(),
-            )?)
-        } else {
-            None
+            PreparedSnapshot::capture_for_device(&commands, Some(self.packet_key.device))?;
+        let bytes = prepared.packet_bytes();
+        let oversized =
+            allow_oversized_draw && bytes > self.descriptors.runtime.config().staging_limit;
+        let charge = if oversized { 0 } else { bytes };
+        let reservation = self
+            .descriptors
+            .runtime
+            .reserve_payload(crate::gpu_runtime::PayloadKind::Frame, charge);
+        let payload = match reservation {
+            Ok(ticket) => ticket,
+            Err(error) if error.kind() == RenderFailureKind::BudgetExceeded => return Ok(None),
+            Err(error) => return Err(error),
         };
+        let draw = PacketDraw {
+            clear,
+            snapshot: prepared.snapshot,
+            route,
+        };
+        let bindings = prepared.bindings;
+        // Context3D submits through an independent encoder. Order the old
+        // pixels on the shared queue before that encoder can reuse its target.
+        let stage3d = bindings.reads_stage3d;
+        let packet = if oversized || stage3d {
+            let saved = self.encode_saved_stage(draw, bindings, stage3d)?;
+            self.stage_packet(None, StageContent::Encoded(saved), Some(payload))?
+        } else {
+            self.stage_packet(Some(draw), StageContent::Live(bindings), Some(payload))?
+        };
+        Ok(Some(packet))
+    }
+
+    fn stage_packet(
+        &mut self,
+        draw: Option<PacketDraw>,
+        content: StageContent,
+        payload: Option<crate::gpu_runtime::OwnedPayload>,
+    ) -> Result<FramePacket, RenderFailure> {
         self.packet_key.packet = self.packet_key.packet.checked_add(1).ok_or_else(|| {
             RenderFailure::new(
                 RenderFailureKind::Internal,
@@ -118,15 +158,11 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         })?;
         self.packet_key.reservation = self.target.frame_reservation();
         self.packet_key.operation = self.active_frame.operations.applied();
-        let draw = Arc::new(PacketDraw {
-            clear,
-            snapshot: prepared.snapshot,
-            route,
-        });
+        let draw = Arc::new(draw);
         self.pending_stage = Some(PendingStage {
             key: self.packet_key,
             draw: Arc::downgrade(&draw),
-            content: StageContent::Live(prepared.bindings),
+            content,
         });
         Ok(FramePacket {
             payload,
@@ -187,7 +223,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         match pending.content {
             StageContent::Failed(error) => return Err(error),
             StageContent::Live(bindings) => {
-                let draw = Arc::unwrap_or_clone(packet.draw);
+                let draw = Arc::unwrap_or_clone(packet.draw).expect("live stage commands");
                 let clear = draw.clear;
                 let commands = self.plan_stage_packet(draw, bindings)?;
                 self.encode_stage_draw(frame.view(), clear, commands, stage_label())?;
@@ -266,40 +302,12 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             return Ok(());
         }
 
-        self.save_pending_stage(draw, false)
-    }
-
-    fn save_pending_stage(
-        &mut self,
-        draw: Arc<PacketDraw>,
-        submit_before_return: bool,
-    ) -> Result<(), RenderFailure> {
-        // Encode V before the write to V+1. This also preserves bitmap fills
-        // already baked into resident shape bind groups, without CPU readback.
         let mut pending = self.pending_stage.take().expect("live stage");
         let StageContent::Live(bindings) = pending.content else {
             unreachable!()
         };
-        let result = (|| {
-            let clear = draw.clear;
-            let commands = self.plan_stage_packet(Arc::unwrap_or_clone(draw), bindings)?;
-            let saved = self.offscreen_texture_pool.get_texture(
-                &self.descriptors,
-                wgpu::Extent3d {
-                    width: self.target.width(),
-                    height: self.target.height(),
-                    depth_or_array_layers: 1,
-                },
-                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                self.target.format(),
-                1,
-            )?;
-            self.encode_stage_draw(&saved.1, clear, commands, "Preserve stage pixels".into())?;
-            if submit_before_return {
-                self.active_frame.submit_direct(&self.descriptors)?;
-            }
-            Ok::<_, RenderFailure>(saved)
-        })();
+        let draw = Arc::unwrap_or_clone(draw).expect("live stage commands");
+        let result = self.encode_saved_stage(draw, bindings, false);
         let status = result.as_ref().map(|_| ()).map_err(Clone::clone);
         pending.content = match result {
             Ok(saved) => StageContent::Encoded(saved),
@@ -307,6 +315,34 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         };
         self.pending_stage = Some(pending);
         status
+    }
+
+    fn encode_saved_stage(
+        &mut self,
+        draw: PacketDraw,
+        bindings: SnapshotBindings,
+        submit_before_return: bool,
+    ) -> Result<SavedStage, RenderFailure> {
+        // Encode V before a write to V+1, including bitmap fills already
+        // baked into resident shape bind groups, without a CPU readback.
+        let clear = draw.clear;
+        let commands = self.plan_stage_packet(draw, bindings)?;
+        let saved = self.offscreen_texture_pool.get_texture(
+            &self.descriptors,
+            wgpu::Extent3d {
+                width: self.target.width(),
+                height: self.target.height(),
+                depth_or_array_layers: 1,
+            },
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            self.target.format(),
+            1,
+        )?;
+        self.encode_stage_draw(&saved.1, clear, commands, "Preserve stage pixels".into())?;
+        if submit_before_return {
+            self.active_frame.submit_direct(&self.descriptors)?;
+        }
+        Ok(saved)
     }
 
     fn take_stage_output(&mut self) -> Result<T::Frame, RenderFailure> {
@@ -638,8 +674,18 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                     crate::graph_encoder::SurfaceCommands::CachedBitmaps(commands)
                 }
                 StageDrawRoute::Graph => {
-                    let packet = self.capture_stage_commands(clear, &commands, route, false)?;
-                    return self.submit_packet_to(frame_output, packet);
+                    let prepared = PreparedSnapshot::capture_for_device(
+                        &commands,
+                        Some(self.packet_key.device),
+                    )?;
+                    self.plan_stage_packet(
+                        PacketDraw {
+                            clear,
+                            route,
+                            snapshot: prepared.snapshot,
+                        },
+                        prepared.bindings,
+                    )?
                 }
             }
         } else {

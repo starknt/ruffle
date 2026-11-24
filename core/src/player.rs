@@ -2499,6 +2499,22 @@ impl Player {
             Vec<BitmapCacheEntry>,
         ) -> Result<R, ruffle_render::error::RenderFailure>,
     ) -> Result<Option<R>, ruffle_render::error::RenderFailure> {
+        self.try_extract_stage(|renderer, clear, commands, caches| {
+            consume(renderer, clear, commands, caches).map(Some)
+        })
+    }
+
+    /// A consumer without enough queue capacity can defer just the picture.
+    /// Reliable writes already encoded during extraction remain ordered.
+    pub fn try_extract_stage<R>(
+        &mut self,
+        consume: impl FnOnce(
+            &mut dyn RenderBackend,
+            Color,
+            CommandList,
+            Vec<BitmapCacheEntry>,
+        ) -> Result<Option<R>, ruffle_render::error::RenderFailure>,
+    ) -> Result<Option<R>, ruffle_render::error::RenderFailure> {
         self.check_render_health()?;
         let result = self.extract_stage_inner(consume);
         if let Err(error) = &result {
@@ -2527,7 +2543,7 @@ impl Player {
             Color,
             CommandList,
             Vec<BitmapCacheEntry>,
-        ) -> Result<R, ruffle_render::error::RenderFailure>,
+        ) -> Result<Option<R>, ruffle_render::error::RenderFailure>,
     ) -> Result<Option<R>, ruffle_render::error::RenderFailure> {
         if !self.renderer.prepare_frame()? {
             self.needs_render = true;
@@ -2589,8 +2605,8 @@ impl Player {
             cache_draws,
         )?;
         self.check_render_health()?;
-        self.needs_render = false;
-        Ok(Some(picture))
+        self.needs_render = picture.is_none();
+        Ok(picture)
     }
 
     /// The current frame of the main timeline, if available.
