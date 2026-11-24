@@ -28,20 +28,26 @@ events, GC and pixel semantics. Optimizations are automatic, not user switches.
 
 ## Budgets and acceptance
 
-New per-Player caches: 24 MiB render, 8 MiB PIC; lazy, bounded, LRU. Total peak
-RSS increase <=5% against the common baseline, not +5% per stage. Existing GPU
-budgets do not increase. Capacity is not proof of RSS acceptance.
+Each Player has a 24 MiB render cache and an 8 MiB PIC cache. Both allocate
+lazily and evict by LRU. Existing GPU resource budgets apply to both paths.
 
-Default performance protocol: 120 warmup +1200 measured frames, five AB/BA
-pairs, fresh processes and identical builds/settings/input. Cold start is
-separate. GPU-completed throughput includes the final drain; CPU/GPU samples
-remain separate. At most two in-flight frames. Correctness captures do not
-run inside the measured section. For new target comparisons, either GPU-completed throughput or target-phase P95
-must improve on each card, with the other metric at least level. CPU and GPU
-P95/P99 regressions must stay within 3% and worst-pair peak RSS growth within 5%. Preserve image
-tolerances. Test default/non-avm_debug AVM and timeline paths, native renderer
-regressions, 30-minute loops and 100 load/unload cycles. Missing platform/device
-coverage is explicitly not-run, never inferred from compilation.
+Run five alternating AB/BA pairs per GPU in fresh processes with matched
+settings and input. Warm up for 120 frames, measure 1,200, allow at most two
+frames in flight, and include the final GPU drain in completed throughput.
+Measure cold starts and capture correctness images in separate runs.
+
+For each GPU, take the median paired change in each of three metrics. A
+candidate qualifies when completed throughput and **1% low FPS** increase
+and the P95 interval between consecutive GPU stage completions decreases.
+Any positive improvement qualifies. For N valid intervals, take the longest
+ceil(N/100), average their lengths in seconds, and take the reciprocal.
+Report N and the tail sample count. Report target-phase P95, CPU/GPU P95 and
+P99, and worst-pair peak RSS growth as costs. The separate control comparison
+retains its 3% timing and 5% RSS tolerances. [Runner and trace fields](../tests/perf/README.md)
+
+Retain image tolerances and check the production AVM and timeline paths,
+native renderer regressions, 30-minute playback and 100 load/unload cycles.
+Record which platforms ran and which had only compile coverage.
 
 Six offline workload groups: sparse blend/mask, transformed filter caches,
 static/1%/100%-dirty display trees, mono/poly/megamorphic traits, dynamic-object
