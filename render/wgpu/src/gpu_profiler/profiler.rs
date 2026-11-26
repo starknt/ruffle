@@ -542,16 +542,12 @@ impl GpuProfiler {
             mapped_buffers: _,
         } = self.pending_frames.remove(0);
 
-        let results = {
-            let timestamp_to_sec = timestamp_period as f64 / 1000.0 / 1000.0 / 1000.0;
-
-            Self::process_timings_recursive(
-                self.device.runtime().health(),
-                timestamp_to_sec,
-                &mut closed_query_by_parent_handle,
-                ROOT_QUERY_HANDLE,
-            )
-        };
+        let results = Self::process_timings_recursive(
+            self.device.runtime().health(),
+            timestamp_period,
+            &mut closed_query_by_parent_handle,
+            ROOT_QUERY_HANDLE,
+        );
 
         // Ensure that closed queries no longer hold references to the query pools.
         // `process_timings_recursive` should have handled this already.
@@ -781,7 +777,7 @@ impl GpuProfiler {
 
     fn process_timings_recursive(
         health: &crate::gpu_runtime::RendererHealth,
-        timestamp_to_sec: f64,
+        timestamp_period: f32,
         closed_scope_by_parent_handle: &mut HashMap<GpuTimerQueryTreeHandle, Vec<GpuProfilerQuery>>,
         parent_handle: GpuTimerQueryTreeHandle,
     ) -> Vec<GpuTimerQueryResult> {
@@ -829,10 +825,11 @@ impl GpuProfiler {
                     Some(start_raw..end_raw)
                 });
 
-                let time = time_raw.as_ref().map(|time_raw| {
-                    (time_raw.start as f64 * timestamp_to_sec)
-                        ..(time_raw.end as f64 * timestamp_to_sec)
-                });
+                let time_ns =
+                    time_raw.and_then(|ticks| super::time_range_ns(ticks, timestamp_period));
+                let time = time_ns
+                    .as_ref()
+                    .map(|ns| ns.start as f64 * 1e-9..ns.end as f64 * 1e-9);
 
                 #[cfg(feature = "profile-with-tracy")]
                 if let (Some(tracy_scope), Some(time_raw)) = (&scope.tracy_scope, &time_raw) {
@@ -841,7 +838,7 @@ impl GpuProfiler {
 
                 let nested_queries = Self::process_timings_recursive(
                     health,
-                    timestamp_to_sec,
+                    timestamp_period,
                     closed_scope_by_parent_handle,
                     scope.handle,
                 );
@@ -854,6 +851,7 @@ impl GpuProfiler {
                 GpuTimerQueryResult {
                     label: std::mem::take(&mut scope.label),
                     time,
+                    time_ns,
                     nested_queries,
                     pid: scope.pid,
                     tid: scope.tid,

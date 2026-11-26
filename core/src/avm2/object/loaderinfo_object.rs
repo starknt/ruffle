@@ -82,6 +82,9 @@ pub struct LoaderInfoObjectData<'gc> {
 
     loader: Option<StageObject<'gc>>,
 
+    /// Advances for each external URL loaded into this Loader.
+    resource_version: Cell<u64>,
+
     /// Whether or not we've fired our 'init' event
     init_event_fired: Cell<bool>,
 
@@ -123,6 +126,7 @@ impl<'gc> LoaderInfoObject<'gc> {
                 base,
                 loaded_stream: Lock::new(LoaderStream::NotYetLoaded(movie, root_clip, is_stage)),
                 loader,
+                resource_version: Cell::new(0),
                 init_event_fired: Cell::new(false),
                 complete_event_fired: Cell::new(false),
                 shared_events: activation
@@ -148,6 +152,12 @@ impl<'gc> LoaderInfoObject<'gc> {
         ));
 
         Ok(object)
+    }
+
+    pub(crate) fn next_resource_version(self) -> u64 {
+        let next = self.0.resource_version.get() + 1;
+        self.0.resource_version.set(next);
+        next
     }
 
     pub fn loader(self) -> Option<StageObject<'gc>> {
@@ -199,6 +209,14 @@ impl<'gc> LoaderInfoObject<'gc> {
         status: u16,
         redirected: bool,
     ) -> bool {
+        let owner_request = |ctx: &UpdateContext<'gc>| {
+            self.loader()
+                .and_then(|loader| ctx.load_manager.read_id(loader.into()))
+        };
+        let request = owner_request(context);
+        let root = *context.root_swf;
+        let still_current =
+            |ctx: &UpdateContext<'gc>| *ctx.root_swf == root && owner_request(ctx) == request;
         self.0.expose_content.set(true);
         if !self.0.init_event_fired.get() {
             self.0.init_event_fired.set(true);
@@ -207,6 +225,9 @@ impl<'gc> LoaderInfoObject<'gc> {
             // Right now, we fire it when downloading is fully completed.
             let init_evt = EventObject::bare_default_event(context, "init");
             Avm2::dispatch_event(context, init_evt, self.into());
+            if !still_current(context) {
+                return false;
+            }
         }
 
         if !self.0.complete_event_fired.get() {
@@ -244,6 +265,9 @@ impl<'gc> LoaderInfoObject<'gc> {
                         total_len,
                     );
                     Avm2::dispatch_event(activation.context, progress_evt, self.into());
+                    if !still_current(activation.context) {
+                        return false;
+                    }
                 }
 
                 if !from_bytes {
@@ -251,6 +275,9 @@ impl<'gc> LoaderInfoObject<'gc> {
                         EventObject::http_status_event(&mut activation, status, redirected);
 
                     Avm2::dispatch_event(context, http_status_evt, self.into());
+                    if !still_current(context) {
+                        return false;
+                    }
                 }
 
                 let complete_evt = EventObject::bare_default_event(context, "complete");

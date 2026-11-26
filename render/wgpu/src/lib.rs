@@ -11,7 +11,7 @@ use crate::buffer_pool::{BufferPool, PoolEntry};
 use crate::mesh::BitmapBinds;
 use crate::pipelines::Pipelines;
 use crate::target::{RenderTarget, SwapChainTarget};
-use crate::utils::{BufferDimensions, capture_image, format_list, get_backend_names};
+use crate::utils::{BufferDimensions, format_list, get_backend_names};
 use bytemuck::{Pod, Zeroable};
 use descriptors::Descriptors;
 pub use gpu_profiler as wgpu_profiler;
@@ -20,11 +20,8 @@ use ruffle_render::bitmap::{BitmapHandle, BitmapHandleImpl, PixelRegion, SyncHan
 use ruffle_render::shape_utils::GradientType;
 use ruffle_render::tessellator::{Gradient as TessGradient, Vertex as TessVertex};
 use std::any::Any;
+use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::{
-    Arc,
-    mpsc::{Receiver, TryRecvError},
-};
 use swf::GradientSpread;
 pub use wgpu;
 
@@ -48,9 +45,12 @@ pub mod gpu_resources;
 pub mod gpu_runtime;
 mod graph_encoder;
 mod pass_graph;
+pub mod pipeline_cache;
 mod pipelines;
 mod pixel_bender;
 mod prepare;
+mod readback;
+pub use readback::AsyncReadback;
 mod render_snapshot;
 pub use render_snapshot::FramePacket;
 mod resource_scheduler;
@@ -229,115 +229,6 @@ impl From<TessGradient> for GradientUniforms {
     }
 }
 
-pub struct AsyncReadback {
-    buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
-    dimensions: BufferDimensions,
-    descriptors: Arc<Descriptors>,
-    receiver: Receiver<Result<(), wgpu::BufferAsyncError>>,
-    started: std::time::Instant,
-    mapping: bool,
-}
-
-impl AsyncReadback {
-    fn new(
-        buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
-        dimensions: BufferDimensions,
-        descriptors: Arc<Descriptors>,
-    ) -> Self {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        buffer
-            .slice(..dimensions.size())
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = sender.send(result);
-            });
-        let _ = descriptors.runtime.request_poll(&descriptors.device);
-        Self {
-            buffer,
-            dimensions,
-            descriptors,
-            receiver,
-            started: std::time::Instant::now(),
-            mapping: true,
-        }
-    }
-
-    pub fn poll(&mut self) -> Result<Option<(Vec<u8>, u32)>, crate::gpu_runtime::RenderFailure> {
-        use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
-        self.descriptors.runtime.check_health()?;
-        if !self.mapping {
-            return Ok(None);
-        }
-        self.descriptors
-            .device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|error| {
-                self.descriptors
-                    .runtime
-                    .health()
-                    .record(crate::utils::poll_failure(error))
-            })?;
-        match self.receiver.try_recv() {
-            Ok(Ok(())) => {
-                let map = self
-                    .buffer
-                    .slice(..self.dimensions.size())
-                    .get_mapped_range()
-                    .map_err(|error| {
-                        self.descriptors.runtime.health().record(RenderFailure::new(
-                            RenderFailureKind::MapFailed,
-                            error.to_string(),
-                        ))
-                    })?;
-                let bytes = map.to_vec();
-                drop(map);
-                self.buffer.unmap();
-                self.mapping = false;
-                Ok(Some((bytes, self.dimensions.padded_bytes_per_row)))
-            }
-            Ok(Err(error)) => {
-                self.mapping = false;
-                Err(self.descriptors.runtime.health().record(RenderFailure::new(
-                    RenderFailureKind::MapFailed,
-                    error.to_string(),
-                )))
-            }
-            Err(TryRecvError::Empty)
-                if self.started.elapsed() < std::time::Duration::from_secs(2) =>
-            {
-                Ok(None)
-            }
-            Err(TryRecvError::Empty) => {
-                Err(self.descriptors.runtime.health().record(RenderFailure::new(
-                    RenderFailureKind::Timeout,
-                    "asynchronous readback timed out",
-                )))
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.mapping = false;
-                Err(self.descriptors.runtime.health().record(RenderFailure::new(
-                    RenderFailureKind::MapFailed,
-                    "buffer map callback disconnected",
-                )))
-            }
-        }
-    }
-}
-
-impl Drop for AsyncReadback {
-    fn drop(&mut self) {
-        // Completed reads already unmapped the buffer. An unobserved failed map
-        // is also unmapped; only cancel a pending map or release a successful one.
-        if self.mapping
-            && !matches!(
-                self.receiver.try_recv(),
-                Ok(Err(_)) | Err(TryRecvError::Disconnected)
-            )
-        {
-            self.buffer.unmap();
-        }
-    }
-}
-
 #[derive(Debug)]
 struct CopiedReadback {
     buffer: PoolEntry<crate::gpu_resources::Buffer, BufferDimensions>,
@@ -444,7 +335,9 @@ pub struct QueueSyncHandle {
 
 impl SyncHandle for QueueSyncHandle {
     fn can_read_current_without_token(&self, bitmap: &BitmapHandle) -> bool {
-        matches!(&self.source, ReadbackSource::Deferred { handle, .. } if handle == bitmap)
+        matches!(&self.source, ReadbackSource::Deferred { handle, read, .. }
+            if handle == bitmap && render_snapshot::bitmap_version(bitmap).is_ok_and(|v| v == read.source)
+                && !read.dependency.is_closed())
     }
 }
 
@@ -502,12 +395,9 @@ impl QueueSyncHandle {
         self,
         frame: &mut ActiveFrame,
     ) -> Result<AsyncReadback, gpu_runtime::RenderFailure> {
+        let dependency = self.dependency.clone();
         let (descriptors, copy) = self.into_copy(frame)?;
-        Ok(AsyncReadback::new(
-            copy.buffer,
-            copy.dimensions,
-            descriptors,
-        ))
+        AsyncReadback::new(copy.buffer, copy.dimensions, descriptors, dependency)
     }
 
     pub fn capture_native<R, F: FnOnce(&[u8], u32, ruffle_render::bitmap::BitmapFormat) -> R>(
@@ -522,9 +412,8 @@ impl QueueSyncHandle {
         } else {
             ruffle_render::bitmap::BitmapFormat::Rgba
         };
-        capture_image(
+        readback::ReadbackBuffer::Pooled(copy.buffer).capture(
             &descriptors.device,
-            &copy.buffer,
             &copy.dimensions,
             None,
             |bytes, stride| read(bytes, stride, format),
@@ -535,7 +424,10 @@ impl QueueSyncHandle {
 #[derive(Debug, Default)]
 struct BitmapAccess {
     reader: std::sync::Weak<VersionedRead>,
-    writer: Option<(render_snapshot::OperationDependency, std::sync::Weak<()>)>,
+    writer: Option<(
+        render_snapshot::OperationDependency,
+        Arc<std::sync::atomic::AtomicBool>,
+    )>,
 }
 
 impl BitmapAccess {
@@ -543,8 +435,8 @@ impl BitmapAccess {
         &self,
         session: &render_snapshot::OperationSequence,
     ) -> Result<(), gpu_runtime::RenderFailure> {
-        if let Some((operation, encoder)) = &self.writer
-            && encoder.strong_count() != 0
+        if let Some((operation, submitted)) = &self.writer
+            && !submitted.load(std::sync::atomic::Ordering::Acquire)
         {
             operation.check(session)?;
         }

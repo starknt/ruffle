@@ -90,6 +90,8 @@ impl Filter {
         match self {
             Filter::BlurFilter(filter) => filter.calculate_dest_rect(source_rect),
             Filter::GlowFilter(filter) => filter.calculate_dest_rect(source_rect),
+            Filter::GradientGlowFilter(filter) => filter.calculate_glow_dest_rect(source_rect),
+            Filter::GradientBevelFilter(filter) => filter.calculate_bevel_dest_rect(source_rect),
             Filter::DropShadowFilter(filter) => filter.calculate_dest_rect(source_rect),
             Filter::BevelFilter(filter) => filter.calculate_dest_rect(source_rect),
             Filter::DisplacementMapFilter(filter) => filter.calculate_dest_rect(source_rect),

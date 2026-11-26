@@ -18,6 +18,7 @@ use ruffle_render_wgpu::backend::{
     WgpuRenderBackend, create_wgpu_instance, request_adapter_and_device,
 };
 use ruffle_render_wgpu::descriptors::Descriptors;
+use ruffle_render_wgpu::gpu_resources::Device;
 use ruffle_render_wgpu::utils::{format_list, get_backend_names};
 use std::any::Any;
 use std::fs::File;
@@ -86,7 +87,9 @@ impl GuiController {
             adapter_info.device_type
         );
         let size = window.inner_size();
-        let descriptors = Descriptors::with_runtime(instance, adapter, device, queue, runtime)?;
+        let device = Device::new(device, queue, runtime);
+        super::pipeline_cache::configure(&device);
+        let descriptors = Descriptors::with_device(instance, adapter, device)?;
         let surface = DesktopSurface::new(&descriptors, surface, size)?;
         let surface_format = surface.render_format();
         tracing::info!("Using surface format {:?}", surface_format);
@@ -196,9 +199,8 @@ impl GuiController {
             Err(error) => {
                 self.descriptors.runtime.fail(error.clone());
                 tracing::error!("GPU rendering stopped: {error}");
-                return;
             }
-        };
+        }
     }
 
     #[must_use]
@@ -395,12 +397,10 @@ impl GuiController {
         //      behind a setting?
         if let Some(player) = player.as_deref_mut()
             && player.debug_ui().has_open_windows()
-        {
-            if let Err(error) = player.render() {
+            && let Err(error) = player.render() {
                 tracing::error!("GPU rendering stopped: {error}");
                 return;
             }
-        }
 
         let movie_view = if let Some(player) = player.as_deref_mut() {
             let renderer =

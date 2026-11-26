@@ -686,7 +686,7 @@ pub(super) fn run_pixelbender_shader_impl(
         depth_stencil_attachment: stencil.map(|(_, attachment)| attachment),
         ..Default::default()
     });
-    render_pass.set_bind_group(0, (&bind_group).raw(), &[]);
+    render_pass.set_bind_group(0, bind_group.raw(), &[]);
     render_pass.set_pipeline(&pipeline);
     if let Some(mask) = mask {
         mask.apply_stencil_reference(&mut render_pass);

@@ -14,3 +14,11 @@ Requesting profile: baseline
 Got profile: baseline
 After dispose: null
 Requesting profile: baselineConstrained
+Got profile: baselineConstrained
+Stale dispose(false) kept successor: true
+Stale dispose(true) kept successor: true
+Immediately after dispose(): null
+Recreated a new context: true
+Recreated profile: baselineConstrained
+Creation events: 7
+After dispose(true) without listener: null

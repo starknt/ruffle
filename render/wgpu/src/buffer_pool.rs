@@ -107,7 +107,7 @@ impl TexturePool {
                 }),
             )
         });
-        Ok(pool.take(descriptors, AlwaysCompatible)?)
+        pool.take(descriptors, AlwaysCompatible)
     }
 
     pub fn get_globals(

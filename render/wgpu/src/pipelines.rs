@@ -401,7 +401,7 @@ fn create_shape_pipeline(
         ))
     };
 
-    Ok(ShapePipeline::build(
+    ShapePipeline::build(
         device.create_render_pipeline(&create_pipeline_descriptor(
             create_debug_label!("{} stencilless pipeline", name).as_deref(),
             shader,
@@ -460,5 +460,5 @@ fn create_shape_pipeline(
                 wgpu::ColorWrites::empty(),
             ),
         },
-    )?)
+    )
 }

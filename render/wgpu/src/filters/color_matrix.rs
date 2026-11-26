@@ -163,6 +163,7 @@ impl ColorMatrixFilter {
             source,
             std::slice::from_ref(filter),
             false,
+            None,
         )
     }
 
@@ -175,6 +176,7 @@ impl ColorMatrixFilter {
         source: &FilterSource,
         filters: &[ColorMatrixFilterArgs],
         compute: bool,
+        destination: Option<&crate::gpu_resources::TextureView>,
     ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
         if filters.is_empty() || filters.len() > super::graph::MAX_POINTWISE_FILTERS {
             return Err(crate::gpu_runtime::RenderFailure::new(
@@ -217,12 +219,13 @@ impl ColorMatrixFilter {
             sample_count,
             if compute {
                 RenderTargetMode::FreshStorage
+            } else if let Some(view) = destination {
+                RenderTargetMode::ExistingWithView(view.clone(), wgpu::Color::TRANSPARENT)
             } else {
                 RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT)
             },
             draw_encoder,
         )?;
-        let source_view = source.texture.create_view(&Default::default())?;
         staging_belt
             .write_buffer(draw_encoder, &self.uniform_buffer, 0, self.uniform_size)?
             .copy_from_slice(bytemuck::bytes_of(&uniforms));
@@ -254,7 +257,7 @@ impl ColorMatrixFilter {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&source_view),
+                        resource: wgpu::BindingResource::TextureView(source.view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -267,10 +270,13 @@ impl ColorMatrixFilter {
                 ],
             })?;
             draw_encoder
-                .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Color matrix compute"),
-                    timestamp_writes: None,
-                })
+                .begin_filter_compute_pass(
+                    source.size,
+                    &wgpu::ComputePassDescriptor {
+                        label: Some("Color matrix compute"),
+                        timestamp_writes: None,
+                    },
+                )
                 .dispatch(
                     pipeline,
                     &group,
@@ -296,7 +302,7 @@ impl ColorMatrixFilter {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&source_view),
+                    resource: wgpu::BindingResource::TextureView(source.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -326,7 +332,7 @@ impl ColorMatrixFilter {
         });
         render_pass.set_pipeline(pipeline);
 
-        render_pass.set_bind_group(0, (&filter_group).raw(), &[]);
+        render_pass.set_bind_group(0, filter_group.raw(), &[]);
 
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(

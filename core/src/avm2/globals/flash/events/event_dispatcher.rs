@@ -59,15 +59,13 @@ pub fn add_event_listener<'gc>(
 
     if !activation.context.host_playback.wall_classes.is_empty()
         && (event_type.as_wstr() == b"timer" || event_type.as_wstr() == b"timerComplete")
-    {
-        if let Some((id, wall, mixed)) = dispatch_list
+        && let Some((id, wall, mixed)) = dispatch_list
             .as_dispatch_mut(activation.gc())
             .expect("dispatcher")
             .active_timer_clock()
         {
             activation.context.timers.classify(id, wall, mixed);
         }
-    }
     Avm2::register_broadcast_listener(activation.context, this, event_type);
 
     Ok(Value::Undefined)
@@ -92,15 +90,13 @@ pub fn remove_event_listener<'gc>(
         .remove_event_listener(event_type, listener, use_capture);
     if !activation.context.host_playback.wall_classes.is_empty()
         && (event_type.as_wstr() == b"timer" || event_type.as_wstr() == b"timerComplete")
-    {
-        if let Some((id, wall, mixed)) = dispatch_list
+        && let Some((id, wall, mixed)) = dispatch_list
             .as_dispatch_mut(activation.gc())
             .expect("dispatcher")
             .active_timer_clock()
         {
             activation.context.timers.classify(id, wall, mixed);
         }
-    }
 
     Ok(Value::Undefined)
 }

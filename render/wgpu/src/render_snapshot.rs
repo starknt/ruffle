@@ -112,6 +112,100 @@ pub struct RenderSnapshot {
     pub commands: Arc<[SnapshotNode]>,
     pub recipes: Vec<ResourceRecipe>,
 }
+impl RenderSnapshot {
+    /// Put stage graph bounds and geometry in attachment pixels before allocating bounded layers.
+    /// Frozen display pages may also be used by an offscreen or another frame.
+    pub(super) fn project_stage(&mut self, scale: Matrix, backend: wgpu::Backend) {
+        for node in Arc::make_mut(&mut self.commands) {
+            node.project_stage(scale, backend);
+        }
+    }
+}
+
+impl SnapshotNode {
+    fn project_stage(&mut self, scale: Matrix, backend: wgpu::Backend) {
+        use swf::Twips;
+
+        if let RenderRegion::Finite([left, top, right, bottom]) = &mut self.region {
+            let (x, y) = (f64::from(scale.a), f64::from(scale.d));
+            *left *= x;
+            *right *= x;
+            *top *= y;
+            *bottom *= y;
+        }
+        if let SnapshotCommand::Bitmap {
+            transform,
+            pixel_snapping,
+            ..
+        } = &mut self.command
+        {
+            pixel_snapping.apply(&mut transform.matrix);
+            *pixel_snapping = PixelSnapping::Never;
+        }
+        let project = |children: &mut Arc<[Self]>| {
+            for child in Arc::make_mut(children) {
+                child.project_stage(scale, backend);
+            }
+        };
+        match &mut self.command {
+            SnapshotCommand::Shape { transform, .. }
+            | SnapshotCommand::Stage3D { transform, .. }
+            | SnapshotCommand::Bitmap { transform, .. } => {
+                transform.matrix = scale * transform.matrix;
+                // Globals normalizes depth by viewport width.
+                transform.tz *= f64::from(scale.a);
+            }
+            SnapshotCommand::Rect { matrix, .. } => *matrix = scale * *matrix,
+            SnapshotCommand::Line {
+                color,
+                matrix,
+                rectangle,
+            } if backend == wgpu::Backend::Dx12 => {
+                // DX12 builds a one-Flash-pixel quad around each line before projection.
+                let mut quads = CommandList::new();
+                if *rectangle {
+                    ruffle_render::lines::emulate_line_rect(&mut quads, *color, *matrix);
+                } else {
+                    ruffle_render::lines::emulate_line(&mut quads, *color, *matrix);
+                }
+                self.command = SnapshotCommand::Shared(
+                    quads
+                        .into_commands()
+                        .into_iter()
+                        .map(|quad| {
+                            let Command::DrawRect { color, matrix } = quad else {
+                                unreachable!("emulated line geometry")
+                            };
+                            Self {
+                                command: SnapshotCommand::Rect {
+                                    color,
+                                    matrix: scale * matrix,
+                                },
+                                region: self.region,
+                            }
+                        })
+                        .collect(),
+                );
+            }
+            SnapshotCommand::Line { matrix, .. } => {
+                // The line encoder adds half a pixel. Project that offset in Flash space.
+                matrix.tx += Twips::HALF_PX;
+                matrix.ty += Twips::HALF_PX;
+                *matrix = scale * *matrix;
+                matrix.tx -= Twips::HALF_PX;
+                matrix.ty -= Twips::HALF_PX;
+            }
+            SnapshotCommand::Shared(children) | SnapshotCommand::Blend { children, .. } => {
+                project(children)
+            }
+            SnapshotCommand::AlphaMask { maskee, mask } => {
+                project(maskee);
+                project(mask);
+            }
+            SnapshotCommand::Mask(_) => {}
+        }
+    }
+}
 #[derive(Clone)]
 enum Handle {
     Bitmap(BitmapHandle),
@@ -201,7 +295,7 @@ pub(crate) struct PacketDraw {
     pub route: StageDrawRoute,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StageDrawRoute {
     Graph,
     AlignedBitmaps,
@@ -237,6 +331,7 @@ pub(crate) struct OperationSequence(Arc<SessionOperations>);
 
 #[derive(Default, Debug)]
 struct SessionOperations {
+    closed: std::sync::atomic::AtomicBool,
     applied: std::sync::atomic::AtomicU64,
     health: ruffle_render::error::RendererHealth,
 }
@@ -254,9 +349,16 @@ impl Drop for ResourceLifetime {
 impl OperationSequence {
     pub fn new(health: &ruffle_render::error::RendererHealth) -> Self {
         Self(Arc::new(SessionOperations {
+            closed: Default::default(),
             applied: Default::default(),
             health: health.clone(),
         }))
+    }
+
+    pub fn close(&self) {
+        self.0
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub fn create_resource(&self) -> Result<ResourceLifetime, RenderFailure> {
@@ -297,7 +399,25 @@ pub(crate) struct OperationDependency {
 }
 
 impl OperationDependency {
+    pub fn is_closed(&self) -> bool {
+        self.session
+            .0
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn check_open(&self) -> Result<(), RenderFailure> {
+        if self.is_closed() {
+            return Err(RenderFailure::new(
+                RenderFailureKind::Canceled,
+                "readback session closed",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn check(&self, executor: &OperationSequence) -> Result<(), RenderFailure> {
+        self.check_open()?;
         if !Arc::ptr_eq(&self.session.0, &executor.0) || executor.applied() < self.after_operation {
             return Err(RenderFailure::new(
                 RenderFailureKind::Validation,

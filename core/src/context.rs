@@ -264,7 +264,7 @@ impl<'gc> HasStringContext<'gc> for UpdateContext<'gc> {
 /// Convenience methods for controlling audio.
 impl<'gc> UpdateContext<'gc> {
     pub fn spawn_future(&mut self, task: crate::backend::tasks::PlayerTask) {
-        self.task_spawner.spawn(task);
+        self.load_manager.spawn_root_task(self.task_spawner, task);
     }
 
     pub(crate) fn in_wall_clock_method(&self) -> bool {
@@ -384,6 +384,8 @@ impl<'gc> UpdateContext<'gc> {
     /// should use `replace_root_movie`.
     pub fn set_root_movie(&mut self, movie: SwfMovieData) {
         self.load_manager.cancel_root_read();
+        self.resources.cancel_reads();
+        StreamManager::close_all(self);
         self.navigator.set_root_url(movie.url());
         if !self.forced_frame_rate {
             *self.frame_rate = movie.frame_rate().into();
@@ -629,7 +631,7 @@ pub struct RenderContext<'a, 'gc> {
     /// Whether we're rendering offscreen. This can disable some logic like Ruffle-side render culling
     pub is_offscreen: bool,
 
-    /// Whether to use cacheAsBitmap, vs drawing everything explicitly
+    /// Use the stage's bitmap caches. BitmapData.draw only rasterizes filters into draw-local caches.
     pub use_bitmap_cache: bool,
 
     /// The current player's stage (including all loaded levels)
@@ -637,6 +639,15 @@ pub struct RenderContext<'a, 'gc> {
 }
 
 impl<'gc> RenderContext<'_, 'gc> {
+    /// BitmapData.draw measures filters in destination pixels at any viewport scale.
+    pub fn filter_view_matrix(&self) -> Matrix {
+        if self.use_bitmap_cache {
+            self.stage.view_matrix()
+        } else {
+            Matrix::IDENTITY
+        }
+    }
+
     /// Convenience method to retrieve the current GC context. Note that explicitly writing
     /// `self.gc_context` can be sometimes necessary to satisfy the borrow checker.
     #[inline(always)]

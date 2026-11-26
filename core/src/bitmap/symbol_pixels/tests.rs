@@ -24,6 +24,7 @@ pub struct TestRenderer {
     managed: bool,
     retained: Option<BitmapHandle>,
     registrations: usize,
+    pub(crate) loader_uploads: Rc<std::cell::RefCell<Vec<ruffle_render::bitmap::LoaderRequest>>>,
     fail_upload: bool,
     regional: bool,
     reads: Vec<PixelRegion>,
@@ -99,6 +100,9 @@ impl RenderBackend for TestRenderer {
     }
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, Error> {
         self.registrations += 1;
+        if let Some(request) = bitmap.loader_request() {
+            self.loader_uploads.borrow_mut().push(request);
+        }
         Ok(BitmapHandle(Arc::new(TestBitmapHandle {
             width: bitmap.width(),
             pixels: std::cell::RefCell::new(bitmap.to_rgba().data().to_vec()),
@@ -302,6 +306,7 @@ pub(crate) fn renderer(managed: bool) -> TestRenderer {
         managed,
         retained: None,
         registrations: 0,
+        loader_uploads: Default::default(),
         fail_upload: false,
         regional: false,
         reads: vec![],

@@ -4,12 +4,16 @@
 //!
 //! Encoders retain only resources referenced by actual commands and their
 //! dependency leases. Submission completion releases those exact use sets.
+mod coverage_shader;
+pub(crate) mod diagnostics;
 mod encoding;
 mod submission_order;
 use crate::gpu_runtime::{
     GpuRuntime, RenderFailure, RenderFailureKind, ResourceId, ResourceKind, ResourceLease,
     ResourceOwner, texture_storage_bytes,
 };
+use crate::pipeline_cache::{PipelineCacheState, PipelineCacheStatus};
+pub use diagnostics::PassDiagnostic;
 pub use encoding::{ComputePass, RenderPass};
 use fnv::FnvHashMap;
 use std::{
@@ -18,7 +22,11 @@ use std::{
     future::Future,
     hash::{Hash, Hasher},
     ops::Deref,
-    sync::{Arc, Mutex, Weak},
+    path::Path,
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -44,7 +52,7 @@ type UseSet = FnvHashMap<ResourceId, ResourceLease>;
 #[derive(Default)]
 pub(crate) struct RecordedUses(UseSet);
 impl RecordedUses {
-    fn from_roots(roots: UseSet) -> Self {
+    fn from_roots<'a>(roots: impl Iterator<Item = &'a ResourceLease>) -> Self {
         fn retain(uses: &mut UseSet, lease: &ResourceLease) {
             if let std::collections::hash_map::Entry::Vacant(entry) = uses.entry(lease.id()) {
                 entry.insert(lease.clone());
@@ -54,8 +62,8 @@ impl RecordedUses {
             }
         }
         let mut uses = Self::default();
-        for lease in roots.into_values() {
-            retain(&mut uses.0, &lease);
+        for lease in roots {
+            retain(&mut uses.0, lease);
         }
         uses
     }
@@ -146,9 +154,12 @@ impl<T: Hash> Hash for Resource<T> {
 }
 
 struct DeviceInner {
+    diagnostics: Option<Arc<diagnostics::Diagnostics>>,
     raw: wgpu::Device,
     queue: wgpu::Queue,
     runtime: GpuRuntime,
+    pipeline_cache: OnceLock<PipelineCacheState>,
+    pipeline_compile_stats: parking_lot::Mutex<(u64, u64)>,
     index: Mutex<FnvHashMap<ObjectKey, Vec<Weak<dyn Indexed>>>>,
     pending_writes: Mutex<UseSet>,
     upload_sealers: Mutex<Vec<Weak<dyn crate::frame_upload::SealUploads>>>,
@@ -230,9 +241,12 @@ impl Device {
     pub fn new(raw: wgpu::Device, queue: wgpu::Queue, runtime: GpuRuntime) -> Self {
         Self(
             Arc::new(DeviceInner {
+                diagnostics: diagnostics::Diagnostics::new(&raw),
                 raw,
                 queue,
                 runtime,
+                pipeline_cache: OnceLock::new(),
+                pipeline_compile_stats: Default::default(),
                 index: Default::default(),
                 pending_writes: Default::default(),
                 upload_sealers: Default::default(),
@@ -254,7 +268,7 @@ impl Device {
         sealers.retain(|weak| weak.strong_count() != 0);
         sealers.push(Arc::downgrade(&sealer));
     }
-    fn seal_uploads(&self) -> Result<(), RenderFailure> {
+    fn seal_uploads(&self, used: &UseSet) -> Result<(), RenderFailure> {
         let sealers: Vec<_> = self
             .0
             .inner()
@@ -265,7 +279,7 @@ impl Device {
             .filter_map(Weak::upgrade)
             .collect();
         for sealer in sealers {
-            sealer.seal()?;
+            sealer.seal(&|id| used.contains_key(&id))?;
         }
         Ok(())
     }
@@ -277,6 +291,65 @@ impl Device {
     }
     pub fn raw(&self) -> &wgpu::Device {
         &self.0.inner().raw
+    }
+
+    /// Configure the shared cache before creating pipelines. Every owner uses the
+    /// first call's configuration and status, including when opening it failed.
+    /// Bump `host_abi` when the host's shaders or pipeline layouts change.
+    ///
+    /// # Safety
+    /// `dir` must be dedicated to this installation's native pipeline cache. The
+    /// caller must control its ancestry, permissions and contents across runs.
+    /// Its parent directory must already exist.
+    pub unsafe fn enable_pipeline_cache(&self, dir: &Path, host_abi: &str) -> PipelineCacheStatus {
+        self.0
+            .inner()
+            .pipeline_cache
+            .get_or_init(|| {
+                // SAFETY: the caller guarantees the cache directory's provenance.
+                unsafe { PipelineCacheState::open(self.raw(), dir, host_abi) }
+            })
+            .status()
+    }
+
+    pub fn pipeline_cache(&self) -> Option<&wgpu::PipelineCache> {
+        self.0
+            .inner()
+            .pipeline_cache
+            .get()
+            .and_then(PipelineCacheState::handle)
+    }
+
+    pub fn pipeline_cache_status(&self) -> PipelineCacheStatus {
+        self.0
+            .inner()
+            .pipeline_cache
+            .get()
+            .map_or(PipelineCacheStatus::Disabled, PipelineCacheState::status)
+    }
+
+    pub fn flush_pipeline_cache(&self) -> bool {
+        self.0
+            .inner()
+            .pipeline_cache
+            .get()
+            .is_some_and(PipelineCacheState::flush)
+    }
+
+    /// Number of tracked native render/compute creation calls (including retries)
+    /// and their summed wall-clock time in nanoseconds, across all device owners.
+    pub fn pipeline_compile_stats(&self) -> (u64, u64) {
+        *self.0.inner().pipeline_compile_stats.lock()
+    }
+
+    fn time_pipeline_creation<T>(&self, create: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let pipeline = create();
+        let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let mut stats = self.0.inner().pipeline_compile_stats.lock();
+        stats.0 = stats.0.saturating_add(1);
+        stats.1 = stats.1.saturating_add(nanos);
+        pipeline
     }
 
     pub fn queue(&self) -> Queue {
@@ -727,9 +800,13 @@ impl Device {
         &self,
         desc: wgpu::ShaderModuleDescriptor<'_>,
     ) -> Result<ShaderModule, RenderFailure> {
-        self.create(ResourceKind::Shader, 0, &[], |device| {
+        let original = self.create(ResourceKind::Shader, 0, &[], |device| {
             Ok(device.create_shader_module(desc.clone()))
-        })
+        })?;
+        if let Some(diagnostics) = &self.0.inner().diagnostics {
+            diagnostics.shader(self, &desc, &original);
+        }
+        Ok(original)
     }
     pub fn create_render_pipeline(
         &self,
@@ -742,9 +819,17 @@ impl Device {
         if let Some(fragment) = &desc.fragment {
             dependencies.push(self.lookup(fragment.module)?);
         }
-        self.create(ResourceKind::Pipeline, 0, &dependencies, |device| {
-            Ok(device.create_render_pipeline(desc))
-        })
+        let desc = wgpu::RenderPipelineDescriptor {
+            cache: desc.cache.or_else(|| self.pipeline_cache()),
+            ..desc.clone()
+        };
+        let original = self.create(ResourceKind::Pipeline, 0, &dependencies, |device| {
+            Ok(self.time_pipeline_creation(|| device.create_render_pipeline(&desc)))
+        })?;
+        if let Some(diagnostics) = &self.0.inner().diagnostics {
+            diagnostics.pipeline(self, &desc, &original);
+        }
+        Ok(original)
     }
     pub fn create_compute_pipeline(
         &self,
@@ -754,8 +839,12 @@ impl Device {
         if let Some(layout) = desc.layout {
             dependencies.push(self.lookup(layout)?);
         }
+        let desc = wgpu::ComputePipelineDescriptor {
+            cache: desc.cache.or_else(|| self.pipeline_cache()),
+            ..desc.clone()
+        };
         self.create(ResourceKind::Pipeline, 0, &dependencies, |device| {
-            Ok(device.create_compute_pipeline(desc))
+            Ok(self.time_pipeline_creation(|| device.create_compute_pipeline(&desc)))
         })
     }
     pub fn create_query_set(
@@ -794,6 +883,7 @@ impl Device {
             raw,
             uses,
             debug_groups: Vec::new(),
+            diagnostics: Vec::new(),
             bitmap_writes: None,
             device: self.clone(),
         })
@@ -831,16 +921,28 @@ impl TextureView {
 }
 
 pub struct CommandEncoder {
+    diagnostics: Vec<diagnostics::Pending>,
     raw: wgpu::CommandEncoder,
     debug_groups: Vec<String>,
-    bitmap_writes: Option<Arc<()>>,
+    bitmap_writes: Option<Arc<AtomicBool>>,
     uses: Arc<Mutex<Recording>>,
     device: Device,
 }
 impl CommandEncoder {
+    /// Reserve this device's queue order before handing a stage to its executor.
+    pub fn into_stage_work(self) -> Result<StageWork, RenderFailure> {
+        let turn = self.device.queue().reserve_submission()?;
+        Ok(StageWork {
+            encoder: self,
+            turn,
+        })
+    }
+
     /// Bitmap readers on another session can proceed once this encoder is submitted.
-    pub(crate) fn pending_bitmap_write(&mut self) -> Weak<()> {
-        Arc::downgrade(self.bitmap_writes.get_or_insert_with(|| Arc::new(())))
+    pub(crate) fn pending_bitmap_write(&mut self) -> Arc<AtomicBool> {
+        self.bitmap_writes
+            .get_or_insert_with(Default::default)
+            .clone()
     }
 
     pub fn transient_bytes(&self) -> u64 {
@@ -864,7 +966,13 @@ impl CommandEncoder {
         {
             return Ok(());
         }
-        self.device.seal_uploads()?;
+        {
+            let recording = self
+                .uses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.device.seal_uploads(&recording.uses)?;
+        }
         let next = self.device.create_command_encoder(&Default::default())?;
         let mut previous = std::mem::replace(self, next);
         let groups = std::mem::take(&mut previous.debug_groups);
@@ -879,7 +987,10 @@ impl CommandEncoder {
         self.device.queue().submit([commands])?;
         Ok(())
     }
-    pub fn finish(self) -> Result<CommandBuffer, RenderFailure> {
+    pub fn finish(mut self) -> Result<CommandBuffer, RenderFailure> {
+        for pass in self.diagnostics.drain(..) {
+            pass.finish(&self.device, &mut self.raw);
+        }
         let (uses, pending) = {
             let mut recording = self
                 .uses
@@ -901,9 +1012,42 @@ impl CommandEncoder {
         })
     }
 }
+/// Owned stage commands and their queue position. Native wgpu-core lowers
+/// the recorded passes to the driver inside `finish` on the executing thread.
+#[must_use = "dropping stage work cancels its unsubmitted queue turn"]
+pub struct StageWork {
+    encoder: CommandEncoder,
+    turn: ReservedSubmission,
+}
+
+impl StageWork {
+    /// Append the target readback and completion callbacks before dispatch.
+    pub fn encoder(&mut self) -> &mut CommandEncoder {
+        &mut self.encoder
+    }
+
+    pub fn submit(self) -> Result<wgpu::SubmissionIndex, RenderFailure> {
+        self.submit_until_closed(&crossbeam_channel::never())
+    }
+
+    /// Disconnecting `closed` releases this stage's unsubmitted turn while a peer holds queue order.
+    pub fn submit_until_closed(
+        self,
+        closed: &crossbeam_channel::Receiver<std::convert::Infallible>,
+    ) -> Result<wgpu::SubmissionIndex, RenderFailure> {
+        use ruffle_render::profile::{NativePhase, native_time};
+        let commands = {
+            let _timer = native_time(NativePhase::EncoderFinish);
+            self.encoder.finish()?
+        };
+        let _timer = native_time(NativePhase::QueueSubmit);
+        self.turn.submit_until_closed([commands], closed)
+    }
+}
+
 pub struct CommandBuffer {
     raw: wgpu::CommandBuffer,
-    bitmap_writes: Option<Arc<()>>,
+    bitmap_writes: Option<Arc<AtomicBool>>,
     uses: RecordedUses,
     pending: Vec<crate::gpu_runtime::UnsubmittedUse>,
 }
@@ -986,6 +1130,7 @@ impl Queue {
         self.0
             .scoped(|_| {
                 let _gate = lock_for_submission(&self.0.0.inner().submission_gate);
+                self.0.runtime().check_health()?;
                 self.0
                     .0
                     .inner()
@@ -996,7 +1141,41 @@ impl Queue {
                 write(self.raw());
                 Ok(())
             })
-            .map_err(|error| self.0.runtime().health().record(error))
+            .map_err(|error| self.drain_after_failure(error, UseSet::default()))
+    }
+
+    fn drain_after_failure(&self, error: RenderFailure, submitting: UseSet) -> RenderFailure {
+        let error = self.0.runtime().health().record(error);
+        let gate = lock_for_submission(&self.0.0.inner().submission_gate);
+        let pending = std::mem::take(
+            &mut *self
+                .0
+                .0
+                .inner()
+                .pending_writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        // A rejected native write or submit may leave staging in wgpu's queue.
+        // Normal submission is now disabled. Keep the charges through its fence.
+        if !pending.is_empty() || !submitting.is_empty() {
+            let index = {
+                let shared = self.0.submission_lock();
+                let _shared = shared.as_deref().map(lock_for_submission);
+                let index = self.raw().submit([]);
+                self.raw()
+                    .on_submitted_work_done(move || drop((pending, submitting)));
+                index
+            };
+            drop(gate);
+            // The progress worker exits on failure. Drive this fence outside
+            // the locks; a timeout leaves the callback owning the charges.
+            let _ = self.0.poll(wgpu::PollType::Wait {
+                submission_index: Some(index),
+                timeout: Some(Duration::from_secs(2)),
+            });
+        }
+        error
     }
 
     pub fn write_buffer(
@@ -1037,6 +1216,18 @@ impl Queue {
         data: &[u8],
         layout: wgpu::TexelCopyBufferLayout,
         size: wgpu::Extent3d,
+    ) -> Result<(), RenderFailure> {
+        self.write_texture_observed(destination, data, layout, size, |_, _| {})
+    }
+
+    /// Reports payload and charged staging bytes after each successful native write.
+    pub(crate) fn write_texture_observed(
+        &self,
+        destination: wgpu::TexelCopyTextureInfo<'_>,
+        data: &[u8],
+        layout: wgpu::TexelCopyBufferLayout,
+        size: wgpu::Extent3d,
+        mut on_write: impl FnMut(u64, u64),
     ) -> Result<(), RenderFailure> {
         let lease = self.0.lookup(destination.texture)?;
         self.0.runtime().check_health()?;
@@ -1129,9 +1320,11 @@ impl Queue {
                     height: (count * bh).min(size.height - first_row * bh),
                     depth_or_array_layers: 1,
                 };
-                self.write(padded * u64::from(count), lease.clone(), |queue| {
+                let staging_bytes = padded * u64::from(count);
+                self.write(staging_bytes, lease.clone(), |queue| {
                     queue.write_texture(target, data, source, extent)
                 })?;
+                on_write(row * u64::from(count), staging_bytes);
                 first_row += count;
             }
         }
@@ -1143,38 +1336,26 @@ impl Queue {
         resources: &[ResourceLease],
     ) -> Result<wgpu::SubmissionIndex, RenderFailure> {
         self.order().wait_pending(self)?;
-        self.0
-            .scoped(|_| {
-                let _gate = lock_for_submission(&self.0.0.inner().submission_gate);
-                let shared = self.0.submission_lock();
-                let _shared = shared.as_deref().map(lock_for_submission);
-                let mut retained = std::mem::take(
-                    &mut *self
-                        .0
-                        .0
-                        .inner()
-                        .pending_writes
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                );
-                retained.extend(resources.iter().map(|lease| (lease.id(), lease.clone())));
-                let index = self.raw().submit(commands);
-                self.raw().on_submitted_work_done(move || drop(retained));
-                Ok(index)
-            })
-            .map_err(|error| self.0.runtime().health().record(error))
+        let commands = commands.into_iter().map(|raw| CommandBuffer {
+            raw,
+            bitmap_writes: None,
+            uses: RecordedUses::default(),
+            pending: Vec::new(),
+        });
+        self.submit_ordered(commands, resources)
     }
     pub fn submit(
         &self,
         commands: impl IntoIterator<Item = CommandBuffer>,
     ) -> Result<wgpu::SubmissionIndex, RenderFailure> {
         self.order().wait_pending(self)?;
-        self.submit_ordered(commands)
+        self.submit_ordered(commands, &[])
     }
 
     fn submit_ordered(
         &self,
         commands: impl IntoIterator<Item = CommandBuffer>,
+        external_resources: &[ResourceLease],
     ) -> Result<wgpu::SubmissionIndex, RenderFailure> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let gate = loop {
@@ -1189,13 +1370,14 @@ impl Queue {
                 .wait_for_oldest(deadline)
                 .map_err(|error| self.0.runtime().health().record(error))?;
         };
+        let mut writes = UseSet::default();
         // Scopes resolve after the closure has released both submission locks.
         self.0
             .scoped(|_| {
                 let shared = self.0.submission_lock();
                 let shared = shared.as_deref().map(lock_for_submission);
                 let mut raw = smallvec::SmallVec::<[wgpu::CommandBuffer; 1]>::new();
-                let mut uses = RecordedUses::from_roots(std::mem::take(
+                writes = std::mem::take(
                     &mut *self
                         .0
                         .0
@@ -1203,9 +1385,10 @@ impl Queue {
                         .pending_writes
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner),
-                ));
+                );
+                let mut uses = RecordedUses::from_roots(writes.values().chain(external_resources));
                 let mut pending = Vec::new();
-                let mut bitmap_writes = smallvec::SmallVec::<[Arc<()>; 1]>::new();
+                let mut bitmap_writes = smallvec::SmallVec::<[Arc<AtomicBool>; 1]>::new();
                 for command in commands {
                     bitmap_writes.extend(command.bitmap_writes);
                     pending.extend(command.pending);
@@ -1219,7 +1402,9 @@ impl Queue {
                 let serial = self.0.runtime().register_recorded_submission(&uses)?;
                 drop(pending);
                 let index = self.raw().submit(raw);
-                drop(bitmap_writes);
+                for submitted in bitmap_writes {
+                    submitted.store(true, Ordering::Release);
+                }
                 {
                     let completed = self.0.runtime().stats().completed;
                     let mut pending = self
@@ -1245,7 +1430,7 @@ impl Queue {
                 drop(gate);
                 Ok(index)
             })
-            .map_err(|error| self.0.runtime().health().record(error))
+            .map_err(|error| self.drain_after_failure(error, writes))
     }
 }
 
@@ -1270,6 +1455,64 @@ impl ComputePipeline {
 
 #[cfg(test)]
 mod tests;
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn disabled_cache_allows_pipeline_creation_and_shares_compile_stats() {
+    use crate::gpu_runtime::{GpuBudgetConfig, OwnerKind};
+    use crate::pipeline_cache::PipelineCacheStatus;
+    use futures::executor::block_on;
+
+    let mut options = wgpu::InstanceDescriptor::new_without_display_handle();
+    options.backends = wgpu::Backends::VULKAN;
+    let instance = wgpu::Instance::new(options);
+    let adapter = block_on(instance.request_adapter(&Default::default())).unwrap();
+    let (raw, queue) = block_on(adapter.request_device(&Default::default())).unwrap();
+    let runtime = GpuRuntime::new(GpuBudgetConfig::for_adapter(
+        adapter.get_info().device_type,
+        false,
+    ))
+    .unwrap();
+    runtime.install_device_callbacks(&raw);
+    let device = Device::new(raw, queue, runtime);
+    let owner = device.with_owner(device.runtime().issue_owner(OwnerKind::Host).unwrap());
+    assert_eq!(
+        device.pipeline_cache_status(),
+        PipelineCacheStatus::Disabled
+    );
+    assert!(owner.pipeline_cache().is_none());
+    assert!(!owner.flush_pipeline_cache());
+
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("pipeline-cache");
+    // SAFETY: this fresh directory is reserved for this test's native cache.
+    let status = unsafe { owner.enable_pipeline_cache(&dir, "test-v1") };
+    assert_eq!(status, PipelineCacheStatus::Unsupported);
+    assert_eq!(device.pipeline_cache_status(), status);
+    assert!(device.pipeline_cache().is_none());
+    assert!(!device.flush_pipeline_cache());
+
+    let module = owner
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() {}".into()),
+        })
+        .unwrap();
+    assert_eq!(device.pipeline_compile_stats(), (0, 0));
+    owner
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+        .unwrap();
+    let (count, nanos) = device.pipeline_compile_stats();
+    assert_eq!(count, 1);
+    assert!(nanos > 0);
+}
 
 /// Native callers share the submission-aware paged upload implementation.
 pub type StagingBelt = crate::frame_upload::FrameUploadArena;

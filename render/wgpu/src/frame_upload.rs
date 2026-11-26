@@ -1,7 +1,7 @@
 //! Three submission slots of bounded, reclaimable upload pages. A page can be
 //! reused only after its actual last submission completes, never by frame age.
 use crate::gpu_resources::{Buffer, CommandEncoder, Device};
-use crate::gpu_runtime::{GpuRuntime, RenderFailure, RenderFailureKind, ResourceKind};
+use crate::gpu_runtime::{GpuRuntime, RenderFailure, RenderFailureKind, ResourceId, ResourceKind};
 use crate::resource_scheduler::{CacheTicket, Reclaim, ReclaimClass};
 use std::sync::{
     Arc, Mutex,
@@ -41,11 +41,11 @@ struct Pages {
     runtime: GpuRuntime,
 }
 impl Pages {
-    fn completed(&self, page: &RetiredPage) -> bool {
-        let serial = page.buffer.lease().last_submission();
-        serial > page.after_serial
-            && serial <= self.runtime.stats().completed
-            && page.buffer.lease().unsubmitted_uses() == 0
+    fn can_evict(&self, page: &RetiredPage) -> bool {
+        let lease = page.buffer.lease();
+        // Submission publishes the serial before releasing its recording use.
+        // Cancellation releases the use without issuing a serial at all.
+        lease.unsubmitted_uses() == 0 && lease.last_submission() <= self.runtime.stats().completed
     }
     fn oldest_index(&self) -> Option<(usize, usize)> {
         self.slots
@@ -57,7 +57,7 @@ impl Pages {
                     .enumerate()
                     .map(move |(index, page)| (slot, index, page))
             })
-            .filter(|(_, _, page)| self.completed(page))
+            .filter(|(_, _, page)| self.can_evict(page))
             .min_by_key(|(_, _, page)| page.age)
             .map(|(slot, index, _)| (slot, index))
     }
@@ -84,7 +84,7 @@ impl Reclaim for Mutex<Pages> {
     }
 }
 pub(crate) trait SealUploads: Send + Sync {
-    fn seal(&self) -> Result<(), RenderFailure>;
+    fn seal(&self, used: &dyn Fn(ResourceId) -> bool) -> Result<(), RenderFailure>;
 }
 #[derive(Debug)]
 struct ActiveUploads {
@@ -95,19 +95,23 @@ struct ActiveUploads {
     runtime: GpuRuntime,
 }
 impl SealUploads for ActiveUploads {
-    fn seal(&self) -> Result<(), RenderFailure> {
+    fn seal(&self, used: &dyn Fn(ResourceId) -> bool) -> Result<(), RenderFailure> {
         let active = {
             let mut buffers = self
                 .buffers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if self.views.load(Ordering::Acquire) != 0 {
+            if self.views.load(Ordering::Acquire) != 0
+                && buffers.iter().any(|page| used(page.buffer.lease().id()))
+            {
                 return Err(RenderFailure::new(
                     RenderFailureKind::Validation,
                     "upload view still held at submission boundary",
                 ));
             }
-            std::mem::take(&mut *buffers)
+            buffers
+                .extract_if(.., |page| used(page.buffer.lease().id()))
+                .collect::<Vec<_>>()
         };
         for page in active {
             if page.mapped {
@@ -280,7 +284,8 @@ impl FrameUploadArena {
                     .position(|page| {
                         page.buffer.usage() == usage
                             && page.buffer.size() >= capacity
-                            && pages.completed(page)
+                            && pages.can_evict(page)
+                            && page.buffer.lease().last_submission() > page.after_serial
                     })
                     .map(|index| (slot, index))
             });
@@ -557,7 +562,7 @@ impl FrameUploadArena {
     }
 
     pub fn finish(&mut self) {
-        if let Err(error) = self.active.seal() {
+        if let Err(error) = self.active.seal(&|_| true) {
             self.device.runtime().fail(error);
         }
     }

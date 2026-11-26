@@ -1346,11 +1346,71 @@ pub fn apply_filter<'gc>(
     context: &mut UpdateContext<'gc>,
     target: BitmapData<'gc>,
     source: BitmapData<'gc>,
-    source_point: (u32, u32),
+    source_point: (i64, i64),
     source_size: (u32, u32),
     dest_point: (i32, i32),
     filter: Filter,
 ) -> Result<(), RenderFailure> {
+    let supported = context.renderer.is_filter_supported(&filter);
+    let gradient = matches!(
+        filter,
+        Filter::GradientGlowFilter(_) | Filter::GradientBevelFilter(_)
+    );
+    let mut gradient_destination = None;
+    let (source_point, source_size, dest_point) =
+        if gradient || matches!(filter, Filter::ConvolutionFilter(_)) {
+            // Clip only to the source here. Pixels outside the destination still feed adjacent taps.
+            let axis = |start: i64, size: u32, limit: u32, dest: i32| {
+                let end = start
+                    .saturating_add(i64::from(size))
+                    .clamp(0, i64::from(limit));
+                let clipped = start.clamp(0, i64::from(limit));
+                let dest = i64::from(dest).saturating_add(clipped.saturating_sub(start));
+                (
+                    clipped as u32,
+                    (end - clipped) as u32,
+                    dest.clamp(i32::MIN.into(), i32::MAX.into()) as i32,
+                )
+            };
+            let (x, w, dx) = axis(source_point.0, source_size.0, source.width(), dest_point.0);
+            let (y, h, dy) = axis(source_point.1, source_size.1, source.height(), dest_point.1);
+            if gradient {
+                // Clip the expanded write independently of the source pixels the filter samples.
+                let bounds = Rectangle::ZERO
+                    .with_width(Twips::from_pixels(f64::from(w)))
+                    .with_height(Twips::from_pixels(f64::from(h)));
+                let bounds = if supported {
+                    filter.calculate_dest_rect(bounds)
+                } else {
+                    bounds
+                };
+                let mut region = PixelRegion {
+                    x_min: (f64::from(dx) + bounds.x_min.to_pixels().floor()) as u32,
+                    y_min: (f64::from(dy) + bounds.y_min.to_pixels().floor()) as u32,
+                    x_max: (f64::from(dx) + bounds.x_max.to_pixels().ceil()) as u32,
+                    y_max: (f64::from(dy) + bounds.y_max.to_pixels().ceil()) as u32,
+                };
+                region.clamp(target.width(), target.height());
+                if region.is_empty() {
+                    return Ok(());
+                }
+                gradient_destination = Some(region);
+            } else if i64::from(dx) >= i64::from(target.width())
+                || i64::from(dy) >= i64::from(target.height())
+                || i64::from(dx) + i64::from(w) <= 0
+                || i64::from(dy) + i64::from(h) <= 0
+            {
+                return Ok(());
+            }
+            ((x, y), (w, h), (dx, dy))
+        } else {
+            let origin = |n: i64| n.clamp(0, u32::MAX.into()) as u32;
+            (
+                (origin(source_point.0), origin(source_point.1)),
+                source_size,
+                dest_point,
+            )
+        };
     // Prevent creating 0x0 textures.
     // FIXME: this is not correct.
     // Currently at minimum, applyFilter(blur) is bugged in that
@@ -1362,7 +1422,7 @@ pub fn apply_filter<'gc>(
         return Ok(());
     }
 
-    if !context.renderer.is_filter_supported(&filter) {
+    if !supported {
         let mut source_region = PixelRegion::for_whole_size(source.width(), source.height());
         let mut dest_region = PixelRegion::for_whole_size(target.width(), target.height());
         dest_region.clamp_with_intersection(
@@ -1391,16 +1451,17 @@ pub fn apply_filter<'gc>(
 
     let source_handle = source.bitmap_handle(context.gc(), context.renderer)?;
     let dest = target.bitmap_handle(context.gc(), context.renderer)?;
-    let (target, _) = target.overwrite_cpu_pixels_from_gpu(context.gc());
-    let mut write = target.borrow_mut(context.gc());
-
+    // Keep the previous readback valid until the renderer confirms the clipped write.
+    let whole_target = gradient_destination
+        .is_none()
+        .then(|| target.overwrite_cpu_pixels_from_gpu(context.gc()).0);
     let sync_handle = context
         .renderer
         .apply_filter(
             source_handle,
             source_point,
             source_size,
-            dest,
+            dest.clone(),
             dest_point,
             filter,
         )
@@ -1410,9 +1471,21 @@ pub fn apply_filter<'gc>(
                 .health()
                 .record(error.into_render_failure())
         })?;
-    let region = PixelRegion::for_whole_size(write.width(), write.height());
     match sync_handle {
-        Some(sync_handle) => write.set_gpu_dirty(context.gc(), sync_handle, region),
+        Some(sync_handle) => {
+            if let Some(region) = gradient_destination
+                && sync_handle.can_read_current_without_token(&dest)
+            {
+                target.mark_gpu_dirty(context.gc(), sync_handle, region);
+            } else {
+                let target = whole_target
+                    .unwrap_or_else(|| target.overwrite_cpu_pixels_from_gpu(context.gc()).0);
+                let mut write = target.borrow_mut(context.gc());
+                let region = write.full_region();
+                write.set_gpu_dirty(context.gc(), sync_handle, region);
+            }
+        }
+        None if gradient_destination.is_some() => (),
         None => {
             tracing::warn!("BitmapData.apply_filter: Renderer not yet implemented")
         }
@@ -1507,8 +1580,16 @@ pub fn draw<'gc>(
     clip_rect: Option<Rectangle<Twips>>,
     quality: StageQuality,
 ) -> Result<(), BitmapDataDrawError> {
-    // Calculate the maximum potential area that this draw call will affect
-    let bounds = transform.matrix * source.bounds();
+    // Scroll rectangles can extend geometry. Filtered children can paint beyond it,
+    // even when the unfiltered source lies entirely outside the destination.
+    let mut bounds = transform.matrix * source.bounds();
+    if let IBitmapDrawable::DisplayObject(object) = &source {
+        bounds = bounds.union(&object.render_bounds_with_transform(
+            &transform.matrix,
+            true,
+            &Matrix::IDENTITY,
+        ));
+    }
     let mut dirty_region = PixelRegion::from(bounds);
     dirty_region.clamp(target.width(), target.height());
     if dirty_region.width() == 0 || dirty_region.height() == 0 {
@@ -1672,6 +1753,21 @@ pub fn draw<'gc>(
         commands
     };
 
+    if !cache_draws.is_empty()
+        && context
+            .renderer
+            .render_offscreen_caches(cache_draws, quality)
+            .map_err(|error| {
+                context
+                    .renderer
+                    .health()
+                    .record(error.into_render_failure())
+            })?
+            .is_none()
+    {
+        return Err(BitmapDataDrawError::Unimplemented);
+    }
+
     let (target, include_dirty_area) = target.overwrite_cpu_pixels_from_gpu(context.gc());
     let mut write = target.borrow_mut(context.gc());
     // If we have another dirty area to preserve, expand this to include it
@@ -1679,10 +1775,6 @@ pub fn draw<'gc>(
         dirty_region.union(old);
     }
 
-    assert!(
-        cache_draws.is_empty(),
-        "BitmapData.draw() should not use cacheAsBitmap"
-    );
     let image = context
         .renderer
         .render_offscreen(handle, commands, quality, dirty_region)

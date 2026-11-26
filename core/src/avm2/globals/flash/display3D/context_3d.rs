@@ -282,6 +282,7 @@ pub fn draw_to_bitmap_data<'gc>(
         )?;
 
         if let Some(sync_handle) = image {
+            activation.context.renderer.submit_offscreen_draws()?;
             write.set_gpu_dirty(activation.gc(), sync_handle, dirty_region);
         } else {
             return Err("Render backend does not support Context3D.drawToBitmapData".into());
@@ -893,14 +894,33 @@ pub fn set_scissor_rectangle<'gc>(
 pub fn dispose<'gc>(
     activation: &mut Activation<'_, 'gc>,
     this: Value<'gc>,
-    _args: FunctionArgs<'_, 'gc>,
+    args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
-    let this = this.as_object().unwrap();
+    use crate::avm2::Object;
+    use crate::avm2::globals::slots::flash_events_event_dispatcher as slots;
+    use crate::string::AvmString;
+
+    let context = this.as_object().unwrap().as_context_3d().unwrap();
+    let stage = context.stage3d();
+    if !stage
+        .context3d()
+        .is_some_and(|current| Object::ptr_eq(current, context))
+    {
+        return Ok(Value::Undefined);
+    }
 
     avm2_stub_method!(activation, "flash.display3D.Context3D", "dispose");
-    this.as_context_3d()
-        .unwrap()
-        .stage3d()
-        .clear_context3d(activation.gc());
+    if args.get_bool(0)
+        && let Some(list) = stage.get_slot(slots::DISPATCH_LIST).as_object()
+        && list
+            .as_dispatch_mut(activation.gc())
+            .unwrap()
+            .has_event_listener(AvmString::new_utf8(activation.gc(), "context3DCreate"))
+    {
+        let profile = context.with_context_3d(|ctx| ctx.profile());
+        stage.set_requesting_context3d(activation.gc(), profile);
+    } else {
+        stage.clear_context3d(activation.gc());
+    }
     Ok(Value::Undefined)
 }

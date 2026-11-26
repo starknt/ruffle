@@ -39,6 +39,7 @@ pub struct Surface {
     pub(crate) display: Option<Arc<dyn crate::display_bitmap::DisplayBitmapEnhancer>>,
     size: wgpu::Extent3d,
     origin: [u32; 2],
+    draw_projection: Option<Arc<crate::globals::Globals>>,
     quality: StageQuality,
     sample_count: u32,
     pipelines: Arc<Pipelines>,
@@ -84,6 +85,7 @@ impl Surface {
         Ok(Self {
             display: None,
             origin: [0, 0],
+            draw_projection: None,
             size,
             quality,
             sample_count,
@@ -106,9 +108,9 @@ impl Surface {
         plan: crate::graph_encoder::SurfaceCommands,
         layer: LayerRef<'encoder>,
         texture_pool: &'global mut TexturePool,
-    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+    ) -> Result<(u32, u32, u32), crate::gpu_runtime::RenderFailure> {
         use crate::graph_encoder::{PlannedList, SurfaceCommands};
-        let aligned_surface;
+        let direct_surface;
         let (surface, direct_attachment, commands) = match plan {
             SurfaceCommands::Graph(graph) => {
                 let direct = graph.graph.direct_attachment();
@@ -123,6 +125,27 @@ impl Surface {
                 };
                 (self, true, PlannedList::from_resident_draws(list, bounds))
             }
+            SurfaceCommands::ViewportDraws(list, viewport) => {
+                let bounds = ruffle_render::region::RenderRect {
+                    x: 0,
+                    y: 0,
+                    width: viewport.width,
+                    height: viewport.height,
+                };
+                direct_surface = Surface {
+                    draw_projection: Some(texture_pool.get_globals(
+                        descriptors,
+                        bounds.width,
+                        bounds.height,
+                    )?),
+                    ..self.clone()
+                };
+                (
+                    &direct_surface,
+                    true,
+                    PlannedList::from_resident_draws(list, bounds),
+                )
+            }
             SurfaceCommands::CachedBitmaps(list) => {
                 let bounds = ruffle_render::region::RenderRect {
                     x: 0,
@@ -132,13 +155,13 @@ impl Surface {
                 };
                 // Each covered pixel contains all its samples. Filtering already
                 // happened when producing the cached image at the stage quality.
-                aligned_surface = Surface {
+                direct_surface = Surface {
                     sample_count: 1,
                     pipelines: descriptors.pipelines(1, self.format)?,
                     ..self.clone()
                 };
                 (
-                    &aligned_surface,
+                    &direct_surface,
                     true,
                     PlannedList::from_resident_draws(list, bounds),
                 )
@@ -168,19 +191,22 @@ impl Surface {
             texture_pool,
         )?;
 
-        if direct {
-            return Ok(());
+        if !direct {
+            run_copy_pipeline(
+                descriptors,
+                self.format,
+                frame_view,
+                target.color_view(),
+                1,
+                draw_encoder,
+            )?;
         }
-        run_copy_pipeline(
-            descriptors,
-            self.format,
-            frame_view,
-            target.color_view(),
-            1,
-            draw_encoder,
-        )?;
-
-        Ok(())
+        let attachment = target.raster_texture();
+        Ok((
+            attachment.width(),
+            attachment.height(),
+            attachment.sample_count(),
+        ))
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -216,6 +242,7 @@ impl Surface {
             draw_encoder,
         )?;
 
+        let _pass = descriptors.device.raster_context(target.raster_texture());
         let mut mask_state = MaskState::empty();
         for commands in
             CommandBatches::new(commands, descriptors.runtime.config().transient_watermark)
@@ -262,13 +289,17 @@ impl Surface {
                             draw_encoder,
                             chunk_buffers,
                         )?;
+                        let globals = self
+                            .draw_projection
+                            .as_deref()
+                            .unwrap_or_else(|| target.globals());
                         if descriptors.bitmap_draw != crate::capabilities::BitmapDraw::Direct {
                             indirect::prepare(
                                 &mut chunk,
                                 descriptors,
                                 draw_encoder,
                                 chunk_buffers,
-                                target.globals(),
+                                globals,
                             )?;
                         }
                         ruffle_render::profile::work(|w| {
@@ -294,7 +325,7 @@ impl Surface {
                                 ..Default::default()
                             },
                         );
-                        render_pass.set_bind_group(0, (target.globals().bind_group()).raw(), &[]);
+                        render_pass.set_bind_group(0, globals.bind_group().raw(), &[]);
                         render_pass.set_bind_group(
                             1,
                             chunk_buffers.bind_group.raw(),
@@ -351,7 +382,7 @@ impl Surface {
                                 None
                             },
                             target.sample_count(),
-                            &FilterSource::for_entire_texture(texture.texture()),
+                            &FilterSource::for_entire_texture(texture.texture(), texture.view()),
                         )
                         .map_err(ruffle_render::error::Error::into_render_failure)?;
                     }
@@ -495,7 +526,7 @@ impl Surface {
                             region.width,
                             region.height,
                         );
-                        render_pass.set_bind_group(2, (&blend_bind_group).raw(), &[]);
+                        render_pass.set_bind_group(2, blend_bind_group.raw(), &[]);
 
                         render_pass.set_vertex_buffer(
                             0,

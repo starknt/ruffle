@@ -1805,6 +1805,42 @@ fn pixel_capture_rejects_buffers_from_another_device_before_mapping() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn rejected_capture_preserves_an_existing_buffer_mapping() {
+    let descriptors = gpu();
+    let dimensions = crate::utils::BufferDimensions::new(1, 1, wgpu::TextureFormat::Rgba8Unorm);
+    let buffer = descriptors
+        .device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: dimensions.size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        })
+        .unwrap();
+    buffer
+        .get_mapped_range_mut(..)
+        .unwrap()
+        .slice(..4)
+        .copy_from_slice(&[1, 2, 3, 4]);
+    let result =
+        crate::utils::capture_image(&descriptors.device, &buffer, &dimensions, None, |_, _| {
+            panic!("rejected map published pixels")
+        });
+    assert_eq!(
+        result.unwrap_err().kind(),
+        crate::gpu_runtime::RenderFailureKind::MapFailed
+    );
+    let original = buffer
+        .get_mapped_range(..)
+        .expect("the original mapping still belongs to its caller");
+    assert_eq!(&original[..4], &[1, 2, 3, 4]);
+    drop(original);
+    buffer.unmap();
+    descriptors.runtime.check_health().unwrap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn explicit_pixel_capture_dependency_must_have_been_submitted() {
     let owner = gpu();
     let other = gpu();
@@ -1880,8 +1916,13 @@ fn async_readback_completion_and_cancellation_return_unmapped_pool_entries() {
             .offscreen_buffer_pool
             .take(&descriptors, dimensions.clone())
             .unwrap();
-        let mut readback =
-            crate::AsyncReadback::new(buffer, dimensions.clone(), descriptors.clone());
+        let mut readback = crate::AsyncReadback::new(
+            buffer,
+            dimensions.clone(),
+            descriptors.clone(),
+            renderer.active_frame.operations.dependency(),
+        )
+        .unwrap();
         if complete {
             descriptors
                 .device
@@ -1898,6 +1939,256 @@ fn async_readback_completion_and_cancellation_return_unmapped_pool_entries() {
             .poll(wgpu::PollType::wait_indefinitely())
             .unwrap();
         descriptors.runtime.check_health().unwrap();
+    }
+    let new_read = || {
+        crate::AsyncReadback::new(
+            renderer
+                .offscreen_buffer_pool
+                .take(&descriptors, dimensions.clone())
+                .unwrap(),
+            dimensions.clone(),
+            descriptors.clone(),
+            renderer.active_frame.operations.dependency(),
+        )
+        .unwrap()
+    };
+    let mut done = new_read();
+    let mut pending = new_read();
+    descriptors
+        .device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    assert!(done.poll().unwrap().is_some());
+    drop(renderer);
+    let canceled = pending.poll().unwrap_err();
+    assert_eq!(
+        canceled.kind(),
+        crate::gpu_runtime::RenderFailureKind::Canceled
+    );
+    assert!(done.poll().unwrap().is_none());
+    descriptors.device.destroy();
+    descriptors.device.poll(wgpu::PollType::Poll).unwrap();
+    assert_eq!(pending.poll().unwrap_err(), canceled);
+    assert!(done.poll().unwrap().is_none());
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn canceled_readback_recycles_its_buffer_after_the_map_callback() {
+    use crate::gpu_runtime::ResourceState;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (1, 1)).unwrap();
+    let renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    let dimensions = crate::utils::BufferDimensions::new(1, 1, wgpu::TextureFormat::Rgba8Unorm);
+    let pool = &renderer.offscreen_buffer_pool;
+    let buffers =
+        std::array::from_fn::<_, 2, _>(|_| pool.take(&descriptors, dimensions.clone()).unwrap());
+    let ids = buffers.each_ref().map(|buffer| buffer.lease().id());
+    let timeout = Duration::from_secs(5);
+
+    // Hold the progress thread before it can deliver the new map callback.
+    let (entered, parked) = mpsc::channel();
+    let (resume, release) = mpsc::channel();
+    descriptors.queue.raw().on_submitted_work_done(move || {
+        entered.send(()).unwrap();
+        let _ = release.recv_timeout(timeout);
+    });
+    descriptors
+        .runtime
+        .request_poll(&descriptors.device)
+        .unwrap();
+    parked.recv_timeout(timeout).unwrap();
+    // Both maps register while a single progress kick is pending.
+    for buffer in buffers {
+        drop(
+            crate::AsyncReadback::new(
+                buffer,
+                dimensions.clone(),
+                descriptors.clone(),
+                renderer.active_frame.operations.dependency(),
+            )
+            .unwrap(),
+        );
+    }
+    let resources = descriptors.runtime.resources();
+    for id in ids {
+        assert_eq!(
+            resources.iter().find(|r| r.id == id).unwrap().state,
+            ResourceState::Active
+        );
+    }
+    let (done, drained) = mpsc::channel();
+    descriptors.queue.raw().on_submitted_work_done(move || {
+        let _ = done.send(());
+    });
+    resume.send(()).unwrap();
+    drained.recv_timeout(timeout).unwrap();
+
+    let reused =
+        std::array::from_fn::<_, 2, _>(|_| pool.take(&descriptors, dimensions.clone()).unwrap());
+    let reused_ids = reused.each_ref().map(|buffer| buffer.lease().id());
+    assert!(
+        ids.iter().all(|id| reused_ids.contains(id)),
+        "both map callbacks must have returned their leases"
+    );
+    for buffer in reused {
+        let pixel = crate::utils::capture_image(
+            &descriptors.device,
+            &buffer,
+            &dimensions,
+            None,
+            |data, _| data[..4].to_vec(),
+        )
+        .unwrap();
+        assert_eq!(pixel, [0; 4]);
+    }
+    descriptors.runtime.check_health().unwrap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn byte_shader_readback_tracks_its_session_through_mapping_and_close() {
+    use ruffle_render::backend::{PixelBenderOutput, PixelBenderTarget};
+    let descriptors = gpu();
+    let make = || {
+        WgpuRenderBackend::new(
+            descriptors.clone(),
+            TextureTarget::new_without_readback(&descriptors.device, (1, 1)).unwrap(),
+        )
+        .unwrap()
+    };
+    let (mut owner, mut sibling) = (make(), make());
+    let submit = |renderer: &mut WgpuRenderBackend<TextureTarget>| {
+        let shader = ruffle_render::pixel_bender::parse_shader(
+            include_bytes!(
+                "../../../../tests/tests/swfs/avm2/pixelbender_padding_bytes/padding_bytes.pbj"
+            ),
+            false,
+        )
+        .unwrap();
+        let shader = renderer.compile_pixelbender_shader(shader).unwrap();
+        renderer
+            .submit_pixelbender_shader(
+                shader,
+                &[],
+                &PixelBenderTarget::Bytes {
+                    width: 2,
+                    height: 1,
+                },
+            )
+            .unwrap()
+    };
+    let mut reading = submit(&mut owner);
+    let mut queued = submit(&mut owner);
+    let mut surviving = submit(&mut sibling);
+    assert!(
+        owner
+            .poll_pixelbender_shader(&mut reading)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        sibling
+            .poll_pixelbender_shader(&mut surviving)
+            .unwrap()
+            .is_none()
+    );
+    descriptors
+        .device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    assert!(
+        sibling.poll_pixelbender_shader(&mut reading).is_err(),
+        "foreign session published mapped bytes"
+    );
+    assert!(sibling.poll_pixelbender_shader(&mut queued).is_err());
+    assert!(
+        owner
+            .poll_pixelbender_shader(&mut queued)
+            .unwrap()
+            .is_none()
+    );
+    let mut failed = submit(&mut sibling);
+    assert!(
+        sibling
+            .poll_pixelbender_shader(&mut failed)
+            .unwrap()
+            .is_none()
+    );
+    let mut canceled = submit(&mut owner);
+    drop(owner);
+    for job in [&mut reading, &mut queued, &mut canceled] {
+        for _ in 0..2 {
+            let Err(error) = sibling.poll_pixelbender_shader(job) else {
+                panic!("closed session published or left a read pending");
+            };
+            assert!(
+                matches!(error, ruffle_render::error::Error::Render(failure) if failure.kind() == crate::gpu_runtime::RenderFailureKind::Canceled)
+            );
+        }
+    }
+    let Some(PixelBenderOutput::Bytes(bytes)) =
+        sibling.poll_pixelbender_shader(&mut surviving).unwrap()
+    else {
+        panic!("sibling readback did not complete");
+    };
+    let expected: Vec<_> = [1.0f32, 1.0, 0.0, 1.0]
+        .repeat(2)
+        .into_iter()
+        .flat_map(f32::to_ne_bytes)
+        .collect();
+    assert_eq!(bytes, expected);
+    assert!(
+        sibling
+            .poll_pixelbender_shader(&mut surviving)
+            .unwrap()
+            .is_none()
+    );
+    descriptors.runtime.check_health().unwrap();
+    let waiters = [
+        descriptors.runtime.health().failure_signal(),
+        descriptors.runtime.health().failure_signal(),
+    ];
+    descriptors.device.destroy();
+    // wgpu delivers the destruction callback once the native queue is empty.
+    descriptors
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(2)),
+        })
+        .unwrap();
+    for waiter in waiters
+        .into_iter()
+        .chain([descriptors.runtime.health().failure_signal()])
+    {
+        assert!(matches!(
+            waiter.recv_timeout(std::time::Duration::from_secs(1)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+    }
+    let loss = descriptors.runtime.check_health().unwrap_err();
+    assert_eq!(
+        loss.kind(),
+        crate::gpu_runtime::RenderFailureKind::DeviceLost
+    );
+    for _ in 0..2 {
+        assert!(
+            matches!(sibling.poll_pixelbender_shader(&mut failed), Err(ruffle_render::error::Error::Render(error)) if error == loss)
+        );
+        assert!(
+            matches!(sibling.poll_pixelbender_shader(&mut canceled), Err(ruffle_render::error::Error::Render(error)) if error.kind() == crate::gpu_runtime::RenderFailureKind::Canceled),
+            "device loss replaced an already delivered cancellation"
+        );
+        assert!(
+            sibling
+                .poll_pixelbender_shader(&mut surviving)
+                .unwrap()
+                .is_none()
+        );
     }
 }
 
@@ -2062,6 +2353,11 @@ fn bitmap_registration_is_lazy_and_first_visible_use_preserves_pixels() {
             [255, 0, 0, 255].repeat(64),
         ))
         .unwrap();
+    let bitmap_owner = (&*handle.0 as &dyn std::any::Any)
+        .downcast_ref::<crate::bitmap_recipe::BitmapRecipe>()
+        .unwrap()
+        .owner;
+    assert_eq!(descriptors.runtime.owner_bytes(bitmap_owner), 0);
     assert_eq!(
         descriptors.runtime.stats().total_bytes,
         before,
@@ -2069,7 +2365,7 @@ fn bitmap_registration_is_lazy_and_first_visible_use_preserves_pixels() {
     );
     let mut commands = CommandList::new();
     commands.render_bitmap(
-        handle,
+        handle.clone(),
         Transform::default(),
         false,
         PixelSnapping::Never,
@@ -2080,6 +2376,7 @@ fn bitmap_registration_is_lazy_and_first_visible_use_preserves_pixels() {
         .unwrap();
     let image = renderer.capture_frame().unwrap().unwrap();
     assert!(image.pixels().all(|p| p.0 == [255, 0, 0, 255]));
+    assert_eq!(descriptors.runtime.owner_bytes(bitmap_owner), 8 * 8 * 4);
 }
 
 #[test]
@@ -2929,21 +3226,35 @@ fn render_color_matrix_test(
         .cloned()
         .map(ruffle_render::filters::Filter::ColorMatrixFilter)
         .collect();
-    render_filter_chain_test(&filters, pixels, width, height)
+    render_filter_chain_test(&gpu(), &filters, pixels, width, height)
+        .into_iter()
+        .map(|(pixels, work)| (pixels, work.filter_passes))
+        .collect()
 }
 
 fn render_filter_chain_test(
+    descriptors: &Arc<Descriptors>,
     filters: &[ruffle_render::filters::Filter],
     pixels: Vec<u8>,
     width: u32,
     height: u32,
-) -> Vec<(Vec<u8>, u64)> {
+) -> Vec<(Vec<u8>, ruffle_render::profile::RenderWork)> {
+    render_filter_chain_with_stage(descriptors, filters, pixels, width, height, |draw| draw)
+}
+
+fn render_filter_chain_with_stage(
+    descriptors: &Arc<Descriptors>,
+    filters: &[ruffle_render::filters::Filter],
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    stage: impl Fn(CommandList) -> CommandList,
+) -> Vec<(Vec<u8>, ruffle_render::profile::RenderWork)> {
     use ruffle_render::{
         backend::BitmapCacheEntry,
         bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping},
         transform::Transform,
     };
-    let descriptors = gpu();
     let mut results = Vec::new();
     for chain in [false, true] {
         let target = TextureTarget::new(&descriptors.device, (width, height)).unwrap();
@@ -2984,7 +3295,7 @@ fn render_filter_chain_test(
             renderer
                 .submit_frame(
                     Color::TRANSPARENT,
-                    draw(destination.clone()),
+                    stage(draw(destination.clone())),
                     vec![BitmapCacheEntry {
                         handle: destination,
                         commands: draw(source),
@@ -3011,14 +3322,22 @@ fn render_filter_chain_test(
                 source = destination;
             }
             renderer
-                .submit_frame(Color::TRANSPARENT, draw(source), vec![])
+                .submit_frame(Color::TRANSPARENT, stage(draw(source)), vec![])
                 .unwrap();
         }
         let work = metrics.snapshot().work;
         if chain
-            && std::env::var_os("RUFFLE_COMPUTE_FILTERS").as_deref() == Some("1".as_ref())
-            && work.filter_kind_color_matrix != 0
+            && work.filter_passes > 0
+            && descriptors.filter_cache_writeback
+                == crate::descriptors::FilterCacheWriteback::Transfer
         {
+            // A full filtered RGBA cache and the stage readback each copy this extent.
+            let image_bytes = u64::from(width) * u64::from(height) * 4;
+            assert_eq!(work.filter_cache_transfers, 1);
+            assert_eq!(work.filter_cache_draw_copies, 0);
+            assert!(work.copy_bytes >= 2 * image_bytes);
+        }
+        if chain && descriptors.compute_filters && work.filter_kind_color_matrix != 0 {
             let byte_matrix = filters
                 .iter()
                 .filter_map(|filter| match filter {
@@ -3027,9 +3346,10 @@ fn render_filter_chain_test(
                 })
                 .all(|matrix| crate::filters::graph::channel_permutation(matrix).is_some());
             if byte_matrix {
-                assert!(
+                assert_eq!(
                     work.compute_filter_passes > 0,
-                    "the requested byte-preserving Vulkan compute filter must actually dispatch"
+                    width.max(height).div_ceil(8) <= descriptors.capabilities.max_compute_groups,
+                    "byte-preserving compute dispatch must fit the granted device limits"
                 );
             } else if filters
                 .iter()
@@ -3075,7 +3395,7 @@ fn render_filter_chain_test(
                 );
             }
         }
-        results.push((image, work.filter_passes));
+        results.push((image, work));
     }
     results
 }
@@ -3416,6 +3736,44 @@ fn shader_blend_keeps_shader_pixels_inside_a_stencil_mask() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn repeated_blur_of_one_bitmap_reuses_its_input_binding() {
+    use crate::gpu_runtime::ResourceKind;
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat};
+
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (16, 16)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, true).unwrap();
+    let bitmap = || Bitmap::new(16, 16, BitmapFormat::Rgba, vec![255; 16 * 16 * 4]);
+    let source = renderer.register_bitmap(bitmap()).unwrap();
+    let dest = renderer.register_bitmap(bitmap()).unwrap();
+    let mut blur = || {
+        renderer
+            .apply_filter(
+                source.clone(),
+                (0, 0),
+                (16, 16),
+                dest.clone(),
+                (0, 0),
+                ruffle_render::filters::Filter::BlurFilter(swf::BlurFilter {
+                    blur_x: swf::Fixed16::from_f32(4.0),
+                    blur_y: swf::Fixed16::ONE,
+                    flags: swf::BlurFilterFlags::from_passes(1),
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        descriptors.runtime.stats().kind_counts[ResourceKind::BindGroup as usize]
+    };
+    let warm = blur();
+    assert_eq!(
+        blur(),
+        warm,
+        "the same input view and uniforms must reuse their bind group"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn noop_blur_does_not_allocate_intermediates() {
     let descriptors = gpu();
     let source = descriptors
@@ -3443,6 +3801,7 @@ fn noop_blur_does_not_allocate_intermediates() {
         .create_command_encoder(&Default::default())
         .unwrap();
     let mut belt = crate::gpu_resources::StagingBelt::new(descriptors.device.clone(), 64);
+    let view = source.create_view(&Default::default()).unwrap();
     let before = descriptors.runtime.stats();
     let result = descriptors
         .filters
@@ -3452,17 +3811,337 @@ fn noop_blur_does_not_allocate_intermediates() {
             &mut pool,
             &mut encoder,
             &mut belt,
-            &crate::filters::FilterSource::for_entire_texture(&source),
+            &crate::filters::FilterSource::for_entire_texture(&source, &view),
             &swf::BlurFilter {
                 blur_x: swf::Fixed16::ONE,
                 blur_y: swf::Fixed16::ONE,
                 flags: swf::BlurFilterFlags::from_passes(3),
             },
+            None,
         )
         .unwrap();
     assert!(result.is_none());
     assert_eq!(descriptors.runtime.stats().total_bytes, before.total_bytes);
     assert_eq!(descriptors.runtime.stats().resources, before.resources);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn gradient_bevel_maps_opposite_edges_to_highlight_and_shadow() {
+    use ruffle_render::filters::Filter;
+    use swf::{GradientFilter, GradientFilterFlags as Flags, GradientRecord};
+    let bevel = Filter::GradientBevelFilter(GradientFilter {
+        colors: vec![
+            GradientRecord {
+                ratio: 0,
+                color: Color::from_rgb(0xff0000, 255),
+            },
+            GradientRecord {
+                ratio: 128,
+                color: Color::TRANSPARENT,
+            },
+            GradientRecord {
+                ratio: 255,
+                color: Color::from_rgb(0x0000ff, 255),
+            },
+        ],
+        blur_x: swf::Fixed16::ONE,
+        blur_y: swf::Fixed16::ONE,
+        angle: swf::Fixed16::ZERO,
+        distance: swf::Fixed16::ONE,
+        strength: swf::Fixed8::ONE,
+        flags: Flags::from_passes(1) | Flags::ON_TOP | Flags::KNOCKOUT,
+    });
+    let mut source = vec![0; 5 * 4];
+    source[8..12].copy_from_slice(&[0, 255, 0, 255]);
+    let mut expected = vec![0; 5 * 4];
+    expected[4..8].copy_from_slice(&[0, 0, 255, 255]);
+    expected[12..16].copy_from_slice(&[255, 0, 0, 255]);
+    for (image, work) in render_filter_chain_test(&gpu(), &[bevel], source, 5, 1) {
+        assert_eq!(image, expected, "gradient bevel highlight and shadow");
+        assert_eq!(work.filter_kind_bevel, 1);
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn gradient_glow_maps_the_offset_alpha_to_color_stops() {
+    use ruffle_render::filters::Filter;
+    use swf::{GradientFilter, GradientFilterFlags as Flags, GradientRecord};
+    let filter = Filter::GradientGlowFilter(GradientFilter {
+        colors: vec![
+            GradientRecord {
+                ratio: 0,
+                color: Color::TRANSPARENT,
+            },
+            GradientRecord {
+                ratio: 128,
+                color: Color::from_rgb(0x00ff00, 255),
+            },
+            GradientRecord {
+                ratio: 255,
+                color: Color::from_rgb(0xff0000, 255),
+            },
+        ],
+        blur_x: swf::Fixed16::ONE,
+        blur_y: swf::Fixed16::ONE,
+        angle: swf::Fixed16::ZERO,
+        distance: swf::Fixed16::from_f32(2.0),
+        strength: swf::Fixed8::ONE,
+        flags: Flags::from_passes(1) | Flags::COMPOSITE_SOURCE | Flags::KNOCKOUT,
+    });
+    let mut source = vec![0; 6 * 4];
+    source[0..4].copy_from_slice(&[0, 0, 128, 128]);
+    source[4..8].copy_from_slice(&[0, 0, 255, 255]);
+    let mut expected = vec![0; 6 * 4];
+    expected[8..12].copy_from_slice(&[0, 255, 0, 255]);
+    expected[12..16].copy_from_slice(&[255, 0, 0, 255]);
+    for (image, _) in render_filter_chain_test(&gpu(), &[filter], source, 6, 1) {
+        assert_eq!(image, expected, "offset alpha selects the gradient color");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn gradient_glow_blurs_a_single_pixel_against_transparent_edges() {
+    use ruffle_render::filters::Filter;
+    use swf::{GradientFilter, GradientFilterFlags as Flags, GradientRecord};
+    let filter = Filter::GradientGlowFilter(GradientFilter {
+        colors: vec![
+            GradientRecord {
+                ratio: 0,
+                color: Color::BLACK,
+            },
+            GradientRecord {
+                ratio: 255,
+                color: Color::WHITE,
+            },
+        ],
+        blur_x: swf::Fixed16::from_f32(3.0),
+        blur_y: swf::Fixed16::ONE,
+        angle: swf::Fixed16::ZERO,
+        distance: swf::Fixed16::ZERO,
+        strength: swf::Fixed8::ONE,
+        flags: Flags::from_passes(1) | Flags::INNER_SHADOW | Flags::KNOCKOUT,
+    });
+    let outputs = render_filter_chain_test(&gpu(), &[filter], vec![0, 0, 255, 255], 1, 1);
+    let bitmap = &outputs[0].0;
+    assert_eq!(bitmap, &outputs[1].0, "display and bitmap filter edges");
+    let gray = bitmap[0];
+    assert!(
+        gray.abs_diff(85) <= 1,
+        "one opaque tap out of three: {gray}"
+    );
+    assert_eq!(*bitmap, [gray, gray, gray, 255]);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn convolution_sharpens_pixels_in_bitmap_and_display_filters() {
+    use ruffle_render::filters::Filter;
+    use swf::{ConvolutionFilter, ConvolutionFilterFlags};
+    let filter = Filter::ConvolutionFilter(ConvolutionFilter {
+        num_matrix_cols: 3,
+        num_matrix_rows: 3,
+        matrix: vec![0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0],
+        divisor: 1.0,
+        bias: 0.0,
+        default_color: Color::TRANSPARENT,
+        flags: ConvolutionFilterFlags::CLAMP | ConvolutionFilterFlags::PRESERVE_ALPHA,
+    });
+    let gray_row = |gray: [u8; 3]| {
+        gray.into_iter()
+            .flat_map(|v| [v, v, v, 255])
+            .collect::<Vec<_>>()
+    };
+    for (image, _) in render_filter_chain_test(&gpu(), &[filter], gray_row([20, 40, 90]), 3, 1) {
+        assert_eq!(image, gray_row([0, 10, 140]), "sharpen with clamped edges");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn full_filtered_caches_can_render_into_the_final_attachment_without_feedback() {
+    use crate::descriptors::FilterCacheWriteback;
+    use ruffle_render::filters::Filter;
+    let mut descriptors = gpu();
+    let settings = Arc::get_mut(&mut descriptors).unwrap();
+    settings.filter_cache_writeback = FilterCacheWriteback::FilterOutput;
+    settings.compute_filters = false;
+    let blur = |x: f32, y: f32| {
+        Filter::BlurFilter(swf::BlurFilter {
+            blur_x: swf::Fixed16::from_f32(x),
+            blur_y: swf::Fixed16::from_f32(y),
+            flags: swf::BlurFilterFlags::from_passes(1),
+        })
+    };
+    let matrix = Filter::ColorMatrixFilter(swf::ColorMatrixFilter {
+        matrix: [
+            0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+        ],
+    });
+    let shadow = swf::DropShadowFilter {
+        color: Color {
+            r: 40,
+            g: 85,
+            b: 230,
+            a: 190,
+        },
+        blur_x: swf::Fixed16::from_f32(4.5),
+        blur_y: swf::Fixed16::from_f32(3.0),
+        angle: swf::Fixed16::from_f32(0.7),
+        distance: swf::Fixed16::from_f32(3.25),
+        strength: swf::Fixed8::ONE,
+        flags: swf::DropShadowFilterFlags::from_passes(1)
+            | swf::DropShadowFilterFlags::COMPOSITE_SOURCE,
+    };
+    let glow = Filter::GlowFilter(shadow.inner_glow_filter());
+    let shadow = Filter::DropShadowFilter(shadow);
+    let mut pixels = vec![0; 24 * 24 * 4];
+    for (x, y) in [(0, 0), (0, 10), (12, 12), (23, 23)] {
+        pixels[(y * 24 + x) * 4..(y * 24 + x + 1) * 4].copy_from_slice(&[82, 128, 33, 160]);
+    }
+    for (filters, writes) in [
+        (vec![blur(3.5, 5.0), matrix.clone()], 1),
+        (vec![blur(3.5, 5.0)], 1),
+        (vec![blur(3.5, 1.0), blur(1.0, 5.0)], 1),
+        (vec![blur(3.5, 1.0)], 0),
+        (vec![matrix.clone()], 0),
+        (vec![glow.clone()], 1),
+        (vec![shadow.clone()], 1),
+        (vec![matrix.clone(), glow], 1),
+        (vec![matrix, shadow], 1),
+    ] {
+        let result = render_filter_chain_test(&descriptors, &filters, pixels.clone(), 24, 24);
+        assert_eq!(
+            result[1].0, result[0].0,
+            "direct cache changed the filtered pixels"
+        );
+        assert!(result[1].0.iter().any(|&channel| channel != 0));
+        assert_eq!(
+            result[1].1.filter_cache_direct_outputs, writes,
+            "final filter attachment"
+        );
+        assert_eq!(result[1].1.filter_cache_draw_copies, 1 - writes);
+        assert_eq!(result[1].1.filter_cache_transfers, 0);
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter supporting 8x8 RGBA8 compute"]
+fn filter_chain_blur_permutation_respects_device_grants_and_masked_blend() {
+    use ruffle_render::filters::Filter;
+
+    let native = gpu();
+    let requested = std::env::var("RUFFLE_COMPUTE_FILTERS").as_deref() == Ok("1");
+    let mut rotate = swf::ColorMatrixFilter::default();
+    for (row, input) in [1, 2, 0].into_iter().enumerate() {
+        rotate.matrix[row * 5 + row] = 0.;
+        rotate.matrix[row * 5 + input] = 1.;
+    }
+    let filters = [
+        Filter::BlurFilter(swf::BlurFilter {
+            blur_x: swf::Fixed16::from_f32(3.5),
+            blur_y: swf::Fixed16::from_f32(2.5),
+            flags: swf::BlurFilterFlags::from_passes(1),
+        }),
+        Filter::ColorMatrixFilter(rotate),
+    ];
+    let restricted = |invocations, storage| {
+        let mut descriptor = crate::capabilities::device_descriptor(
+            &native.adapter,
+            crate::capabilities::NativeGpuUse::SharedStage,
+        );
+        descriptor.required_features = wgpu::Features::empty();
+        let limits = &mut descriptor.required_limits;
+        limits.max_storage_textures_per_shader_stage = storage;
+        limits.max_compute_invocations_per_workgroup = invocations;
+        limits.max_compute_workgroups_per_dimension = 2;
+        let (device, queue) =
+            futures::executor::block_on(native.adapter.request_device(&descriptor)).unwrap();
+        let descriptors = Descriptors::new(
+            native.wgpu_instance.clone(),
+            native.adapter.clone(),
+            device,
+            queue,
+        )
+        .unwrap();
+        assert!(!descriptors.capabilities.timestamps);
+        Arc::new(descriptors)
+    };
+    let two_groups = restricted(64, 1);
+    for (descriptors, width, capable, dispatch) in [
+        (native.clone(), 17, requested, requested),
+        (restricted(64, 0), 16, false, false),
+        (restricted(32, 1), 16, false, false),
+        (two_groups.clone(), 16, true, requested),
+        (two_groups, 17, true, false),
+    ] {
+        assert_eq!(descriptors.capabilities.compute_rgba8, capable);
+        let height = 13;
+        let mut pixels = vec![0; (width * height * 4) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                if x < 2 || x >= 9 {
+                    let offset = ((y * width + x) * 4) as usize;
+                    pixels[offset..offset + 4].copy_from_slice(&[120, 0, 0, 128]);
+                }
+            }
+        }
+        let results =
+            render_filter_chain_with_stage(&descriptors, &filters, pixels, width, height, |draw| {
+                let mut stage = CommandList::new();
+                rect(
+                    &mut stage,
+                    0.,
+                    7.,
+                    width as f32,
+                    6.,
+                    Color::from_rgb(0x173305, 255),
+                );
+                stage.push_mask();
+                rect(&mut stage, 0., 0., 11., 13., Color::WHITE);
+                stage.activate_mask();
+                stage.blend(draw, RenderBlendMode::Builtin(BlendMode::Add));
+                stage.deactivate_mask();
+                rect(&mut stage, 0., 0., 11., 13., Color::WHITE);
+                stage.pop_mask();
+                stage
+            });
+        let (image, work) = &results[1];
+        assert_eq!(&results[0].0, image);
+        assert_eq!(results[0].1.compute_filter_passes, 0);
+        assert_eq!(work.compute_filter_passes, u64::from(dispatch));
+        assert!(work.filter_kind_blur > 0);
+        assert_eq!(work.filter_kind_color_matrix, 1);
+        let pixel = |x, y| -> [u8; 4] {
+            let offset = ((y * width + x) * 4u32) as usize;
+            image[offset..offset + 4].try_into().unwrap()
+        };
+        let [r, g, blue, alpha] = pixel(0, 0);
+        assert_eq!([r, g], [0, 0]);
+        assert!(blue > 0 && (1..128).contains(&alpha));
+        assert_eq!(pixel(5, 4), [0; 4]);
+        assert!(pixel(10, 4)[3] > 0);
+        assert_eq!(pixel(11, 4), [0; 4]);
+        let [r, g, blue, alpha] = pixel(10, 8);
+        assert_eq!([r, g, alpha], [23, 51, 255]);
+        assert!(blue > 5);
+        assert_eq!(pixel(11, 8), [23, 51, 5, 255]);
+        let limits = descriptors.device.limits();
+        eprintln!(
+            "{width}x{height} storage={} invocations={} groups={} timestamps={} compute_rgba8={capable} compute_passes={} edge={:?} blend={:?} masked={:?}",
+            limits.max_storage_textures_per_shader_stage,
+            limits.max_compute_invocations_per_workgroup,
+            limits.max_compute_workgroups_per_dimension,
+            descriptors.capabilities.timestamps,
+            work.compute_filter_passes,
+            pixel(0, 0),
+            pixel(10, 8),
+            pixel(11, 8)
+        );
+    }
 }
 
 #[test]
@@ -3491,7 +4170,7 @@ fn filter_chain_preserves_fractional_blur_halos_at_image_edges() {
     for (x, y) in [(0, 0), (0, 15), (15, 31), (31, 31), (16, 16)] {
         pixels[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4].copy_from_slice(&[255; 4]);
     }
-    let results = render_filter_chain_test(&filters, pixels, 32, 32);
+    let results = render_filter_chain_test(&gpu(), &filters, pixels, 32, 32);
     assert_eq!(results[0].0, results[1].0);
     assert!(results[1].0[3] > 0, "edge contribution must survive");
 }
@@ -3708,6 +4387,31 @@ fn compatible_sparse_regions_share_one_submission_and_preserve_row_offsets() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn owned_stage_capture_records_one_sample_per_phase_before_submission() {
+    use ruffle_render::profile::{NativePhase, RenderMetrics, enter};
+
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (2, 2)).unwrap();
+    let mut renderer = WgpuRenderBackend::new(descriptors, target).unwrap();
+    assert!(renderer.prepare_frame().unwrap());
+    let metrics = RenderMetrics::default();
+    let _scope = enter(Some(&metrics));
+    let packet = renderer
+        .try_capture_stage_packet(Color::BLACK, CommandList::new(), vec![])
+        .unwrap()
+        .unwrap();
+    let captured = metrics.snapshot();
+    renderer.submit_stage_packet(packet).unwrap();
+    let submitted = metrics.snapshot();
+    for name in ["stageCacheEncode", "stageSnapshotCapture"] {
+        let i = NativePhase::NAMES.iter().position(|&n| n == name).unwrap();
+        assert_eq!(captured.native_timings[i].samples, 1, "{name}");
+        assert_eq!(submitted.native_timings[i].samples, 1, "{name}");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn packets_order_bitmap_creation_reads_and_the_last_release() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion};
     use std::num::NonZeroU32;
@@ -3863,15 +4567,18 @@ fn realtime_packet_pressure_defers_and_oversized_draws_recover_on_a_shared_devic
             .is_none()
     );
     renderer.discard_frame();
-    drop(blocked);
+    let mut observed = Vec::new();
     renderer
         .read_bitmap_region(
             &cache,
             PixelRegion::for_whole_size(1, 1),
-            Box::new(|bytes, _| assert_eq!(&bytes[..4], &[255, 0, 0, 255])),
+            Box::new(|bytes, _| observed.extend_from_slice(&bytes[..4])),
         )
         .unwrap()
         .unwrap();
+    assert_eq!(observed, [255, 0, 0, 255]);
+    assert_eq!(descriptors.runtime.stats().queued_frame_bytes, 8192);
+    drop(blocked);
     let bitmap = other
         .register_bitmap(Bitmap::new(1, 1, BitmapFormat::Rgba, vec![1, 2, 3, 255]))
         .unwrap();
@@ -4033,6 +4740,496 @@ fn detached_stage3d_frame_keeps_pixels_when_the_independent_encoder_reuses_its_t
     renderer.submit_stage_packet(packet).unwrap();
     let image = renderer.capture_frame().unwrap().unwrap();
     assert_eq!(image.get_pixel(1, 1).0, [255, 0, 0, 255]);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn detached_stage_precedes_a_readback_reserved_before_worker_dispatch() {
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (2, 1)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
+    let mut copy = descriptors
+        .device
+        .create_command_encoder(&Default::default())
+        .unwrap();
+    renderer.target().encode_readback(&mut copy);
+    let copy = copy.finish().unwrap();
+
+    let packet = renderer
+        .capture_stage_packet(Color::RED, CommandList::new(), vec![])
+        .unwrap();
+    assert!(renderer.prepare_frame().unwrap());
+    let (stage, _frame) = renderer.encode_stage_packet(packet).unwrap();
+    let read = descriptors.queue.reserve_submission().unwrap();
+    let reader = std::thread::spawn(move || read.submit([copy]).unwrap());
+    let index = stage.submit().unwrap();
+    renderer.confirm_stage_submission(index).unwrap();
+    reader.join().unwrap();
+    assert_eq!(
+        renderer.capture_frame().unwrap().unwrap().into_raw(),
+        [255, 0, 0, 255].repeat(2)
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter; run with ordinary, statistics and coverage modes"]
+fn native_pass_diagnostics_calibrate_layers_and_msaa() {
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (64, 48)).unwrap();
+    let mut renderer = WgpuRenderBackend::new(descriptors.clone(), target).unwrap();
+    let metrics = ruffle_render::profile::RenderMetrics::default();
+    let _scope = ruffle_render::profile::enter(Some(&metrics));
+    let mode = std::env::var("RUFFLE_GPU_PASS_DIAGNOSTICS").unwrap_or_default();
+    let mut frame = 0;
+    for quality in [StageQuality::Low, StageQuality::High] {
+        renderer.set_quality(quality).unwrap();
+        let mut previous = 0.;
+        for layers in [1, 4] {
+            let mut draws = CommandList::new();
+            for _ in 0..layers {
+                rect(&mut draws, 0., 0., 64., 48., Color::RED);
+            }
+            renderer.submit_frame(Color::BLACK, draws, vec![]).unwrap();
+            let image = renderer.capture_frame().unwrap().unwrap();
+            assert!(image.pixels().all(|p| p.0 == [255, 0, 0, 255]));
+            frame += 1;
+            let (_, _, samples) = renderer.last_stage_attachment().unwrap();
+            assert_eq!(samples, renderer.sample_count());
+            let rows = descriptors.device.take_pass_diagnostics();
+            eprintln!("calibration frame={frame} layers={layers} samples={samples} rows={rows:?}");
+            if mode.is_empty() {
+                assert!(rows.is_empty());
+                continue;
+            }
+            let stage: Vec<_> = rows.iter().filter(|r| r.kind == "stage").collect();
+            assert_eq!(stage.len(), 1);
+            let r = stage[0];
+            assert_eq!(
+                (r.frame_id, r.width, r.height, r.sample_count),
+                (Some(frame), 64, 48, samples)
+            );
+            assert_eq!(r.resolve, samples > 1);
+            assert!(r.end_ns.unwrap() >= r.start_ns.unwrap());
+            let count = if let Some(coverage) = r.coverage_pixels {
+                assert_eq!(coverage, f64::from(64 * 48 * layers));
+                coverage
+            } else {
+                assert_ne!(mode, "coverage");
+                r.fragment_invocations.unwrap() as f64
+            };
+            if layers == 1 {
+                assert!(count >= 64. * 48.);
+                previous = count;
+            } else {
+                assert!((count / previous - 4.).abs() < 0.1);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn native_pass_diagnostics_without_hardware_queries() {
+    let native = gpu();
+    let mut desc = crate::capabilities::device_descriptor(
+        &native.adapter,
+        crate::capabilities::NativeGpuUse::SharedStage,
+    );
+    desc.required_features = wgpu::Features::empty();
+    let (device, queue) =
+        futures::executor::block_on(native.adapter.request_device(&desc)).unwrap();
+    let descriptors = Arc::new(
+        Descriptors::new(
+            native.wgpu_instance.clone(),
+            native.adapter.clone(),
+            device,
+            queue,
+        )
+        .unwrap(),
+    );
+    let target = TextureTarget::new(&descriptors.device, (11, 9)).unwrap();
+    let mut renderer = WgpuRenderBackend::new(descriptors.clone(), target).unwrap();
+    renderer.set_quality(StageQuality::Low).unwrap();
+    let mut draws = CommandList::new();
+    rect(&mut draws, 0., 0., 11., 9., Color::RED);
+    rect(&mut draws, 3., 2., 4., 5., Color::WHITE);
+    renderer.submit_frame(Color::BLACK, draws, vec![]).unwrap();
+    let image = renderer.capture_frame().unwrap().unwrap();
+    assert_eq!(image.pixels().filter(|p| p.0 == [255; 4]).count(), 20);
+    let rows = descriptors.device.take_pass_diagnostics();
+    eprintln!("no hardware queries rows={rows:?}");
+    if crate::gpu_resources::diagnostics::requested().is_some() {
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            (row.start_ns, row.end_ns, row.fragment_invocations),
+            (None, None, None)
+        );
+        assert_eq!(
+            (row.method, row.status, row.coverage_pixels),
+            ("additive-coverage", "ok", Some(119.))
+        );
+    } else {
+        assert!(rows.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn native_pass_diagnostics_attribute_filter_work() {
+    use ruffle_render::filters::Filter;
+    let descriptors = gpu();
+    let filters = [
+        Filter::BlurFilter(swf::BlurFilter {
+            blur_x: swf::Fixed16::from_f32(3.),
+            blur_y: swf::Fixed16::from_f32(3.),
+            flags: swf::BlurFilterFlags::from_passes(1),
+        }),
+        Filter::ColorMatrixFilter(swf::ColorMatrixFilter::default()),
+    ];
+    let results = render_filter_chain_test(
+        &descriptors,
+        &filters,
+        [37, 91, 123, 255].repeat(17 * 13),
+        17,
+        13,
+    );
+    assert_eq!(results[0].0, results[1].0);
+    let rows = descriptors.device.take_pass_diagnostics();
+    eprintln!("filter fixture rows={rows:?}");
+    if crate::gpu_resources::diagnostics::requested().is_none() {
+        assert!(rows.is_empty());
+        return;
+    }
+    assert!(rows.iter().any(|r| r.kind == "offscreen"));
+    let filter: Vec<_> = rows.iter().filter(|r| r.kind == "filter").collect();
+    let expected: u64 = results.iter().map(|(_, work)| work.filter_passes).sum();
+    assert_eq!(filter.len() as u64, expected);
+    assert!(filter.iter().any(|r| r.filter == Some("BlurFilter")));
+    assert!(filter.iter().any(|r| r.filter == Some("ColorMatrixFilter")));
+    assert_eq!(
+        filter.iter().filter(|r| r.pass == "compute").count() as u64,
+        results
+            .iter()
+            .map(|(_, w)| w.compute_filter_passes)
+            .sum::<u64>()
+    );
+    for r in filter {
+        assert_eq!((r.width, r.height), (17, 13));
+        assert_eq!(r.status, "ok");
+        assert!(r.end_ns.unwrap() >= r.start_ns.unwrap());
+        assert_eq!(
+            r.fragment_invocations.is_some() || r.coverage_pixels.is_some(),
+            r.pass == "raster"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn stage_render_scale_projects_the_full_viewport_into_the_native_attachment() {
+    use ruffle_render::backend::ViewportDimensions;
+
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (65, 39)).unwrap();
+    let mut renderer = WgpuRenderBackend::new(descriptors, target).unwrap();
+    let viewport = ViewportDimensions {
+        width: 65,
+        height: 39,
+        scale_factor: 1.5,
+    };
+    renderer.set_viewport_dimensions(viewport).unwrap();
+    assert!(renderer.last_stage_attachment().is_none());
+    assert!(renderer.set_stage_render_scale_percent(66).is_err());
+    let mut geometry = CommandList::new();
+    for _ in 0..64 {
+        rect(&mut geometry, 40., 20., 32., 24., Color::RED);
+    }
+    geometry.draw_rect(
+        Color::WHITE,
+        Matrix {
+            a: 18.,
+            b: 7.,
+            d: 7.,
+            ..Matrix::IDENTITY
+        },
+    );
+    let mut graph = CommandList::new();
+    graph.blend(geometry.clone(), RenderBlendMode::Builtin(BlendMode::Layer));
+
+    for (percent, width, height) in [
+        (50, 33, 20),
+        (67, 44, 26),
+        (75, 49, 29),
+        (85, 55, 33),
+        (100, 65, 39),
+    ] {
+        renderer.set_stage_render_scale_percent(percent).unwrap();
+        for quality in [StageQuality::Low, StageQuality::High] {
+            renderer.set_quality(quality).unwrap();
+            let samples = renderer.sample_count();
+            assert_eq!(samples, if quality == StageQuality::Low { 1 } else { 4 });
+            for commands in [&geometry, &graph] {
+                renderer
+                    .submit_frame(Color::BLACK, commands.clone(), vec![])
+                    .unwrap();
+                let image = renderer.capture_frame().unwrap().unwrap();
+                let attachment = &renderer.target().texture;
+                assert_eq!(
+                    renderer.last_stage_attachment(),
+                    Some((width, height, samples))
+                );
+                assert_eq!(
+                    (attachment.width(), attachment.height()),
+                    (width, height),
+                    "{percent}% native resolve attachment"
+                );
+                assert_eq!(attachment.sample_count(), 1);
+                assert_eq!(image.dimensions(), (width, height));
+                let logical = renderer.viewport_dimensions();
+                assert_eq!(
+                    (logical.width, logical.height, logical.scale_factor),
+                    (65, 39, 1.5)
+                );
+                assert_eq!(image.get_pixel(width - 1, height - 1).0, [255, 0, 0, 255]);
+                assert_eq!(image.get_pixel(width / 2, height - 1).0, [0, 0, 0, 255]);
+                assert_eq!(
+                    image.pixels().any(|p| (1..255).contains(&p[1])),
+                    samples > 1,
+                    "{percent}% resolved diagonal"
+                );
+                let packet = renderer
+                    .capture_stage_packet(Color::BLACK, commands.clone(), vec![])
+                    .unwrap();
+                assert!(renderer.prepare_frame().unwrap());
+                renderer.submit_stage_packet(packet).unwrap();
+                assert_eq!(
+                    renderer.last_stage_attachment(),
+                    Some((width, height, samples))
+                );
+                assert_eq!(renderer.capture_frame().unwrap().unwrap(), image);
+            }
+            eprintln!("stage {percent}% {width}x{height} samples={samples}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn stage_render_scale_keeps_hairlines_in_the_same_place_on_graph_and_direct_routes() {
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (64, 32)).unwrap();
+    let mut renderer = WgpuRenderBackend::new(descriptors, target).unwrap();
+    renderer.set_stage_render_scale_percent(50).unwrap();
+    renderer.set_quality(StageQuality::High).unwrap();
+    let mut lines = CommandList::new();
+    let matrix = Matrix::create_box(26., 12., Twips::from_pixels(21.5), Twips::from_pixels(7.5));
+    lines.draw_line_rect(Color::WHITE, matrix);
+    lines.draw_line(Color::RED, matrix);
+    let mut direct = lines.clone();
+    for _ in 0..64 {
+        rect(&mut direct, -20., -20., 1., 1., Color::RED);
+    }
+    renderer.submit_frame(Color::BLACK, direct, vec![]).unwrap();
+    let reference = renderer.capture_frame().unwrap().unwrap();
+    renderer.submit_frame(Color::BLACK, lines, vec![]).unwrap();
+    let image = renderer.capture_frame().unwrap().unwrap();
+    assert_eq!(
+        image
+            .pixels()
+            .zip(reference.pixels())
+            .filter(|(a, b)| a != b)
+            .count(),
+        0
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn stage_render_scale_preserves_offscreen_pixels_and_composes_a_bounded_mask() {
+    use ruffle_render::backend::{BitmapCacheEntry, ViewportDimensions};
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use std::num::NonZeroU32;
+
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (40, 24)).unwrap();
+    let mut renderer = WgpuRenderBackend::new(descriptors, target).unwrap();
+    renderer.set_stage_render_scale_percent(50).unwrap();
+    renderer
+        .set_viewport_dimensions(ViewportDimensions {
+            width: 64,
+            height: 32,
+            scale_factor: 2.0,
+        })
+        .unwrap();
+    renderer.set_quality(StageQuality::High).unwrap();
+
+    let region = PixelRegion::for_whole_size(48, 16);
+    let bitmap = renderer
+        .register_bitmap(Bitmap::new(
+            48,
+            16,
+            BitmapFormat::Rgba,
+            vec![0; 48 * 16 * 4],
+        ))
+        .unwrap();
+    let mut content = CommandList::new();
+    rect(&mut content, 32., 0., 16., 16., Color::RED);
+    let sync = renderer
+        .render_offscreen(bitmap.clone(), content, StageQuality::Low, region)
+        .unwrap()
+        .unwrap();
+    renderer
+        .resolve_sync_handle(
+            sync,
+            Box::new(|bytes, stride| {
+                for y in 0..16 {
+                    let row = &bytes[y * stride as usize..][..48 * 4];
+                    assert!(row[..32 * 4].iter().all(|&v| v == 0));
+                    assert_eq!(row[32 * 4..], [255, 0, 0, 255].repeat(16));
+                }
+            }),
+        )
+        .unwrap();
+
+    let cache = renderer
+        .create_bitmap_cache(NonZeroU32::new(48).unwrap(), NonZeroU32::new(16).unwrap())
+        .unwrap();
+    let mut cache_commands = CommandList::new();
+    cache_commands.render_bitmap(
+        bitmap,
+        Default::default(),
+        false,
+        PixelSnapping::Never,
+        region,
+    );
+    let mut stage = CommandList::new();
+    stage.render_bitmap(
+        cache.clone(),
+        Default::default(),
+        false,
+        PixelSnapping::Always,
+        region,
+    );
+    renderer
+        .submit_frame(
+            Color::BLACK,
+            stage.clone(),
+            vec![BitmapCacheEntry {
+                handle: cache,
+                clear: Color::TRANSPARENT,
+                commands: cache_commands,
+                filters: vec![],
+            }],
+        )
+        .unwrap();
+    assert_eq!(renderer.last_stage_attachment(), Some((32, 16, 4)));
+    let image = renderer.capture_frame().unwrap().unwrap();
+    assert_eq!(image.get_pixel(16, 6).0, [255, 0, 0, 255]);
+    assert_eq!(image.get_pixel(24, 6).0, [0, 0, 0, 255]);
+
+    let mut mask = CommandList::new();
+    rect(&mut mask, 40., 4., 10., 8., Color::WHITE);
+    let mut masked = CommandList::new();
+    masked.render_alpha_mask(stage.clone(), mask);
+    let packet = renderer
+        .capture_stage_packet(Color::BLACK, masked, vec![])
+        .unwrap();
+    assert!(renderer.prepare_frame().unwrap());
+    renderer.submit_stage_packet(packet).unwrap();
+    let image = renderer.capture_frame().unwrap().unwrap();
+    for (x, y, pixel) in image.enumerate_pixels() {
+        let expected = if (20..24).contains(&x) && (2..6).contains(&y) {
+            [255, 0, 0, 255]
+        } else {
+            [0, 0, 0, 255]
+        };
+        assert_eq!(pixel.0, expected, "masked pixel ({x},{y})");
+    }
+
+    renderer.set_stage_render_scale_percent(100).unwrap();
+    renderer.submit_frame(Color::BLACK, stage, vec![]).unwrap();
+    assert_eq!(
+        renderer.last_stage_attachment(),
+        Some((64, 32, 1)),
+        "aligned caches can bypass MSAA"
+    );
+    assert_eq!(renderer.sample_count(), 4);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn stage_work_matches_direct_pixels_for_graph_and_fast_paths() {
+    use crate::render_snapshot::StageDrawRoute;
+    use ruffle_render::backend::BitmapCacheEntry;
+    use ruffle_render::bitmap::{PixelRegion, PixelSnapping};
+    use std::num::NonZeroU32;
+
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (16, 8)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let size = NonZeroU32::new(4).unwrap();
+    let cache = renderer.create_bitmap_cache(size, size).unwrap();
+    renderer
+        .submit_frame(
+            Color::BLACK,
+            CommandList::new(),
+            vec![BitmapCacheEntry {
+                handle: cache.clone(),
+                clear: Color::RED,
+                commands: CommandList::new(),
+                filters: vec![],
+            }],
+        )
+        .unwrap();
+    let mut aligned = CommandList::new();
+    aligned.render_bitmap(
+        cache,
+        Default::default(),
+        false,
+        PixelSnapping::Never,
+        PixelRegion::for_whole_size(4, 4),
+    );
+    let mut resident = CommandList::new();
+    for _ in 0..64 {
+        rect(&mut resident, 0., 0., 4., 4., Color::RED);
+    }
+    let mut graph = CommandList::new();
+    graph.blend(resident.clone(), RenderBlendMode::Builtin(BlendMode::Layer));
+
+    for (commands, route) in [
+        (graph, StageDrawRoute::Graph),
+        (aligned, StageDrawRoute::AlignedBitmaps),
+        (resident, StageDrawRoute::Resident),
+    ] {
+        renderer
+            .submit_frame(Color::WHITE, commands.clone(), vec![])
+            .unwrap();
+        let reference = renderer.capture_frame().unwrap().unwrap();
+        assert_eq!(reference.get_pixel(1, 1).0, [255, 0, 0, 255]);
+        assert_eq!(reference.get_pixel(8, 4).0, [255; 4]);
+        for threaded in [false, true] {
+            renderer
+                .submit_frame(Color::BLUE, CommandList::new(), vec![])
+                .unwrap();
+            assert!(renderer.prepare_frame().unwrap());
+            let packet = renderer
+                .capture_stage_packet(Color::WHITE, commands.clone(), vec![])
+                .unwrap();
+            let draw = packet.draw.as_ref().as_ref().unwrap();
+            assert_eq!(draw.route, route);
+            let (mut work, _frame) = renderer.encode_stage_packet(packet).unwrap();
+            renderer.target().encode_readback(work.encoder());
+            let submit = move || work.submit().unwrap();
+            let index = if threaded {
+                std::thread::spawn(submit).join().unwrap()
+            } else {
+                submit()
+            };
+            renderer.confirm_stage_submission(index).unwrap();
+            assert_eq!(renderer.capture_frame().unwrap().unwrap(), reference);
+        }
+    }
 }
 
 #[test]
@@ -4227,6 +5424,57 @@ fn a_shared_device_cannot_resolve_another_sessions_unsubmitted_bitmap_write() {
         )
         .unwrap()
         .unwrap();
+    let submitted = producer.register_bitmap(pixels([4, 5, 6, 255])).unwrap();
+    let held_read = producer
+        .copy_bitmap_region(target.clone(), region, submitted.clone(), region)
+        .unwrap()
+        .unwrap();
+    producer
+        .read_bitmap_region(
+            &submitted,
+            region,
+            Box::new(|bytes, _| assert_eq!(&bytes[..4], [255, 0, 0, 255])),
+        )
+        .unwrap()
+        .unwrap();
+    // The next write stays in the producer's encoder when that session closes.
+    let unsubmitted = producer.register_bitmap(pixels([0, 255, 0, 255])).unwrap();
+    let abandoned = producer
+        .copy_bitmap_region(unsubmitted, region, target.clone(), region)
+        .unwrap()
+        .unwrap();
+    drop(producer);
+    assert!(
+        other
+            .resolve_sync_handle(abandoned, Box::new(|_, _| called.set(true)))
+            .is_err()
+    );
+    assert!(
+        other
+            .read_bitmap_region(&target, region, Box::new(|_, _| called.set(true)))
+            .is_err(),
+        "closed writer exposed the previous version"
+    );
+    other
+        .update_texture(&submitted, pixels([0, 0, 255, 255]), region)
+        .expect("closed reader blocked a submitted bitmap");
+    let mut observed = Vec::new();
+    other
+        .read_bitmap_region(
+            &submitted,
+            region,
+            Box::new(|bytes, _| observed.extend_from_slice(&bytes[..8])),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed, [0, 0, 255, 255].repeat(2));
+    assert!(
+        other
+            .resolve_sync_handle(held_read, Box::new(|_, _| called.set(true)))
+            .is_err()
+    );
+    assert!(!called.get());
+    descriptors.runtime.check_health().unwrap();
 }
 
 #[test]
@@ -4257,6 +5505,7 @@ fn a_live_bitmap_read_keeps_the_requested_version_across_later_writes() {
         .copy_bitmap_region(red.clone(), area, dest.clone(), area)
         .unwrap()
         .unwrap();
+    assert!(old.can_read_current_without_token(&dest));
     let full = PixelRegion::for_whole_size(4, 1);
     renderer
         .update_texture(
@@ -4265,6 +5514,10 @@ fn a_live_bitmap_read_keeps_the_requested_version_across_later_writes() {
             full,
         )
         .unwrap();
+    assert!(
+        !old.can_read_current_without_token(&dest),
+        "overwritten token lost its version"
+    );
     let middle = renderer
         .copy_bitmap_region(
             dest.clone(),
@@ -4774,7 +6027,28 @@ fn bitmap_cache_filtered_dirty_halo_matches_full_redraw_at_edges_and_with_msaa()
                             .unwrap();
                         renderer.capture_frame().unwrap().unwrap().into_raw()
                     };
-                let actual = render(&mut renderer, cache.clone());
+                let metrics = ruffle_render::profile::RenderMetrics::default();
+                let actual = {
+                    let _scope = ruffle_render::profile::enter(Some(&metrics));
+                    render(&mut renderer, cache.clone())
+                };
+                if step > 0 {
+                    let work = metrics.snapshot().work;
+                    assert!(
+                        (1..96 * 96).contains(&work.offscreen_pixels),
+                        "filter {filter_index}, quality {quality:?}, step {step}: rasterized {} pixels",
+                        work.offscreen_pixels
+                    );
+                    assert_eq!(
+                        (
+                            work.filter_cache_direct_outputs,
+                            work.filter_cache_draw_copies,
+                            work.filter_cache_transfers
+                        ),
+                        (0, 0, 0),
+                        "filter {filter_index}, quality {quality:?}, step {step}: full-cache writeback"
+                    );
+                }
                 let mut reference = WgpuRenderBackend::with_options(
                     descriptors.clone(),
                     TextureTarget::new(&descriptors.device, (96, 96)).unwrap(),

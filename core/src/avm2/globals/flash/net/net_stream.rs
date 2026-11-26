@@ -53,6 +53,17 @@ pub fn play<'gc>(
     Ok(Value::Undefined)
 }
 
+pub fn close<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    if let Some(ns) = this.as_object().unwrap().as_netstream() {
+        ns.close(activation.context);
+    }
+    Ok(Value::Undefined)
+}
+
 pub fn pause<'gc>(
     activation: &mut Activation<'_, 'gc>,
     this: Value<'gc>,

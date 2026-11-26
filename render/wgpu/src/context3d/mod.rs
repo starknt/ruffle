@@ -82,18 +82,7 @@ pub struct WgpuContext3D {
     vertex_attributes: [Option<VertexAttributeInfo>; MAX_VERTEX_ATTRIBUTES],
 
     buffer_command_encoder: crate::gpu_resources::CommandEncoder,
-    // We may re-create `render_pass` multiple times while processing
-    // `commands`. If we do, then we only want to perform a clear if there
-    // was an explicit `Clear` command. Otherwise, we want to preserve the
-    // contents of the previous render pass.
-    //
-    // This variable gets set to `Some` when we encounter a `Clear` command,
-    // and then gets set to `None` when we create a new render pass.
-    clear_color: Option<ClearColor>,
-    // After a call to 'present()', the Context3D API requires a call to 'clear'
-    // before any new calls to 'drawTriangles'. This tracks whether we've
-    // seen a `Context3DCommand::Clear` so far. Note that this is separate from
-    // `clear_color`, which may be `None` even if we've seen a `Clear` command.
+    // Flash requires a clear between present() and the next drawTriangles().
     seen_clear_command: bool,
 
     scissor_rectangle: Option<Rectangle<Twips>>,
@@ -197,7 +186,6 @@ impl WgpuContext3D {
             front_buffer_resolve_texture_view: None,
 
             buffer_command_encoder,
-            clear_color: None,
             seen_clear_command: false,
             scissor_rectangle: None,
         })
@@ -243,8 +231,7 @@ impl WgpuContext3D {
         height: u32,
         sample_count: u32,
     ) -> Result<TextureView, crate::gpu_runtime::RenderFailure> {
-        Ok(self
-            .descriptors
+        self.descriptors
             .device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("Context3D depth texture"),
@@ -260,7 +247,7 @@ impl WgpuContext3D {
                 view_formats: &[wgpu::TextureFormat::Depth24PlusStencil8],
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             })?
-            .create_view(&Default::default())?)
+            .create_view(&Default::default())
     }
 
     // This restores rendering to our normal buffer. It can be triggered explicitly
@@ -279,14 +266,35 @@ impl WgpuContext3D {
             .update_target_format(TextureFormat::Rgba8Unorm);
     }
 
-    fn make_render_pass<'a>(
-        &'a mut self,
+    // Append the render pass after all uploads already staged for this context.
+    fn take_render_encoder(&mut self) -> Result<CommandEncoder, crate::gpu_runtime::RenderFailure> {
+        let next = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: create_debug_label!("Buffer command encoder").as_deref(),
+            })?;
+        self.buffer_staging_belt.finish();
+        Ok(std::mem::replace(&mut self.buffer_command_encoder, next))
+    }
+
+    fn submit_render_pass(
+        &mut self,
+        encoder: CommandEncoder,
+        writes_color: bool,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.descriptors.queue.submit([encoder.finish()?])?;
+        self.buffer_staging_belt.recall();
+        if writes_color && self.current_texture_view == self.back_buffer_texture_view {
+            crate::record_bitmap_write(&self.back_buffer_raw_texture_handle)?;
+        }
+        Ok(())
+    }
+
+    fn begin_target_pass<'a>(
+        &self,
         command_encoder: &'a mut CommandEncoder,
+        clear_color: Option<ClearColor>,
     ) -> RenderPass<'a> {
-        // Subsequent draw calls (without an intermediate 'clear()' call)
-        // will use a clear color of None. This ensures that by itself,
-        // re-creating the render pass has no effect on the output
-        let clear_color = self.clear_color.take();
         let color_load = match clear_color {
             Some(clear) if clear.mask & COLOR_MASK != 0 => wgpu::LoadOp::Clear(clear.rgb),
             _ => wgpu::LoadOp::Load,
@@ -318,7 +326,7 @@ impl WgpuContext3D {
             None
         };
 
-        let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Context3D render pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: self.current_texture_view.as_ref().unwrap(),
@@ -334,7 +342,10 @@ impl WgpuContext3D {
             })],
             depth_stencil_attachment,
             ..Default::default()
-        });
+        })
+    }
+
+    fn bind_draw_state(&mut self, pass: &mut RenderPass<'_>) {
         if let Some(bind_group) = self.bind_group.as_ref() {
             pass.set_bind_group(0, (bind_group).raw(), &[]);
         }
@@ -381,7 +392,6 @@ impl WgpuContext3D {
                 i += 1;
             }
         }
-        pass
     }
 }
 
@@ -461,7 +471,7 @@ impl Context3D for WgpuContext3D {
         let size = (u64::from(num_indices) * 2).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
         let buffer = self.device.create_buffer(&BufferDescriptor {
             label: None,
-            size: size as u64,
+            size,
             usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })?;
@@ -613,17 +623,25 @@ impl Context3D for WgpuContext3D {
                 stencil,
                 mask,
             } => {
-                self.clear_color = Some(ClearColor {
-                    rgb: wgpu::Color {
-                        r: red,
-                        g: green,
-                        b: blue,
-                        a: alpha,
-                    },
-                    mask,
-                    depth: depth as f32,
-                    stencil,
-                });
+                let writes_color = mask & COLOR_MASK != 0;
+                let writes_depth_stencil = self.current_depth_texture_view.is_some()
+                    && mask & (DEPTH_MASK | STENCIL_MASK) != 0;
+                if self.current_texture_view.is_some() && (writes_color || writes_depth_stencil) {
+                    let clear = ClearColor {
+                        rgb: wgpu::Color {
+                            r: red,
+                            g: green,
+                            b: blue,
+                            a: alpha,
+                        },
+                        mask,
+                        depth: depth as f32,
+                        stencil,
+                    };
+                    let mut encoder = self.take_render_encoder()?;
+                    drop(self.begin_target_pass(&mut encoder, Some(clear)));
+                    self.submit_render_pass(encoder, writes_color)?;
+                }
                 self.seen_clear_command = true;
             }
             Context3DCommand::ConfigureBackBuffer {
@@ -736,75 +754,40 @@ impl Context3D for WgpuContext3D {
                     .map(|t| t.create_view(&Default::default()))
                     .transpose()?;
 
-                if sample_count > 1 {
-                    self.current_texture_resolve_view = Some(
-                        back_buffer_resolve_texture
-                            .as_ref()
-                            .unwrap()
-                            .create_view(&Default::default())?,
-                    );
+                self.current_texture_resolve_view = self.back_buffer_resolve_texture_view.clone();
 
-                    // We always use a non-multisampled texture as our raw texture handle,
-                    // which is what the Stage rendering code expects. In multisample mode,
-                    // this is our resolve texture.
-                    self.back_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
+                // Stage rendering samples the single-sampled resolve texture for MSAA.
+                let make_handle = |texture, view| -> Result<_, crate::gpu_runtime::RenderFailure> {
+                    Ok(BitmapHandle(Arc::new(Texture {
                         _allocation: Default::default(),
-                        view: self.back_buffer_resolve_texture_view.clone().unwrap(),
-                        texture: back_buffer_resolve_texture.unwrap(),
+                        view,
+                        texture,
                         batch_source: Default::default(),
                         repeating_linear: Default::default(),
                         repeating_nearest: Default::default(),
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
                         access: Default::default(),
-                        _lifetime: None,
+                        _lifetime: Some(self.operations.create_resource()?),
                         version: Default::default(),
-                    }));
-                    self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
-                        _allocation: Default::default(),
-                        view: self.front_buffer_resolve_texture_view.clone().unwrap(),
-                        texture: front_buffer_resolve_texture.unwrap(),
-                        batch_source: Default::default(),
-                        repeating_linear: Default::default(),
-                        repeating_nearest: Default::default(),
-                        clamped_linear: Default::default(),
-                        clamped_nearest: Default::default(),
-                        access: Default::default(),
-                        _lifetime: None,
-                        version: Default::default(),
-                    }));
-                } else {
-                    // In non-multisample mode, we don't have a separate resolve buffer,
-                    // so our main texture gets used as the raw texture handle.
-
-                    self.back_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
-                        _allocation: Default::default(),
-                        view: self.back_buffer_texture_view.clone().unwrap(),
-                        texture: back_buffer_texture,
-                        batch_source: Default::default(),
-                        repeating_linear: Default::default(),
-                        repeating_nearest: Default::default(),
-                        clamped_linear: Default::default(),
-                        clamped_nearest: Default::default(),
-                        access: Default::default(),
-                        _lifetime: None,
-                        version: Default::default(),
-                    }));
-                    self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
-                        _allocation: Default::default(),
-                        view: self.front_buffer_texture_view.clone().unwrap(),
-                        texture: front_buffer_texture,
-                        batch_source: Default::default(),
-                        repeating_linear: Default::default(),
-                        repeating_nearest: Default::default(),
-                        clamped_linear: Default::default(),
-                        clamped_nearest: Default::default(),
-                        access: Default::default(),
-                        _lifetime: None,
-                        version: Default::default(),
-                    }));
-                    self.current_texture_resolve_view = None;
-                }
+                    })))
+                };
+                self.back_buffer_raw_texture_handle = make_handle(
+                    back_buffer_resolve_texture.unwrap_or(back_buffer_texture),
+                    self.back_buffer_resolve_texture_view
+                        .as_ref()
+                        .or(self.back_buffer_texture_view.as_ref())
+                        .unwrap()
+                        .clone(),
+                )?;
+                self.front_buffer_raw_texture_handle = make_handle(
+                    front_buffer_resolve_texture.unwrap_or(front_buffer_texture),
+                    self.front_buffer_resolve_texture_view
+                        .as_ref()
+                        .or(self.front_buffer_texture_view.as_ref())
+                        .unwrap()
+                        .clone(),
+                )?;
 
                 self.current_pipeline
                     .update_has_depth_texture(depth_and_stencil);
@@ -979,30 +962,14 @@ impl Context3D for WgpuContext3D {
                     );
                 }
 
-                self.buffer_staging_belt.finish();
-                let new_encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: create_debug_label!("Buffer command encoder").as_deref(),
-                        })?;
-                let finished_buffer_command_encoder =
-                    std::mem::replace(&mut self.buffer_command_encoder, new_encoder);
-
-                // Note - we need to unconditionally re-create the render pass, since we had to submit the
-                // buffer command encoder above.
-
                 if let Some((new_pipeline, new_bind_group)) = new_pipeline {
                     self.compiled_pipeline = Some(new_pipeline);
                     self.bind_group = Some(new_bind_group);
                 }
 
-                let mut render_command_encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: create_debug_label!("Render command encoder").as_deref(),
-                        })?;
-
-                let mut render_pass = self.make_render_pass(&mut render_command_encoder);
+                let mut encoder = self.take_render_encoder()?;
+                let mut render_pass = self.begin_target_pass(&mut encoder, None);
+                self.bind_draw_state(&mut render_pass);
 
                 render_pass
                     .set_index_buffer(index_buffer.buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -1011,18 +978,8 @@ impl Context3D for WgpuContext3D {
                     render_pass.draw_indexed(indices, 0, 0..1);
                 }
 
-                // A `RenderPass` needs to hold references to several fields in `self`, so we can't
-                // easily re-use it across multiple `DrawTriangles` calls.
                 drop(render_pass);
-
-                self.descriptors.queue.submit([
-                    finished_buffer_command_encoder.finish()?,
-                    render_command_encoder.finish()?,
-                ])?;
-                self.buffer_staging_belt.recall();
-                if self.current_texture_view == self.back_buffer_texture_view {
-                    crate::record_bitmap_write(&self.back_buffer_raw_texture_handle)?;
-                }
+                self.submit_render_pass(encoder, can_draw)?;
             }
 
             Context3DCommand::SetVertexBufferAt {
@@ -1282,7 +1239,6 @@ impl Context3D for WgpuContext3D {
 
         self.set_render_to_back_buffer();
         self.seen_clear_command = false;
-        self.clear_color = None;
         let _ = self.operations.record();
     }
 }

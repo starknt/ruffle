@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, Write};
 use std::sync::{Arc, Mutex, mpsc};
 
-type WriteJob = (Bytes, oneshot::Sender<io::Result<File>>);
+type WriteJob = (Bytes, mpsc::SyncSender<io::Result<File>>);
 
 #[derive(Clone, Default)]
 pub(super) struct SnapshotWriter {
@@ -16,7 +16,7 @@ pub(super) struct SnapshotWriter {
 }
 
 impl SnapshotWriter {
-    fn store(&self, bytes: Bytes) -> io::Result<oneshot::Receiver<io::Result<File>>> {
+    fn store(&self, bytes: Bytes) -> io::Result<File> {
         let writer = {
             let mut current = self.sender.lock().unwrap();
             if current.is_none() {
@@ -28,27 +28,28 @@ impl SnapshotWriter {
                     .name("ruffle-loadbytes".into())
                     .spawn(move || {
                         for (bytes, reply) in rx {
-                            if !reply.is_canceled() {
-                                let result = (|| {
-                                    let mut file = match &directory {
-                                        Some(directory) => tempfile::tempfile_in(directory),
-                                        None => tempfile::tempfile(),
-                                    }?;
-                                    file.write_all(&bytes)?;
-                                    file.rewind()?;
-                                    Ok(file)
-                                })();
-                                let _ = reply.send(result);
-                            }
+                            let result = (|| {
+                                let mut file = match &directory {
+                                    Some(directory) => tempfile::tempfile_in(directory),
+                                    None => tempfile::tempfile(),
+                                }?;
+                                file.write_all(&bytes)?;
+                                file.rewind()?;
+                                Ok(file)
+                            })();
+                            drop(bytes);
+                            let _ = reply.send(result);
                         }
                     })?;
                 *current = Some(tx);
             }
             current.as_ref().unwrap().clone()
         };
-        let (reply, receiver) = oneshot::channel();
+        // The caller already owns this snapshot. Finish spooling before it
+        // returns to AS and can mutate or enqueue another unadmitted body.
+        let (reply, receiver) = mpsc::sync_channel(0);
         writer.send((bytes, reply)).map_err(io::Error::other)?;
-        Ok(receiver)
+        receiver.recv().map_err(io::Error::other)?
     }
 }
 
@@ -73,16 +74,20 @@ impl MovieBudgets {
         let snapshot = match reservation {
             Ok(reservation) => Ok(MovieInput {
                 bytes,
-                _reservation: reservation,
+                loader_request: None,
+                abort: None,
+                reservation: super::ByteCharge {
+                    permits: reservation,
+                    bytes: length,
+                },
             }),
             Err(_) => Err(self.spill.store(bytes)),
         };
         async move {
-            let stored = match snapshot {
+            let mut file = match snapshot {
                 Ok(input) => return Ok(input),
                 Err(stored) => stored?,
             };
-            let mut file = stored.await.map_err(io::Error::other)??;
             let reservation = input.reserve(Some(length)).await;
             let (send, receive) = oneshot::channel();
             rayon::spawn_fifo(move || {
@@ -92,7 +97,9 @@ impl MovieBudgets {
                         file.read_exact(&mut data)?;
                         Ok(MovieInput {
                             bytes: data.into(),
-                            _reservation: reservation,
+                            loader_request: None,
+                            abort: None,
+                            reservation,
                         })
                     })();
                     let _ = send.send(result);

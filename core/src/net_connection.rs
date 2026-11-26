@@ -241,7 +241,9 @@ impl<'gc> NetConnections<'gc> {
         let player = context.player_handle();
         for (handle, connection) in context.net_connections.connections.iter_mut() {
             if let Some(task) = connection.flush_pending(handle, &player) {
-                context.task_spawner.spawn(task);
+                context
+                    .load_manager
+                    .spawn_root_task(context.task_spawner, task);
             }
         }
     }
@@ -570,6 +572,10 @@ impl FlashRemoting {
             if let Ok(response_packet) = flash_lso::packet::read::parse(&response) {
                 player.lock().unwrap().update(|uc| {
                     for message in response_packet.messages {
+                        // An earlier responder can close or reconnect while handling this packet.
+                        if !uc.net_connections.connections.contains_key(self_handle) {
+                            break;
+                        }
                         if let Some(target_uri) = message.target_uri.strip_prefix('/') {
                             let mut responder = None;
                             if let Some(index) = target_uri

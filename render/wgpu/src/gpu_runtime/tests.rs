@@ -114,7 +114,10 @@ fn idle_storage_remains_unavailable_to_other_submissions_until_completed() {
     assert_eq!(gpu.stats().active_bytes, 0);
     assert_eq!(gpu.stats().idle_bytes, 8);
     assert!(!texture.is_reusable());
+    let host_sample = texture.host_sample();
     gpu.complete_submission(serial);
+    assert!(!texture.is_reusable());
+    drop(host_sample);
     assert!(texture.is_reusable());
     texture.set_idle(false);
     assert_eq!(gpu.stats().active_bytes, 8);

@@ -1,0 +1,24 @@
+outer half-alpha foot is red true
+outer opaque stem is blue true
+outer knockout clears overlap true
+inner colors the stem true
+inner masks the exterior true
+full colors both sides true
+offscreen source casts visible glow true
+outside glow bounds untouched true
+in-place subrectangle samples its neighbor true
+in-place source neighbor preserved true
+negative distance casts left true
+zero strength copies source true
+inner normal alpha 128 knockout alpha 128
+outer normal alpha 255 knockout alpha 127
+full normal alpha 255 knockout alpha 255
+full opaque first stop colors transparent pixels true
+strength scales lookup before color selection true
+opaque destination keeps red at full opacity true
+opaque identity keeps source blue true
+strength scales blurred alpha true
+fractional offset mixes alpha before strength true
+sub-twip offset reaches adjacent pixel true
+distant single pixel 1 true
+distant single pixel 3 true

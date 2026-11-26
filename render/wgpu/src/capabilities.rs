@@ -163,6 +163,14 @@ pub fn device_descriptor(
             available,
         ),
     };
+    if crate::gpu_resources::diagnostics::requested()
+        == Some(crate::gpu_resources::diagnostics::Mode::Statistics)
+    {
+        wanted |= Features::PIPELINE_STATISTICS_QUERY;
+    }
+    if adapter.get_info().backend == wgpu::Backend::Vulkan {
+        wanted |= Features::PIPELINE_CACHE;
+    }
     if BitmapDraw::requested().can_request(adapter) {
         let available = adapter.limits();
         // Match both sides of an experiment, including the optional count path.
@@ -202,6 +210,7 @@ pub fn device_descriptor(
 #[serde(rename_all = "camelCase")]
 pub struct NativeCapabilities {
     pub compute_rgba8: bool,
+    pub raster_rgba8: bool,
     pub filterable_rgba16f_storage: bool,
     pub max_compute_groups: u32,
     pub timestamps: bool,
@@ -236,15 +245,21 @@ impl NativeCapabilities {
             && limits.max_compute_workgroup_size_y >= 8
             && limits.max_compute_workgroup_size_z >= 1
             && limits.max_compute_workgroups_per_dimension > 0;
+        let rgba8 = TextureFormat::Rgba8Unorm;
+        let rgba8_usages = format_features(rgba8).allowed_usages;
         let fp16 = format_features(TextureFormat::Rgba16Float);
         let arrays = features.contains(Features::TEXTURE_BINDING_ARRAY)
             && limits.max_binding_array_elements_per_shader_stage > 0;
         let indirect = downlevel.contains(DownlevelFlags::INDIRECT_EXECUTION);
         Self {
-            compute_rgba8: compute
-                && format_features(TextureFormat::Rgba8Unorm)
-                    .allowed_usages
-                    .contains(usage),
+            compute_rgba8: compute && rgba8_usages.contains(usage),
+            raster_rgba8: limits.max_color_attachments > 0
+                && limits.max_sampled_textures_per_shader_stage > 0
+                && rgba8
+                    .target_pixel_byte_cost()
+                    .is_some_and(|cost| cost <= limits.max_color_attachment_bytes_per_sample)
+                && rgba8_usages
+                    .contains(TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT),
             filterable_rgba16f_storage: compute
                 && fp16.allowed_usages.contains(usage)
                 && fp16

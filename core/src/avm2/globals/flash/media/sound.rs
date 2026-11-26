@@ -214,10 +214,13 @@ pub fn extract<'gc>(
 /// `Sound.close`
 pub fn close<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    _this: Value<'gc>,
+    this: Value<'gc>,
     _args: FunctionArgs<'_, 'gc>,
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_method!(activation, "flash.media.Sound", "close");
+    activation
+        .context
+        .load_manager
+        .close_read(this.as_object().unwrap());
     Ok(Value::Undefined)
 }
 
@@ -291,6 +294,7 @@ pub fn load_compressed_data_from_byte_array<'gc>(
         Error::rust_error(format!("Failed to register sound from bytearray: {e:?}").into())
     })?;
 
+    activation.context.load_manager.close_read(this_object);
     let progress_evt =
         EventObject::progress_event(activation, "progress", bytes.len(), bytes.len());
 
@@ -318,6 +322,7 @@ pub fn load_pcm_from_byte_array<'gc>(
     // TODO Add proper implementation.
     //   The following line ensures proper behavior
     //   when calling load multiple times.
+    activation.context.load_manager.close_read(this_object);
     this.set_loading_state(SoundLoadingState::Loaded);
     avm2_stub_method!(activation, "flash.media.Sound", "loadPCMFromByteArray");
 

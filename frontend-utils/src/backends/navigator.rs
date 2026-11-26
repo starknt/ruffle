@@ -287,6 +287,7 @@ impl<F: TaskSpawner + 'static, I: NavigatorInterface> NavigatorBackend
         };
 
         let client = self.client.clone();
+        let loader_request = request.loader_request();
 
         match processed_url.scheme() {
             "file" => {
@@ -305,7 +306,8 @@ impl<F: TaskSpawner + 'static, I: NavigatorInterface> NavigatorBackend
 
                     let response: Box<dyn SuccessResponse> = Box::new(Response {
                         url: response_url.to_string(),
-                        response_body: ResponseBody::File(contents),
+                        loader_request,
+                        response_body: ResponseBody::File(contents.map(Into::into)),
                         text_encoding: None,
                         status: 0,
                         redirected: false,
@@ -364,6 +366,7 @@ impl<F: TaskSpawner + 'static, I: NavigatorInterface> NavigatorBackend
 
                 let response: Box<dyn SuccessResponse> = Box::new(Response {
                     url,
+                    loader_request,
                     response_body: ResponseBody::Network(Arc::new(Mutex::new(Some(response)))),
                     text_encoding,
                     status,
@@ -393,7 +396,15 @@ impl<F: TaskSpawner + 'static, I: NavigatorInterface> NavigatorBackend
             let cookie = eligible && self.cookies.cookies(&url).is_some();
             scheduler.observe(eligible, cookie);
             if eligible && (!cookie || scheduler.cache_enabled()) {
-                return scheduler.fetch(client.as_ref().clone(), self.cookies.clone(), url, reason);
+                let loader_request = request.loader_request();
+                let fetch =
+                    scheduler.fetch(client.as_ref().clone(), self.cookies.clone(), url, reason);
+                return Box::pin(async move {
+                    let mut response = fetch.await?;
+                    // Joined transfers and preloads acquire their own tag at logical delivery.
+                    response.loader_request = loader_request;
+                    Ok(Box::new(response) as Box<dyn SuccessResponse>)
+                });
             }
         }
         self.fetch(request)
@@ -542,17 +553,15 @@ impl<F: TaskSpawner + 'static, I: NavigatorInterface> NavigatorBackend
     }
 }
 
-/// Spawns a new asynchronous task in a tokio runtime, without the current executor needing to belong to tokio
+/// Runs a future on Tokio until it completes or its caller drops the returned future.
 pub async fn spawn_tokio<F>(future: F) -> F::Output
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move { sender.send(future.await) });
-    tokio::task::unconstrained(receiver)
-        .await
-        .expect("Oneshot should succeed")
+    let (task, result) = futures::FutureExt::remote_handle(future);
+    tokio::spawn(task);
+    result.await
 }
 
 #[cfg(test)]
@@ -585,7 +594,7 @@ mod tests {
     // and local IO to execute, but small enough to fail tests quickly.
     const TIMEOUT: Duration = Duration::from_secs(1);
 
-    struct TestFutureSpawner;
+    pub(super) struct TestFutureSpawner;
 
     impl TaskSpawner for TestFutureSpawner {
         fn try_spawn(
@@ -633,7 +642,9 @@ mod tests {
         };
     }
 
-    fn new_test_backend(socket_allow: bool) -> ExternalNavigatorBackend<TestFutureSpawner, ()> {
+    pub(super) fn new_test_backend(
+        socket_allow: bool,
+    ) -> ExternalNavigatorBackend<TestFutureSpawner, ()> {
         let url = Url::parse("https://example.com/path/").unwrap();
         ExternalNavigatorBackend::new(
             url.clone(),
@@ -718,6 +729,84 @@ mod tests {
         client_write
             .try_write(&mut data.as_bytes().to_vec())
             .expect("client write");
+    }
+
+    #[macro_rules_attribute::apply(async_test)]
+    async fn dropping_direct_fetch_before_headers_closes_the_request() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let (accept, addr) = start_test_server().await;
+        let mut backend = new_test_backend(false);
+        backend.client = Some(Rc::new(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        ));
+        let mut fetch = backend.fetch(Request::get(format!("http://{addr}/")));
+        assert!(futures::poll!(&mut fetch).is_pending());
+
+        let mut socket = accept.await.unwrap();
+        let read_headers = async {
+            let mut headers = BufReader::new(&mut socket).lines();
+            assert_eq!(
+                headers.next_line().await.unwrap().as_deref(),
+                Some("GET / HTTP/1.1")
+            );
+            while !headers.next_line().await.unwrap().unwrap().is_empty() {}
+        };
+        read_headers.or(async_timeout!()).await;
+        drop(fetch);
+        assert_eq!(socket.read(&mut [0]).or(async_timeout!()).await.unwrap(), 0);
+    }
+
+    #[macro_rules_attribute::apply(async_test)]
+    async fn joined_readers_share_the_buffered_allocation() {
+        use ruffle_core::backend::navigator::{FetchReason, LoaderRequest};
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let (accept, addr) = start_test_server().await;
+        let serve = async {
+            let mut socket = accept.await.unwrap();
+            let mut headers = BufReader::new(&mut socket).lines();
+            assert_eq!(
+                headers.next_line().await.unwrap().as_deref(),
+                Some("GET /image.png HTTP/1.1")
+            );
+            while !headers.next_line().await.unwrap().unwrap().is_empty() {}
+            write_server(
+                &mut socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nimage",
+            )
+            .await;
+        };
+        let mut backend = new_test_backend(false);
+        let scheduler = backend.configure_buffered_assets(|_| true);
+        let first = LoaderRequest {
+            session_generation: 7,
+            request_id: 3,
+            resource_version: 1,
+        };
+        let second = LoaderRequest {
+            request_id: 4,
+            resource_version: 2,
+            ..first
+        };
+        let load = |tag| {
+            let mut request = Request::get(format!("http://{addr}/image.png"));
+            request.set_loader_request(tag);
+            let response = backend.fetch_buffered(request, FetchReason::LoadSwf);
+            async move {
+                let response = response.await.map_err(|e| e.error).unwrap();
+                assert_eq!(response.loader_request(), Some(tag));
+                response.body_bytes().await.unwrap()
+            }
+        };
+        let (_, first, second) = futures::join!(serve, load(first), load(second));
+        assert_eq!(&first[..], b"image");
+        assert_eq!(first.as_ptr(), second.as_ptr());
+        let stats = scheduler.stats();
+        assert_eq!(stats.joined, 1);
+        assert_eq!(stats.transfers, 1);
+        assert_eq!(stats.peak_shared_bytes, first.len());
+        assert_eq!(stats.delivered, 2);
     }
 
     #[macro_rules_attribute::apply(async_test)]

@@ -1,6 +1,8 @@
 use super::*;
 use crate::gpu_runtime::{GpuBudgetConfig, ResourceKind};
 
+mod staging_pressure;
+
 fn device(limit: u64) -> Device {
     device_with_staging_budget(limit, 64 * 1024 * 1024)
 }
@@ -206,6 +208,39 @@ fn submitted_uploads_retire_only_after_gpu_completion() {
         .unwrap();
     assert_eq!(device.runtime().stats().total_bytes, 0);
     assert_eq!(device.runtime().stats().resources, 0);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn external_submissions_track_the_raw_commands_and_pending_writes() {
+    let device = device(4096);
+    let descriptor = wgpu::BufferDescriptor {
+        label: None,
+        size: 256,
+        usage: wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    };
+    let uploaded = device.create_buffer(&descriptor).unwrap();
+    let cleared = device.create_buffer(&descriptor).unwrap();
+    let queue = device.queue();
+    queue.write_buffer(&uploaded, 0, &[7; 256]).unwrap();
+    let mut encoder = device.raw().create_command_encoder(&Default::default());
+    encoder.clear_buffer(cleared.raw(), 0, None);
+    let index = queue
+        .submit_external([encoder.finish()], std::slice::from_ref(cleared.lease()))
+        .unwrap();
+    assert_eq!(device.runtime().stats().submitted, 1);
+    assert_eq!(uploaded.lease().last_submission(), 1);
+    assert_eq!(cleared.lease().last_submission(), 1);
+    drop((uploaded, cleared));
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    assert_eq!(device.runtime().stats().completed, 1);
+    assert_eq!(device.runtime().stats().total_bytes, 0);
 }
 
 #[test]
@@ -1023,9 +1058,10 @@ fn large_texture_upload_slices_padded_layers_in_the_same_operation() {
             data[start..start + 16].fill((z * 10 + y) as u8);
         }
     }
+    let mut writes = Vec::new();
     device
         .queue()
-        .write_texture(
+        .write_texture_observed(
             texture.as_image_copy(),
             &data,
             wgpu::TexelCopyBufferLayout {
@@ -1034,8 +1070,10 @@ fn large_texture_upload_slices_padded_layers_in_the_same_operation() {
                 rows_per_image: Some(7),
             },
             size,
+            |payload, staging| writes.push((payload, staging)),
         )
         .unwrap();
+    assert_eq!(writes, [(16, 256); 10]);
     assert!(
         device.runtime().stats().submitted > 0,
         "mandatory upload must submit bounded slices"
@@ -1353,8 +1391,12 @@ fn queued_stage_copy_precedes_a_later_upload_after_a_successor_is_cancelled() {
     queue.write_buffer(&source, 0, &[12; 4]).unwrap();
     let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
     encoder.copy_buffer_to_buffer(&source, 0, &saved, 0, 4);
-    let turn = queue.reserve_submission().unwrap();
-    let successor = queue.reserve_submission().unwrap();
+    let stage = encoder.into_stage_work().unwrap();
+    let successor = device
+        .create_command_encoder(&Default::default())
+        .unwrap()
+        .into_stage_work()
+        .unwrap();
     drop(successor);
     let (started, ready) = crossbeam_channel::bounded(1);
     let (wrote, observed) = crossbeam_channel::bounded(1);
@@ -1367,7 +1409,7 @@ fn queued_stage_copy_precedes_a_later_upload_after_a_successor_is_cancelled() {
         });
         ready.recv_timeout(Duration::from_secs(2)).unwrap();
         let early = observed.recv_timeout(Duration::from_millis(40)).is_ok();
-        turn.submit([encoder.finish().unwrap()]).unwrap();
+        stage.submit().unwrap();
         assert!(!early, "a reliable upload overtook an accepted stage");
     });
     let (tx, rx) = crossbeam_channel::bounded(1);

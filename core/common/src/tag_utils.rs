@@ -149,6 +149,13 @@ impl MovieBytes {
         }
         &self.file
     }
+    /// Returns the number of backing bytes retained by the full movie file.
+    pub fn file_capacity(&self) -> usize {
+        match &self.mapping {
+            Some(mapping) => mapping.view.len(),
+            None => self.file.capacity(),
+        }
+    }
     fn share_pages(&mut self) {
         if self.file.len() >= 64 * 1024
             && let Ok(m) = Mapping::new(&self.file)

@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::io::Cursor;
 
+use futures::future::AbortHandle;
 use gc_arena::barrier::unlock;
 use gc_arena::{Collect, Gc, Lock, Mutation};
 use id3::Tag;
@@ -45,13 +46,12 @@ struct ExternalSoundData {
     /// Whether we are currently loading a sound.
     is_loading: Cell<bool>,
 
-    /// The load generation associated with this external sound.
-    /// Used to prevent multiple simultaneous loads on one Sound.
-    load_id: Cell<u32>,
+    #[collect(require_static)]
+    read: AbortHandle,
 }
 
 impl<'gc> ExternalSound<'gc> {
-    pub fn empty(mc: &Mutation<'gc>, is_streaming: bool, load_id: u32) -> ExternalSound<'gc> {
+    fn empty(mc: &Mutation<'gc>, is_streaming: bool, read: AbortHandle) -> ExternalSound<'gc> {
         ExternalSound(Gc::new(
             mc,
             ExternalSoundData {
@@ -59,7 +59,7 @@ impl<'gc> ExternalSound<'gc> {
                 will_autoplay: Cell::new(is_streaming),
                 transform: Cell::new(SoundTransform::default()),
                 is_loading: Cell::new(true),
-                load_id: Cell::new(load_id),
+                read,
             },
         ))
     }
@@ -101,8 +101,8 @@ impl<'gc> ExternalSound<'gc> {
         self.0.is_loading.set(is_loading)
     }
 
-    pub fn load_id(self) -> u32 {
-        self.0.load_id.get()
+    pub fn read_cancelled(self) -> bool {
+        self.0.read.is_aborted()
     }
 }
 
@@ -591,9 +591,8 @@ fn load_sound<'gc>(
             .unwrap_or(&Value::Undefined)
             .as_bool(activation.swf_version());
 
-        let mut load_id = 0;
-
         if let Some(external) = sound.external() {
+            external.0.read.abort();
             // Any external sound instances that are playing
             // are stopped when `loadSound` is called again, streaming or not.
             // (Previous `attachSound` instances will continue to play.)
@@ -604,21 +603,27 @@ fn load_sound<'gc>(
             // If a load on this Sound is already in progress,
             // onLoad gets called with success as `false`.
             if external.is_loading() {
+                external.set_is_loading(false);
                 let _ = this.call_method(
                     istr!("onLoad"),
                     &[false.into()],
                     activation,
                     ExecutionReason::Special,
                 );
+                // A replacement opened inside onLoad owns the Sound now.
+                if !sound
+                    .external()
+                    .is_some_and(|current| Gc::ptr_eq(current.0, external.0))
+                {
+                    return Ok(Value::Undefined);
+                }
             }
-
-            // Add 1 to the load counter for this Sound
-            load_id = external.load_id() + 1;
         }
 
+        let (read, registration) = AbortHandle::new_pair();
         sound.set_external(
             activation.gc(),
-            ExternalSound::empty(activation.gc(), is_streaming, load_id),
+            ExternalSound::empty(activation.gc(), is_streaming, read),
         );
 
         let request_url = url.to_utf8_lossy().into_owned();
@@ -638,7 +643,6 @@ fn load_sound<'gc>(
                 activation.context,
                 this,
                 Request::get(request_url),
-                load_id,
             );
             return Ok(Value::Undefined);
         }
@@ -647,7 +651,7 @@ fn load_sound<'gc>(
             activation.context,
             this,
             Request::get(request_url),
-            load_id,
+            registration,
         );
         activation.context.spawn_future(future);
     }

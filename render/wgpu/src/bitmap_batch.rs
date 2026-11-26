@@ -95,14 +95,13 @@ impl BitmapBatchCache {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((binding, age)) = state.entries.get_mut(&key) {
-                if let Some((group, _)) = &*binding
+            if let Some((binding, age)) = state.entries.get_mut(&key)
+                && let Some((group, _)) = &*binding
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                {
-                    *age = self.scheduler.tick();
-                    return Ok(group.clone());
-                }
+            {
+                *age = self.scheduler.tick();
+                return Ok(group.clone());
             }
         }
         let array_views;

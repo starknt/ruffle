@@ -236,7 +236,7 @@ pub trait TDisplayObjectContainer<'gc>:
         let removed_child = self
             .raw_container_mut(context.gc())
             .replace_at_depth(child, depth);
-        children_changed(self.into());
+        children_changed(self);
 
         child.set_parent(context, Some(self.into()));
         child.set_place_frame(0);
@@ -278,7 +278,7 @@ pub trait TDisplayObjectContainer<'gc>:
 
         self.raw_container_mut(context.gc())
             .swap_at_depth(context, this, child, depth);
-        children_changed((*self).into());
+        children_changed(*self);
     }
 
     /// Insert a child display object into the container at a specific position
@@ -319,7 +319,7 @@ pub trait TDisplayObjectContainer<'gc>:
 
         self.raw_container_mut(context.gc())
             .insert_at_id(child, index);
-        children_changed((*self).into());
+        children_changed(*self);
 
         if parent_changed {
             dispatch_added_event(this, child, child_was_on_stage, context);
@@ -333,7 +333,7 @@ pub trait TDisplayObjectContainer<'gc>:
     fn swap_at_index(&mut self, context: &mut UpdateContext<'gc>, index1: usize, index2: usize) {
         self.raw_container_mut(context.gc())
             .swap_at_id(index1, index2);
-        children_changed((*self).into());
+        children_changed(*self);
     }
 
     /// Remove (and unloads) a child display object from this container's render and depth lists.
@@ -584,7 +584,7 @@ pub trait TDisplayObjectContainer<'gc>:
     fn render_children(self, context: &mut RenderContext<'_, 'gc>) {
         let count = self.num_children();
         if count != 0
-            && (count == 1 || !super::snapshot::children::render(self.into(), count, context))
+            && (count == 1 || !super::snapshot::children::render(self, count, context))
         {
             render_order(self.iter_render_list(), context);
         }

@@ -8,6 +8,7 @@ use crate::bitmap::BitmapHandle;
 /// Failures that stop native rendering instead of changing Flash's pixels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderFailureKind {
+    Canceled,
     BudgetExceeded,
     OutOfMemory,
     DeviceLost,

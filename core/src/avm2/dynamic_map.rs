@@ -58,7 +58,7 @@ impl<'gc> DynamicMapKey for DynamicKey<'gc> {
     }
 }
 
-impl<'a> DynamicMapKey for &'a str {
+impl DynamicMapKey for &str {
     #[inline]
     fn hash_with(&self, hasher: &FnvBuildHasher) -> u64 {
         hasher.hash_one(self)

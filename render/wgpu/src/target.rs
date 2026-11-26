@@ -38,6 +38,16 @@ pub trait RenderTarget: Debug + 'static {
         height: u32,
     ) -> Result<(), Error>;
 
+    /// Replace the stage generation even when its rounded texture size is unchanged.
+    fn replace_stage(
+        &mut self,
+        device: &crate::gpu_resources::Device,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error> {
+        self.resize(device, width, height)
+    }
+
     fn format(&self) -> wgpu::TextureFormat;
 
     fn width(&self) -> u32;

@@ -52,6 +52,30 @@ class NativePerfTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     compare_bitmap_draws(before, after, 'gpu', mode)
 
+    def test_cache_transfer_comparison_requires_both_copy_paths_on_the_measured_frames(self):
+        from native_perf import compare_filter_paths
+        before, after = NativeWgpuAcceptanceTest().paired()
+        for row in before:
+            row.update(filterDrawCopyFrames=1200, filterTransferFrames=0)
+        for row in after:
+            row.update(completedFrameMs=9., filterDrawCopyFrames=0, filterTransferFrames=1200)
+        self.assertTrue(compare_filter_paths(before, after, 'gpu', transfer=True)['accepted'])
+        before[0]['filterDrawCopyFrames'] = 1199
+        with self.assertRaises(ValueError):
+            compare_filter_paths(before, after, 'gpu', transfer=True)
+
+    def test_direct_cache_comparison_requires_the_final_pass_without_a_copy(self):
+        from native_perf import compare_filter_cache
+        before, after = NativeWgpuAcceptanceTest().paired()
+        for row in before:
+            row.update(filterDrawCopyFrames=1200, filterTransferFrames=0, filterDirectFrames=0)
+        for row in after:
+            row.update(completedFrameMs=9., filterDrawCopyFrames=0, filterTransferFrames=0, filterDirectFrames=1200)
+        self.assertTrue(compare_filter_cache(before, after, 'gpu', 'direct')['accepted'])
+        for key, value in [('filterDrawCopyFrames', 1), ('filterTransferFrames', 1), ('filterDirectFrames', 1199)]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                compare_filter_cache(before, [*after[:-1], dict(after[-1], **{key: value})], 'gpu', 'direct')
+
     def test_compute_comparison_requires_the_opt_in_dispatch_on_every_measured_frame(self):
         from native_perf import compare_filter_paths
         before, after = NativeWgpuAcceptanceTest().paired()

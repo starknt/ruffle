@@ -3,6 +3,8 @@
 #[cfg(test)]
 mod construction_cache_tests;
 #[cfg(test)]
+mod import_ownership_tests;
+#[cfg(test)]
 mod mouse_pick_tests;
 use crate::avm1::ActivationIdentifier as Avm1ActivationIdentifier;
 use crate::avm1::Avm1;
@@ -42,10 +44,13 @@ use crate::loader::{self, ContentType};
 use crate::prelude::*;
 use crate::streams::NetStream;
 use crate::string::{AvmString, SwfStrExt as _, WStr, WString};
-use crate::tag_utils::{self, ControlFlow, Error, SwfMovie, SwfMovieData, SwfSlice, SwfStream};
+use crate::tag_utils::{
+    self, ControlFlow, Error, SwfMovie, SwfMovieData, SwfMovieWeak, SwfSlice, SwfStream,
+};
 use crate::vminterface::Instantiator;
 use bitflags::bitflags;
 use core::fmt;
+use futures::future::{AbortHandle, AbortRegistration};
 use gc_arena::barrier::unlock;
 use gc_arena::lock::{Lock, RefLock};
 use gc_arena::{Collect, DynamicRoot, Gc, GcWeak, Mutation, Rootable};
@@ -60,6 +65,7 @@ use std::cell::{Cell, OnceCell, Ref, RefCell, RefMut};
 use std::cmp::max;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::{Rc, Weak};
 use swf::extensions::ReadSwfExt;
 use swf::{ClipEventFlag, DefineBitsLossless, FrameLabelData, TagCode, UTF_8};
 
@@ -156,10 +162,87 @@ impl<'gc> MovieClipWeak<'gc> {
     }
 }
 
+/// The importing clip can be reused for another movie while a library is in flight.
+#[derive(Collect)]
+#[collect(no_drop)]
+struct ImportSource<'gc> {
+    clip: MovieClipWeak<'gc>,
+    // Keep a temporary library clip alive while its own imports are pending.
+    library_clip: Option<MovieClip<'gc>>,
+    movie: SwfMovieWeak<'gc>,
+    loader_read: Option<u64>,
+    #[collect(require_static)]
+    abort: Rc<AbortHandle>,
+}
+
+impl<'gc> ImportSource<'gc> {
+    fn current(&self, uc: &UpdateContext<'gc>) -> Option<MovieClip<'gc>> {
+        let importer = self.clip.upgrade(uc.gc())?;
+        let mut source = self;
+        loop {
+            let clip = source
+                .library_clip
+                .or_else(|| source.clip.upgrade(uc.gc()))?;
+            if source.abort.is_aborted()
+                || clip.avm1_removed()
+                || Some(clip.movie()) != source.movie.upgrade(uc.gc())
+                || clip.import_loader_read(uc) != source.loader_read
+            {
+                return None;
+            }
+            let Some(parent) = clip.0.shared.get().importer_movie else {
+                return Some(importer);
+            };
+            source = Gc::as_ref(parent);
+        }
+    }
+}
+
+pub(crate) struct ImportHandle(DynamicRoot<Rootable![ImportSource<'_>]>);
+
+impl ImportHandle {
+    pub(crate) fn current<'gc>(&self, uc: &UpdateContext<'gc>) -> Option<MovieClip<'gc>> {
+        uc.dynamic_root.fetch(&self.0).current(uc)
+    }
+}
+
 #[derive(Clone)]
 pub struct MovieClipHandle(DynamicRoot<Rootable![MovieClipData<'_>]>);
 
 impl MovieClipHandle {
+    pub(crate) fn start_import<'gc>(
+        uc: &UpdateContext<'gc>,
+        clip: MovieClip<'gc>,
+    ) -> (AbortRegistration, ImportHandle) {
+        let (abort, registration) = AbortHandle::new_pair();
+        let abort = Rc::new(abort);
+        // A nested import belongs to every importing clip in its chain.
+        let mut owner = Some(clip);
+        while let Some(clip) = owner {
+            let mut reads = clip.0.pending_imports.take().into_vec();
+            reads.retain(|read| read.strong_count() != 0);
+            reads.push(Rc::downgrade(&abort));
+            clip.0.pending_imports.replace(reads.into_boxed_slice());
+            owner = clip
+                .0
+                .shared
+                .get()
+                .importer_movie
+                .and_then(|s| s.clip.upgrade(uc.gc()));
+        }
+        let source = ImportSource {
+            clip: clip.downgrade(),
+            library_clip: clip.0.shared.get().importer_movie.map(|_| clip),
+            movie: clip.movie().downgrade(),
+            loader_read: clip.import_loader_read(uc),
+            abort,
+        };
+        (
+            registration,
+            ImportHandle(uc.dynamic_root.stash(uc.gc(), Gc::new(uc.gc(), source))),
+        )
+    }
+
     pub fn stash<'gc>(uc: &UpdateContext<'gc>, this: MovieClip<'gc>) -> Self {
         Self(uc.dynamic_root.stash(uc.gc(), this.0))
     }
@@ -176,6 +259,9 @@ pub struct MovieClipData<'gc> {
     base: InteractiveObjectBase<'gc>,
     cell: RefLock<MovieClipDataMut<'gc>>,
     shared: Lock<Gc<'gc, MovieClipShared<'gc>>>,
+
+    #[collect(require_static)]
+    pending_imports: RefCell<Box<[Weak<AbortHandle>]>>,
 
     tag_stream_pos: Cell<u64>,
 
@@ -252,6 +338,7 @@ impl<'gc> MovieClipData<'gc> {
                 avm1_text_field_bindings: Vec::new(),
             }),
             shared: Lock::new(Gc::new(mc, shared)),
+            pending_imports: Default::default(),
             tag_stream_pos: Cell::new(0),
             current_frame: Cell::new(0),
             audio_stream: Cell::new(None),
@@ -320,13 +407,14 @@ impl<'gc> MovieClip<'gc> {
         MovieClip(Gc::new(mc, data))
     }
 
-    pub fn new_import_assets(
+    pub(crate) fn new_import_assets(
         context: &mut UpdateContext<'gc>,
         movie: SwfMovie<'gc>,
-        parent: MovieClip<'gc>,
+        parent: &ImportHandle,
     ) -> Self {
         let loader_info = None;
-        let shared = MovieClipShared::for_full_movie(movie, loader_info, Some(parent));
+        let source = context.dynamic_root.fetch(&parent.0);
+        let shared = MovieClipShared::for_full_movie(movie, loader_info, Some(source));
 
         let data = MovieClipData::new(shared, context.gc());
         data.flags.set(MovieClipFlags::PLAYING);
@@ -367,6 +455,7 @@ impl<'gc> MovieClip<'gc> {
 
     pub fn instantiate(self, mc: &Mutation<'gc>) -> Self {
         let instance = Self(Gc::new(mc, (*self.0).clone()));
+        instance.0.pending_imports.take();
         instance.base().set_construction_clean(false);
         instance
     }
@@ -386,6 +475,7 @@ impl<'gc> MovieClip<'gc> {
         is_root: bool,
         loader_info: Option<LoaderInfoObject<'gc>>,
     ) {
+        self.cancel_imports();
         self.invalidate_construction();
         let write = Gc::write(context.gc(), self.0);
 
@@ -574,7 +664,16 @@ impl<'gc> MovieClip<'gc> {
                 }
                 TagCode::DefineText => shared.define_text(context, reader, 1),
                 TagCode::DefineText2 => shared.define_text(context, reader, 2),
-                TagCode::DoInitAction => self.do_init_action(context, reader),
+                TagCode::DoInitAction => {
+                    self.do_init_action(context, reader)?;
+                    if shared
+                        .importer_movie
+                        .is_some_and(|source| source.current(context).is_none())
+                    {
+                        return Ok(ControlFlow::Exit);
+                    }
+                    Ok(())
+                }
                 TagCode::DefineSceneAndFrameLabelData => shared.scene_and_frame_labels(reader),
                 TagCode::ExportAssets => shared.export_assets(context, reader),
                 TagCode::FrameLabel => shared.frame_label(reader),
@@ -640,6 +739,24 @@ impl<'gc> MovieClip<'gc> {
         is_finished
     }
 
+    fn import_loader_read(self, uc: &UpdateContext<'gc>) -> Option<u64> {
+        self.loader_info()?
+            .loader()
+            .and_then(|loader| uc.load_manager.read_id(loader.into()))
+    }
+
+    fn cancel_imports(self) {
+        for read in self
+            .0
+            .pending_imports
+            .take()
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            read.abort();
+        }
+    }
+
     pub fn finish_importing(self) {
         self.0
             .shared
@@ -668,6 +785,9 @@ impl<'gc> MovieClip<'gc> {
                 break;
             };
 
+            let Some(parent) = parent.current(context) else {
+                return Ok(());
+            };
             target = parent;
         }
 
@@ -2459,6 +2579,7 @@ impl<'gc> MovieClip<'gc> {
     // after one frame if the target is a MovieClip? Test the behaviour and adapt the code
     // if necessary.
     pub fn avm1_unload_movie(self, context: &mut UpdateContext<'gc>) {
+        self.cancel_imports();
         // TODO: In Flash player, the MovieClip properties change to the unloaded state
         // one frame after the unloadMovie command has been read, even if the MovieClip
         // is not a root MovieClip (see the movieclip_library_state_values test).
@@ -3098,6 +3219,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn avm1_unload(self, context: &mut UpdateContext<'gc>) {
+        self.cancel_imports();
         for child in self.iter_render_list() {
             child.avm1_unload(context);
         }
@@ -4283,7 +4405,8 @@ impl<'gc, 'a> MovieClipShared<'gc> {
 
     #[inline]
     fn import_exports_of_importer(&self, context: &mut UpdateContext<'gc>) {
-        let Some(importer_library) = self.importer_movie.and_then(|mc| {
+        let Some(importer_library) = self.importer_movie.and_then(|source| {
+            let mc = source.current(context)?;
             context
                 .library
                 .library_for_movie(mc.movie(), context.gc_context)
@@ -4356,7 +4479,10 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         reader: &mut SwfStream<'a>,
     ) -> Result<(), Error> {
         let exports = reader.read_export_assets()?;
-        let importer_movie = self.importer_movie.map(|mc| mc.movie());
+        let importer_movie = self
+            .importer_movie
+            .and_then(|s| s.current(context))
+            .map(|mc| mc.movie());
         for export in exports {
             let name = export.name.decode(reader.encoding());
             let name = AvmString::new(context.gc(), name);
@@ -5001,7 +5127,7 @@ struct MovieClipShared<'gc> {
     loader_info: Option<LoaderInfoObject<'gc>>,
 
     // If this movie was loaded from ImportAssets(2), this will be the root MovieClip of the parent movie.
-    importer_movie: Option<MovieClip<'gc>>,
+    importer_movie: Option<Gc<'gc, ImportSource<'gc>>>,
 }
 
 #[derive(Default)]
@@ -5040,7 +5166,7 @@ impl<'gc> MovieClipShared<'gc> {
     fn for_full_movie(
         movie: SwfMovie<'gc>,
         loader_info: Option<LoaderInfoObject<'gc>>,
-        importer_movie: Option<MovieClip<'gc>>,
+        importer_movie: Option<Gc<'gc, ImportSource<'gc>>>,
     ) -> Self {
         let num_frames = movie.num_frames();
 
@@ -5060,7 +5186,7 @@ impl<'gc> MovieClipShared<'gc> {
         swf_data: SwfSlice,
         header_frames: FrameNumber,
         loader_info: Option<LoaderInfoObject<'gc>>,
-        importer_movie: Option<MovieClip<'gc>>,
+        importer_movie: Option<Gc<'gc, ImportSource<'gc>>>,
     ) -> Self {
         Self {
             cell: Default::default(),

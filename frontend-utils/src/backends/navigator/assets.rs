@@ -1,10 +1,13 @@
 //! Session-local scheduling for explicitly buffered, public HTTP resources.
+#[cfg(test)]
+#[path = "asset_body_tests.rs"]
+mod tests;
 use super::fetch::{Response, ResponseBody};
 use futures::channel::oneshot;
 use futures::future::{FutureExt, LocalBoxFuture, WeakShared};
 use reqwest::{Client, cookie::CookieStore, header};
 use ruffle_core::backend::navigator::{
-    ErrorResponse, FetchReason, OwnedFuture, SuccessResponse, get_encoding,
+    Bytes, ErrorResponse, FetchReason, OwnedFuture, SuccessResponse, get_encoding,
 };
 use ruffle_core::loader::Error;
 use ruffle_core::swf::Encoding;
@@ -51,7 +54,7 @@ struct Preload {
     cookies: (bool, u64),
     started: Instant,
     claimed: Rc<Cell<bool>>,
-    ready: oneshot::Receiver<Option<(Response, Reservation)>>,
+    ready: oneshot::Receiver<Option<Response>>,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -233,7 +236,7 @@ impl AssetScheduler {
         jar: Arc<super::SessionCookies>,
         url: Url,
         reason: FetchReason,
-    ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+    ) -> OwnedFuture<Response, ErrorResponse> {
         let this = self.clone();
         Box::pin(async move {
             let preload = {
@@ -245,13 +248,13 @@ impl AssetScheduler {
                 && ticket.cookies == jar.snapshot(&url)
             {
                 ticket.claimed.set(true);
-                if let Ok(Some((response, _reservation))) = ticket.ready.await
+                if let Ok(Some(response)) = ticket.ready.await
                     && ticket.cookies == jar.snapshot(&url)
                 {
                     let mut state = this.inner.borrow_mut();
                     state.stats.preloaded += 1;
                     state.stats.requested += 1;
-                    return Ok(Box::new(response) as Box<dyn SuccessResponse>);
+                    return Ok(response);
                 }
             }
             let _slot = this
@@ -345,37 +348,7 @@ impl AssetScheduler {
                         s.stats.cache_hits += 1;
                         s.stats.cache_bytes += hit.bytes.len() as u64;
                     }
-                    let meta = Meta {
-                        url: url.to_string(),
-                        status: 200,
-                        redirected: false,
-                        encoding: hit
-                            .encoding
-                            .as_deref()
-                            .and_then(|e| Encoding::for_label(e.as_bytes())),
-                    };
-                    if may_share
-                        && hit.bytes.len() <= MAX_BODY
-                        && let Some(budget) = Reservation::new(&state, hit.bytes.len())
-                    {
-                        return Outcome::Shared(
-                            meta,
-                            Rc::new(SharedBody {
-                                data: hit.bytes,
-                                budget,
-                            }),
-                        );
-                    }
-                    return Outcome::Disk {
-                        response: RefCell::new(Some(Response {
-                            url: meta.url,
-                            status: 200,
-                            redirected: false,
-                            text_encoding: meta.encoding,
-                            response_body: ResponseBody::File(Ok(hit.bytes)),
-                        })),
-                        _slot: slot,
-                    };
+                    return Outcome::cached(&url, hit, slot, &state, may_share);
                 }
                 state.borrow_mut().stats.cache_misses += 1;
             }
@@ -438,19 +411,7 @@ impl AssetScheduler {
                     st.stats.headers_ms += began.elapsed().as_millis() as u64;
                     drop(st);
                     permit.complete();
-                    return Outcome::Disk {
-                        response: RefCell::new(Some(Response {
-                            url: url.to_string(),
-                            text_encoding: hit
-                                .encoding
-                                .as_deref()
-                                .and_then(|name| Encoding::for_label(name.as_bytes())),
-                            status: 200,
-                            redirected: false,
-                            response_body: ResponseBody::File(Ok(hit.bytes)),
-                        })),
-                        _slot: slot,
-                    };
+                    return Outcome::cached(&url, hit, slot, &state, false);
                 }
                 // A bad or evicted entity needs a second, unconditional network transfer.
                 state.borrow_mut().stats.transfers += 1;
@@ -525,6 +486,7 @@ impl AssetScheduler {
                             prefix = data;
                         } else {
                             permit.complete();
+                            let data = Bytes::from(data);
                             let data = if let Some(write) = disk {
                                 write.save(data).await
                             } else {
@@ -541,6 +503,7 @@ impl AssetScheduler {
             }
             Outcome::Single(RefCell::new(Some(Response {
                 url: meta.url,
+                loader_request: None,
                 text_encoding: meta.encoding,
                 status: meta.status,
                 redirected: meta.redirected,
@@ -777,16 +740,22 @@ impl Drop for Reservation {
 }
 
 pub(super) struct SharedBody {
-    data: Vec<u8>,
+    data: Bytes,
     budget: Reservation,
 }
 impl SharedBody {
-    pub fn bytes(&self) -> Vec<u8> {
+    pub fn into_bytes(self: Rc<Self>) -> Bytes {
         self.budget.state.borrow_mut().stats.delivered += 1;
-        self.data.clone()
+        match Rc::try_unwrap(self) {
+            Ok(body) => body.data,
+            Err(shared) => shared.data.clone(),
+        }
     }
     pub fn len(&self) -> usize {
         self.data.len()
+    }
+    pub fn reserved_bytes(&self) -> usize {
+        self.budget.bytes
     }
 }
 struct DiskWrite {
@@ -798,13 +767,12 @@ struct DiskWrite {
     state: Rc<RefCell<State>>,
 }
 impl DiskWrite {
-    async fn save(self, data: Vec<u8>) -> Vec<u8> {
+    async fn save(self, data: Bytes) -> Bytes {
         if data.is_empty() || data.len() > 32 * 1024 * 1024 {
             return data;
         }
         // Keep the downloaded bytes usable even if the store is unavailable.
-        let shared = Arc::new(data);
-        let worker = shared.clone();
+        let worker = data.clone();
         let wrote = tokio::task::spawn_blocking(move || {
             self.store.put(
                 &self.url,
@@ -819,7 +787,7 @@ impl DiskWrite {
         if wrote {
             self.state.borrow_mut().stats.cache_writes += 1;
         }
-        Arc::unwrap_or_clone(shared)
+        data
     }
 }
 
@@ -831,7 +799,14 @@ pub(super) struct UnsharedBody {
     permit: TransferPermit,
 }
 impl UnsharedBody {
-    pub async fn read(self) -> Result<Vec<u8>, Error> {
+    pub async fn read(self) -> Result<Bytes, Error> {
+        let state = self.permit.state.clone();
+        let bytes = self.buffer().await?;
+        state.borrow_mut().stats.delivered += 1;
+        Ok(bytes)
+    }
+
+    async fn buffer(self) -> Result<Bytes, Error> {
         let began = Instant::now();
         let prefix_bytes = self.prefix.len();
         let result = run_io(read_body(self.http, self.prefix, usize::MAX)).await;
@@ -841,10 +816,10 @@ impl UnsharedBody {
             .map_err(|e| Error::FetchError(e.to_string()))?;
         {
             let mut state = self.permit.state.borrow_mut();
-            state.stats.delivered += 1;
             state.stats.body_bytes += (data.len() - prefix_bytes) as u64;
             state.stats.body_ms += began.elapsed().as_millis() as u64;
         }
+        let data = Bytes::from(data);
         let data = if let Some(write) = self.disk {
             write.save(data).await
         } else {
@@ -906,14 +881,15 @@ impl Meta {
                 .and_then(get_encoding),
         }
     }
-    fn response(&self, response_body: ResponseBody) -> Box<dyn SuccessResponse> {
-        Box::new(Response {
+    fn response(&self, response_body: ResponseBody) -> Response {
+        Response {
             url: self.url.clone(),
+            loader_request: None,
             status: self.status,
             redirected: self.redirected,
             text_encoding: self.encoding,
             response_body,
-        })
+        }
     }
 }
 
@@ -942,38 +918,71 @@ impl Failure {
 enum Outcome {
     Shared(Meta, Rc<SharedBody>),
     Single(RefCell<Option<Response>>),
-    // Once delivered, the loader owns its body and other loaders can read the disk.
-    Disk {
-        response: RefCell<Option<Response>>,
-        _slot: tokio::sync::OwnedSemaphorePermit,
-    },
     Failure(Failure),
     HttpError(Failure),
     BodyError(Meta, String),
 }
 impl Outcome {
-    async fn into_preload(self, state: &Rc<RefCell<State>>) -> Option<(Response, Reservation)> {
-        let mut response = match self {
-            Self::Disk { response, .. } => response.into_inner()?,
-            Self::Single(response) => response.into_inner()?,
-            _ => return None,
+    fn cached(
+        url: &Url,
+        hit: CachedAsset,
+        slot: tokio::sync::OwnedSemaphorePermit,
+        state: &Rc<RefCell<State>>,
+        may_share: bool,
+    ) -> Self {
+        let meta = Meta {
+            url: url.to_string(),
+            status: 200,
+            redirected: false,
+            encoding: hit
+                .encoding
+                .as_deref()
+                .and_then(|e| Encoding::for_label(e.as_bytes())),
         };
+        let data = Bytes::from(hit.bytes);
+        let body = if data.len() <= MAX_BODY
+            && let Some(budget) = Reservation::new(state, data.len())
+        {
+            let body = Rc::new(SharedBody { data, budget });
+            if may_share {
+                return Self::Shared(meta, body);
+            }
+            ResponseBody::Shared(Some(body))
+        } else {
+            ResponseBody::Disk(Some((data, slot)))
+        };
+        Self::Single(RefCell::new(Some(meta.response(body))))
+    }
+
+    async fn into_preload(self, state: &Rc<RefCell<State>>) -> Option<Response> {
+        let Self::Single(response) = self else {
+            return None;
+        };
+        let mut response = response.into_inner()?;
+        if matches!(response.response_body, ResponseBody::Shared(_)) {
+            return Some(response);
+        }
         let size = usize::try_from(response.expected_length().ok()??).ok()?;
         let reservation = Reservation::new(state, size)?;
         let data = match response.response_body {
-            ResponseBody::File(Ok(data)) => data,
+            ResponseBody::Disk(Some((data, _slot))) => data,
             // A DiskWrite exists only after checking origin, HTTP policy and cookies.
-            ResponseBody::Scheduled(Some(body)) if body.disk.is_some() => body.read().await.ok()?,
+            ResponseBody::Scheduled(Some(body)) if body.disk.is_some() => {
+                body.buffer().await.ok()?
+            }
             _ => return None,
         };
         if data.len() != size {
             return None;
         }
-        response.response_body = ResponseBody::File(Ok(data));
-        Some((response, reservation))
+        response.response_body = ResponseBody::Shared(Some(Rc::new(SharedBody {
+            data,
+            budget: reservation,
+        })));
+        Some(response)
     }
 
-    fn for_reader(&self, leader: bool) -> Option<Result<Box<dyn SuccessResponse>, ErrorResponse>> {
+    fn for_reader(&self, leader: bool) -> Option<Result<Response, ErrorResponse>> {
         match self {
             Self::Shared(meta, body) => {
                 Some(Ok(meta.response(ResponseBody::Shared(Some(body.clone())))))
@@ -984,10 +993,8 @@ impl Outcome {
             Self::HttpError(f) if leader => Some(Err(f.response())),
             Self::HttpError(_) => None,
             Self::Failure(f) => Some(Err(f.response())),
-            Self::Single(r) | Self::Disk { response: r, .. } if leader => Some(Ok(Box::new(
-                r.borrow_mut().take().expect("original reader"),
-            ))),
-            Self::Single(_) | Self::Disk { .. } => None,
+            Self::Single(r) if leader => Some(Ok(r.borrow_mut().take().expect("original reader"))),
+            Self::Single(_) => None,
         }
     }
 }

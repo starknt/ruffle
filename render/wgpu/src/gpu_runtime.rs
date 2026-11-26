@@ -1073,7 +1073,7 @@ impl ResourceLease {
         ledger
             .records
             .get(&self.id())
-            .is_some_and(|r| r.last_submission <= ledger.stats.completed)
+            .is_some_and(|r| r.host_readers == 0 && r.last_submission <= ledger.stats.completed)
     }
 }
 

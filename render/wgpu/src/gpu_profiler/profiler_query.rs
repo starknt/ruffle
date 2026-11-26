@@ -22,6 +22,9 @@ pub struct GpuTimerQueryResult {
     /// If timestamp writing was disabled for this scope, this is None.
     pub time: Option<Range<f64>>,
 
+    /// Native device-clock interval in nanoseconds, shared with presentation timestamps.
+    pub time_ns: Option<Range<u64>>,
+
     /// Scopes that were opened while this scope was open.
     pub nested_queries: Vec<GpuTimerQueryResult>,
 }

@@ -57,15 +57,26 @@ impl SubmissionOrder {
     pub(super) fn wait_pending(&self, queue: &Queue) -> Result<(), RenderFailure> {
         if self.pending.load(Ordering::Acquire) {
             let through = self.state.lock().unwrap().issued;
-            self.wait_through(queue, through)?;
+            self.wait_through(queue, through, &crossbeam_channel::never())?;
         }
         Ok(())
     }
 
-    fn wait_through(&self, queue: &Queue, through: u64) -> Result<(), RenderFailure> {
+    fn wait_through(
+        &self,
+        queue: &Queue,
+        through: u64,
+        closed: &Receiver<std::convert::Infallible>,
+    ) -> Result<(), RenderFailure> {
         let health = queue.0.runtime().health();
         loop {
             health.check()?;
+            if closed.try_recv() == Err(crossbeam_channel::TryRecvError::Disconnected) {
+                return Err(RenderFailure::new(
+                    RenderFailureKind::Canceled,
+                    "stage session closed",
+                ));
+            }
             let done = {
                 let state = self.state.lock().unwrap();
                 state
@@ -78,6 +89,7 @@ impl SubmissionOrder {
             let failed = health.failure_signal();
             crossbeam_channel::select_biased! {
                 recv(failed) -> _ => return Err(health.failure().expect("failed device signal")),
+                recv(closed) -> _ => continue,
                 recv(done) -> _ => (),
             }
         }
@@ -89,8 +101,18 @@ impl ReservedSubmission {
         self,
         commands: impl IntoIterator<Item = CommandBuffer>,
     ) -> Result<wgpu::SubmissionIndex, RenderFailure> {
-        self.queue.order().wait_through(&self.queue, self.id - 1)?;
-        self.queue.submit_ordered(commands)
+        self.submit_until_closed(commands, &crossbeam_channel::never())
+    }
+
+    pub(super) fn submit_until_closed(
+        self,
+        commands: impl IntoIterator<Item = CommandBuffer>,
+        closed: &Receiver<std::convert::Infallible>,
+    ) -> Result<wgpu::SubmissionIndex, RenderFailure> {
+        self.queue
+            .order()
+            .wait_through(&self.queue, self.id - 1, closed)?;
+        self.queue.submit_ordered(commands, &[])
     }
 }
 

@@ -96,6 +96,9 @@ def summarize(path):
         'workTotals': {key: sum(r.get('work', {}).get(key, 0) for r in frames)
                        for key in {key for r in frames for key in r.get('work', {})}},
         'computeFilterFrames': sum(r.get('work', {}).get('compute_filter_passes', 0) > 0 for r in frames),
+        'filterDrawCopyFrames': sum(r.get('work', {}).get('filter_cache_draw_copies', 0) > 0 for r in frames),
+        'filterDirectFrames': sum(r.get('work', {}).get('filter_cache_direct_outputs', 0) > 0 for r in frames),
+        'filterTransferFrames': sum(r.get('work', {}).get('filter_cache_transfers', 0) > 0 for r in frames),
         'bitmapArrayFrames': sum(r.get('work', {}).get('bitmap_binding_array_batches', 0) > 0 for r in frames),
         'bitmapLayerFrames': sum(r.get('work', {}).get('bitmap_layer_batches', 0) > 0 for r in frames),
         'bitmapIndirectFrames': sum(r.get('work', {}).get('bitmap_indirect_draws', 0) > 0 for r in frames),
@@ -173,7 +176,21 @@ def compare(baseline, candidate, phase, control=False):
             'frameIntervalP95Regression':interval, 'onePercentLowGain':low}
 
 
-def compare_filter_paths(baseline, candidate, phase):
+def compare_filter_cache(baseline, candidate, phase, path):
+    counters = {'draw': 'filterDrawCopyFrames', 'transfer': 'filterTransferFrames', 'direct': 'filterDirectFrames'}
+    for runs, selected in ((baseline, 'draw'), (candidate, path)):
+        for row in runs:
+            for mode, key in counters.items():
+                # Transfer traces written before direct output existed only have two counters.
+                count = row.get(key, 0 if mode == 'direct' and path == 'transfer' else None)
+                if count != (row['frames'] if mode == selected else 0):
+                    raise ValueError('cache comparison requires the selected output on every measured frame')
+    return compare(baseline, candidate, phase)
+
+
+def compare_filter_paths(baseline, candidate, phase, *, transfer=False):
+    if transfer:
+        return compare_filter_cache(baseline, candidate, phase, 'transfer')
     if (any(run.get('computeFilterFrames') != 0 for run in baseline)
             or any(run.get('computeFilterFrames') != run['frames'] for run in candidate)):
         raise ValueError('filter comparison requires fragment and compute execution on every measured frame')
@@ -233,6 +250,10 @@ def main():
     experiment = parser.add_mutually_exclusive_group()
     experiment.add_argument('--compare-compute-filters', action='store_true',
                             help='compare fragment with opt-in compute in the same binary')
+    experiment.add_argument('--compare-filter-cache-transfer', dest='filter_cache', action='store_const', const='transfer',
+                            help='compare a fullscreen draw with a texture transfer for full filtered caches')
+    experiment.add_argument('--compare-filter-cache-direct', dest='filter_cache', action='store_const', const='direct',
+                            help='compare a fullscreen copy draw with rendering the final filter into the cache')
     experiment.add_argument('--compare-bitmap-bindings', action='store_true',
                             help='compare sixteen explicit textures with the optional binding array')
     experiment.add_argument('--compare-bitmap-layers', action='store_true',
@@ -242,7 +263,8 @@ def main():
     parser.add_argument('--profile-off', action='store_true',
                         help='disable measurement instrumentation in both binaries')
     args = parser.parse_args()
-    if ((args.compare_compute_filters or args.compare_bitmap_bindings or args.compare_bitmap_layers or args.compare_bitmap_draw)
+    if ((args.compare_compute_filters or args.filter_cache or args.compare_bitmap_bindings
+         or args.compare_bitmap_layers or args.compare_bitmap_draw)
             and (not args.baseline.samefile(args.candidate) or args.control or args.profile_off)):
         parser.error('path comparisons need the same executable and enabled target measurements')
     args.output.mkdir(parents=True, exist_ok=False)
@@ -253,6 +275,8 @@ def main():
     metadata['manifestSha256'] = hashlib.sha256(args.manifest.read_bytes()).hexdigest()
     if args.compare_compute_filters:
         metadata['filterPaths'] = {'baseline': 'fragment', 'candidate': 'compute'}
+    if args.filter_cache:
+        metadata['filterCacheCopy'] = {'baseline': 'draw', 'candidate': args.filter_cache}
     if args.compare_bitmap_bindings:
         metadata['bitmapBindings'] = {'baseline': 'explicit-on-array-device', 'candidate': 'array'}
     if args.compare_bitmap_layers:
@@ -277,6 +301,10 @@ def main():
                     if args.compare_compute_filters:
                         env = dict(os.environ if env is None else env,
                                    RUFFLE_COMPUTE_FILTERS='1' if label == 'candidate' else '0')
+                    elif args.filter_cache:
+                        env = dict(os.environ if env is None else env, RUFFLE_COMPUTE_FILTERS='0',
+                                   RUFFLE_FILTER_CACHE_TRANSFER=({'transfer': '1', 'direct': 'direct'}[args.filter_cache]
+                                                                if label == 'candidate' else '0'))
                     elif args.compare_bitmap_bindings or args.compare_bitmap_layers:
                         env = dict(os.environ if env is None else env,
                                    RUFFLE_BITMAP_BINDINGS=metadata['bitmapBindings'][label])
@@ -286,7 +314,9 @@ def main():
                     subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=3600, env=env)
                 runs[label].append(summarize(path))
             print(f'{case}: pair {pair+1}/{args.pairs} complete', flush=True)
-        if args.compare_compute_filters:
+        if args.filter_cache:
+            comparison = compare_filter_cache(runs['baseline'], runs['candidate'], args.phase, args.filter_cache)
+        elif args.compare_compute_filters:
             comparison = compare_filter_paths(runs['baseline'], runs['candidate'], args.phase)
         elif args.compare_bitmap_bindings or args.compare_bitmap_layers:
             comparison = compare_bitmap_paths(runs['baseline'], runs['candidate'], args.phase,

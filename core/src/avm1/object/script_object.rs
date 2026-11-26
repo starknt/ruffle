@@ -210,9 +210,7 @@ impl<'gc> Object<'gc> {
     ) -> R {
         let object = self.0.borrow();
         visit(
-            &mut object.properties.iter().filter_map(|(key, property)| {
-                property.is_enumerable().then(|| (key, property.data()))
-            }),
+            &mut object.properties.iter().filter(|&(_key, property)| property.is_enumerable()).map(|(key, property)| (key, property.data())),
         )
     }
 

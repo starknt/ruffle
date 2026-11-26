@@ -284,7 +284,7 @@ impl BitmapRecipe {
             pending
                 .coverage
                 .for_each(|region| -> Result<(), RenderFailure> {
-                    device.queue().write_texture(
+                    device.queue().write_texture_observed(
                         wgpu::TexelCopyTextureInfo {
                             texture: &texture.texture,
                             mip_level: 0,
@@ -307,6 +307,23 @@ impl BitmapRecipe {
                             width: region.width(),
                             height: region.height(),
                             depth_or_array_layers: 1,
+                        },
+                        |upload_bytes, staging_bytes| {
+                            if let Some(request) = pending.pixels.loader_request() {
+                                tracing::debug!(
+                                    target: "ruffle_loader",
+                                    stage = "gpu_upload",
+                                    session_generation = request.session_generation,
+                                    request_id = request.request_id,
+                                    resource_version = request.resource_version,
+                                    device_generation = self.device_generation,
+                                    bitmap_owner = self.owner.id,
+                                    bitmap_version = version,
+                                    upload_bytes,
+                                    staging_bytes,
+                                    "Loader image uploaded"
+                                );
+                            }
                         },
                     )?;
                     ruffle_render::profile::uploaded(

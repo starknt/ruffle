@@ -1,0 +1,14 @@
+interior ff406080 ff7090b0
+clamp ff80a0c0
+preserved alpha 64
+outside destination 0 0
+filtered alpha 96
+default fill 40000000
+color fill ff5070a0
+display clone 3 3 0,0,0,0,1,0,0,1,0 2 7 false false 204080 1
+independent clone 1
+bounded dimensions 15 0
+opaque destination ff00ff00
+truncate after bias 30303 40404
+clipped region ff112233 8000ff00 ff080808 ff112233
+straight channel rounding ffb1b1b1

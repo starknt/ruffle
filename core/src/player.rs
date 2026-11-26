@@ -347,6 +347,10 @@ impl PlayerSession {
     pub fn poll_tasks(&mut self) {
         self.executor.run();
     }
+
+    pub fn pending_tasks(&self) -> usize {
+        self.executor.pending_tasks()
+    }
 }
 
 pub struct Player {
@@ -3517,7 +3521,14 @@ impl PlayerBuilder {
 
     /// A headless session owns its executor until the host drops the session.
     pub fn build_session(self) -> PlayerSession {
-        let executor = crate::backend::tasks::LocalExecutor::new();
+        self.build_session_with_executor(crate::backend::tasks::LocalExecutor::new())
+    }
+
+    /// Keeps navigator and VM futures on the host's single ordered local executor.
+    pub fn build_session_with_executor(
+        self,
+        executor: crate::backend::tasks::LocalExecutor,
+    ) -> PlayerSession {
         let player = self.build_with_spawner(executor.spawner());
         PlayerSession { player, executor }
     }

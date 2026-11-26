@@ -600,6 +600,10 @@ impl CommandTarget {
             .unwrap_or_else(|| self.frame_buffer.view())
     }
 
+    pub(super) fn raster_texture(&self) -> &crate::gpu_resources::Texture {
+        self.frame_buffer.texture()
+    }
+
     pub fn color_texture(&self) -> &crate::gpu_resources::Texture {
         self.resolve_buffer
             .as_ref()

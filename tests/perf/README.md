@@ -82,6 +82,13 @@ interval P95 growth and 1% Low FPS loss as well as its other timing limits.
 It also checks the 5% peak RSS bound and requires complete interval measurements.
 Use `--compare-bitmap-bindings --case ordered_bitmaps --phase gpu` to compare
 explicit slots and binding arrays with the same device features and executable.
+For a full filtered bitmap cache, pass the same executable as baseline and
+candidate and use `--case blur_color_matrix --compare-filter-cache-transfer
+--phase "gpu:Copy filtered to CAB"`. The runner selects drawing or texture
+copying with `RUFFLE_FILTER_CACHE_TRANSFER` and checks the corresponding
+`filter_cache_draw_copies` or `filter_cache_transfers` count on every measured
+frame. Partial updates have their own bounded copies. Keep the completed-frame
+and window measurements separate when testing this path in a player.
 Absent, orphan or duplicate GPU identities never become zero-time measurements.
 
 `nativeNs.preparation` measures owner-thread CPU preparation and joining, excluding

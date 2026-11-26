@@ -50,6 +50,7 @@ package flash.net {
                     this.tempBuf.clear();
 
                     this.dispatchEvent(new DataEvent(DataEvent.DATA, false, false, data));
+                    if (!this.socket.connected) return; // A listener closed or reconnected the socket.
                 } else {
                     this.tempBuf.writeByte(byte);
                 }
@@ -87,6 +88,7 @@ package flash.net {
             }
 
             socket.connect(host, port);
+            this.tempBuf.clear();
         }
 
         public function send(object:*):void {

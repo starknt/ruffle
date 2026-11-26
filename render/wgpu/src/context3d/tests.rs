@@ -20,6 +20,199 @@ fn descriptors(staging: u64) -> Arc<Descriptors> {
     Arc::new(Descriptors::with_runtime(instance, adapter, device, queue, runtime).unwrap())
 }
 
+fn configure_back_buffer(context: &mut dyn Context3D, anti_alias: u32) {
+    context
+        .process_command(Context3DCommand::ConfigureBackBuffer {
+            width: 2,
+            height: 2,
+            anti_alias,
+            depth_and_stencil: true,
+            wants_best_resolution: false,
+            wants_best_resolution_on_browser_zoom: false,
+        })
+        .unwrap();
+}
+
+fn clear(context: &mut dyn Context3D, color: wgpu::Color, mask: u32) {
+    context
+        .process_command(Context3DCommand::Clear {
+            red: color.r,
+            green: color.g,
+            blue: color.b,
+            alpha: color.a,
+            depth: 1.0,
+            stencil: 0,
+            mask,
+        })
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn clear_without_draw_is_visible_in_the_presented_stage_packet() {
+    use crate::{
+        backend::WgpuRenderBackend, render_snapshot::bitmap_version, target::TextureTarget,
+    };
+    use ruffle_render::{
+        backend::RenderBackend,
+        commands::{CommandHandler, CommandList},
+    };
+
+    let descriptors = descriptors(4096);
+    let target = TextureTarget::new(&descriptors.device, (2, 2)).unwrap();
+    let mut renderer = WgpuRenderBackend::new(descriptors, target).unwrap();
+    let mut context = renderer
+        .create_context3d(Context3DProfile::Baseline)
+        .unwrap();
+    for anti_alias in [0, 4] {
+        configure_back_buffer(&mut *context, anti_alias);
+        let before = bitmap_version(&context.back_buffer_handle().unwrap()).unwrap();
+        let prior_packet = renderer
+            .capture_stage_packet(swf::Color::BLACK, CommandList::new(), vec![])
+            .unwrap();
+        clear(&mut *context, wgpu::Color::RED, COLOR_MASK);
+        clear(&mut *context, wgpu::Color::BLUE, DEPTH_MASK | STENCIL_MASK);
+        context.present();
+        let front = context.bitmap_handle();
+        let presented = bitmap_version(&front).unwrap();
+        let mut stage = CommandList::new();
+        stage.render_stage3d(front, Default::default());
+        let packet = renderer
+            .capture_stage_packet(swf::Color::BLACK, stage, vec![])
+            .unwrap();
+        assert!(packet.after_operation() >= prior_packet.after_operation() + 3);
+        assert!(renderer.prepare_frame().unwrap());
+        renderer.submit_stage_packet(packet).unwrap();
+        assert_eq!(
+            renderer.capture_frame().unwrap().unwrap().into_raw(),
+            [255, 0, 0, 255].repeat(4)
+        );
+        assert_eq!(presented.key, before.key);
+        assert_eq!(presented.version, before.version + 1);
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn stage_render_scale_projects_the_presented_context3d_buffer_once() {
+    use crate::{backend::WgpuRenderBackend, target::TextureTarget};
+    use ruffle_render::{
+        backend::RenderBackend,
+        commands::{CommandHandler, CommandList},
+        matrix::Matrix,
+    };
+
+    let descriptors = descriptors(4096);
+    let target = TextureTarget::new(&descriptors.device, (8, 4)).unwrap();
+    let mut renderer = WgpuRenderBackend::new(descriptors, target).unwrap();
+    renderer.set_stage_render_scale_percent(50).unwrap();
+    let mut context = renderer
+        .create_context3d(Context3DProfile::Baseline)
+        .unwrap();
+    configure_back_buffer(&mut *context, 4);
+    clear(&mut *context, wgpu::Color::RED, COLOR_MASK);
+    context.present();
+    let front = context.bitmap_handle();
+    let texture = &crate::as_texture(&front, renderer.device())
+        .unwrap()
+        .texture;
+    assert_eq!((texture.width(), texture.height()), (2, 2));
+    let mut stage = CommandList::new();
+    stage.render_stage3d(
+        front,
+        ruffle_render::transform::Transform {
+            matrix: Matrix::translate(swf::Twips::from_pixels(4.), swf::Twips::from_pixels(2.)),
+            ..Default::default()
+        },
+    );
+    let packet = renderer
+        .capture_stage_packet(swf::Color::BLACK, stage, vec![])
+        .unwrap();
+    assert!(renderer.prepare_frame().unwrap());
+    renderer.submit_stage_packet(packet).unwrap();
+    let image = renderer.capture_frame().unwrap().unwrap();
+    assert_eq!(image.dimensions(), (4, 2));
+    for (x, y, pixel) in image.enumerate_pixels() {
+        assert_eq!(
+            pixel.0,
+            if (x, y) == (2, 1) {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 0, 255]
+            }
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn offscreen_clear_survives_switching_back_to_the_back_buffer() {
+    use crate::{backend::WgpuRenderBackend, target::TextureTarget};
+    use ruffle_render::{backend::RenderBackend, bitmap::PixelRegion};
+    use std::num::NonZeroU32;
+
+    let descriptors = descriptors(4096);
+    let mut context = WgpuContext3D::new(descriptors.clone(), Context3DProfile::Baseline).unwrap();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (2, 2)).unwrap();
+    let mut renderer = WgpuRenderBackend::new(descriptors.clone(), target).unwrap();
+    configure_back_buffer(&mut context, 0);
+    let size = NonZeroU32::new(2).unwrap();
+    // A readable target lets the test verify the actual offscreen pixels after the switch.
+    let bitmap = renderer.create_empty_texture(size, size).unwrap();
+    let texture = Rc::new(TextureWrapper {
+        texture: crate::as_texture(&bitmap, &descriptors.device)
+            .unwrap()
+            .texture
+            .clone(),
+        _lifetime: context.operations.create_resource().unwrap(),
+    });
+    context
+        .process_command(Context3DCommand::SetRenderToTexture {
+            texture,
+            enable_depth_and_stencil: false,
+            anti_alias: 0,
+            surface_selector: 0,
+        })
+        .unwrap();
+    clear(&mut context, wgpu::Color::BLUE, COLOR_MASK);
+    context
+        .process_command(Context3DCommand::SetRenderToBackBuffer)
+        .unwrap();
+    clear(&mut context, wgpu::Color::RED, COLOR_MASK);
+    context.present();
+    renderer
+        .read_bitmap_region(
+            &bitmap,
+            PixelRegion::for_pixel(0, 0),
+            Box::new(|bytes, _| {
+                assert_eq!(&bytes[..4], &[0, 0, 255, 255]);
+            }),
+        )
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn reconfigured_stage3d_buffer_keeps_its_identity_until_last_release() {
+    use crate::render_snapshot::bitmap_version;
+    let mut context = WgpuContext3D::new(descriptors(4096), Context3DProfile::Baseline).unwrap();
+    for anti_alias in [0, 4] {
+        configure_back_buffer(&mut context, anti_alias);
+        let old = context.back_buffer_handle().unwrap();
+        let previous = bitmap_version(&old).unwrap();
+        configure_back_buffer(&mut context, anti_alias);
+        let replacement = bitmap_version(&context.back_buffer_handle().unwrap()).unwrap();
+        assert_ne!(replacement.key, previous.key);
+        assert_eq!(bitmap_version(&old).unwrap(), previous);
+        let configured = context.operations.applied();
+        drop(old.clone());
+        assert_eq!(context.operations.applied(), configured);
+        drop(old);
+        assert_eq!(context.operations.applied(), configured + 1);
+    }
+}
+
 #[test]
 #[ignore = "requires a Vulkan adapter"]
 fn odd_index_upload_preserves_neighbors_and_snapshots_the_entire_input() {

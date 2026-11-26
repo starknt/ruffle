@@ -9,6 +9,13 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use wgpu::Backend;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FilterCacheWriteback {
+    Draw,
+    Transfer,
+    FilterOutput,
+}
+
 pub struct Descriptors {
     _progress: Arc<crate::gpu_runtime::GpuProgress>,
     pub runtime: crate::gpu_runtime::GpuRuntime,
@@ -21,6 +28,7 @@ pub struct Descriptors {
     pub limits: wgpu::Limits,
     pub capabilities: crate::capabilities::NativeCapabilities,
     pub(crate) compute_filters: bool,
+    pub(crate) filter_cache_writeback: FilterCacheWriteback,
     pub backend: Backend,
     pub queue: crate::gpu_resources::Queue,
     pub bitmap_samplers: BitmapSamplers,
@@ -86,6 +94,7 @@ impl Descriptors {
         let device = device.with_owner(runtime.issue_owner(crate::gpu_runtime::OwnerKind::Scene)?);
         let queue = device.queue();
         let limits = device.limits();
+        device.configure_coverage(&adapter);
         let capabilities = crate::capabilities::NativeCapabilities::granted(&adapter, &device);
         use crate::capabilities::BitmapBindings;
         let bindings = match BitmapBindings::requested() {
@@ -131,6 +140,11 @@ impl Descriptors {
             capabilities,
             compute_filters: capabilities.compute_rgba8
                 && crate::capabilities::compute_filters_requested(),
+            filter_cache_writeback: match std::env::var("RUFFLE_FILTER_CACHE_TRANSFER").as_deref() {
+                Ok("1") => FilterCacheWriteback::Transfer,
+                Ok("direct") => FilterCacheWriteback::FilterOutput,
+                _ => FilterCacheWriteback::Draw,
+            },
             backend,
             queue,
             bitmap_samplers,

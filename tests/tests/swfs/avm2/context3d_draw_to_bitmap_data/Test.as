@@ -10,10 +10,12 @@ package {
     import flash.display3D.Context3D;
     import flash.display3D.Context3DProgramType;
     import flash.display3D.Context3DRenderMode;
+    import flash.display3D.Context3DTextureFormat;
     import flash.display3D.Context3DVertexBufferFormat;
     import flash.display3D.IndexBuffer3D;
     import flash.display3D.Program3D;
     import flash.display3D.VertexBuffer3D;
+    import flash.display3D.textures.Texture;
     import flash.events.Event;
 
     // drawToBitmapData copies the back buffer into a BitmapData 1:1 from the
@@ -90,6 +92,28 @@ package {
             trace("small(5,5):  " + hex(small.getPixel32(5, 5)));
             trace("small(20,5): " + hex(small.getPixel32(20, 5)));
             trace("small(29,5): " + hex(small.getPixel32(29, 5)));
+
+            // Move the red quad to the right half before the first CPU read of the copy.
+            var delayed:BitmapData = new BitmapData(50, 50);
+            context.drawToBitmapData(delayed);
+            for (var vertex:int = 0; vertex < 4; vertex++) {
+                vertexData[vertex * 7] += 1;
+            }
+            vertexBuffer.uploadFromVector(vertexData, 0, 4);
+            context.drawTriangles(indexBuffer, 0, 2);
+            trace("delayed(45,5): " + hex(delayed.getPixel32(45, 5)));
+            context.drawToBitmapData(same);
+            trace("second draw(45,5): " + hex(same.getPixel32(45, 5)));
+
+            // The texture's cyan clear must leave the back buffer's yellow intact.
+            var texture:Texture = context.createTexture(64, 64, Context3DTextureFormat.BGRA, true);
+            context.clear(1, 1, 0, 1);
+            context.setRenderToTexture(texture);
+            context.clear(0, 1, 1, 1);
+            context.setRenderToBackBuffer();
+            context.drawTriangles(indexBuffer, 0, 2);
+            context.drawToBitmapData(same);
+            trace("back after texture clear(5,5): " + hex(same.getPixel32(5, 5)));
 
             // Null destination throws #2007.
             try {

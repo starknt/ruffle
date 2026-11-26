@@ -428,11 +428,9 @@ impl MainWindow {
             && !self.minimized
             && !self.occluded
             && let Some(player) = player.as_deref_mut()
-        {
-            if let Err(error) = player.render() {
+            && let Err(error) = player.render() {
                 tracing::error!("Rendering stopped: {error}");
             }
-        }
         if player_needs_render || self.gui.needs_render() {
             self.gui.window().request_redraw();
         }
@@ -745,7 +743,17 @@ impl ApplicationHandler<RuffleEvent> for App {
         // `MainWindow` needs a tokio context to properly drop.
         {
             enter_runtime!(self);
-            let _ = self.main_window.take();
+            if let Some(main_window) = self.main_window.take() {
+                let device = &main_window.gui.descriptors().device;
+                let saved = device.flush_pipeline_cache();
+                let (pipelines, compile_ns) = device.pipeline_compile_stats();
+                tracing::info!(
+                    saved,
+                    pipelines,
+                    compile_ns,
+                    "Native pipeline cache shutdown"
+                );
+            }
         }
 
         // Manually stop the tokio runtime: this makes sure that any pending Player-bound futures

@@ -1216,14 +1216,13 @@ fn abstract_interpret_ops<'gc>(
                         optimize_op_to!(Op::Nop);
                         new_value.constant_value = Some(ConstantValue::Null);
                     }
-                } else if let Some(stack_class) = stack_value.class {
-                    if class == stack_class
-                        || (stack_value.is_not_primitive() && stack_class.has_class_in_chain(class))
+                } else if let Some(stack_class) = stack_value.class
+                    && (class == stack_class
+                        || (stack_value.is_not_primitive() && stack_class.has_class_in_chain(class)))
                     {
                         optimize_op_to!(Op::Nop);
                         new_value.not_null = stack_value.not_null;
                     }
-                }
 
                 stack.push(activation, new_value)?;
             }

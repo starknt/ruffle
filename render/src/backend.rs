@@ -37,6 +37,7 @@ pub trait BitmapCacheLease: Debug {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BitmapUsage {
     Mutable,
+    OpaqueMutable,
     Symbol,
     Excluded,
 }
@@ -112,6 +113,16 @@ pub trait RenderBackend: Any {
         self.register_shape_with_scale(shape.as_ref().into(), bitmap_source, scale)
     }
 
+    /// Encode the draw-local filter caches in dependency order before their consumer.
+    fn render_offscreen_caches(
+        &mut self,
+        _entries: Vec<BitmapCacheEntry>,
+        _quality: StageQuality,
+    ) -> Result<Option<()>, Error> {
+        self.health().check()?;
+        Ok(None)
+    }
+
     fn render_offscreen(
         &mut self,
         handle: BitmapHandle,
@@ -119,6 +130,11 @@ pub trait RenderBackend: Any {
         quality: StageQuality,
         bounds: PixelRegion,
     ) -> Result<Option<Box<dyn SyncHandle>>, Error>;
+
+    /// Submit pending offscreen draws before an independent encoder can overwrite their inputs.
+    fn submit_offscreen_draws(&mut self) -> Result<(), RenderFailure> {
+        self.health().check()
+    }
 
     /// Applies the given filter with a `BitmapHandle` source onto a destination `BitmapHandle`.
     /// The `destination_rect` must be calculated by the caller and is assumed to be correct.

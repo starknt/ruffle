@@ -200,9 +200,7 @@ impl DisplacementMapFilter {
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
             draw_encoder,
         )?;
-        let source_view = source.texture.create_view(&Default::default())?;
         let map_texture = as_texture(&map_handle, &descriptors.device)?;
-        let map_view = map_texture.texture.create_view(&Default::default())?;
         staging_belt
             .write_buffer(draw_encoder, &self.uniform_buffer, 0, self.uniform_size)?
             .copy_from_slice(bytemuck::cast_slice(&[DisplacementMapUniform {
@@ -239,11 +237,11 @@ impl DisplacementMapFilter {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&source_view),
+                    resource: wgpu::BindingResource::TextureView(source.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&map_view),
+                    resource: wgpu::BindingResource::TextureView(&map_texture.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -279,7 +277,7 @@ impl DisplacementMapFilter {
         });
         render_pass.set_pipeline(pipeline);
 
-        render_pass.set_bind_group(0, (&filter_group).raw(), &[]);
+        render_pass.set_bind_group(0, filter_group.raw(), &[]);
 
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(

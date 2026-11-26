@@ -69,11 +69,11 @@ impl RenderBackend for NullRenderer {
         dimensions: ViewportDimensions,
     ) -> Result<(), crate::error::RenderFailure> {
         self.health.check()?;
-        let output = (|| {
+        {
             self.dimensions = dimensions;
-        })();
+        };
         self.health.check()?;
-        Ok(output)
+        Ok(())
     }
     fn register_shape(
         &mut self,
@@ -81,7 +81,7 @@ impl RenderBackend for NullRenderer {
         _bitmap_source: &dyn BitmapSource,
     ) -> Result<ShapeHandle, crate::error::RenderFailure> {
         self.health.check()?;
-        let output = (|| ShapeHandle(Arc::new(NullShapeHandle)))();
+        let output = ShapeHandle(Arc::new(NullShapeHandle));
         self.health.check()?;
         Ok(output)
     }
@@ -94,7 +94,7 @@ impl RenderBackend for NullRenderer {
         _bounds: PixelRegion,
     ) -> Result<Option<Box<dyn SyncHandle>>, crate::error::Error> {
         self.health.check()?;
-        let output = (|| None)();
+        let output = None;
         self.health.check()?;
         Ok(output)
     }
@@ -139,9 +139,9 @@ impl RenderBackend for NullRenderer {
 
     fn set_quality(&mut self, _quality: StageQuality) -> Result<(), crate::error::RenderFailure> {
         self.health.check()?;
-        let output = (|| {})();
+        {};
         self.health.check()?;
-        Ok(output)
+        Ok(())
     }
 
     fn run_pixelbender_shader(

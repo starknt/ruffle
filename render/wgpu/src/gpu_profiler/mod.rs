@@ -16,3 +16,19 @@ pub use profiler_command_recorder::ProfilerCommandRecorder;
 pub use profiler_query::{GpuProfilerQuery, GpuTimerQueryResult};
 pub use profiler_settings::GpuProfilerSettings;
 pub use scope::{ManualOwningScope, OwningScope, Scope};
+
+pub(crate) fn time_range_ns(
+    ticks: std::ops::Range<u64>,
+    period: f32,
+) -> Option<std::ops::Range<u64>> {
+    let ns = |value| {
+        if period == 1.0 {
+            value
+        } else {
+            (value as f64 * f64::from(period)).round() as u64
+        }
+    };
+    let start = ns(ticks.start);
+    let duration = ns(ticks.end.checked_sub(ticks.start)?);
+    Some(start..start.checked_add(duration)?)
+}

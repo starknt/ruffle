@@ -76,7 +76,7 @@ pub fn external_interface_avm1(
         }
     }
 
-    Ok(())
+    check_nested_callbacks(environment, "avm1")
 }
 
 pub fn external_interface_avm2(
@@ -151,5 +151,28 @@ pub fn external_interface_avm2(
         }
     }
 
-    Ok(())
+    check_nested_callbacks(environment, "avm2")
+}
+
+fn check_nested_callbacks(
+    environment: &impl Environment,
+    avm: &str,
+) -> Result<(), libtest_mimic::Failed> {
+    let root = VfsPath::new(PhysicalFS::new(format!("tests/external_interface/{avm}")));
+    let options = TestOptions::read(&root.join("test.toml")?)?;
+    let test = Test::from_options(options, root, format!("external_interface_{avm}_nested"))?;
+    let mut runner = test.create_test_runner(environment)?;
+    runner
+        .player()
+        .lock()
+        .unwrap()
+        .set_external_interface_provider(Some(Box::new(ExternalInterfaceTestProvider::new())));
+
+    loop {
+        match runner.tick()? {
+            TestStatus::Continue => {}
+            TestStatus::Sleep(duration) => sleep(duration),
+            TestStatus::Finished => return Ok(()),
+        }
+    }
 }

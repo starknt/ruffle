@@ -1,0 +1,4 @@
+[
+  { "type": "Send", "payload": [97, 0, 120] },
+  { "type": "WaitForDisconnect" }
+]

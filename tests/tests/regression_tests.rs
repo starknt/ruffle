@@ -22,6 +22,8 @@ use std::thread::sleep;
 mod environment;
 mod external_interface;
 mod shared_object;
+#[cfg(feature = "imgtests")]
+mod stage_render_extent;
 
 const TEST_TOML_NAME: &str = "test.toml";
 
@@ -111,6 +113,17 @@ fn main() {
     runner.with_additional_test(Trial::test("external_interface_avm2", move || {
         external_interface_avm2(&*env_clone)
     }));
+
+    #[cfg(feature = "imgtests")]
+    {
+        let env = env.clone();
+        runner.with_additional_test(
+            Trial::test("stage_render_extent_flash_semantics", move || {
+                stage_render_extent::flash_semantics(&*env)
+            })
+            .with_ignored_flag(true), // Requires a native GPU.
+        );
+    }
 
     let conclusion = runner.run();
 

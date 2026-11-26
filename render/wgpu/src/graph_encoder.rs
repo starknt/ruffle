@@ -120,6 +120,8 @@ pub enum SurfaceCommands {
     Graph(GraphEncoder),
     CachedBitmaps(CommandList),
     ResidentDraws(CommandList),
+    /// Resident stage commands retain their original transforms and cached instance buffers.
+    ViewportDraws(CommandList, ruffle_render::backend::ViewportDimensions),
 }
 
 impl SurfaceCommands {

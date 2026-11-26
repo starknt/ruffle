@@ -1,0 +1,10 @@
+[ExternalInterface] starting reentry
+[ExternalInterface] trace: [String("successful reentry!")]
+[ExternalInterface] callback returned: String("Traced!")
+outer received Traced!: true
+[ExternalInterface] starting reentry
+callback throwing
+[ExternalInterface] callback returned: Null
+outer resumed with null: true
+[ExternalInterface] ping
+ping after throw: Pong!

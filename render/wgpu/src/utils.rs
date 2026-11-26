@@ -75,13 +75,11 @@ pub fn create_buffer_with_data(
     usage: wgpu::BufferUsages,
     label: Option<String>,
 ) -> Result<crate::gpu_resources::Buffer, crate::gpu_runtime::RenderFailure> {
-    Ok(
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            usage,
-            label: label.as_deref(),
-            contents: data,
-        })?,
-    )
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        usage,
+        label: label.as_deref(),
+        contents: data,
+    })
 }
 
 // Based off wgpu example 'capture'
@@ -137,51 +135,8 @@ pub fn capture_image<R, F: FnOnce(&[u8], u32) -> R>(
     dependency: Option<wgpu::SubmissionIndex>,
     with_rgba: F,
 ) -> Result<R, crate::gpu_runtime::RenderFailure> {
-    use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
-    let timeout = std::time::Duration::from_secs(2);
-    device.runtime().check_health()?;
-    if buffer.lease().id().device_generation() != device.runtime().generation() {
-        return Err(RenderFailure::new(
-            RenderFailureKind::Validation,
-            "readback buffer belongs to another device",
-        ));
-    }
-    if let Some(index) = dependency {
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(index),
-                timeout: Some(timeout),
-            })
-            .map_err(poll_failure)?;
-    }
-    let failed = device.runtime().health().failure_signal();
-    let (sender, receiver) = crossbeam_channel::bounded(1);
-    let buffer_slice = buffer.slice(..dimensions.size());
-    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.try_send(result);
-    });
-    let result = (|| {
-        device.runtime().request_poll(device)?;
-        crossbeam_channel::select_biased! {
-            recv(failed) -> _ => return Err(device.runtime().failure().expect("failed signal")),
-            recv(receiver) -> result => result
-                .map_err(|_| RenderFailure::new(RenderFailureKind::MapFailed, "readback map callback disconnected"))?
-                .map_err(|error| RenderFailure::new(RenderFailureKind::MapFailed, format!("readback map: {error}")))?,
-            default(timeout) => return Err(RenderFailure::new(RenderFailureKind::Timeout, "readback map callback timed out")),
-        }
-        device.runtime().check_health()?;
-        let map = buffer_slice.get_mapped_range().map_err(|error| {
-            RenderFailure::new(
-                RenderFailureKind::MapFailed,
-                format!("readback range: {error}"),
-            )
-        })?;
-        let result = with_rgba(&map, dimensions.padded_bytes_per_row);
-        drop(map);
-        Ok(result)
-    })();
-    buffer.unmap();
-    result
+    crate::readback::ReadbackBuffer::Shared(buffer.clone())
+        .capture(device, dimensions, dependency, with_rgba)
 }
 
 pub fn poll_failure(error: wgpu::PollError) -> crate::gpu_runtime::RenderFailure {
@@ -324,7 +279,7 @@ pub fn run_copy_regions_pipeline(
     });
 
     render_pass.set_pipeline(&pipeline);
-    render_pass.set_bind_group(2, (&copy_bind_group).raw(), &[]);
+    render_pass.set_bind_group(2, copy_bind_group.raw(), &[]);
 
     if let Some(regions) = regions {
         for region in regions {
