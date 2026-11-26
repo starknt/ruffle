@@ -555,9 +555,9 @@ impl CurrentPipeline {
             })
             .collect::<Vec<_>>();
 
-        let compiled = self
-            .device
-            .create_render_pipeline(&RenderPipelineDescriptor {
+        let compiled = self.device.create_render_pipeline_for(
+            crate::pipeline_profile::Family::Stage3d,
+            &RenderPipelineDescriptor {
                 label: create_debug_label!("RenderPipeline").as_deref(),
                 layout: Some(&pipeline_layout),
                 vertex: VertexState {
@@ -594,7 +594,8 @@ impl CurrentPipeline {
                 },
                 multiview_mask: None,
                 cache: None,
-            })?;
+            },
+        )?;
         Ok(Some((compiled, bind_group)))
     }
 

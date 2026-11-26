@@ -120,9 +120,9 @@ impl BevelFilter {
     ) -> Result<&crate::gpu_resources::RenderPipeline, crate::gpu_runtime::RenderFailure> {
         self.pipeline.get_or_init(format, msaa_sample_count, || {
             let label = create_debug_label!("Bevel Filter ({} msaa)", msaa_sample_count);
-            descriptors
-                .persistent_device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            descriptors.persistent_device.create_render_pipeline_for(
+                crate::pipeline_profile::Family::Filter,
+                &wgpu::RenderPipelineDescriptor {
                     label: label.as_deref(),
                     layout: Some(&self.pipeline_layout),
                     vertex: wgpu::VertexState {
@@ -154,7 +154,8 @@ impl BevelFilter {
                     }),
                     multiview_mask: None,
                     cache: None,
-                })
+                },
+            )
         })
     }
 

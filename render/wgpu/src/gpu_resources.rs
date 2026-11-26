@@ -9,6 +9,8 @@ use crate::gpu_runtime::{
     GpuRuntime, RenderFailure, RenderFailureKind, ResourceId, ResourceKind, ResourceLease,
     ResourceOwner, texture_storage_bytes,
 };
+use crate::pipeline_cache::{PipelineCacheState, PipelineCacheStatus};
+use crate::pipeline_profile::{Family, Kind, ObjectInfo, Profile, Signature, Variant, signature};
 pub use encoding::{ComputePass, RenderPass};
 use fnv::FnvHashMap;
 use std::{
@@ -21,6 +23,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+use std::{path::Path, sync::OnceLock};
 
 pub type Buffer = Resource<wgpu::Buffer>;
 pub type Texture = Resource<wgpu::Texture>;
@@ -86,13 +89,18 @@ impl Recording {
 trait Indexed: Any + Send + Sync {
     fn matches(&self, raw: &dyn Any) -> bool;
     fn lease(&self) -> &ResourceLease;
+    fn profile_info(&self) -> Option<&ObjectInfo>;
 }
 struct Object<T> {
+    profile: OnceLock<Box<ObjectInfo>>,
     raw: T,
     lease: ResourceLease,
     device: Device,
 }
 impl<T: Any + Eq + Send + Sync> Indexed for Object<T> {
+    fn profile_info(&self) -> Option<&ObjectInfo> {
+        self.profile.get().map(Box::as_ref)
+    }
     fn matches(&self, raw: &dyn Any) -> bool {
         raw.downcast_ref::<T>().is_some_and(|raw| self.raw == *raw)
     }
@@ -103,6 +111,23 @@ impl<T: Any + Eq + Send + Sync> Indexed for Object<T> {
 
 pub struct Resource<T>(Arc<Object<T>>);
 impl<T> Resource<T> {
+    fn set_profile(&self, key: Signature, variant: Option<Arc<Variant>>) {
+        let _ = self.0.profile.set(Box::new(ObjectInfo {
+            key,
+            instance: variant.map(|v| v.instance()),
+        }));
+    }
+    pub fn profile_use(&self) {
+        if let Some(instance) = self.0.profile.get().and_then(|o| o.instance.as_ref()) {
+            instance.variant().used();
+        }
+    }
+    pub fn profile_hit(&self) {
+        if let Some(instance) = self.0.profile.get().and_then(|o| o.instance.as_ref()) {
+            instance.variant().hit();
+        }
+    }
+
     pub fn lease(&self) -> &ResourceLease {
         &self.0.lease
     }
@@ -144,6 +169,9 @@ impl<T: Hash> Hash for Resource<T> {
 }
 
 struct DeviceInner {
+    pipeline_cache: OnceLock<PipelineCacheState>,
+    pipeline_profile: OnceLock<Profile>,
+    pipeline_compile_stats: parking_lot::Mutex<(u64, u64)>,
     raw: wgpu::Device,
     queue: wgpu::Queue,
     runtime: GpuRuntime,
@@ -227,6 +255,9 @@ impl Device {
     pub fn new(raw: wgpu::Device, queue: wgpu::Queue, runtime: GpuRuntime) -> Self {
         Self(
             Arc::new(DeviceInner {
+                pipeline_cache: Default::default(),
+                pipeline_profile: Default::default(),
+                pipeline_compile_stats: Default::default(),
                 raw,
                 queue,
                 runtime,
@@ -275,6 +306,116 @@ impl Device {
         &self.0.inner().raw
     }
 
+    /// Configure the shared cache before creating pipelines. Every owner uses the
+    /// first call's configuration and status, including when opening it failed.
+    /// Bump `host_abi` when the host's shaders or pipeline layouts change.
+    ///
+    /// # Safety
+    /// `dir` must be dedicated to this installation's native pipeline cache. The
+    /// caller must control its ancestry, permissions and contents across runs.
+    /// Its parent directory must already exist.
+    pub unsafe fn enable_pipeline_cache(&self, dir: &Path, host_abi: &str) -> PipelineCacheStatus {
+        self.0
+            .inner()
+            .pipeline_cache
+            .get_or_init(|| {
+                // SAFETY: the caller guarantees the cache directory's provenance.
+                unsafe { PipelineCacheState::open(self.raw(), dir, host_abi) }
+            })
+            .status()
+    }
+
+    pub fn pipeline_frame(&self, frame_id: u64) -> Option<crate::pipeline_profile::FrameScope> {
+        self.pipeline_profile().map(|_| {
+            crate::pipeline_profile::frame_scope(crate::pipeline_profile::Frame {
+                device: self.runtime().generation(),
+                session: self.1.id,
+                frame_id,
+            })
+        })
+    }
+    pub fn enable_pipeline_profile(&self) {
+        self.0
+            .inner()
+            .pipeline_profile
+            .get_or_init(Profile::default);
+    }
+
+    pub fn pipeline_profile(&self) -> Option<&Profile> {
+        self.0.inner().pipeline_profile.get()
+    }
+
+    pub fn profile_variant(
+        &self,
+        family: Family,
+        kind: Kind,
+        key: Signature,
+    ) -> Option<Arc<Variant>> {
+        self.pipeline_profile()?
+            .variant(self.runtime().generation(), family, kind, key)
+    }
+
+    /// Observe a host-owned native object without changing the legacy tracked-pipeline counters.
+    pub fn create_profiled_external<T>(
+        &self,
+        family: Family,
+        kind: Kind,
+        key: impl FnOnce() -> Signature,
+        create: impl FnOnce() -> T,
+    ) -> (T, Option<crate::pipeline_profile::Instance>) {
+        let variant = self
+            .pipeline_profile()
+            .and_then(|_| self.profile_variant(family, kind, key()));
+        match variant {
+            Some(v) => (v.measure(create), Some(v.instance())),
+            None => (create(), None),
+        }
+    }
+
+    fn resource_signature<T: Any + Eq + Hash>(&self, raw: &T) -> Option<Signature> {
+        self.lookup_object(raw).ok()?.profile_info().map(|v| v.key)
+    }
+
+    pub fn pipeline_cache(&self) -> Option<&wgpu::PipelineCache> {
+        self.0
+            .inner()
+            .pipeline_cache
+            .get()
+            .and_then(PipelineCacheState::handle)
+    }
+
+    pub fn pipeline_cache_status(&self) -> PipelineCacheStatus {
+        self.0
+            .inner()
+            .pipeline_cache
+            .get()
+            .map_or(PipelineCacheStatus::Disabled, PipelineCacheState::status)
+    }
+
+    pub fn flush_pipeline_cache(&self) -> bool {
+        self.0
+            .inner()
+            .pipeline_cache
+            .get()
+            .is_some_and(PipelineCacheState::flush)
+    }
+
+    /// Number of tracked native render/compute creation calls (including retries)
+    /// and their summed wall-clock time in nanoseconds, across all device owners.
+    pub fn pipeline_compile_stats(&self) -> (u64, u64) {
+        *self.0.inner().pipeline_compile_stats.lock()
+    }
+
+    fn time_pipeline_creation<T>(&self, create: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let pipeline = create();
+        let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let mut stats = self.0.inner().pipeline_compile_stats.lock();
+        stats.0 = stats.0.saturating_add(1);
+        stats.1 = stats.1.saturating_add(nanos);
+        pipeline
+    }
+
     pub fn queue(&self) -> Queue {
         Queue(self.clone())
     }
@@ -313,6 +454,7 @@ impl Device {
     fn wrap<T: Any + Eq + Hash + Send + Sync>(&self, raw: T, lease: ResourceLease) -> Resource<T> {
         let key = object_key(&raw);
         let object = Arc::new(Object {
+            profile: OnceLock::new(),
             raw,
             lease,
             device: self.clone(),
@@ -660,9 +802,15 @@ impl Device {
         &self,
         desc: &wgpu::BindGroupLayoutDescriptor<'_>,
     ) -> Result<BindGroupLayout, RenderFailure> {
-        self.create(ResourceKind::Pipeline, 0, &[], |device| {
+        let layout = self.create(ResourceKind::Pipeline, 0, &[], |device| {
             Ok(device.create_bind_group_layout(desc))
-        })
+        })?;
+        if self.pipeline_profile().is_some() {
+            let mut entries = desc.entries.to_vec();
+            entries.sort_unstable_by_key(|e| e.binding);
+            layout.set_profile(signature(format_args!("{entries:?}")), None);
+        }
+        Ok(layout)
     }
     pub fn create_bind_group(
         &self,
@@ -715,20 +863,58 @@ impl Device {
             .flatten()
             .map(|v| self.lookup(*v))
             .collect();
-        self.create(ResourceKind::Pipeline, 0, &dependencies?, |device| {
+        let layout = self.create(ResourceKind::Pipeline, 0, &dependencies?, |device| {
             Ok(device.create_pipeline_layout(desc))
-        })
+        })?;
+        if self.pipeline_profile().is_some() {
+            let groups: Vec<_> = desc
+                .bind_group_layouts
+                .iter()
+                .map(|g| g.map(|g| self.resource_signature(g)))
+                .collect();
+            layout.set_profile(
+                signature(format_args!("{groups:?} {}", desc.immediate_size)),
+                None,
+            );
+        }
+        Ok(layout)
     }
     pub fn create_shader_module(
         &self,
         desc: wgpu::ShaderModuleDescriptor<'_>,
     ) -> Result<ShaderModule, RenderFailure> {
-        self.create(ResourceKind::Shader, 0, &[], |device| {
-            Ok(device.create_shader_module(desc.clone()))
-        })
+        self.create_shader_module_for(Family::TwoD, desc)
+    }
+    pub fn create_shader_module_for(
+        &self,
+        family: Family,
+        desc: wgpu::ShaderModuleDescriptor<'_>,
+    ) -> Result<ShaderModule, RenderFailure> {
+        let profile = self.pipeline_profile().map(|_| {
+            let key = signature(format_args!("{:?}", desc.source));
+            (key, self.profile_variant(family, Kind::Shader, key))
+        });
+        let module = self.create(ResourceKind::Shader, 0, &[], |device| {
+            let create = || device.create_shader_module(desc.clone());
+            Ok(match &profile {
+                Some((_, Some(v))) => v.measure(create),
+                _ => create(),
+            })
+        })?;
+        if let Some((key, v)) = profile {
+            module.set_profile(key, v);
+        }
+        Ok(module)
     }
     pub fn create_render_pipeline(
         &self,
+        desc: &wgpu::RenderPipelineDescriptor<'_>,
+    ) -> Result<RenderPipeline, RenderFailure> {
+        self.create_render_pipeline_for(Family::TwoD, desc)
+    }
+    pub fn create_render_pipeline_for(
+        &self,
+        family: Family,
         desc: &wgpu::RenderPipelineDescriptor<'_>,
     ) -> Result<RenderPipeline, RenderFailure> {
         let mut dependencies = vec![self.lookup(desc.vertex.module)?];
@@ -738,21 +924,86 @@ impl Device {
         if let Some(fragment) = &desc.fragment {
             dependencies.push(self.lookup(fragment.module)?);
         }
-        self.create(ResourceKind::Pipeline, 0, &dependencies, |device| {
-            Ok(device.create_render_pipeline(desc))
-        })
+        let profile = self.pipeline_profile().map(|_| {
+            let fragment = desc.fragment.as_ref().map(|f| {
+                (
+                    self.resource_signature(f.module),
+                    f.entry_point,
+                    &f.compilation_options,
+                    f.targets,
+                )
+            });
+            let key = signature(format_args!(
+                "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                desc.layout.map(|l| self.resource_signature(l)),
+                self.resource_signature(desc.vertex.module),
+                desc.vertex.entry_point,
+                desc.vertex.compilation_options,
+                desc.vertex.buffers,
+                fragment,
+                desc.primitive,
+                desc.depth_stencil,
+                desc.multisample,
+                desc.multiview_mask
+            ));
+            (key, self.profile_variant(family, Kind::Render, key))
+        });
+        let desc = wgpu::RenderPipelineDescriptor {
+            cache: desc.cache.or_else(|| self.pipeline_cache()),
+            ..desc.clone()
+        };
+        let pipeline = self.create(ResourceKind::Pipeline, 0, &dependencies, |device| {
+            let create = || self.time_pipeline_creation(|| device.create_render_pipeline(&desc));
+            Ok(match &profile {
+                Some((_, Some(v))) => v.measure(create),
+                _ => create(),
+            })
+        })?;
+        if let Some((key, v)) = profile {
+            pipeline.set_profile(key, v);
+        }
+        Ok(pipeline)
     }
     pub fn create_compute_pipeline(
         &self,
+        desc: &wgpu::ComputePipelineDescriptor<'_>,
+    ) -> Result<ComputePipeline, RenderFailure> {
+        self.create_compute_pipeline_for(Family::Filter, desc)
+    }
+    pub fn create_compute_pipeline_for(
+        &self,
+        family: Family,
         desc: &wgpu::ComputePipelineDescriptor<'_>,
     ) -> Result<ComputePipeline, RenderFailure> {
         let mut dependencies = vec![self.lookup(desc.module)?];
         if let Some(layout) = desc.layout {
             dependencies.push(self.lookup(layout)?);
         }
-        self.create(ResourceKind::Pipeline, 0, &dependencies, |device| {
-            Ok(device.create_compute_pipeline(desc))
-        })
+        let profile = self.pipeline_profile().map(|_| {
+            let key = signature(format_args!(
+                "{:?} {:?} {:?} {:?}",
+                desc.layout.map(|l| self.resource_signature(l)),
+                self.resource_signature(desc.module),
+                desc.entry_point,
+                desc.compilation_options
+            ));
+            (key, self.profile_variant(family, Kind::Compute, key))
+        });
+        let desc = wgpu::ComputePipelineDescriptor {
+            cache: desc.cache.or_else(|| self.pipeline_cache()),
+            ..desc.clone()
+        };
+        let pipeline = self.create(ResourceKind::Pipeline, 0, &dependencies, |device| {
+            let create = || self.time_pipeline_creation(|| device.create_compute_pipeline(&desc));
+            Ok(match &profile {
+                Some((_, Some(v))) => v.measure(create),
+                _ => create(),
+            })
+        })?;
+        if let Some((key, v)) = profile {
+            pipeline.set_profile(key, v);
+        }
+        Ok(pipeline)
     }
     pub fn create_query_set(
         &self,

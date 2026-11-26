@@ -99,7 +99,9 @@ impl GuiController {
             .ok_or_else(|| anyhow!("surface has no supported format"))?;
         tracing::info!("Using surface format {:?}", surface_format);
         let size = window.inner_size();
-        let descriptors = Descriptors::with_runtime(instance, adapter, device, queue, runtime)?;
+        let device = ruffle_render_wgpu::gpu_resources::Device::new(device, queue, runtime);
+        super::pipeline_cache::configure(&device);
+        let descriptors = Descriptors::with_device(instance, adapter, device)?;
         descriptors.device.configure_surface(
             &surface,
             &wgpu::SurfaceConfiguration {

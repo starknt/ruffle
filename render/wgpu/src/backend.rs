@@ -2057,6 +2057,9 @@ async fn request_device(
         | GpuProfiler::ALL_WGPU_TIMER_FEATURES;
 
     features |= optional_features & adapter.features();
+    if adapter.get_info().backend == wgpu::Backend::Vulkan {
+        features |= wgpu::Features::PIPELINE_CACHE & adapter.features();
+    }
 
     adapter
         .request_device(&wgpu::DeviceDescriptor {

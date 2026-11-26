@@ -32,6 +32,13 @@ thiserror.workspace = true
 tracy-client = { version = "0.18", optional = true }
 futures = { workspace = true }
 rayon = { workspace = true }
+sha2.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
 
 [features]
 render_debug_labels = []

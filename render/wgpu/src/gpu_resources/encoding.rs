@@ -198,6 +198,7 @@ impl From<wgpu::BufferSlice<'_>> for BufferRange {
 #[derive(Default)]
 struct PassState {
     pipeline: Option<wgpu::RenderPipeline>,
+    profile: Option<Arc<Variant>>,
     bindings: FnvHashMap<u32, (Option<wgpu::BindGroup>, smallvec::SmallVec<[u32; 4]>)>,
     vertices: FnvHashMap<u32, Option<BufferRange>>,
     index: Option<(BufferRange, wgpu::IndexFormat)>,
@@ -235,6 +236,16 @@ impl RenderPass<'_> {
             return;
         }
         self.uses.retain(pipeline);
+        self.state.profile = self
+            .uses
+            .device
+            .pipeline_profile()
+            .and_then(|_| self.uses.device.lookup_object(pipeline).ok())
+            .and_then(|o| {
+                o.profile_info()
+                    .and_then(|i| i.instance.as_ref())
+                    .map(|v| v.variant().clone())
+            });
         self.raw.set_pipeline(pipeline);
         self.state.pipeline = Some(pipeline.clone());
         // Conservatively rebind after any pipeline-layout change.
@@ -294,9 +305,15 @@ impl RenderPass<'_> {
         self.changes.index_buffers += 1;
     }
     pub fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
+        if let Some(v) = &self.state.profile {
+            v.used();
+        }
         self.raw.draw(vertices, instances);
     }
     pub fn draw_indexed(&mut self, indices: Range<u32>, base_vertex: i32, instances: Range<u32>) {
+        if let Some(v) = &self.state.profile {
+            v.used();
+        }
         self.raw.draw_indexed(indices, base_vertex, instances);
     }
     pub fn set_stencil_reference(&mut self, value: u32) {
@@ -362,6 +379,12 @@ impl ComputePass<'_> {
         self.uses.retain(bindings);
         self.raw.set_pipeline(pipeline);
         self.raw.set_bind_group(0, bindings, &[]);
+        if self.uses.device.pipeline_profile().is_some()
+            && let Ok(object) = self.uses.device.lookup_object(pipeline)
+            && let Some(v) = object.profile_info().and_then(|i| i.instance.as_ref())
+        {
+            v.variant().used();
+        }
         self.raw.dispatch_workgroups(groups[0], groups[1], 1);
     }
 

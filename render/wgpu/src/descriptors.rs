@@ -143,8 +143,9 @@ impl Descriptors {
                         immediate_size: 0,
                     },
                 )?;
-                self.persistent_device
-                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                self.persistent_device.create_render_pipeline_for(
+                    crate::pipeline_profile::Family::Copy,
+                    &wgpu::RenderPipelineDescriptor {
                         label: create_debug_label!("Copy pipeline").as_deref(),
                         layout: Some(copy_texture_pipeline_layout),
                         vertex: wgpu::VertexState {
@@ -182,7 +183,8 @@ impl Descriptors {
                         },
                         multiview_mask: None,
                         cache: None,
-                    })
+                    },
+                )
             })?
             .clone(),
         )

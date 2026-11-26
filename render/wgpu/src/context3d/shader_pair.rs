@@ -58,18 +58,23 @@ impl ShaderPairAgal {
             let result = compiled.try_get_or_insert_mut_with_key(data, |data| {
                 let vertex_naga_module =
                     naga_agal::agal_to_naga(&self.vertex_shader, &data.vertex_attributes)?;
-                let vertex_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("AGAL vertex shader"),
-                    source: wgpu::ShaderSource::Naga(Cow::Owned(vertex_naga_module)),
-                })?;
+                let vertex_module = device.create_shader_module_for(
+                    crate::pipeline_profile::Family::Stage3d,
+                    wgpu::ShaderModuleDescriptor {
+                        label: Some("AGAL vertex shader"),
+                        source: wgpu::ShaderSource::Naga(Cow::Owned(vertex_naga_module)),
+                    },
+                )?;
 
                 let fragment_naga_module =
                     naga_agal::agal_to_naga(&self.fragment_shader, &data.vertex_attributes)?;
-                let fragment_module =
-                    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                let fragment_module = device.create_shader_module_for(
+                    crate::pipeline_profile::Family::Stage3d,
+                    wgpu::ShaderModuleDescriptor {
                         label: Some("AGAL fragment shader"),
                         source: wgpu::ShaderSource::Naga(Cow::Owned(fragment_naga_module)),
-                    })?;
+                    },
+                )?;
 
                 let mut layout_entries = vec![
                     // Vertex shader program constants

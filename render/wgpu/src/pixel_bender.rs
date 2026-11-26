@@ -66,8 +66,9 @@ impl PixelBenderWgpuShader {
             &mut self.pipelines.borrow_mut(),
             (samples, format, mask),
             || {
-                self.device
-                    .create_render_pipeline(&RenderPipelineDescriptor {
+                self.device.create_render_pipeline_for(
+                    crate::pipeline_profile::Family::PixelBender,
+                    &RenderPipelineDescriptor {
                         label: create_debug_label!("PixelBender shader pipeline").as_deref(),
                         layout: Some(&self.pipeline_layout),
                         vertex: VertexState {
@@ -99,7 +100,8 @@ impl PixelBenderWgpuShader {
                         },
                         multiview_mask: None,
                         cache: None,
-                    })
+                    },
+                )
             },
         )?
         .clone())
@@ -243,15 +245,21 @@ impl PixelBenderWgpuShader {
             mapped_at_creation: false,
         })?;
 
-        let vertex_shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Naga(Cow::Owned(shaders.vertex)),
-        })?;
+        let vertex_shader = device.create_shader_module_for(
+            crate::pipeline_profile::Family::PixelBender,
+            ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Naga(Cow::Owned(shaders.vertex)),
+            },
+        )?;
 
-        let fragment_shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Naga(Cow::Owned(shaders.fragment)),
-        })?;
+        let fragment_shader = device.create_shader_module_for(
+            crate::pipeline_profile::Family::PixelBender,
+            ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Naga(Cow::Owned(shaders.fragment)),
+            },
+        )?;
 
         Ok(PixelBenderWgpuShader {
             bind_group_layout,

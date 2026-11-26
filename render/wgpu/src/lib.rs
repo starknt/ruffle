@@ -48,6 +48,8 @@ pub mod gpu_resources;
 pub mod gpu_runtime;
 mod graph_encoder;
 mod pass_graph;
+pub mod pipeline_cache;
+pub mod pipeline_profile;
 mod pipelines;
 mod pixel_bender;
 mod prepare;
