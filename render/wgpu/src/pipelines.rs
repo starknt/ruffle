@@ -1,9 +1,12 @@
 use crate::blend::{ComplexBlend, TrivialBlend};
+use crate::gpu_resources::{Device, PipelineLayout, RenderPipeline, ShaderModule};
+use crate::gpu_runtime::RenderFailure;
 use crate::layouts::BindLayouts;
 use crate::shaders::Shaders;
 use crate::surface::mask::MaskMode;
 use crate::{PosColorVertex, PosUvVertex, PosVertex};
 use enum_map::{EnumMap, enum_map};
+use once_cell::sync::OnceCell;
 use wgpu::{BlendState, PrimitiveTopology, vertex_attr_array};
 
 pub const VERTEX_BUFFERS_DESCRIPTION_POS: [Option<wgpu::VertexBufferLayout>; 1] =
@@ -37,8 +40,18 @@ pub const VERTEX_BUFFERS_DESCRIPTION_COLOR: [Option<wgpu::VertexBufferLayout>; 1
 
 #[derive(Debug)]
 pub struct ShapePipeline {
-    pub pipelines: EnumMap<MaskMode, crate::gpu_resources::RenderPipeline>,
-    stencilless: crate::gpu_resources::RenderPipeline,
+    device: Device,
+    name: String,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    shader: ShaderModule,
+    layout: PipelineLayout,
+    vertices: &'static [Option<wgpu::VertexBufferLayout<'static>>],
+    topology: PrimitiveTopology,
+    blend: BlendState,
+    opaque: bool,
+    masked: EnumMap<MaskMode, OnceCell<RenderPipeline>>,
+    stencilless: OnceCell<RenderPipeline>,
 }
 
 #[derive(Debug)]
@@ -48,12 +61,7 @@ pub struct Pipelines {
     /// Renders a bitmap without any blending, and does
     /// not write to the alpha channel. This is used for
     /// drawing a finished Stage3D buffer onto the background.
-    pub bitmap_opaque: crate::gpu_resources::RenderPipeline,
-    /// Like `bitmap_opaque`, but with a no-op `DepthStencilState`.
-    /// This is used when we're inside a `RenderPass` that is
-    /// using a stencil buffer, but we don't want to write to it
-    /// or use it in any way.
-    pub bitmap_opaque_dummy_stencil: crate::gpu_resources::RenderPipeline,
+    pub bitmap_opaque: ShapePipeline,
     pub bitmap: EnumMap<TrivialBlend, ShapePipeline>,
     pub bitmap_batch: ShapePipeline,
     pub gradients: ShapePipeline,
@@ -62,29 +70,51 @@ pub struct Pipelines {
 }
 
 impl ShapePipeline {
-    pub fn pipeline_for(&self, mask_mode: MaskMode) -> &crate::gpu_resources::RenderPipeline {
-        &self.pipelines[mask_mode]
+    pub fn pipeline_for(&self, mask: MaskMode) -> Result<&RenderPipeline, RenderFailure> {
+        self.variant(Some(mask))
+    }
+    pub fn stencilless_pipeline(&self) -> Result<&RenderPipeline, RenderFailure> {
+        self.variant(None)
     }
 
-    pub fn stencilless_pipeline(&self) -> &crate::gpu_resources::RenderPipeline {
-        &self.stencilless
-    }
-
-    /// Builds of a nested `EnumMap` that maps a `MaskState` to
-    /// a `RenderPipeline`. The provided callback is used to construct the `RenderPipeline`
-    /// for each possible `MaskState`.
-    fn build(
-        stencilless: crate::gpu_resources::RenderPipeline,
-        mut f: impl FnMut(
-            MaskMode,
-        ) -> Result<
-            crate::gpu_resources::RenderPipeline,
-            crate::gpu_runtime::RenderFailure,
-        >,
-    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
-        Ok(ShapePipeline {
-            pipelines: enum_map! { mask => f(mask)? },
-            stencilless,
+    fn variant(&self, mask: Option<MaskMode>) -> Result<&RenderPipeline, RenderFailure> {
+        let cell = mask.map_or(&self.stencilless, |mode| &self.masked[mode]);
+        cell.get_or_try_init(|| {
+            let depth = mask.map(|mode| {
+                let mut state = mode.pipeline_stencil();
+                if self.opaque {
+                    state.stencil.read_mask = 0;
+                    state.stencil.write_mask = 0;
+                }
+                state
+            });
+            let write_mask = if self.opaque {
+                wgpu::ColorWrites::COLOR
+            } else {
+                mask.map_or(wgpu::ColorWrites::ALL, MaskMode::color_writes)
+            };
+            let constants = if self.opaque && mask.is_none() {
+                &[("late_saturate", 1.0)][..]
+            } else {
+                &[]
+            };
+            self.device
+                .create_render_pipeline(&create_pipeline_descriptor(
+                    create_debug_label!("{} {:?}", self.name, mask).as_deref(),
+                    &self.shader,
+                    &self.shader,
+                    &self.layout,
+                    depth,
+                    &[Some(wgpu::ColorTargetState {
+                        format: self.format,
+                        blend: Some(self.blend),
+                        write_mask,
+                    })],
+                    self.vertices,
+                    self.samples,
+                    constants,
+                    self.topology,
+                ))
         })
     }
 }
@@ -111,7 +141,7 @@ impl Pipelines {
             &VERTEX_BUFFERS_DESCRIPTION_COLOR,
             &colort_bindings,
             BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-            0,
+            false,
             PrimitiveTopology::TriangleList,
         )?;
 
@@ -124,7 +154,7 @@ impl Pipelines {
             &VERTEX_BUFFERS_DESCRIPTION_COLOR,
             &colort_bindings,
             BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-            0,
+            false,
             PrimitiveTopology::LineStrip,
         )?;
 
@@ -143,7 +173,7 @@ impl Pipelines {
             &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
             &gradient_bindings,
             BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-            0,
+            false,
             PrimitiveTopology::TriangleList,
         )?;
 
@@ -163,7 +193,7 @@ impl Pipelines {
                 &VERTEX_BUFFERS_DESCRIPTION_POS,
                 &complex_blend_bindings,
                 BlendState::REPLACE,
-                0,
+                false,
                 PrimitiveTopology::TriangleList,
             )?
         };
@@ -184,65 +214,23 @@ impl Pipelines {
                 &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
                 &bitmap_blend_bindings,
                 blend.blend_state(),
-                0,
+                false,
                 PrimitiveTopology::TriangleList,
             )?
         }};
 
-        let bitmap_opaque_pipeline_layout_label =
-            create_debug_label!("Opaque bitmap pipeline layout");
-        let bitmap_opaque_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: bitmap_opaque_pipeline_layout_label.as_deref(),
-                bind_group_layouts: &bitmap_blend_bindings,
-                immediate_size: 0,
-            })?;
-
-        let bitmap_opaque = device.create_render_pipeline(&create_pipeline_descriptor(
-            create_debug_label!("Bitmap opaque copy").as_deref(),
+        let bitmap_opaque = create_shape_pipeline(
+            "Bitmap opaque copy",
+            device,
+            format,
             &shaders.bitmap_shader,
-            &shaders.bitmap_shader,
-            &bitmap_opaque_pipeline_layout,
-            None,
-            &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::COLOR,
-            })],
-            &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
             msaa_sample_count,
-            &[("late_saturate", 1.0)],
+            &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
+            &bitmap_blend_bindings,
+            BlendState::REPLACE,
+            true,
             PrimitiveTopology::TriangleList,
-        ))?;
-
-        let bitmap_opaque_dummy_depth =
-            device.create_render_pipeline(&create_pipeline_descriptor(
-                create_debug_label!("Bitmap opaque copy").as_deref(),
-                &shaders.bitmap_shader,
-                &shaders.bitmap_shader,
-                &bitmap_opaque_pipeline_layout,
-                Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Stencil8,
-                    depth_write_enabled: Some(false),
-                    depth_compare: Some(wgpu::CompareFunction::Always),
-                    stencil: wgpu::StencilState {
-                        front: wgpu::StencilFaceState::IGNORE,
-                        back: wgpu::StencilFaceState::IGNORE,
-                        read_mask: 0,
-                        write_mask: 0,
-                    },
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::COLOR,
-                })],
-                &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
-                msaa_sample_count,
-                &[],
-                PrimitiveTopology::TriangleList,
-            ))?;
+        )?;
 
         let bitmap_batch = create_shape_pipeline(
             "Adjacent bitmap textures",
@@ -257,7 +245,7 @@ impl Pipelines {
                 Some(bind_layouts.bitmap_batch.raw()),
             ],
             BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-            0,
+            false,
             PrimitiveTopology::TriangleList,
         )?;
 
@@ -276,7 +264,7 @@ impl Pipelines {
             &VERTEX_BUFFERS_DESCRIPTION_POS_UV,
             &alpha_mask_bindings,
             BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-            0,
+            false,
             PrimitiveTopology::TriangleList,
         )?;
 
@@ -286,7 +274,6 @@ impl Pipelines {
             lines: lines_pipelines,
             bitmap: bitmap_pipelines,
             bitmap_opaque,
-            bitmap_opaque_dummy_stencil: bitmap_opaque_dummy_depth,
             gradients: gradient_pipeline,
             complex_blends: complex_blend_pipelines,
             alpha_mask: alpha_mask_pipeline,
@@ -358,107 +345,40 @@ fn create_shape_pipeline(
     format: wgpu::TextureFormat,
     shader: &crate::gpu_resources::ShaderModule,
     msaa_sample_count: u32,
-    vertex_buffers_layout: &[Option<wgpu::VertexBufferLayout<'_>>],
+    vertex_buffers_layout: &'static [Option<wgpu::VertexBufferLayout<'static>>],
     bind_group_layouts: &[Option<&wgpu::BindGroupLayout>],
     blend: BlendState,
-    immediate_size: u32,
+    opaque: bool,
     primitive_topology: PrimitiveTopology,
 ) -> Result<ShapePipeline, crate::gpu_runtime::RenderFailure> {
     let pipeline_layout_label = create_debug_label!("{} shape pipeline layout", name);
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: pipeline_layout_label.as_deref(),
         bind_group_layouts,
-        immediate_size,
+        immediate_size: 0,
     })?;
 
-    let mask_render_state = |mask_name, stencil_state, write_mask| {
-        device.create_render_pipeline(&create_pipeline_descriptor(
-            create_debug_label!("{} pipeline {}", name, mask_name).as_deref(),
-            shader,
-            shader,
-            &pipeline_layout,
-            Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Stencil8,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: wgpu::StencilState {
-                    front: stencil_state,
-                    back: stencil_state,
-                    read_mask: !0,
-                    write_mask: !0,
-                },
-                bias: Default::default(),
-            }),
-            &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(blend),
-                write_mask,
-            })],
-            vertex_buffers_layout,
-            msaa_sample_count,
-            &[],
-            primitive_topology,
-        ))
+    let variant = ShapePipeline {
+        device: device.clone(),
+        name: name.to_owned(),
+        format,
+        samples: msaa_sample_count,
+        shader: shader.clone(),
+        layout: pipeline_layout,
+        vertices: vertex_buffers_layout,
+        topology: primitive_topology,
+        blend,
+        opaque,
+        masked: Default::default(),
+        stencilless: OnceCell::new(),
     };
-
-    Ok(ShapePipeline::build(
-        device.create_render_pipeline(&create_pipeline_descriptor(
-            create_debug_label!("{} stencilless pipeline", name).as_deref(),
-            shader,
-            shader,
-            &pipeline_layout,
-            None,
-            &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(blend),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            vertex_buffers_layout,
-            msaa_sample_count,
-            &[],
-            primitive_topology,
-        ))?,
-        |mask_mode| match mask_mode {
-            MaskMode::NoMask => mask_render_state(
-                "no mask",
-                wgpu::StencilFaceState {
-                    compare: wgpu::CompareFunction::Always,
-                    fail_op: wgpu::StencilOperation::Keep,
-                    depth_fail_op: wgpu::StencilOperation::Keep,
-                    pass_op: wgpu::StencilOperation::Keep,
-                },
-                wgpu::ColorWrites::ALL,
-            ),
-            MaskMode::DrawMaskStencil => mask_render_state(
-                "draw mask stencil",
-                wgpu::StencilFaceState {
-                    compare: wgpu::CompareFunction::Equal,
-                    fail_op: wgpu::StencilOperation::Keep,
-                    depth_fail_op: wgpu::StencilOperation::Keep,
-                    pass_op: wgpu::StencilOperation::IncrementClamp,
-                },
-                wgpu::ColorWrites::empty(),
-            ),
-            MaskMode::DrawMaskedContent => mask_render_state(
-                "draw masked content",
-                wgpu::StencilFaceState {
-                    compare: wgpu::CompareFunction::Equal,
-                    fail_op: wgpu::StencilOperation::Keep,
-                    depth_fail_op: wgpu::StencilOperation::Keep,
-                    pass_op: wgpu::StencilOperation::Keep,
-                },
-                wgpu::ColorWrites::ALL,
-            ),
-            MaskMode::ClearMaskStencil => mask_render_state(
-                "clear mask stencil",
-                wgpu::StencilFaceState {
-                    compare: wgpu::CompareFunction::Equal,
-                    fail_op: wgpu::StencilOperation::Keep,
-                    depth_fail_op: wgpu::StencilOperation::Keep,
-                    pass_op: wgpu::StencilOperation::DecrementClamp,
-                },
-                wgpu::ColorWrites::empty(),
-            ),
-        },
-    )?)
+    if std::env::var_os("RUFFLE_2D_PIPELINE_LAZY").as_deref() == Some("0".as_ref()) {
+        variant.variant(None)?;
+        for (mode, _) in &variant.masked {
+            if !opaque || mode == MaskMode::NoMask {
+                variant.variant(Some(mode))?;
+            }
+        }
+    }
+    Ok(variant)
 }

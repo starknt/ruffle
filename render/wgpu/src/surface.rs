@@ -284,7 +284,7 @@ impl Surface {
                         );
 
                         for command in &chunk {
-                            renderer.execute(&mut render_pass.scope(command.name()), command);
+                            renderer.execute(&mut render_pass.scope(command.name()), command)?;
                         }
                     }
                     Chunk::Blend {
@@ -449,11 +449,12 @@ impl Surface {
                         if needs_stencil {
                             mask_state.apply_stencil_reference(&mut render_pass);
                             render_pass.set_pipeline(
-                                pipelines.complex_blends[blend_mode].pipeline_for(mask_state.mode),
+                                pipelines.complex_blends[blend_mode]
+                                    .pipeline_for(mask_state.mode)?,
                             );
                         } else {
                             render_pass.set_pipeline(
-                                pipelines.complex_blends[blend_mode].stencilless_pipeline(),
+                                pipelines.complex_blends[blend_mode].stencilless_pipeline()?,
                             );
                         }
 

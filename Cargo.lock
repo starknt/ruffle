@@ -4913,6 +4913,7 @@ dependencies = [
  "naga",
  "naga-agal",
  "naga-pixelbender",
+ "once_cell",
  "parking_lot",
  "profiling",
  "rayon",

@@ -1,4 +1,5 @@
 use crate::blend::{ComplexBlend, TrivialBlend};
+use crate::gpu_runtime::RenderFailure;
 use crate::pipelines::Pipelines;
 use crate::surface::buffers::{ChunkBufferBuilder, ChunkBuffers, DrawOffsets};
 use crate::surface::mask::MaskState;
@@ -277,7 +278,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         &mut self,
         render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         command: &'encoder DrawCommand,
-    ) {
+    ) -> Result<(), RenderFailure> {
         if self.needs_stencil {
             self.mask_state.apply_stencil_reference(render_pass);
         }
@@ -296,7 +297,7 @@ impl<'encoder> CommandRenderer<'encoder> {
                 *blend_mode,
                 *render_stage3d,
                 draw_offsets,
-            ),
+            )?,
             DrawCommand::RenderTextureBatch {
                 binds,
                 draw_offsets,
@@ -307,28 +308,31 @@ impl<'encoder> CommandRenderer<'encoder> {
                     if self.needs_stencil {
                         self.pipelines
                             .bitmap_batch
-                            .pipeline_for(self.mask_state.mode)
+                            .pipeline_for(self.mask_state.mode)?
                     } else {
-                        self.pipelines.bitmap_batch.stencilless_pipeline()
+                        self.pipelines.bitmap_batch.stencilless_pipeline()?
                     },
                 );
                 self.set_material(render_pass, binds);
                 self.draw(render_pass, draw_offsets);
             }
-            DrawCommand::DrawColor { draw_offsets } => self.draw_color(render_pass, draw_offsets),
-            DrawCommand::DrawLine { draw_offsets } => self.draw_lines(render_pass, draw_offsets),
+            DrawCommand::DrawColor { draw_offsets } => {
+                self.draw_color(render_pass, draw_offsets)?
+            }
+            DrawCommand::DrawLine { draw_offsets } => self.draw_lines(render_pass, draw_offsets)?,
             DrawCommand::SetMask(mask_state) => self.set_mask_state(*mask_state),
             DrawCommand::RenderAlphaMask {
                 maskee,
                 mask,
                 binds,
                 draw_offsets,
-            } => self.render_alpha_mask(render_pass, maskee, mask, binds, draw_offsets),
+            } => self.render_alpha_mask(render_pass, maskee, mask, binds, draw_offsets)?,
             DrawCommand::RenderGradient {
                 bind_group,
                 draw_offsets,
-            } => self.draw_gradient(render_pass, bind_group, draw_offsets),
+            } => self.draw_gradient(render_pass, bind_group, draw_offsets)?,
         }
+        Ok(())
     }
 
     pub fn set_pipeline(
@@ -407,24 +411,32 @@ impl<'encoder> CommandRenderer<'encoder> {
         blend_mode: TrivialBlend,
         render_stage3d: bool,
         draw_offsets: &'encoder DrawOffsets,
-    ) {
+    ) -> Result<(), RenderFailure> {
         match (self.needs_stencil, render_stage3d) {
             (true, true) => {
-                self.set_pipeline(render_pass, &self.pipelines.bitmap_opaque_dummy_stencil);
+                self.set_pipeline(
+                    render_pass,
+                    self.pipelines
+                        .bitmap_opaque
+                        .pipeline_for(crate::surface::mask::MaskMode::NoMask)?,
+                );
             }
             (true, false) => {
                 self.set_pipeline(
                     render_pass,
-                    self.pipelines.bitmap[blend_mode].pipeline_for(self.mask_state.mode),
+                    self.pipelines.bitmap[blend_mode].pipeline_for(self.mask_state.mode)?,
                 );
             }
             (false, true) => {
-                self.set_pipeline(render_pass, &self.pipelines.bitmap_opaque);
+                self.set_pipeline(
+                    render_pass,
+                    self.pipelines.bitmap_opaque.stencilless_pipeline()?,
+                );
             }
             (false, false) => {
                 self.set_pipeline(
                     render_pass,
-                    self.pipelines.bitmap[blend_mode].stencilless_pipeline(),
+                    self.pipelines.bitmap[blend_mode].stencilless_pipeline()?,
                 );
             }
         }
@@ -432,6 +444,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         self.set_material(render_pass, bind_group);
 
         self.draw(render_pass, draw_offsets);
+        Ok(())
     }
 
     pub fn draw_gradient(
@@ -439,19 +452,22 @@ impl<'encoder> CommandRenderer<'encoder> {
         render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         bind_group: &'encoder crate::gpu_resources::BindGroup,
         draw_offsets: &'encoder DrawOffsets,
-    ) {
+    ) -> Result<(), RenderFailure> {
         self.set_pipeline(
             render_pass,
             if self.needs_stencil {
-                self.pipelines.gradients.pipeline_for(self.mask_state.mode)
+                self.pipelines
+                    .gradients
+                    .pipeline_for(self.mask_state.mode)?
             } else {
-                self.pipelines.gradients.stencilless_pipeline()
+                self.pipelines.gradients.stencilless_pipeline()?
             },
         );
 
         self.set_material(render_pass, bind_group);
 
         self.draw(render_pass, draw_offsets);
+        Ok(())
     }
 
     pub fn render_alpha_mask(
@@ -461,7 +477,7 @@ impl<'encoder> CommandRenderer<'encoder> {
         _mask: &PoolOrArcTexture,
         bind_group: &'encoder crate::gpu_resources::BindGroup,
         draw_offsets: &'encoder DrawOffsets,
-    ) {
+    ) -> Result<(), RenderFailure> {
         if let Some(work) = &mut self.work {
             // Count the pass once, even if it contains several alpha masks or
             // also uses stencil masking.
@@ -470,49 +486,54 @@ impl<'encoder> CommandRenderer<'encoder> {
         self.set_pipeline(
             render_pass,
             if self.needs_stencil {
-                self.pipelines.alpha_mask.pipeline_for(self.mask_state.mode)
+                self.pipelines
+                    .alpha_mask
+                    .pipeline_for(self.mask_state.mode)?
             } else {
-                self.pipelines.alpha_mask.stencilless_pipeline()
+                self.pipelines.alpha_mask.stencilless_pipeline()?
             },
         );
 
         self.set_material(render_pass, bind_group);
 
         self.draw(render_pass, draw_offsets);
+        Ok(())
     }
 
     pub fn draw_color(
         &mut self,
         render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         draw_offsets: &'encoder DrawOffsets,
-    ) {
+    ) -> Result<(), RenderFailure> {
         self.set_pipeline(
             render_pass,
             if self.needs_stencil {
-                self.pipelines.color.pipeline_for(self.mask_state.mode)
+                self.pipelines.color.pipeline_for(self.mask_state.mode)?
             } else {
-                self.pipelines.color.stencilless_pipeline()
+                self.pipelines.color.stencilless_pipeline()?
             },
         );
 
         self.draw(render_pass, draw_offsets);
+        Ok(())
     }
 
     pub fn draw_lines(
         &mut self,
         render_pass: &mut crate::gpu_resources::RenderPass<'encoder>,
         draw_offsets: &'encoder DrawOffsets,
-    ) {
+    ) -> Result<(), RenderFailure> {
         self.set_pipeline(
             render_pass,
             if self.needs_stencil {
-                self.pipelines.lines.pipeline_for(self.mask_state.mode)
+                self.pipelines.lines.pipeline_for(self.mask_state.mode)?
             } else {
-                self.pipelines.lines.stencilless_pipeline()
+                self.pipelines.lines.stencilless_pipeline()?
             },
         );
 
         self.draw(render_pass, draw_offsets);
+        Ok(())
     }
 
     pub fn set_mask_state(&mut self, mask_state: MaskState) {
