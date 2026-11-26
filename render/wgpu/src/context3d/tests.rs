@@ -171,3 +171,61 @@ fn surviving_stage3d_handles_are_not_misclassified_as_descriptor_resources() {
             .all(|r| baseline.contains(&r.id))
     );
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn resident_pipeline_survives_agal_specialization_eviction_and_stream_regrouping() {
+    use Context3DVertexBufferFormat::{Float2, Float3, Float4};
+    let descriptors = descriptors(1 << 20);
+    let device = &descriptors.device;
+    let mut pipeline = CurrentPipeline::new(device).unwrap();
+    // mov op, va0 and mov oc, fc0
+    let mov = |stage, source| {
+        vec![
+            160, 1, 0, 0, 0, 161, stage, 0, 0, 0, 0, 0, 0, 15, 3, 0, 0, 0, 228, source, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+        ]
+    };
+    pipeline.set_shaders(Some(Rc::new(
+        ShaderPairAgal::new(mov(0, 0), mov(1, 1)).unwrap(),
+    )));
+    let buffer = || {
+        Rc::new(VertexBufferWrapper {
+            data_32_per_vertex: 8,
+            buffer: device
+                .create_buffer(&BufferDescriptor {
+                    label: None,
+                    size: 96,
+                    usage: BufferUsages::VERTEX,
+                    mapped_at_creation: false,
+                })
+                .unwrap(),
+        })
+    };
+    let first = buffer();
+    let second = buffer();
+    let mut inputs = super::pipeline_cache::VertexInputs::default();
+    let info = |buffer: &Rc<VertexBufferWrapper>, format, offset| {
+        Some(VertexAttributeInfo {
+            buffer: buffer.clone(),
+            format,
+            offset_in_32bit_units: offset,
+        })
+    };
+    let before = device.pipeline_compile_stats().0;
+    let mut ids = Vec::new();
+    for format in [Float4, Float3, Float2, Float4] {
+        pipeline.update_vertex_buffer_at(inputs.set(0, info(&first, format, 0)));
+        pipeline.rebuild_pipeline(&descriptors, &inputs).unwrap();
+        ids.push(pipeline.active().unwrap().0.clone());
+    }
+    assert_eq!(ids[0], ids[3]);
+    assert_eq!(device.pipeline_compile_stats().0 - before, 3);
+    assert!(!inputs.set(0, info(&second, Float4, 0)));
+    assert!(Rc::ptr_eq(&inputs.buffers[0], &second));
+    assert!(inputs.set(1, info(&second, Float4, 4)));
+    assert_eq!(inputs.streams.len(), 1);
+    assert!(inputs.set(1, info(&first, Float4, 4)));
+    assert_eq!(inputs.streams.len(), 2);
+    assert!(Rc::ptr_eq(&inputs.buffers[1], &first));
+}

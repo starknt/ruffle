@@ -11,6 +11,7 @@ use wgpu::SamplerBindingType;
 use super::MAX_VERTEX_ATTRIBUTES;
 
 pub struct ShaderPairAgal {
+    pub(super) upload_id: u64,
     vertex_shader: ParsedBytecode,
 
     fragment_shader: ParsedBytecode,
@@ -26,6 +27,7 @@ pub struct CompiledShaderProgram {
     pub vertex_module: crate::gpu_resources::ShaderModule,
     pub fragment_module: crate::gpu_resources::ShaderModule,
     pub bind_group_layout: crate::gpu_resources::BindGroupLayout,
+    pub pipeline_layout: crate::gpu_resources::PipelineLayout,
 }
 
 impl ShaderPairAgal {
@@ -34,7 +36,9 @@ impl ShaderPairAgal {
         let fragment_shader = naga_agal::parse_bytecode(&fragment_bytecode)?;
         let fragment_sampler_configs = naga_agal::extract_sampler_configs(&fragment_shader)?;
 
+        static NEXT_UPLOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
+            upload_id: NEXT_UPLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             vertex_shader,
             fragment_shader,
             fragment_sampler_configs,
@@ -133,7 +137,14 @@ impl ShaderPairAgal {
                         entries: &layout_entries,
                     })?;
 
+                let pipeline_layout =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Stage3D program layout"),
+                        bind_group_layouts: &[Some(&bind_group_layout)],
+                        immediate_size: 0,
+                    })?;
                 Ok(CompiledShaderProgram {
+                    pipeline_layout,
                     vertex_module,
                     fragment_module,
                     bind_group_layout,

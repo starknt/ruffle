@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use swf::{Rectangle, Twips};
 
 use crate::gpu_resources::StagingBelt;
-use crate::gpu_resources::{BindGroup, TextureView};
+use crate::gpu_resources::TextureView;
 use crate::gpu_resources::{CommandEncoder, RenderPass};
 use wgpu::Extent3d;
 use wgpu::{
@@ -29,6 +29,8 @@ use std::sync::Arc;
 use tracing::instrument;
 
 mod current_pipeline;
+mod pipeline_cache;
+use pipeline_cache::VertexInputs;
 mod shader_pair;
 #[cfg(test)]
 mod tests;
@@ -71,10 +73,8 @@ pub struct WgpuContext3D {
     front_buffer_raw_texture_handle: BitmapHandle,
 
     current_pipeline: CurrentPipeline,
-    compiled_pipeline: Option<crate::gpu_resources::RenderPipeline>,
-    bind_group: Option<BindGroup>,
 
-    vertex_attributes: [Option<VertexAttributeInfo>; MAX_VERTEX_ATTRIBUTES],
+    vertex_inputs: VertexInputs,
 
     buffer_command_encoder: crate::gpu_resources::CommandEncoder,
     // We may re-create `render_pass` multiple times while processing
@@ -156,9 +156,7 @@ impl WgpuContext3D {
             back_buffer_raw_texture_handle,
             front_buffer_raw_texture_handle,
             current_pipeline,
-            compiled_pipeline: None,
-            bind_group: None,
-            vertex_attributes: std::array::from_fn(|_| None),
+            vertex_inputs: VertexInputs::default(),
 
             current_texture_view: None,
             current_texture_size: None,
@@ -280,12 +278,11 @@ impl WgpuContext3D {
             depth_stencil_attachment,
             ..Default::default()
         });
-        if let Some(bind_group) = self.bind_group.as_ref() {
-            pass.set_bind_group(0, (bind_group).raw(), &[]);
+        if let Some((pipeline, bindings)) = self.current_pipeline.active() {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bindings.raw(), &[]);
         }
-        if let Some(compiled_pipeline) = self.compiled_pipeline.as_ref() {
-            pass.set_pipeline(compiled_pipeline);
-        }
+
         if let Some(rect) = &self.scissor_rectangle {
             let current_size = self.current_texture_size.unwrap();
             if rect.x_min.to_pixels() < 0.0
@@ -314,17 +311,8 @@ impl WgpuContext3D {
 
         pass.set_stencil_reference(self.current_pipeline.stencil_ref_value());
 
-        let mut seen = Vec::new();
-
-        // Create a binding for each unique buffer that we encounter.
-        // TODO - deduplicate this with the similar logic in set_pipelines
-        let mut i = 0;
-        for attr in self.vertex_attributes.iter().flatten() {
-            if !seen.iter().any(|b| Rc::ptr_eq(b, &attr.buffer)) {
-                pass.set_vertex_buffer(i as u32, attr.buffer.buffer.slice(..));
-                seen.push(attr.buffer.clone());
-                i += 1;
-            }
+        for (slot, buffer) in self.vertex_inputs.buffers.iter().enumerate() {
+            pass.set_vertex_buffer(slot as u32, buffer.buffer.slice(..));
         }
         pass
     }
@@ -893,28 +881,27 @@ impl Context3D for WgpuContext3D {
                 let indices =
                     (first_index as u32)..((first_index as u32) + (num_triangles as u32 * 3));
 
-                let (can_draw, new_pipeline) =
-                    if self.current_pipeline.has_unbound_required_textures() {
-                        (false, None)
-                    } else {
-                        match self
-                            .current_pipeline
-                            .rebuild_pipeline(&self.descriptors, &self.vertex_attributes)
-                        {
-                            Ok(new_pipeline) => (true, new_pipeline),
-                            // Flash skips the draw when the vertex shader reads
-                            // an attribute that has no vertex buffer bound.
-                            // TODO throw Error #3611 when Context3D.enableErrorChecking is set
-                            Err(PipelineError::Agal(
-                                naga_agal::Error::MissingVertexAttributeData,
-                            )) => (false, None),
-                            Err(PipelineError::Render(error)) => return Err(error),
-                            Err(PipelineError::Agal(e)) => {
-                                tracing::error!("Failed to compile AGAL shaders: {e:?}");
-                                (false, None)
-                            }
+                let can_draw = if self.current_pipeline.has_unbound_required_textures() {
+                    false
+                } else {
+                    match self
+                        .current_pipeline
+                        .rebuild_pipeline(&self.descriptors, &self.vertex_inputs)
+                    {
+                        Ok(()) => true,
+                        // Flash skips the draw when the vertex shader reads
+                        // an attribute that has no vertex buffer bound.
+                        // TODO throw Error #3611 when Context3D.enableErrorChecking is set
+                        Err(PipelineError::Agal(naga_agal::Error::MissingVertexAttributeData)) => {
+                            false
                         }
-                    };
+                        Err(PipelineError::Render(error)) => return Err(error),
+                        Err(PipelineError::Agal(e)) => {
+                            tracing::error!("Failed to compile AGAL shaders: {e:?}");
+                            false
+                        }
+                    }
+                };
 
                 if !self.seen_clear_command {
                     tracing::warn!(
@@ -933,11 +920,6 @@ impl Context3D for WgpuContext3D {
 
                 // Note - we need to unconditionally re-create the render pass, since we had to submit the
                 // buffer command encoder above.
-
-                if let Some((new_pipeline, new_bind_group)) = new_pipeline {
-                    self.compiled_pipeline = Some(new_pipeline);
-                    self.bind_group = Some(new_bind_group);
-                }
 
                 let mut render_command_encoder =
                     self.device
@@ -983,9 +965,9 @@ impl Context3D for WgpuContext3D {
                     None
                 };
 
-                self.vertex_attributes[index as usize] = info;
+                let layout_changed = self.vertex_inputs.set(index as usize, info);
                 self.current_pipeline
-                    .update_vertex_buffer_at(index as usize);
+                    .update_vertex_buffer_at(layout_changed);
             }
 
             Context3DCommand::SetShaders { module } => {
@@ -1067,27 +1049,32 @@ impl Context3D for WgpuContext3D {
                 texture,
                 cube,
             } => {
-                let bound_texture = if let Some(texture) = texture {
-                    let texture_wrapper =
-                        <dyn Any>::downcast_ref::<TextureWrapper>(texture.as_ref()).unwrap();
+                if !self
+                    .current_pipeline
+                    .same_texture(sampler as usize, texture.as_ref(), cube)
+                {
+                    let bound_texture = if let Some(texture) = texture {
+                        let texture_wrapper =
+                            <dyn Any>::downcast_ref::<TextureWrapper>(texture.as_ref()).unwrap();
 
-                    let mut view: wgpu::TextureViewDescriptor = Default::default();
-                    if cube {
-                        view.dimension = Some(wgpu::TextureViewDimension::Cube);
-                        view.array_layer_count = Some(6);
-                    }
+                        let mut view: wgpu::TextureViewDescriptor = Default::default();
+                        if cube {
+                            view.dimension = Some(wgpu::TextureViewDimension::Cube);
+                            view.array_layer_count = Some(6);
+                        }
 
-                    Some(BoundTextureData {
-                        view: texture_wrapper.texture.create_view(&view)?,
-                        id: texture,
-                        cube,
-                    })
-                } else {
-                    None
-                };
+                        Some(BoundTextureData {
+                            view: texture_wrapper.texture.create_view(&view)?,
+                            id: texture,
+                            cube,
+                        })
+                    } else {
+                        None
+                    };
 
-                self.current_pipeline
-                    .update_texture_at(sampler as usize, bound_texture);
+                    self.current_pipeline
+                        .update_texture_at(sampler as usize, bound_texture);
+                }
             }
             Context3DCommand::SetColorMask {
                 red,

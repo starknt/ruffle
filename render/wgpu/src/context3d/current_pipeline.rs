@@ -2,7 +2,7 @@ use naga::valid::{Capabilities, ValidationFlags, Validator};
 use naga_agal::{Filter, SamplerConfig, Wrapping};
 use ruffle_render::backend::{
     Context3DCompareMode, Context3DStencilAction, Context3DTextureFilter, Context3DTriangleFace,
-    Context3DVertexBufferFormat, Context3DWrapMode, Texture,
+    Context3DWrapMode, Texture,
 };
 
 use crate::gpu_resources::Buffer;
@@ -55,12 +55,12 @@ use std::cell::Cell;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 
+use super::pipeline_cache::{PipelineCache, PipelineKey, Prepared, VertexInputs};
 use crate::bitmaps::WgpuSamplerConfig;
-use crate::context3d::VertexBufferWrapper;
 use crate::context3d::shader_pair::{ShaderCompileData, ShaderTextureInfo};
 use crate::descriptors::Descriptors;
 
-use super::{MAX_VERTEX_ATTRIBUTES, ShaderPairAgal, VertexAttributeInfo};
+use super::ShaderPairAgal;
 
 const AGAL_NUM_VERTEX_CONSTANTS: u64 = 128;
 const AGAL_NUM_FRAGMENT_CONSTANTS: u64 = 28;
@@ -75,18 +75,8 @@ const FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE: u64 =
 // which modify the current state (`setVertexBufferAt`, `setCulling`, etc.)
 // These methods can be called at any time.
 //
-// In WGPU, this state is associated by a `RenderPipeline` object,
-// which needs to be rebuilt whenever the state changes.
-//
-// To match up these APIs, we store the current state in `CurrentPipeline`.
-// Whenever a state-changing `Context3DCommand` is executed, we mark the `CurrentPipeline`
-// as dirty. When a `crate::gpu_resources::RenderPipeline` is actually needed by `drawTriangles`,
-// we build a new `crate::gpu_resources::RenderPipeline` from the `CurrentPipeline` state (if it's dirty).
-//
-// The `CurrentPipeline` state (including the compiled `crate::gpu_resources::RenderPipeline`) is stored
-// in `WgpuContext3D`, and is re-used across calls to `present`. Due to lifetime issues,
-// we don't actually store the `crate::gpu_resources::RenderPipeline` in `CurrentPipeline` - it's
-// instead stored in `WgpuContext3D`.
+// A draw resolves structural changes to a device-local pipeline. Resource-only
+// changes update the bindings independently of the AGAL specialization.
 pub struct CurrentPipeline {
     device: crate::gpu_resources::Device,
     shaders: Option<Rc<ShaderPairAgal>>,
@@ -118,6 +108,11 @@ pub struct CurrentPipeline {
     target_format: TextureFormat,
 
     dirty: Cell<bool>,
+    bindings_dirty: bool,
+    reuse: bool,
+    cache: PipelineCache,
+    materials: crate::material_cache::MaterialCache,
+    active: Option<(Prepared, crate::gpu_resources::BindGroup)>,
 
     // Sampler configuration information for each texture slot.
     // This is updated by `Context3D.setSamplerStateAt`, as well
@@ -163,6 +158,11 @@ impl CurrentPipeline {
             vertex_shader_uniforms,
             fragment_shader_uniforms,
             dirty: Cell::new(true),
+            bindings_dirty: true,
+            reuse: std::env::var("RUFFLE_STAGE3D_PIPELINE_REUSE").as_deref() != Ok("0"),
+            cache: PipelineCache::new(device.runtime().scheduler()),
+            materials: crate::material_cache::MaterialCache::new(device.runtime(), 64),
+            active: None,
             culling: Context3DTriangleFace::None,
 
             has_depth_texture: false,
@@ -195,14 +195,23 @@ impl CurrentPipeline {
     }
 
     pub fn set_shaders(&mut self, shaders: Option<Rc<ShaderPairAgal>>) {
-        self.dirty.set(true);
+        if !self.reuse
+            || self.shaders.as_ref().map(|p| p.upload_id) != shaders.as_ref().map(|p| p.upload_id)
+        {
+            self.dirty.set(true);
+        }
         self.shaders = shaders;
         if let Some(shaders) = &self.shaders {
             for (i, sampler_config) in shaders.fragment_sampler_configs().iter().enumerate() {
                 // When we call `Context3D.setProgram`, sampler configs from the fragment shader override
                 // any previously set sampler configs (if 'ignoresampler' was set in the program, then the corresponding
                 // array entry will be `None`).
-                self.sampler_configs[i] = sampler_config.unwrap_or(self.sampler_configs[i]);
+                if let Some(config) = sampler_config
+                    && *config != self.sampler_configs[i]
+                {
+                    self.bindings_dirty = true;
+                    self.sampler_configs[i] = *config;
+                }
             }
         }
     }
@@ -218,9 +227,30 @@ impl CurrentPipeline {
         false
     }
 
+    pub fn same_texture(
+        &self,
+        index: usize,
+        texture: Option<&Rc<dyn Texture>>,
+        cube: bool,
+    ) -> bool {
+        self.reuse
+            && match (&self.bound_textures[index], texture) {
+                (Some(old), Some(new)) => {
+                    old.cube == cube && std::ptr::addr_eq(Rc::as_ptr(&old.id), Rc::as_ptr(new))
+                }
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
     pub fn update_texture_at(&mut self, index: usize, texture: Option<BoundTextureData>) {
-        // FIXME - determine if the texture actually changed
-        self.dirty.set(true);
+        if !self.reuse
+            || self.bound_textures[index].as_ref().map(|t| t.cube)
+                != texture.as_ref().map(|t| t.cube)
+        {
+            self.dirty.set(true);
+        }
+        self.bindings_dirty = true;
         self.bound_textures[index] = texture;
     }
 
@@ -238,9 +268,10 @@ impl CurrentPipeline {
         }
     }
 
-    pub fn update_vertex_buffer_at(&self, _index: usize) {
-        // FIXME - check if it's the same, so we can skip rebuilding the pipeline
-        self.dirty.set(true);
+    pub fn update_vertex_buffer_at(&self, layout_changed: bool) {
+        if layout_changed || !self.reuse {
+            self.dirty.set(true);
+        }
     }
 
     pub fn update_color_mask(&mut self, color_mask: wgpu::ColorWrites) {
@@ -279,25 +310,104 @@ impl CurrentPipeline {
         }
     }
 
-    /// If the pipeline is dirty, recompiles it and returns `Some(freshly_compiled_pipeline`)
-    /// Otherwise, returns `None`.
-    ///
-    /// If the shaders fail to compile, the pipeline stays dirty.
+    pub fn active(
+        &self,
+    ) -> Option<(
+        &crate::gpu_resources::RenderPipeline,
+        &crate::gpu_resources::BindGroup,
+    )> {
+        self.active.as_ref().map(|(p, b)| (&p.pipeline, b))
+    }
+
     pub fn rebuild_pipeline(
+        &mut self,
+        descriptors: &Descriptors,
+        inputs: &VertexInputs,
+    ) -> Result<(), super::PipelineError> {
+        if !self.dirty.get() && !self.bindings_dirty {
+            return Ok(());
+        }
+        let prepared = if self.dirty.get() {
+            let shaders = self.shaders.as_ref().expect("Missing shaders!");
+            let cull_mode = match self.culling {
+                Context3DTriangleFace::Back => Some(wgpu::Face::Back),
+                Context3DTriangleFace::Front => Some(wgpu::Face::Front),
+                Context3DTriangleFace::FrontAndBack => {
+                    tracing::error!("FrontAndBack culling not supported!");
+                    None
+                }
+                Context3DTriangleFace::None => None,
+            };
+
+            let texture_infos = self.bound_textures.each_ref().map(|t| {
+                t.as_ref().map(|t| {
+                    if t.cube {
+                        ShaderTextureInfo::Cube
+                    } else {
+                        ShaderTextureInfo::D2
+                    }
+                })
+            });
+            let key = PipelineKey {
+                program: shaders.upload_id,
+                shader: ShaderCompileData {
+                    vertex_attributes: inputs.attributes,
+                    texture_infos,
+                },
+                streams: inputs.streams.clone(),
+                cull: cull_mode,
+                depth: self.has_depth_texture.then(|| {
+                    (
+                        self.depth_mask,
+                        self.pass_compare_mode,
+                        self.stencil.clone(),
+                    )
+                }),
+                target: ColorTargetState {
+                    format: self.target_format,
+                    blend: Some(wgpu::BlendState {
+                        color: self.color_component,
+                        alpha: self.alpha_component,
+                    }),
+                    write_mask: self.color_mask,
+                },
+                samples: self.sample_count,
+            };
+            if let Some(prepared) = self.reuse.then(|| self.cache.get(&key)).flatten() {
+                prepared
+            } else {
+                let prepared = self.compile_pipeline(shaders, &key)?;
+                if self.reuse {
+                    self.cache.insert(key, &prepared);
+                }
+                prepared
+            }
+        } else {
+            self.active
+                .as_ref()
+                .expect("binding update has an active pipeline")
+                .0
+                .clone()
+        };
+        let bindings = match &self.active {
+            Some((old, group))
+                if self.reuse && !self.bindings_dirty && old.bindings == prepared.bindings =>
+            {
+                group.clone()
+            }
+            _ => self.bindings(descriptors, &prepared.bindings)?,
+        };
+        self.active = Some((prepared, bindings));
+        self.dirty.set(false);
+        self.bindings_dirty = false;
+        Ok(())
+    }
+
+    fn bindings(
         &self,
         descriptors: &Descriptors,
-        vertex_attributes: &[Option<VertexAttributeInfo>; MAX_VERTEX_ATTRIBUTES],
-    ) -> Result<
-        Option<(
-            crate::gpu_resources::RenderPipeline,
-            crate::gpu_resources::BindGroup,
-        )>,
-        super::PipelineError,
-    > {
-        if !self.dirty.get() {
-            return Ok(None);
-        }
-
+        layout: &crate::gpu_resources::BindGroupLayout,
+    ) -> Result<crate::gpu_resources::BindGroup, crate::gpu_runtime::RenderFailure> {
         let bind_group_label = create_debug_label!("Bind group");
 
         let wgpu_samplers =
@@ -388,215 +498,87 @@ impl CurrentPipeline {
             }
         }
 
-        let agal_attributes = vertex_attributes.clone().map(|attr| {
-            attr.map(|attr| match attr.format {
-                Context3DVertexBufferFormat::Float4 => naga_agal::VertexAttributeFormat::Float4,
-                Context3DVertexBufferFormat::Float3 => naga_agal::VertexAttributeFormat::Float3,
-                Context3DVertexBufferFormat::Float2 => naga_agal::VertexAttributeFormat::Float2,
-                Context3DVertexBufferFormat::Float1 => naga_agal::VertexAttributeFormat::Float1,
-                Context3DVertexBufferFormat::Bytes4 => naga_agal::VertexAttributeFormat::Bytes4,
-            })
-        });
-
-        let mut texture_infos = [None; 8];
-        for (i, bound_texture) in self.bound_textures.iter().enumerate() {
-            if let Some(bound_texture) = bound_texture {
-                if bound_texture.cube {
-                    texture_infos[i] = Some(ShaderTextureInfo::Cube);
-                } else {
-                    texture_infos[i] = Some(ShaderTextureInfo::D2);
-                }
-            }
-        }
-
-        let compiled_shaders = self.shaders.as_ref().expect("Missing shaders!").compile(
-            &self.device,
-            ShaderCompileData {
-                vertex_attributes: agal_attributes,
-                texture_infos,
-            },
-        )?;
-
-        self.dirty.set(false);
-
-        let pipeline_layout_label = create_debug_label!("Pipeline layout");
-        let pipeline_layout =
-            self.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: pipeline_layout_label.as_deref(),
-                    bind_group_layouts: &[Some(&compiled_shaders.bind_group_layout)],
-                    immediate_size: 0,
-                })?;
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let desc = wgpu::BindGroupDescriptor {
             label: bind_group_label.as_deref(),
-            layout: &compiled_shaders.bind_group_layout,
+            layout,
             entries: &bind_group_entries,
-        })?;
-
-        struct BufferData {
-            buffer: Rc<VertexBufferWrapper>,
-            attrs: Vec<wgpu::VertexAttribute>,
-            total_size: usize,
-        }
-
-        // The user can call Context3D.setVertexBufferAt with a a mixture of vertex buffers.
-        // We need to create one 'BufferData' struct for each distinct vertex buffer
-        // across all of the calls to 'setVertexBufferAt'. The 'BufferData' keeps track
-        // of all of the bound indices associated with that buffer.
-        let mut index_per_buffer: Vec<BufferData> = Vec::new();
-
-        for (i, attr) in vertex_attributes.iter().enumerate() {
-            if let Some(attr) = attr {
-                let (format, entry_size_bytes) = match attr.format {
-                    Context3DVertexBufferFormat::Float4 => (
-                        wgpu::VertexFormat::Float32x4,
-                        4 * std::mem::size_of::<f32>(),
-                    ),
-                    Context3DVertexBufferFormat::Float3 => (
-                        wgpu::VertexFormat::Float32x3,
-                        3 * std::mem::size_of::<f32>(),
-                    ),
-                    Context3DVertexBufferFormat::Float2 => (
-                        wgpu::VertexFormat::Float32x2,
-                        2 * std::mem::size_of::<f32>(),
-                    ),
-                    Context3DVertexBufferFormat::Float1 => {
-                        (wgpu::VertexFormat::Float32, std::mem::size_of::<f32>())
-                    }
-                    // AGAL shaders always work with floating-point values, so
-                    // we use Unorm8x4 to convert the bytes to floats in the range
-                    // [0, 1].
-                    Context3DVertexBufferFormat::Bytes4 => (wgpu::VertexFormat::Unorm8x4, 4),
-                };
-
-                let buffer_data = index_per_buffer
-                    .iter_mut()
-                    .find(|data| Rc::ptr_eq(&data.buffer, &attr.buffer));
-
-                let buffer_data = if let Some(buffer_data) = buffer_data {
-                    buffer_data
-                } else {
-                    index_per_buffer.push(BufferData {
-                        buffer: attr.buffer.clone(),
-                        attrs: Vec::new(),
-                        total_size: 0,
-                    });
-                    index_per_buffer.last_mut().unwrap()
-                };
-
-                let offset_bytes = attr.offset_in_32bit_units * 4;
-
-                // ActionScript may call setVertexBufferAt with overlapping offsets, e.g.:
-
-                // ```
-                // setVertexBufferAt(0, buffer, 0, "float3"]
-                // setVertexBufferAt(1, buffer, 2, "float4"]
-                // setVertexBufferAt(2, buffer, 6, "float2"]
-                // ```
-                //
-                // To correctly compute the total size, we look at the furthest extent of any buffer
-                // (its offset plus its length), rather than simply adding up all of the lengths.
-                buffer_data.total_size = std::cmp::max(
-                    buffer_data.total_size,
-                    entry_size_bytes + offset_bytes as usize,
-                );
-                buffer_data.attrs.push(wgpu::VertexAttribute {
-                    format,
-                    offset: offset_bytes,
-                    shader_location: i as u32,
-                })
-            }
-        }
-
-        let cull_mode = match self.culling {
-            Context3DTriangleFace::Back => Some(wgpu::Face::Back),
-            Context3DTriangleFace::Front => Some(wgpu::Face::Front),
-            Context3DTriangleFace::FrontAndBack => {
-                tracing::error!("FrontAndBack culling not supported!");
-                None
-            }
-            Context3DTriangleFace::None => None,
         };
-
-        let depth_stencil = if self.has_depth_texture {
-            Some(DepthStencilState {
-                format: TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: Some(self.depth_mask),
-                depth_compare: Some(self.pass_compare_mode),
-                stencil: self.stencil.clone(),
-                bias: Default::default(),
-            })
+        if self.reuse {
+            self.materials.get_or_create(&self.device, &desc)
         } else {
-            None
-        };
+            self.device.create_bind_group(&desc)
+        }
+    }
 
-        let wgpu_vertex_buffers = index_per_buffer
+    fn compile_pipeline(
+        &self,
+        shaders: &ShaderPairAgal,
+        key: &PipelineKey,
+    ) -> Result<Prepared, super::PipelineError> {
+        let compiled = shaders.compile(&self.device, key.shader.clone())?;
+        let depth_stencil = key
+            .depth
+            .as_ref()
+            .map(|(write, compare, stencil)| DepthStencilState {
+                format: TextureFormat::Depth24PlusStencil8,
+                depth_write_enabled: Some(*write),
+                depth_compare: Some(*compare),
+                stencil: stencil.clone(),
+                bias: Default::default(),
+            });
+        let buffers: smallvec::SmallVec<[_; 4]> = key
+            .streams
             .iter()
-            .map(|data| {
-                // This value is set when Context3D.createVertexBuffer is called.
-                // We may not all of the data associated with a single vertex
-                // (e.g. we might have 8 floats per vertex, but only
-                // call setVertexBufferAt once to bind the first 4 floats per vertex.
-                // However, the total size of the bindings can be at most the total
-                // amount of data per vertex. Verify that here
-                let data_bytes_per_vertex = (data.buffer.data_32_per_vertex * 4) as u64;
-                if data.total_size > data_bytes_per_vertex as usize {
-                    panic!("Total size of bound vertex attributes {:?} exceeds data_bytes_per_vertex {:?}", data.total_size,
-                    data_bytes_per_vertex);
-                }
-
-                let attrs = &data.attrs;
+            .map(|s| {
+                assert!(
+                    s.attributes
+                        .iter()
+                        .all(|a| a.offset + a.format.size() <= s.stride),
+                    "vertex attribute exceeds Stage3D buffer stride"
+                );
                 Some(wgpu::VertexBufferLayout {
-                    array_stride: data_bytes_per_vertex,
+                    array_stride: s.stride,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: attrs,
+                    attributes: &s.attributes,
                 })
             })
-            .collect::<Vec<_>>();
-
-        let compiled = self.device.create_render_pipeline_for(
+            .collect();
+        let pipeline = self.device.create_render_pipeline_for(
             crate::pipeline_profile::Family::Stage3d,
             &RenderPipelineDescriptor {
-                label: create_debug_label!("RenderPipeline").as_deref(),
-                layout: Some(&pipeline_layout),
+                label: Some("Stage3D render pipeline"),
+                layout: Some(&compiled.pipeline_layout),
                 vertex: VertexState {
-                    module: &compiled_shaders.vertex_module,
+                    module: &compiled.vertex_module,
                     entry_point: Some(naga_agal::SHADER_ENTRY_POINT),
-                    buffers: &wgpu_vertex_buffers,
+                    buffers: &buffers,
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
-                    module: &compiled_shaders.fragment_module,
+                    module: &compiled.fragment_module,
                     entry_point: Some(naga_agal::SHADER_ENTRY_POINT),
-                    targets: &[Some(ColorTargetState {
-                        format: self.target_format,
-                        blend: Some(wgpu::BlendState {
-                            color: self.color_component,
-                            alpha: self.alpha_component,
-                        }),
-                        write_mask: self.color_mask,
-                    })],
+                    targets: &[Some(key.target.clone())],
                     compilation_options: Default::default(),
                 }),
                 primitive: wgpu::PrimitiveState {
-                    // Stage3d appears to use clockwise winding:
-                    // https://stackoverflow.com/questions/8677498/stage3d-culling-confusion
                     front_face: FrontFace::Cw,
-                    cull_mode,
+                    cull_mode: key.cull,
                     ..Default::default()
                 },
                 depth_stencil,
                 multisample: wgpu::MultisampleState {
-                    count: self.sample_count,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
+                    count: key.samples,
+                    ..Default::default()
                 },
                 multiview_mask: None,
                 cache: None,
             },
         )?;
-        Ok(Some((compiled, bind_group)))
+        Ok(Prepared {
+            pipeline,
+            bindings: compiled.bind_group_layout.clone(),
+            _layout: compiled.pipeline_layout.clone(),
+        })
     }
 
     pub fn set_culling(&mut self, face: Context3DTriangleFace) {
@@ -640,7 +622,12 @@ impl CurrentPipeline {
             // FIXME - implement this
             mipmap: naga_agal::Mipmap::Disable,
         };
-        self.dirty.set(true);
+        if !self.reuse {
+            self.dirty.set(true);
+        }
+        if self.sampler_configs[sampler] != sampler_config {
+            self.bindings_dirty = true;
+        }
         self.sampler_configs[sampler] = sampler_config;
     }
 
