@@ -392,6 +392,17 @@ impl Device {
             .map_or(PipelineCacheStatus::Disabled, PipelineCacheState::status)
     }
 
+    pub fn pipeline_cache_dirty(&self) {
+        if let Some(c) = self.0.inner().pipeline_cache.get() {
+            c.dirty()
+        }
+    }
+    pub fn schedule_pipeline_cache_save(&self) {
+        if let Some(c) = self.0.inner().pipeline_cache.get() {
+            c.schedule()
+        }
+    }
+
     pub fn flush_pipeline_cache(&self) -> bool {
         self.0
             .inner()
@@ -962,6 +973,7 @@ impl Device {
         if let Some((key, v)) = profile {
             pipeline.set_profile(key, v);
         }
+        self.pipeline_cache_dirty();
         Ok(pipeline)
     }
     pub fn create_compute_pipeline(
@@ -1003,6 +1015,7 @@ impl Device {
         if let Some((key, v)) = profile {
             pipeline.set_profile(key, v);
         }
+        self.pipeline_cache_dirty();
         Ok(pipeline)
     }
     pub fn create_query_set(

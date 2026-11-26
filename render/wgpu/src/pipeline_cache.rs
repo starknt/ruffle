@@ -1,10 +1,12 @@
 //! Installation-private storage for native wgpu pipeline cache snapshots.
 
+mod writer;
 use futures::FutureExt;
 use sha2::{Digest, Sha256, digest::Output};
 use std::fs::{self, File, Metadata};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use writer::Writer;
 
 const MAGIC: &[u8; 8] = b"RFLWGPU1";
 // Bump when engine shaders or pipeline layouts change independently of the crate version.
@@ -26,7 +28,9 @@ pub enum PipelineCacheStatus {
 #[derive(Debug)]
 pub(crate) struct PipelineCacheState {
     status: PipelineCacheStatus,
-    cache: Option<(wgpu::PipelineCache, CacheFile)>,
+    writer: Option<Writer>,
+    cache: Option<wgpu::PipelineCache>,
+    _active: Option<File>,
 }
 
 impl PipelineCacheState {
@@ -36,8 +40,13 @@ impl PipelineCacheState {
     pub(crate) unsafe fn open(device: &wgpu::Device, dir: &Path, host_abi: &str) -> Self {
         let inactive = |status| Self {
             status,
+            writer: None,
             cache: None,
+            _active: None,
         };
+        if std::env::var_os("RUFFLE_PIPELINE_CACHE").as_deref() == Some(std::ffi::OsStr::new("0")) {
+            return inactive(PipelineCacheStatus::Disabled);
+        }
         if !device.features().contains(wgpu::Features::PIPELINE_CACHE) {
             return inactive(PipelineCacheStatus::Unsupported);
         }
@@ -47,14 +56,39 @@ impl PipelineCacheState {
         let Ok(file) = CacheFile::new(dir, key) else {
             return inactive(PipelineCacheStatus::Unavailable);
         };
+        let Ok(active) = private_lock(&file.path.with_extension("active")).and_then(|f| {
+            f.lock_shared()?;
+            Ok(f)
+        }) else {
+            return inactive(PipelineCacheStatus::Unavailable);
+        };
+        let complete = |status, cache: wgpu::PipelineCache| {
+            let writer = private_lock(&file.path.with_extension("writer"))
+                .ok()
+                .and_then(|lock| {
+                    lock.try_lock().ok()?;
+                    let handle = cache.clone();
+                    let file = file.clone();
+                    Writer::new(move || {
+                        let _writer = &lock;
+                        handle
+                            .get_data()
+                            .is_some_and(|data| file.store_budgeted(&data, SNAPSHOT_BUDGET).is_ok())
+                    })
+                    .ok()
+                });
+            Self {
+                status,
+                cache: Some(cache),
+                writer,
+                _active: Some(active),
+            }
+        };
         match file.load() {
             Ok(data) => {
                 // SAFETY: the host guarantees provenance; load verified this whole snapshot.
                 if let Some(cache) = unsafe { create_cache(device, Some(&data)) } {
-                    return Self {
-                        status: PipelineCacheStatus::Loaded,
-                        cache: Some((cache, file)),
-                    };
+                    return complete(PipelineCacheStatus::Loaded, cache);
                 }
             }
             Err(e)
@@ -66,16 +100,13 @@ impl PipelineCacheState {
         }
         // SAFETY: creating an empty cache supplies no driver data.
         match unsafe { create_cache(device, None) } {
-            Some(cache) => Self {
-                status: PipelineCacheStatus::Cold,
-                cache: Some((cache, file)),
-            },
+            Some(cache) => complete(PipelineCacheStatus::Cold, cache),
             None => inactive(PipelineCacheStatus::Unavailable),
         }
     }
 
     pub(crate) fn handle(&self) -> Option<&wgpu::PipelineCache> {
-        self.cache.as_ref().map(|(cache, _)| cache)
+        self.cache.as_ref()
     }
 
     pub(crate) fn status(&self) -> PipelineCacheStatus {
@@ -83,12 +114,18 @@ impl PipelineCacheState {
     }
 
     pub(crate) fn flush(&self) -> bool {
-        let Some((cache, file)) = &self.cache else {
-            return false;
-        };
-        cache
-            .get_data()
-            .is_some_and(|data| file.store(&data).is_ok())
+        self.writer.as_ref().is_some_and(|w| w.save(true))
+    }
+
+    pub(crate) fn dirty(&self) {
+        if let Some(w) = &self.writer {
+            w.dirty()
+        }
+    }
+    pub(crate) fn schedule(&self) {
+        if let Some(w) = &self.writer {
+            w.save(false);
+        }
     }
 }
 
@@ -132,7 +169,7 @@ fn identity(info: &wgpu::AdapterInfo, host_abi: &str) -> Option<Hash> {
     Some(hash.finalize())
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct CacheFile {
     path: PathBuf,
     identity: Hash,
@@ -222,6 +259,63 @@ impl CacheFile {
             .finalize()
     }
 
+    fn store_budgeted(&self, data: &[u8], budget: u64) -> io::Result<()> {
+        let len = data.len() as u64;
+        if !(1..=MAX_SNAPSHOT).contains(&len) || len + HEADER_LEN as u64 > budget {
+            return Err(ErrorKind::InvalidData.into());
+        }
+        let dir = self.checked_dir()?;
+        let directory_lock = private_lock(&dir.join("budget.lock"))?;
+        directory_lock.lock()?;
+        let mut used = len + HEADER_LEN as u64;
+        let mut older = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path == self.path || path.extension().and_then(|v| v.to_str()) != Some("bin") {
+                continue;
+            }
+            let Some(stem) = path
+                .file_stem()
+                .and_then(|v| v.to_str())
+                .filter(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))
+            else {
+                continue;
+            };
+            let identity: Option<Vec<u8>> = (0..32)
+                .map(|i| u8::from_str_radix(&stem[2 * i..2 * i + 2], 16).ok())
+                .collect();
+            let Some(identity) = identity else { continue };
+            let metadata = fs::symlink_metadata(&path)?;
+            if check_private_file(&metadata).is_err() {
+                continue;
+            }
+            used = used.saturating_add(metadata.len());
+            older.push((
+                metadata.modified()?,
+                metadata.len(),
+                Self {
+                    path,
+                    identity: Hash::from_slice(&identity).to_owned(),
+                },
+            ));
+        }
+        older.sort_by_key(|v| v.0);
+        for (_, size, old) in older {
+            if used <= budget {
+                break;
+            }
+            let active = private_lock(&old.path.with_extension("active"))?;
+            if active.try_lock().is_ok() && old.load().is_ok() {
+                fs::remove_file(&old.path)?;
+                used = used.saturating_sub(size);
+            }
+        }
+        if used > budget {
+            return Err(io::Error::other("snapshot directory budget exhausted"));
+        }
+        self.store(data)
+    }
+
     fn store(&self, data: &[u8]) -> io::Result<()> {
         let len = data.len() as u64;
         if !(1..=MAX_SNAPSHOT).contains(&len) {
@@ -243,6 +337,31 @@ impl CacheFile {
         temp.persist(&self.path)?;
         Ok(())
     }
+}
+
+const SNAPSHOT_BUDGET: u64 = if cfg!(target_os = "android") {
+    128
+} else {
+    256
+} * 1024
+    * 1024;
+
+// Stable lock files are never unlinked: all processes lock the same inode across replacement.
+fn private_lock(path: &Path) -> io::Result<File> {
+    let mut options = File::options();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+        );
+    }
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x0020_0000);
+    let f = options.open(path)?;
+    check_private_file(&f.metadata()?)?;
+    Ok(f)
 }
 
 fn check_ancestry(path: &Path) -> io::Result<()> {
@@ -334,6 +453,57 @@ mod tests {
 
     fn private_test_root() -> tempfile::TempDir {
         tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn cache_budget_evicts_only_idle_complete_snapshots() {
+        let root = private_test_root();
+        let dir = root.path().join("gpu");
+        let files: Vec<_> = (0..3)
+            .map(|i| CacheFile::new(&dir, [i; 32].into()).unwrap())
+            .collect();
+        let bytes = [0; 128];
+        let budget = 2 * (HEADER_LEN as u64 + 128);
+        files[0].store_budgeted(&bytes, budget).unwrap();
+        files[1].store_budgeted(&bytes, budget).unwrap();
+        let active = private_lock(&files[0].path.with_extension("active")).unwrap();
+        active.lock_shared().unwrap();
+        fs::write(dir.join("unrelated.bin"), [1]).unwrap();
+        files[2].store_budgeted(&bytes, budget).unwrap();
+        assert!(files[0].load().is_ok());
+        assert!(!files[1].path.exists());
+        assert_eq!(files[2].load().unwrap(), bytes);
+        assert!(dir.join("unrelated.bin").exists());
+    }
+
+    #[test]
+    fn independent_process_cannot_replace_an_active_writer() {
+        const KEY: &str = "RUFFLE_TEST_PIPELINE_WRITER_FILE";
+        if let Some(path) = std::env::var_os(KEY) {
+            let file = private_lock(Path::new(&path)).unwrap();
+            assert!(matches!(
+                file.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            return;
+        }
+        let root = private_test_root();
+        let path = root.path().join("writer");
+        let file = private_lock(&path).unwrap();
+        file.try_lock().unwrap();
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline_cache::tests::independent_process_cannot_replace_an_active_writer"
+                ])
+                .env(KEY, &path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        drop(file);
+        assert!(private_lock(&path).unwrap().try_lock().is_ok());
     }
 
     #[test]
@@ -455,13 +625,18 @@ mod tests {
             compilation_options: Default::default(),
             cache: cold.handle(),
         });
+        cold.dirty();
         assert!(cold.flush());
+        drop(cold);
         assert_eq!(open(&device, "v1").status(), PipelineCacheStatus::Loaded);
         assert_eq!(open(&device, "v2").status(), PipelineCacheStatus::Cold);
-        let path = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        let path = CacheFile::new(&dir, identity(&device.adapter_info(), "v1").unwrap())
+            .unwrap()
+            .path;
         fs::write(path, b"interrupted snapshot").unwrap();
         let rebuilt = open(&device, "v1");
         assert_eq!(rebuilt.status(), PipelineCacheStatus::Cold);
+        rebuilt.dirty();
         assert!(rebuilt.flush());
         assert_eq!(open(&device, "v1").status(), PipelineCacheStatus::Loaded);
         device.destroy();
