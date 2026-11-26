@@ -1,9 +1,13 @@
 use crate::gpu_resources::CommandEncoder;
 use crate::surface::mask::{MaskMode, MaskState};
+use lru::LruCache;
+use once_cell::sync::OnceCell;
+use parking_lot::Mutex;
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
+use std::sync::Weak;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::gpu_resources::StagingBelt;
@@ -32,18 +36,48 @@ use crate::{
 #[derive(Debug)]
 pub struct PixelBenderWgpuShader {
     device: crate::gpu_resources::Device,
+    program: Arc<Program>,
+    float_parameters_buffer: crate::gpu_resources::Buffer,
+    int_parameters_buffer: crate::gpu_resources::Buffer,
+    zeroed_out_of_range_mode: crate::gpu_resources::Buffer,
+    staging_belt: RefCell<StagingBelt>,
+}
+
+#[derive(Debug)]
+struct Program {
     bind_group_layout: crate::gpu_resources::BindGroupLayout,
     pipeline_layout: PipelineLayout,
-    pipelines: RefCell<HashMap<(u32, wgpu::TextureFormat, Option<MaskMode>), RenderPipeline>>,
+    pipelines:
+        Mutex<LruCache<(u32, TextureFormat, Option<MaskMode>), Arc<OnceCell<RenderPipeline>>>>,
     vertex_shader: crate::gpu_resources::ShaderModule,
     fragment_shader: crate::gpu_resources::ShaderModule,
     shader: PixelBenderShader,
-    float_parameters_buffer: crate::gpu_resources::Buffer,
     float_parameters_buffer_size: u64,
-    int_parameters_buffer: crate::gpu_resources::Buffer,
     int_parameters_buffer_size: u64,
-    zeroed_out_of_range_mode: crate::gpu_resources::Buffer,
-    staging_belt: RefCell<StagingBelt>,
+}
+
+pub(crate) struct Programs(Mutex<LruCache<crate::pipeline_profile::Signature, Weak<Program>>>);
+impl Default for Programs {
+    fn default() -> Self {
+        Self(Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())))
+    }
+}
+impl Programs {
+    fn get(
+        &self,
+        device: &crate::gpu_resources::Device,
+        shader: PixelBenderShader,
+    ) -> Result<Arc<Program>, crate::gpu_runtime::RenderFailure> {
+        let key = crate::pipeline_profile::signature(format_args!("{shader:?}"));
+        if let Some(program) = self.0.lock().get(&key).and_then(Weak::upgrade)
+            && program.shader == shader
+        {
+            return Ok(program);
+        }
+        let program = Arc::new(Program::new(device, shader)?);
+        self.0.lock().put(key, Arc::downgrade(&program));
+        Ok(program)
+    }
 }
 
 impl PixelBenderWgpuShader {
@@ -52,7 +86,7 @@ impl PixelBenderWgpuShader {
     }
 
     pub(crate) fn resource_id(&self) -> crate::gpu_runtime::ResourceId {
-        self.bind_group_layout.lease().id()
+        self.float_parameters_buffer.lease().id()
     }
 
     /// Gets a `RenderPipeline` for the specified sample count
@@ -62,55 +96,57 @@ impl PixelBenderWgpuShader {
         format: TextureFormat,
         mask: Option<MaskMode>,
     ) -> Result<crate::gpu_resources::RenderPipeline, crate::gpu_runtime::RenderFailure> {
-        Ok(crate::gpu_resources::try_cached(
-            &mut self.pipelines.borrow_mut(),
-            (samples, format, mask),
-            || {
-                self.device.create_render_pipeline_for(
-                    crate::pipeline_profile::Family::PixelBender,
-                    &RenderPipelineDescriptor {
-                        label: create_debug_label!("PixelBender shader pipeline").as_deref(),
-                        layout: Some(&self.pipeline_layout),
-                        vertex: VertexState {
-                            module: &self.vertex_shader,
-                            entry_point: Some(naga_pixelbender::VERTEX_SHADER_ENTRYPOINT),
-                            buffers: &VERTEX_BUFFERS_DESCRIPTION_FILTERS,
-                            compilation_options: Default::default(),
-                        },
-                        fragment: Some(wgpu::FragmentState {
-                            module: &self.fragment_shader,
-                            entry_point: Some(naga_pixelbender::FRAGMENT_SHADER_ENTRYPOINT),
-                            targets: &[Some(ColorTargetState {
-                                format,
-                                // FIXME - what should this be?
-                                blend: Some(wgpu::BlendState {
-                                    color: BlendComponent::OVER,
-                                    alpha: BlendComponent::OVER,
-                                }),
-                                write_mask: mask.map_or(ColorWrites::ALL, MaskMode::color_writes),
-                            })],
-                            compilation_options: Default::default(),
-                        }),
-                        primitive: Default::default(),
-                        depth_stencil: mask.map(MaskMode::pipeline_stencil),
-                        multisample: wgpu::MultisampleState {
-                            count: samples,
-                            mask: !0,
-                            alpha_to_coverage_enabled: false,
-                        },
-                        multiview_mask: None,
-                        cache: None,
+        let slot = self
+            .program
+            .pipelines
+            .lock()
+            .get_or_insert_mut((samples, format, mask), || Arc::new(OnceCell::new()))
+            .clone();
+        slot.get_or_try_init(|| {
+            self.device.create_render_pipeline_for(
+                crate::pipeline_profile::Family::PixelBender,
+                &RenderPipelineDescriptor {
+                    label: create_debug_label!("PixelBender shader pipeline").as_deref(),
+                    layout: Some(&self.program.pipeline_layout),
+                    vertex: VertexState {
+                        module: &self.program.vertex_shader,
+                        entry_point: Some(naga_pixelbender::VERTEX_SHADER_ENTRYPOINT),
+                        buffers: &VERTEX_BUFFERS_DESCRIPTION_FILTERS,
+                        compilation_options: Default::default(),
                     },
-                )
-            },
-        )?
-        .clone())
+                    fragment: Some(wgpu::FragmentState {
+                        module: &self.program.fragment_shader,
+                        entry_point: Some(naga_pixelbender::FRAGMENT_SHADER_ENTRYPOINT),
+                        targets: &[Some(ColorTargetState {
+                            format,
+                            // FIXME - what should this be?
+                            blend: Some(wgpu::BlendState {
+                                color: BlendComponent::OVER,
+                                alpha: BlendComponent::OVER,
+                            }),
+                            write_mask: mask.map_or(ColorWrites::ALL, MaskMode::color_writes),
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: Default::default(),
+                    depth_stencil: mask.map(MaskMode::pipeline_stencil),
+                    multisample: wgpu::MultisampleState {
+                        count: samples,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                },
+            )
+        })
+        .cloned()
     }
 }
 
 impl PixelBenderShaderImpl for PixelBenderWgpuShader {
     fn parsed_shader(&self) -> &PixelBenderShader {
-        &self.shader
+        &self.program.shader
     }
 }
 
@@ -128,6 +164,55 @@ impl PixelBenderWgpuShader {
                 .runtime
                 .issue_owner(crate::gpu_runtime::OwnerKind::ShaderJob)?,
         );
+        let program = descriptors.pbj_programs.get(&device, shader)?;
+        let float_label = create_debug_label!(
+            "PixelBender float parameters buffer for {:?}",
+            program.shader.name
+        );
+
+        let float_parameters_buffer = device.create_buffer(&BufferDescriptor {
+            label: float_label.as_deref(),
+            size: program.float_parameters_buffer_size,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })?;
+
+        let int_label = create_debug_label!(
+            "PixelBender int parameters buffer for {:?}",
+            program.shader.name
+        );
+
+        let int_parameters_buffer = device.create_buffer(&BufferDescriptor {
+            label: int_label.as_deref(),
+            size: program.int_parameters_buffer_size,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })?;
+
+        let zeroed_out_of_range_mode = device.create_buffer(&BufferDescriptor {
+            label: create_debug_label!("PixelBender zeroed_out_of_range_mode parameter buffer")
+                .as_deref(),
+            size: program.int_parameters_buffer_size,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })?;
+
+        Ok(Self {
+            program,
+            float_parameters_buffer,
+            int_parameters_buffer,
+            zeroed_out_of_range_mode,
+            staging_belt: RefCell::new(StagingBelt::new(device.clone(), 8)),
+            device,
+        })
+    }
+}
+
+impl Program {
+    fn new(
+        device: &crate::gpu_resources::Device,
+        shader: PixelBenderShader,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let mut layout_entries = vec![
             // One sampler per filter/wrapping combination - see BitmapFilters
             // An AGAL shader can use any of these samplers, so
@@ -217,34 +302,6 @@ impl PixelBenderWgpuShader {
         let shaders =
             naga_pixelbender::ShaderBuilder::build(&shader).expect("Failed to compile shader");
 
-        let float_label =
-            create_debug_label!("PixelBender float parameters buffer for {:?}", shader.name);
-
-        let float_parameters_buffer = device.create_buffer(&BufferDescriptor {
-            label: float_label.as_deref(),
-            size: shaders.float_parameters_buffer_size,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })?;
-
-        let int_label =
-            create_debug_label!("PixelBender int parameters buffer for {:?}", shader.name);
-
-        let int_parameters_buffer = device.create_buffer(&BufferDescriptor {
-            label: int_label.as_deref(),
-            size: shaders.int_parameters_buffer_size,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })?;
-
-        let zeroed_out_of_range_mode = device.create_buffer(&BufferDescriptor {
-            label: create_debug_label!("PixelBender zeroed_out_of_range_mode parameter buffer")
-                .as_deref(),
-            size: shaders.int_parameters_buffer_size,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })?;
-
         let vertex_shader = device.create_shader_module_for(
             crate::pipeline_profile::Family::PixelBender,
             ShaderModuleDescriptor {
@@ -261,21 +318,15 @@ impl PixelBenderWgpuShader {
             },
         )?;
 
-        Ok(PixelBenderWgpuShader {
+        Ok(Self {
+            shader,
             bind_group_layout,
             pipeline_layout,
-            pipelines: Default::default(),
-            shader,
+            pipelines: Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap())),
             vertex_shader,
             fragment_shader,
-            float_parameters_buffer,
             float_parameters_buffer_size: shaders.float_parameters_buffer_size,
-            int_parameters_buffer,
             int_parameters_buffer_size: shaders.int_parameters_buffer_size,
-            zeroed_out_of_range_mode,
-            // FIXME - come up with a good chunk size
-            staging_belt: RefCell::new(StagingBelt::new(device.clone(), 8)),
-            device,
         })
     }
 }
@@ -407,7 +458,9 @@ pub(super) fn run_pixelbender_shader_impl(
             resource: BindingResource::Buffer(wgpu::BufferBinding {
                 buffer: &compiled_shader.float_parameters_buffer,
                 offset: 0,
-                size: Some(NonZeroU64::new(compiled_shader.float_parameters_buffer_size).unwrap()),
+                size: Some(
+                    NonZeroU64::new(compiled_shader.program.float_parameters_buffer_size).unwrap(),
+                ),
             }),
         },
         BindGroupEntry {
@@ -415,7 +468,9 @@ pub(super) fn run_pixelbender_shader_impl(
             resource: BindingResource::Buffer(wgpu::BufferBinding {
                 buffer: &compiled_shader.int_parameters_buffer,
                 offset: 0,
-                size: Some(NonZeroU64::new(compiled_shader.int_parameters_buffer_size).unwrap()),
+                size: Some(
+                    NonZeroU64::new(compiled_shader.program.int_parameters_buffer_size).unwrap(),
+                ),
             }),
         },
         BindGroupEntry {
@@ -527,7 +582,7 @@ pub(super) fn run_pixelbender_shader_impl(
                 );
             }
             PixelBenderShaderArgument::ValueInput { index, value } => {
-                let param = &compiled_shader.shader.params[*index as usize];
+                let param = &compiled_shader.program.shader.params[*index as usize];
 
                 let name = match param {
                     PixelBenderParam::Normal { name, .. } => name,
@@ -655,7 +710,7 @@ pub(super) fn run_pixelbender_shader_impl(
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
-        layout: &compiled_shader.bind_group_layout,
+        layout: &compiled_shader.program.bind_group_layout,
         entries: &bind_group_entries,
     })?;
 

@@ -199,6 +199,7 @@ impl From<wgpu::BufferSlice<'_>> for BufferRange {
 struct PassState {
     pipeline: Option<wgpu::RenderPipeline>,
     profile: Option<Arc<Variant>>,
+    history: Option<Arc<history::Observation>>,
     bindings: FnvHashMap<u32, (Option<wgpu::BindGroup>, smallvec::SmallVec<[u32; 4]>)>,
     vertices: FnvHashMap<u32, Option<BufferRange>>,
     index: Option<(BufferRange, wgpu::IndexFormat)>,
@@ -236,6 +237,12 @@ impl RenderPass<'_> {
             return;
         }
         self.uses.retain(pipeline);
+        self.state.history = self
+            .uses
+            .device
+            .history()
+            .and_then(|_| self.uses.device.lookup_object(pipeline).ok())
+            .and_then(|o| o.observation().cloned());
         self.state.profile = self
             .uses
             .device
@@ -305,12 +312,22 @@ impl RenderPass<'_> {
         self.changes.index_buffers += 1;
     }
     pub fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
+        if let Some(obs) = &self.state.history
+            && let Some(h) = self.uses.device.history()
+        {
+            h.used(obs);
+        }
         if let Some(v) = &self.state.profile {
             v.used();
         }
         self.raw.draw(vertices, instances);
     }
     pub fn draw_indexed(&mut self, indices: Range<u32>, base_vertex: i32, instances: Range<u32>) {
+        if let Some(obs) = &self.state.history
+            && let Some(h) = self.uses.device.history()
+        {
+            h.used(obs);
+        }
         if let Some(v) = &self.state.profile {
             v.used();
         }
@@ -384,6 +401,12 @@ impl ComputePass<'_> {
             && let Some(v) = object.profile_info().and_then(|i| i.instance.as_ref())
         {
             v.variant().used();
+        }
+        if let Some(h) = self.uses.device.history()
+            && let Ok(o) = self.uses.device.lookup_object(pipeline)
+            && let Some(obs) = o.observation()
+        {
+            h.used(obs);
         }
         self.raw.dispatch_workgroups(groups[0], groups[1], 1);
     }

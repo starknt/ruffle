@@ -10,7 +10,7 @@ use writer::Writer;
 
 const MAGIC: &[u8; 8] = b"RFLWGPU1";
 // Bump when engine shaders or pipeline layouts change independently of the crate version.
-const ENGINE_ABI: &str = "ruffle-shaders-layouts-v1";
+pub(crate) const ENGINE_ABI: &str = "ruffle-shaders-layouts-v1";
 const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
 const HEADER_LEN: usize = 8 + 32 + 8 + 32;
 type Hash = Output<Sha256>;
@@ -175,25 +175,30 @@ struct CacheFile {
     identity: Hash,
 }
 
+pub(crate) fn private_dir(dir: &Path) -> io::Result<PathBuf> {
+    if dir.components().any(|c| c == Component::ParentDir) {
+        return Err(ErrorKind::InvalidInput.into());
+    }
+    // A trailing slash forces Unix lstat to follow even a final directory symlink.
+    let dir: PathBuf = std::path::absolute(dir)?.components().collect();
+    let parent = dir.parent().ok_or(ErrorKind::InvalidInput)?;
+    check_ancestry(parent)?;
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    match builder.create(&dir) {
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        result => result?,
+    }
+    check_private_dir(&dir)?;
+    // A private directory can still be unwritable due to ACLs or a read-only mount.
+    tempfile::NamedTempFile::new_in(&dir)?.close()?;
+    Ok(dir)
+}
+
 impl CacheFile {
     fn new(dir: &Path, identity: Hash) -> io::Result<Self> {
-        if dir.components().any(|c| c == Component::ParentDir) {
-            return Err(ErrorKind::InvalidInput.into());
-        }
-        // A trailing slash forces Unix lstat to follow even a final directory symlink.
-        let dir: PathBuf = std::path::absolute(dir)?.components().collect();
-        let parent = dir.parent().ok_or(ErrorKind::InvalidInput)?;
-        check_ancestry(parent)?;
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        match builder.create(&dir) {
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-            result => result?,
-        }
-        check_private_dir(&dir)?;
-        // A private directory can still be unwritable due to ACLs or a read-only mount.
-        tempfile::NamedTempFile::new_in(&dir)?.close()?;
+        let dir = private_dir(dir)?;
         Ok(Self {
             path: dir.join(format!("{identity:x}.bin")),
             identity,
@@ -209,26 +214,8 @@ impl CacheFile {
 
     fn load(&self) -> io::Result<Vec<u8>> {
         self.checked_dir()?;
-        check_private_file(&fs::symlink_metadata(&self.path)?)?;
-        #[cfg(unix)]
-        let mut file = {
-            use rustix::fs::{Mode, OFlags, open};
-            File::from(open(
-                &self.path,
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-                Mode::empty(),
-            )?)
-        };
-        #[cfg(not(unix))]
-        let mut file = {
-            let mut options = File::options();
-            #[cfg(windows)]
-            // FILE_FLAG_OPEN_REPARSE_POINT lets us validate the opened object itself.
-            std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x0020_0000);
-            options.read(true).open(&self.path)?
-        };
+        let mut file = open_private_read(&self.path)?;
         let metadata = file.metadata()?;
-        check_private_file(&metadata)?;
         let mut header = [0; HEADER_LEN];
         file.read_exact(&mut header)?;
         let len = u64::from_le_bytes(header[40..48].try_into().expect("eight-byte length field"));
@@ -347,6 +334,30 @@ const SNAPSHOT_BUDGET: u64 = if cfg!(target_os = "android") {
     * 1024;
 
 // Stable lock files are never unlinked: all processes lock the same inode across replacement.
+pub(crate) fn open_private_read(path: &Path) -> io::Result<File> {
+    check_private_file(&fs::symlink_metadata(path)?)?;
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+        File::from(open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )?)
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let mut options = File::options();
+        #[cfg(windows)]
+        // FILE_FLAG_OPEN_REPARSE_POINT lets us validate the opened object itself.
+        std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x0020_0000);
+        options.read(true).open(path)?
+    };
+    let metadata = file.metadata()?;
+    check_private_file(&metadata)?;
+    Ok(file)
+}
+
 fn private_lock(path: &Path) -> io::Result<File> {
     let mut options = File::options();
     options.create(true).truncate(false).read(true).write(true);

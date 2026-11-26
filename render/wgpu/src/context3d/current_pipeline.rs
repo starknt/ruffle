@@ -515,7 +515,7 @@ impl CurrentPipeline {
         shaders: &ShaderPairAgal,
         key: &PipelineKey,
     ) -> Result<Prepared, super::PipelineError> {
-        let compiled = shaders.compile(&self.device, key.shader.clone())?;
+        let compiled = shaders.program.compile(&self.device, key.shader.clone())?;
         let depth_stencil = key
             .depth
             .as_ref()
@@ -543,8 +543,9 @@ impl CurrentPipeline {
                 })
             })
             .collect();
-        let pipeline = self.device.create_render_pipeline_for(
-            crate::pipeline_profile::Family::Stage3d,
+        let pipeline = self.device.create_agal_pipeline(
+            shaders.program.content,
+            &key.shader,
             &RenderPipelineDescriptor {
                 label: Some("Stage3D render pipeline"),
                 layout: Some(&compiled.pipeline_layout),

@@ -224,6 +224,9 @@ name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "as-raw-xcb-connection"
@@ -372,6 +375,9 @@ name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "bitstream-io"
@@ -2335,6 +2341,8 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -3236,6 +3244,7 @@ dependencies = [
  "naga",
  "num-derive",
  "num-traits",
+ "serde",
 ]
 
 [[package]]
@@ -3256,6 +3265,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
  "rustc-hash 1.1.0",
+ "serde",
  "thiserror 2.0.18",
 ]
 
@@ -5461,6 +5471,9 @@ name = "smallvec"
 version = "1.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "smithay-client-toolkit"
@@ -6809,6 +6822,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
  "log",
+ "macro_rules_attribute",
  "naga",
  "naga-types",
  "once_cell",
@@ -6817,6 +6831,7 @@ dependencies = [
  "profiling",
  "raw-window-handle",
  "rustc-hash 1.1.0",
+ "serde",
  "smallvec",
  "thiserror 2.0.18",
  "wgpu-core-deps-apple",
@@ -6927,6 +6942,7 @@ dependencies = [
  "log",
  "naga-types",
  "raw-window-handle",
+ "serde",
  "static_assertions",
  "web-sys",
 ]

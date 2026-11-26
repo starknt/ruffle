@@ -31,7 +31,7 @@ use tracing::instrument;
 mod current_pipeline;
 mod pipeline_cache;
 use pipeline_cache::VertexInputs;
-mod shader_pair;
+pub(crate) mod shader_pair;
 #[cfg(test)]
 mod tests;
 
@@ -515,6 +515,7 @@ impl Context3D for WgpuContext3D {
     ) -> Result<(), AgalError> {
         let shader_pair = ShaderPairAgal::new(vertex_shader_agal, fragment_shader_agal)?;
 
+        self.device.register_agal(&shader_pair.program);
         *module.borrow_mut() = Some(Rc::new(shader_pair));
 
         Ok(())

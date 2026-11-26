@@ -10,7 +10,7 @@ use std::{
     time::Instant,
 };
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Family {
     TwoD,
@@ -30,8 +30,21 @@ pub enum Kind {
     Compute,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, serde::Deserialize,
+)]
 pub struct Signature([u8; 32]);
+
+impl Signature {
+    pub(crate) fn from_parts(parts: &[&[u8]]) -> Self {
+        let mut hash = Sha256::new();
+        for part in parts {
+            hash.update((part.len() as u64).to_le_bytes());
+            hash.update(part);
+        }
+        Self(hash.finalize().into())
+    }
+}
 
 /// Input consists of content and descriptor state under this renderer ABI.
 pub fn signature(input: fmt::Arguments<'_>) -> Signature {
@@ -67,6 +80,9 @@ pub struct Frame {
 }
 
 thread_local! { static FRAME: Cell<Option<Frame>> = const { Cell::new(None) }; }
+pub(crate) fn current_frame() -> Option<Frame> {
+    FRAME.get()
+}
 pub struct FrameScope(Option<Frame>, std::marker::PhantomData<std::rc::Rc<()>>);
 pub fn frame_scope(frame: Frame) -> FrameScope {
     FrameScope(FRAME.replace(Some(frame)), Default::default())

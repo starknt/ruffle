@@ -4203,6 +4203,37 @@ fn native_gl_initialized_and_staged_buffers_preserve_bytes() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn equal_pixelbender_programs_share_modules_but_keep_instance_identity() {
+    use crate::{gpu_runtime::ResourceKind, pixel_bender::PixelBenderWgpuShader};
+    let d = gpu();
+    let shader = ruffle_render::pixel_bender::parse_shader(
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/tests/swfs/avm2/pixelbender_logicalnot/logicalnot.pbj"
+        )),
+        true,
+    )
+    .unwrap();
+    let a = PixelBenderWgpuShader::new(&d, shader.clone()).unwrap();
+    let modules = || {
+        d.runtime
+            .resources()
+            .iter()
+            .filter(|r| r.kind == ResourceKind::Shader)
+            .count()
+    };
+    let first = modules();
+    let b = PixelBenderWgpuShader::new(&d, shader).unwrap();
+    assert_ne!(a.resource_id(), b.resource_id());
+    assert_eq!(modules(), first);
+    drop(a);
+    assert_eq!(modules(), first);
+    drop(b);
+    assert_eq!(modules() + 2, first);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn pixelbender_allocations_are_attributed_to_the_shader_until_drop() {
     use crate::gpu_runtime::OwnerKind;
     let descriptors = gpu();

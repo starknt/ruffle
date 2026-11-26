@@ -78,6 +78,8 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     budget: crate::idle_pool::Budget,
     target: T,
     stage_frame: Option<T::Frame>,
+    pipeline_session: u64,
+    pipeline_frame_number: u64,
     display_enhancer: Option<Arc<dyn crate::display_bitmap::DisplayBitmapEnhancer>>,
     surface: Surface,
     meshes: Vec<Mesh>,
@@ -105,6 +107,9 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
 
 impl<T: RenderTarget> Drop for WgpuRenderBackend<T> {
     fn drop(&mut self) {
+        self.descriptors
+            .device
+            .end_movie_session(self.pipeline_session);
         self.preparation_generation.cancel();
         // Descriptors may outlive a movie/renderer in a shared-device host.
         // Cached bindings must not keep that renderer's targets alive there.
@@ -297,6 +302,8 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             descriptors,
             target,
             stage_frame: None,
+            pipeline_session: 0,
+            pipeline_frame_number: 0,
             surface,
             display_enhancer: None,
             meshes: Vec::new(),
@@ -659,6 +666,14 @@ enum WgpuPixelBenderPending {
 }
 
 impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+    fn set_movie_pipeline_history(&mut self, data: &[u8], header: &swf::HeaderExt) {
+        self.pipeline_session =
+            self.descriptors
+                .device
+                .begin_movie_session(data, header, self.surface.quality());
+        self.pipeline_frame_number = 0;
+    }
+
     fn health(&self) -> &ruffle_render::error::RendererHealth {
         self.descriptors.runtime.health()
     }
@@ -861,6 +876,21 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
     ) -> Result<ruffle_render::backend::FrameSubmission, crate::gpu_runtime::RenderFailure> {
+        self.pipeline_frame_number = self.pipeline_frame_number.saturating_add(1);
+        let device = &self.descriptors.device;
+        let _scope = (device.pipeline_history_enabled() || device.pipeline_profile().is_some())
+            .then(|| {
+                let generation = self.descriptors.runtime.generation();
+                let active = crate::pipeline_profile::current_frame()
+                    .filter(|f| f.device == generation && f.session == self.pipeline_session);
+                crate::pipeline_profile::frame_scope(active.unwrap_or(
+                    crate::pipeline_profile::Frame {
+                        device: generation,
+                        session: self.pipeline_session,
+                        frame_id: self.pipeline_frame_number,
+                    },
+                ))
+            });
         let _render_backend =
             ruffle_render::profile::time(ruffle_render::profile::Phase::RenderBackend);
         let frame_output = self.stage_frame.take().ok_or_else(|| {

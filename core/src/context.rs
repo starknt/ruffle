@@ -384,6 +384,10 @@ impl<'gc> UpdateContext<'gc> {
     /// should use `replace_root_movie`.
     pub fn set_root_movie(&mut self, movie: SwfMovieData) {
         self.load_manager.cancel_root_read();
+        if movie.is_movie() && !movie.data().is_empty() {
+            self.renderer
+                .set_movie_pipeline_history(movie.data(), movie.header());
+        }
         self.navigator.set_root_url(movie.url());
         if !self.forced_frame_rate {
             *self.frame_rate = movie.frame_rate().into();

@@ -6,9 +6,6 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 const HOST_ABI: &str = "ruffle-desktop-shaders-layouts-v1";
 
 pub(super) fn configure(device: &Device) {
-    if !device.features().contains(wgpu::Features::PIPELINE_CACHE) {
-        return;
-    }
     let (Some(cache), Ok(exe)) = (dirs::cache_dir(), std::env::current_exe()) else {
         return;
     };

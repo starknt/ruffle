@@ -5,6 +5,7 @@
 //! Encoders retain only resources referenced by actual commands and their
 //! dependency leases. Submission completion releases those exact use sets.
 mod encoding;
+mod history;
 use crate::gpu_runtime::{
     GpuRuntime, RenderFailure, RenderFailureKind, ResourceId, ResourceKind, ResourceLease,
     ResourceOwner, texture_storage_bytes,
@@ -25,6 +26,7 @@ use std::{
 };
 use std::{path::Path, sync::OnceLock};
 
+pub struct ExternalHistory(Arc<history::Observation>);
 pub type Buffer = Resource<wgpu::Buffer>;
 pub type Texture = Resource<wgpu::Texture>;
 pub type TextureView = Resource<wgpu::TextureView>;
@@ -90,16 +92,30 @@ trait Indexed: Any + Send + Sync {
     fn matches(&self, raw: &dyn Any) -> bool;
     fn lease(&self) -> &ResourceLease;
     fn profile_info(&self) -> Option<&ObjectInfo>;
+    fn layout(&self) -> Option<&history::Layout>;
+    fn observation(&self) -> Option<&Arc<history::Observation>>;
+}
+#[derive(Default)]
+struct Metadata {
+    profile: OnceLock<Arc<ObjectInfo>>,
+    observation: OnceLock<Arc<history::Observation>>,
+    layout: OnceLock<Box<history::Layout>>,
 }
 struct Object<T> {
-    profile: OnceLock<Box<ObjectInfo>>,
+    metadata: OnceLock<Box<Metadata>>,
     raw: T,
     lease: ResourceLease,
     device: Device,
 }
 impl<T: Any + Eq + Send + Sync> Indexed for Object<T> {
+    fn layout(&self) -> Option<&history::Layout> {
+        self.metadata.get()?.layout.get().map(Box::as_ref)
+    }
+    fn observation(&self) -> Option<&Arc<history::Observation>> {
+        self.metadata.get()?.observation.get()
+    }
     fn profile_info(&self) -> Option<&ObjectInfo> {
-        self.profile.get().map(Box::as_ref)
+        self.metadata.get()?.profile.get().map(Arc::as_ref)
     }
     fn matches(&self, raw: &dyn Any) -> bool {
         raw.downcast_ref::<T>().is_some_and(|raw| self.raw == *raw)
@@ -111,19 +127,39 @@ impl<T: Any + Eq + Send + Sync> Indexed for Object<T> {
 
 pub struct Resource<T>(Arc<Object<T>>);
 impl<T> Resource<T> {
+    fn meta(&self) -> &Metadata {
+        self.0.metadata.get_or_init(Default::default)
+    }
     fn set_profile(&self, key: Signature, variant: Option<Arc<Variant>>) {
-        let _ = self.0.profile.set(Box::new(ObjectInfo {
+        let _ = self.meta().profile.set(Arc::new(ObjectInfo {
             key,
             instance: variant.map(|v| v.instance()),
         }));
     }
     pub fn profile_use(&self) {
-        if let Some(instance) = self.0.profile.get().and_then(|o| o.instance.as_ref()) {
+        if let Some(o) = self.0.metadata.get().and_then(|m| m.observation.get())
+            && let Some(h) = self.0.device.history()
+        {
+            h.used(o)
+        }
+        if let Some(instance) = self
+            .0
+            .metadata
+            .get()
+            .and_then(|m| m.profile.get())
+            .and_then(|o| o.instance.as_ref())
+        {
             instance.variant().used();
         }
     }
     pub fn profile_hit(&self) {
-        if let Some(instance) = self.0.profile.get().and_then(|o| o.instance.as_ref()) {
+        if let Some(instance) = self
+            .0
+            .metadata
+            .get()
+            .and_then(|m| m.profile.get())
+            .and_then(|o| o.instance.as_ref())
+        {
             instance.variant().hit();
         }
     }
@@ -171,6 +207,8 @@ impl<T: Hash> Hash for Resource<T> {
 struct DeviceInner {
     pipeline_cache: OnceLock<PipelineCacheState>,
     pipeline_profile: OnceLock<Profile>,
+    movie_session: std::sync::atomic::AtomicU64,
+    history: OnceLock<Option<history::History>>,
     pipeline_compile_stats: parking_lot::Mutex<(u64, u64)>,
     raw: wgpu::Device,
     queue: wgpu::Queue,
@@ -257,6 +295,8 @@ impl Device {
             Arc::new(DeviceInner {
                 pipeline_cache: Default::default(),
                 pipeline_profile: Default::default(),
+                movie_session: Default::default(),
+                history: Default::default(),
                 pipeline_compile_stats: Default::default(),
                 raw,
                 queue,
@@ -317,6 +357,10 @@ impl Device {
     pub unsafe fn enable_pipeline_cache(&self, dir: &Path, host_abi: &str) -> PipelineCacheStatus {
         self.0
             .inner()
+            .history
+            .get_or_init(|| history::History::open(self, dir, host_abi));
+        self.0
+            .inner()
             .pipeline_cache
             .get_or_init(|| {
                 // SAFETY: the caller guarantees the cache directory's provenance.
@@ -325,11 +369,107 @@ impl Device {
             .status()
     }
 
+    pub fn register_history_kernel(
+        &self,
+        name: &'static str,
+        shader: &'static str,
+        layout: Vec<wgpu::BindGroupLayoutEntry>,
+    ) {
+        if let Some(h) = self.history() {
+            h.kernel(self, name, shader, layout)
+        }
+    }
+    pub fn pipeline_history_enabled(&self) -> bool {
+        self.history().is_some()
+    }
+    pub fn pipeline_history_presentation(&self, settings: impl FnOnce() -> String) {
+        if let Some(h) = self.history() {
+            h.presentation(settings());
+        }
+    }
+    /// The native compositor builds its mandatory pipeline while attaching its window.
+    pub fn ready_pipeline_history(
+        &self,
+        family: Family,
+        key: impl FnOnce() -> Signature,
+    ) -> Option<ExternalHistory> {
+        self.history().map(|_| {
+            ExternalHistory(history::Observation::new(
+                history::Recipe::ready(family, key()),
+                0,
+                false,
+            ))
+        })
+    }
+    pub fn use_ready_pipeline(&self, o: &ExternalHistory) {
+        if let Some(h) = self.history() {
+            h.used(&o.0)
+        }
+    }
+    fn history(&self) -> Option<&history::History> {
+        self.0.inner().history.get()?.as_ref()
+    }
+    pub(crate) fn begin_movie_session(
+        &self,
+        data: &[u8],
+        header: &swf::HeaderExt,
+        quality: ruffle_render::quality::StageQuality,
+    ) -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let session = NEXT.fetch_add(1, Ordering::Relaxed);
+        self.0
+            .inner()
+            .movie_session
+            .store(session, Ordering::Release);
+        if let Some(history) = self.history() {
+            history.begin(
+                self,
+                session,
+                data,
+                &format!("{:?}", header.swf_header()),
+                &format!("{quality:?}"),
+            );
+        }
+        session
+    }
+    pub(crate) fn end_movie_session(&self, session: u64) {
+        use std::sync::atomic::Ordering;
+        if session != 0
+            && self
+                .0
+                .inner()
+                .movie_session
+                .compare_exchange(session, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            && let Some(h) = self.history()
+        {
+            h.end(Some(session))
+        }
+    }
+    pub fn background_pipeline_cache(&self) {
+        self.schedule_pipeline_cache_save();
+        if let Some(h) = self.history() {
+            h.save();
+        }
+    }
+    fn speculation_fits(&self) -> bool {
+        self.runtime().check_health().is_ok()
+            && self.runtime().stats().total_bytes.saturating_add(64 * 1024)
+                < self.runtime().config().soft_limit
+            && self.runtime().stats().resources.saturating_add(8)
+                < self.runtime().config().resource_limit
+            && self.runtime().config().cache_limit >= 64 * 1024
+    }
     pub fn pipeline_frame(&self, frame_id: u64) -> Option<crate::pipeline_profile::FrameScope> {
-        self.pipeline_profile().map(|_| {
+        (self.pipeline_profile().is_some() || self.history().is_some()).then(|| {
             crate::pipeline_profile::frame_scope(crate::pipeline_profile::Frame {
                 device: self.runtime().generation(),
-                session: self.1.id,
+                session: self
+                    .0
+                    .inner()
+                    .movie_session
+                    .load(std::sync::atomic::Ordering::Acquire),
                 frame_id,
             })
         })
@@ -404,6 +544,9 @@ impl Device {
     }
 
     pub fn flush_pipeline_cache(&self) -> bool {
+        if let Some(h) = self.history() {
+            h.save();
+        }
         self.0
             .inner()
             .pipeline_cache
@@ -465,7 +608,7 @@ impl Device {
     fn wrap<T: Any + Eq + Hash + Send + Sync>(&self, raw: T, lease: ResourceLease) -> Resource<T> {
         let key = object_key(&raw);
         let object = Arc::new(Object {
-            profile: OnceLock::new(),
+            metadata: OnceLock::new(),
             raw,
             lease,
             device: self.clone(),
@@ -505,6 +648,17 @@ impl Device {
         dependencies: &[ResourceLease],
         mut create: impl FnMut(&wgpu::Device) -> Result<T, RenderFailure>,
     ) -> Result<(T, ResourceLease), RenderFailure> {
+        if history::speculative() {
+            if !self.speculation_fits() {
+                return Err(RenderFailure::new(
+                    RenderFailureKind::BudgetExceeded,
+                    "prewarm skipped under pressure",
+                ));
+            }
+            let reservation = self.runtime().reserve(kind, self.1, bytes)?;
+            let raw = self.scoped(create)?;
+            return Ok((raw, reservation.commit(dependencies)?));
+        }
         self.reclaim_soft(bytes);
         self.recover(|| {
             let reservation = self.runtime().reserve(kind, self.1, bytes)?;
@@ -816,10 +970,14 @@ impl Device {
         let layout = self.create(ResourceKind::Pipeline, 0, &[], |device| {
             Ok(device.create_bind_group_layout(desc))
         })?;
-        if self.pipeline_profile().is_some() {
+        if self.pipeline_profile().is_some() || self.history().is_some() {
             let mut entries = desc.entries.to_vec();
             entries.sort_unstable_by_key(|e| e.binding);
-            layout.set_profile(signature(format_args!("{entries:?}")), None);
+            let key = signature(format_args!("{entries:?}"));
+            layout.set_profile(key, None);
+            if let Some(h) = self.history() {
+                h.group(self, key, &layout)
+            }
         }
         Ok(layout)
     }
@@ -877,12 +1035,26 @@ impl Device {
         let layout = self.create(ResourceKind::Pipeline, 0, &dependencies?, |device| {
             Ok(device.create_pipeline_layout(desc))
         })?;
-        if self.pipeline_profile().is_some() {
+        if self.pipeline_profile().is_some() || self.history().is_some() {
             let groups: Vec<_> = desc
                 .bind_group_layouts
                 .iter()
                 .map(|g| g.map(|g| self.resource_signature(g)))
                 .collect();
+            if self.history().is_some()
+                && let Some(groups) = groups
+                    .iter()
+                    .map(|g| match g {
+                        Some(v) => v.map(Some),
+                        None => Some(None),
+                    })
+                    .collect::<Option<Vec<_>>>()
+            {
+                let _ = layout.meta().layout.set(Box::new(history::Layout {
+                    groups,
+                    immediate: desc.immediate_size,
+                }));
+            }
             layout.set_profile(
                 signature(format_args!("{groups:?} {}", desc.immediate_size)),
                 None,
@@ -901,7 +1073,7 @@ impl Device {
         family: Family,
         desc: wgpu::ShaderModuleDescriptor<'_>,
     ) -> Result<ShaderModule, RenderFailure> {
-        let profile = self.pipeline_profile().map(|_| {
+        let profile = (self.pipeline_profile().is_some() || self.history().is_some()).then(|| {
             let key = signature(format_args!("{:?}", desc.source));
             (key, self.profile_variant(family, Kind::Shader, key))
         });
@@ -914,6 +1086,9 @@ impl Device {
         })?;
         if let Some((key, v)) = profile {
             module.set_profile(key, v);
+            if let Some(h) = self.history() {
+                h.shader(self, key, &module)
+            }
         }
         Ok(module)
     }
@@ -923,7 +1098,38 @@ impl Device {
     ) -> Result<RenderPipeline, RenderFailure> {
         self.create_render_pipeline_for(Family::TwoD, desc)
     }
+    pub(crate) fn register_agal(&self, program: &Arc<crate::context3d::shader_pair::AgalProgram>) {
+        if let Some(h) = self.history() {
+            h.agal(self, program)
+        }
+    }
+    pub(crate) fn create_agal_pipeline(
+        &self,
+        content: Signature,
+        spec: &crate::context3d::shader_pair::ShaderCompileData,
+        desc: &wgpu::RenderPipelineDescriptor<'_>,
+    ) -> Result<RenderPipeline, RenderFailure> {
+        if let Some(h) = self.history()
+            && let Some(mut recipe) = history::Recipe::render(self, Family::Stage3d, desc)
+        {
+            recipe.agal = Some((content, spec.clone()));
+            return h.render(self, Family::Stage3d, desc, recipe);
+        }
+        self.create_render_direct(Family::Stage3d, desc)
+    }
     pub fn create_render_pipeline_for(
+        &self,
+        family: Family,
+        desc: &wgpu::RenderPipelineDescriptor<'_>,
+    ) -> Result<RenderPipeline, RenderFailure> {
+        if let Some(h) = self.history()
+            && let Some(recipe) = history::Recipe::render(self, family, desc)
+        {
+            return h.render(self, family, desc, recipe);
+        }
+        self.create_render_direct(family, desc)
+    }
+    fn create_render_direct(
         &self,
         family: Family,
         desc: &wgpu::RenderPipelineDescriptor<'_>,
@@ -983,6 +1189,18 @@ impl Device {
         self.create_compute_pipeline_for(Family::Filter, desc)
     }
     pub fn create_compute_pipeline_for(
+        &self,
+        family: Family,
+        desc: &wgpu::ComputePipelineDescriptor<'_>,
+    ) -> Result<ComputePipeline, RenderFailure> {
+        if let Some(h) = self.history()
+            && let Some(recipe) = history::Recipe::compute(self, family, desc)
+        {
+            return h.compute(self, family, desc, recipe);
+        }
+        self.create_compute_direct(family, desc)
+    }
+    fn create_compute_direct(
         &self,
         family: Family,
         desc: &wgpu::ComputePipelineDescriptor<'_>,

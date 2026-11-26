@@ -26,6 +26,7 @@ pub struct Descriptors {
     copy_pipeline:
         Mutex<FnvHashMap<(u32, wgpu::TextureFormat), crate::gpu_resources::RenderPipeline>>,
     pub shaders: Shaders,
+    pub(crate) pbj_programs: crate::pixel_bender::Programs,
     pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), Arc<Pipelines>>>,
     pub filters: Filters,
     pub(crate) bitmap_batches: crate::bitmap_batch::BitmapBatchCache,
@@ -92,6 +93,7 @@ impl Descriptors {
         let materials = crate::material_cache::MaterialCache::new(&runtime, 128);
         let bitmap_batches = crate::bitmap_batch::BitmapBatchCache::new(&runtime);
         Ok(Self {
+            pbj_programs: Default::default(),
             bitmap_batches,
             direct_bitmap_blends: std::env::var_os("RUFFLE_DIRECT_BITMAP_BLENDS").as_deref()
                 == Some(std::ffi::OsStr::new("1")),

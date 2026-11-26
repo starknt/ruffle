@@ -87,6 +87,24 @@ impl ResourceScheduler {
         state.hooks.retain(|(_, h)| h.strong_count() > 0);
         state.hooks.push((class, Arc::downgrade(&hook)));
     }
+    /// A speculative allocation must yield to the foreground without evicting other owners.
+    pub fn admit_optional(&self, class: ReclaimClass, bytes: u64) -> Option<CacheTicket> {
+        let index = class as usize;
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bytes > self.0.limits[index].saturating_sub(state.bytes[index]) {
+            return None;
+        }
+        state.bytes[index] += bytes;
+        Some(CacheTicket {
+            scheduler: self.clone(),
+            class,
+            bytes,
+        })
+    }
     pub fn admit(&self, class: ReclaimClass, bytes: u64) -> Option<CacheTicket> {
         let index = class as usize;
         let limit = self.0.limits[index];

@@ -66,6 +66,7 @@ impl From<FrameSubmission> for FrameOutcome {
 }
 
 pub trait RenderBackend: Any {
+    fn set_movie_pipeline_history(&mut self, _data: &[u8], _header: &swf::HeaderExt) {}
     fn display_sampling_revision(&self) -> u64 {
         0
     }
