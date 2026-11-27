@@ -1386,7 +1386,9 @@ fn changing_presentation_separates_normal_movie_manifests() {
         let o = d
             .ready_pipeline_history(Family::Compositor, || signature(format_args!("{name}")))
             .unwrap();
-        d.use_ready_pipeline(&o);
+        let mut uses = PipelineUses::default();
+        d.record_external_pipeline_use(&mut uses, Some(&o), None);
+        uses.submitted(&d);
     };
     observe("compositor");
     d.pipeline_history_presentation(|| "FSR".into());

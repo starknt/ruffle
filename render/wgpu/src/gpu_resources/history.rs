@@ -907,30 +907,40 @@ impl History {
         });
         Ok(p)
     }
-    pub fn used(&self, obs: &Observation) {
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+    pub fn mode(&self) -> &'static str {
+        if self.consume { "consume" } else { "record" }
+    }
+    pub fn used(
+        &self,
+        obs: &Observation,
+        epoch: u64,
+        frame: Option<crate::pipeline_profile::Frame>,
+        count: u64,
+    ) {
         let mut state = self.state.lock();
         let Some(m) = state.movie.as_mut() else {
             return;
         };
-        if crate::pipeline_profile::current_frame().is_some_and(|f| f.session != m.session) {
+        if self.epoch() != epoch || frame.is_some_and(|f| f.session != m.session) {
             return;
         }
         if m.used.len() >= MAX_ENTRIES && !m.used.contains_key(&obs.key) {
             return;
         }
         let e = m.used.entry(obs.key).or_insert_with(|| Entry {
-            warm: obs.warm_epoch == Some(self.epoch.load(Ordering::Acquire)),
+            warm: obs.warm_epoch == Some(epoch),
             recipe: obs.recipe.clone(),
             uses: 0,
-            first: crate::pipeline_profile::current_frame()
-                .and_then(|f| f.packet_id.or(f.frame_id))
-                .unwrap_or(0),
+            first: frame.and_then(|f| f.packet_id.or(f.frame_id)).unwrap_or(0),
             ns: obs.ns,
         });
-        if e.uses == 0 && obs.warm_epoch == Some(self.epoch.load(Ordering::Acquire)) {
+        if e.uses == 0 && obs.warm_epoch == Some(epoch) {
             m.warm_uses += 1;
         }
-        e.uses = e.uses.saturating_add(1);
+        e.uses = e.uses.saturating_add(count);
     }
     fn checksum(entries: &[Entry]) -> Option<String> {
         Some(format!(
@@ -1054,6 +1064,11 @@ mod tests {
                 },
             )
         };
+        let used = |pipeline: RenderPipeline| {
+            let mut uses = PipelineUses::default();
+            pipeline.record_pipeline_use(&mut uses);
+            uses.submitted(&device);
+        };
         let barrier = || {
             let (tx, rx) = mpsc::channel();
             h.jobs
@@ -1076,13 +1091,13 @@ mod tests {
             tx
         };
         h.begin(&device, 1, b"movie", "header", "High");
-        create().unwrap().profile_use();
+        used(create().unwrap());
         h.end(Some(1));
         let baseline = device.pipeline_compile_stats().0;
         let hold = hold_worker();
         h.begin(&device, 2, b"movie", "header", "High");
         assert_eq!(h.state.lock().movie.as_ref().unwrap().wanted.len(), 1);
-        create().unwrap().profile_use();
+        used(create().unwrap());
         h.end(Some(2));
         hold.send(()).unwrap();
         barrier();
@@ -1103,7 +1118,7 @@ mod tests {
         assert_eq!(device.pipeline_compile_stats().0, baseline + 1);
         assert_eq!(device.runtime().stats().creation_retries, retries);
         drop(buffer);
-        create().unwrap().profile_use();
+        used(create().unwrap());
         h.end(Some(3));
 
         let hold = hold_worker();
@@ -1121,3 +1136,6 @@ mod tests {
         assert!(fresh.runtime().check_health().is_ok());
     }
 }
+
+#[cfg(test)]
+mod submission_tests;

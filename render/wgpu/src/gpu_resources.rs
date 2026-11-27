@@ -35,6 +35,93 @@ use std::{
 pub use submission_order::ReservedSubmission;
 
 pub struct ExternalHistory(Arc<history::Observation>);
+
+#[derive(Hash, PartialEq, Eq)]
+struct PipelineUseKey {
+    device: u64,
+    epoch: u64,
+    frame: Option<crate::pipeline_profile::Frame>,
+    observation: usize,
+    variant: usize,
+}
+
+struct PipelineUse {
+    observation: Option<Arc<history::Observation>>,
+    variant: Option<Arc<Variant>>,
+    count: u64,
+}
+
+type UseCounts = indexmap::IndexMap<PipelineUseKey, PipelineUse, fnv::FnvBuildHasher>;
+
+/// Draw and dispatch counts for one command recording. Dropping it cancels the observations.
+#[derive(Default)]
+pub struct PipelineUses {
+    entries: Option<Box<UseCounts>>,
+}
+impl PipelineUses {
+    fn record(
+        &mut self,
+        device: &Device,
+        observation: Option<&Arc<history::Observation>>,
+        variant: Option<&Arc<Variant>>,
+    ) {
+        if observation.is_none() && variant.is_none() {
+            return;
+        }
+        let generation = device.runtime().generation();
+        let key = PipelineUseKey {
+            device: generation,
+            epoch: observation
+                .and_then(|_| device.history())
+                .map_or(0, history::History::epoch),
+            frame: crate::pipeline_profile::current_frame().filter(|f| f.device == generation),
+            observation: observation.map_or(0, |v| Arc::as_ptr(v) as usize),
+            variant: variant.map_or(0, |v| Arc::as_ptr(v) as usize),
+        };
+        let entry = self
+            .entries
+            .get_or_insert_with(Default::default)
+            .entry(key)
+            .or_insert_with(|| PipelineUse {
+                observation: observation.cloned(),
+                variant: variant.cloned(),
+                count: 0,
+            });
+        entry.count = entry.count.saturating_add(1);
+    }
+
+    /// Raw wgpu callers own their queue. The encoder drops this callback if it is abandoned.
+    pub fn observe_raw_completion(self, encoder: &wgpu::CommandEncoder, device: &Device) {
+        if self.entries.is_some() {
+            let device = device.clone();
+            encoder.on_submitted_work_done(move || {
+                if device.runtime().check_health().is_ok() {
+                    self.submitted(&device);
+                }
+            });
+        }
+    }
+
+    /// Publish only after this recording's checked queue submission succeeds.
+    pub fn submitted(self, device: &Device) {
+        if let Some(entries) = self.entries {
+            for (key, use_) in *entries {
+                if key.device != device.runtime().generation() {
+                    continue;
+                }
+                if let Some(obs) = use_.observation
+                    && let Some(h) = device.history()
+                {
+                    h.used(&obs, key.epoch, key.frame, use_.count);
+                }
+                if let Some(v) = use_.variant {
+                    v.used(key.frame, use_.count);
+                }
+            }
+        }
+    }
+}
+
 pub type Buffer = Resource<wgpu::Buffer>;
 pub type Texture = Resource<wgpu::Texture>;
 pub type TextureView = Resource<wgpu::TextureView>;
@@ -76,6 +163,7 @@ impl RecordedUses {
 }
 #[derive(Default)]
 struct Recording {
+    pipeline_uses: PipelineUses,
     uses: UseSet,
     objects: FnvHashMap<ObjectKey, smallvec::SmallVec<[Arc<dyn Indexed>; 1]>>,
     transient_bytes: u64,
@@ -144,21 +232,17 @@ impl<T> Resource<T> {
             instance: variant.map(|v| v.instance()),
         }));
     }
-    pub fn profile_use(&self) {
-        if let Some(o) = self.0.metadata.get().and_then(|m| m.observation.get())
-            && let Some(h) = self.0.device.history()
-        {
-            h.used(o)
-        }
-        if let Some(instance) = self
-            .0
-            .metadata
+    /// Add a raw pass's draw or dispatch to the observations for this submission.
+    pub fn record_pipeline_use(&self, uses: &mut PipelineUses) {
+        let Some(meta) = self.0.metadata.get() else {
+            return;
+        };
+        let variant = meta
+            .profile
             .get()
-            .and_then(|m| m.profile.get())
-            .and_then(|o| o.instance.as_ref())
-        {
-            instance.variant().used();
-        }
+            .and_then(|info| info.instance.as_ref())
+            .map(|i| i.variant());
+        uses.record(&self.0.device, meta.observation.get(), variant);
     }
     pub fn profile_hit(&self) {
         if let Some(instance) = self
@@ -170,6 +254,10 @@ impl<T> Resource<T> {
         {
             instance.variant().hit();
         }
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.0.device
     }
 
     pub fn lease(&self) -> &ResourceLease {
@@ -437,10 +525,16 @@ impl Device {
             ))
         })
     }
-    pub fn use_ready_pipeline(&self, o: &ExternalHistory) {
-        if let Some(h) = self.history() {
-            h.used(&o.0)
-        }
+    pub fn record_external_pipeline_use(
+        &self,
+        uses: &mut PipelineUses,
+        history: Option<&ExternalHistory>,
+        profile: Option<&crate::pipeline_profile::Instance>,
+    ) {
+        uses.record(self, history.map(|o| &o.0), profile.map(|p| p.variant()));
+    }
+    pub fn pipeline_history_mode(&self) -> &'static str {
+        self.history().map_or("off", history::History::mode)
     }
     fn history(&self) -> Option<&history::History> {
         self.0.inner().history.get()?.as_ref()
@@ -1312,6 +1406,7 @@ impl Device {
             Ok(device.create_command_encoder(desc))
         })?;
         let uses = Arc::new(Mutex::new(Recording {
+            pipeline_uses: Default::default(),
             uses: UseSet::default(),
             objects: Default::default(),
             transient_bytes: 0,
@@ -1436,7 +1531,7 @@ impl CommandEncoder {
         for pass in self.diagnostics.drain(..) {
             pass.finish(&self.device, &mut self.raw);
         }
-        let (uses, pending) = {
+        let (uses, pending, pipeline_uses) = {
             let mut recording = self
                 .uses
                 .lock()
@@ -1444,6 +1539,7 @@ impl CommandEncoder {
             (
                 std::mem::take(&mut recording.uses),
                 std::mem::take(&mut recording.pending),
+                std::mem::take(&mut recording.pipeline_uses),
             )
         };
         self.device.runtime().check_health()?;
@@ -1452,6 +1548,7 @@ impl CommandEncoder {
         Ok(CommandBuffer {
             raw,
             uses: RecordedUses(uses),
+            pipeline_uses,
             bitmap_writes: self.bitmap_writes,
             pending,
         })
@@ -1491,6 +1588,7 @@ impl StageWork {
 }
 
 pub struct CommandBuffer {
+    pipeline_uses: PipelineUses,
     raw: wgpu::CommandBuffer,
     bitmap_writes: Option<Arc<AtomicBool>>,
     uses: RecordedUses,
@@ -1784,6 +1882,7 @@ impl Queue {
         let commands = commands.into_iter().map(|raw| CommandBuffer {
             raw,
             bitmap_writes: None,
+            pipeline_uses: Default::default(),
             uses: RecordedUses::default(),
             pending: Vec::new(),
         });
@@ -1816,6 +1915,7 @@ impl Queue {
                 .map_err(|error| self.0.runtime().health().record(error))?;
         };
         let mut writes = UseSet::default();
+        let mut observations = smallvec::SmallVec::<[PipelineUses; 1]>::new();
         // Scopes resolve after the closure has released both submission locks.
         self.0
             .scoped(|_| {
@@ -1835,6 +1935,9 @@ impl Queue {
                 let mut pending = Vec::new();
                 let mut bitmap_writes = smallvec::SmallVec::<[Arc<AtomicBool>; 1]>::new();
                 for command in commands {
+                    if command.pipeline_uses.entries.is_some() {
+                        observations.push(command.pipeline_uses);
+                    }
                     bitmap_writes.extend(command.bitmap_writes);
                     pending.extend(command.pending);
                     raw.push(command.raw);
@@ -1876,6 +1979,11 @@ impl Queue {
                 Ok(index)
             })
             .map_err(|error| self.drain_after_failure(error, writes))
+            .inspect(|_| {
+                for recorded in observations {
+                    recorded.submitted(&self.0);
+                }
+            })
     }
 }
 

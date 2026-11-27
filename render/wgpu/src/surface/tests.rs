@@ -375,6 +375,20 @@ fn adjacent_bitmap_textures_batch_without_reordering_translucent_pixels() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
     use ruffle_render::transform::Transform;
     for descriptors in [gpu(), gpu_with_backend(wgpu::Backends::GL, None, None)] {
+        descriptors.device.enable_pipeline_profile();
+        let submitted_2d_uses = || -> u64 {
+            let profile = descriptors.device.pipeline_profile().unwrap().snapshot(
+                descriptors.device.runtime().generation(),
+                std::time::Instant::now(),
+            );
+            profile["variants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|v| v["family"] == "twoD" && v["kind"] == "render")
+                .map(|v| v["uses"].as_u64().unwrap())
+                .sum()
+        };
         for count in [32, 37] {
             for quality in [StageQuality::Low, StageQuality::High] {
                 for smoothing in [false, true] {
@@ -459,6 +473,7 @@ fn adjacent_bitmap_textures_batch_without_reordering_translucent_pixels() {
                         }
                         let metrics = ruffle_render::profile::RenderMetrics::default();
                         let _scope = ruffle_render::profile::enter(Some(&metrics));
+                        let before = submitted_2d_uses();
                         renderer
                             .submit_frame(Color::WHITE, commands, vec![])
                             .unwrap();
@@ -478,6 +493,10 @@ fn adjacent_bitmap_textures_batch_without_reordering_translucent_pixels() {
                                     .features()
                                     .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE)
                             {
+                                assert!(
+                                    submitted_2d_uses() >= before + 3,
+                                    "the rectangle and both indirect bitmap batches must reach the profile"
+                                );
                                 assert_eq!(
                                     work.entries()
                                         .find(|(k, _)| *k == "bitmap_indirect_draws")

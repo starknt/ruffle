@@ -71,7 +71,7 @@ impl fmt::Display for Signature {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Frame {
     pub device: u64,
@@ -170,12 +170,12 @@ impl Variant {
         Instance(self.clone())
     }
 
-    pub fn used(&self) {
+    pub(crate) fn used(&self, frame: Option<Frame>, count: u64) {
         let mut c = self.counts.lock();
         if c.uses == 0 {
-            c.first_use = self.frame();
+            c.first_use = frame.filter(|f| f.device == self.device);
         }
-        c.uses += 1;
+        c.uses = c.uses.saturating_add(count);
     }
 
     pub fn hit(&self) {

@@ -430,33 +430,28 @@ impl RenderPass<'_> {
         self.state.index = Some(key);
         self.changes.index_buffers += 1;
     }
+    fn record_draw(&mut self) {
+        self.uses.recording.pipeline_uses.record(
+            &self.uses.device,
+            self.state.history.as_ref(),
+            self.state.profile.as_ref(),
+        );
+    }
     pub fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
-        if let Some(obs) = &self.state.history
-            && let Some(h) = self.uses.device.history()
-        {
-            h.used(obs);
-        }
-        if let Some(v) = &self.state.profile {
-            v.used();
-        }
+        self.record_draw();
         self.raw.draw(vertices, instances);
     }
     pub fn draw_indexed(&mut self, indices: Range<u32>, base_vertex: i32, instances: Range<u32>) {
-        if let Some(obs) = &self.state.history
-            && let Some(h) = self.uses.device.history()
-        {
-            h.used(obs);
-        }
-        if let Some(v) = &self.state.profile {
-            v.used();
-        }
+        self.record_draw();
         self.raw.draw_indexed(indices, base_vertex, instances);
     }
     pub fn draw_indexed_indirect(&mut self, buffer: &Buffer, offset: u64) {
+        self.record_draw();
         self.uses.retain(buffer.raw());
         self.raw.draw_indexed_indirect(buffer, offset);
     }
     pub fn multi_draw_indexed_indirect(&mut self, buffer: &Buffer, offset: u64, count: u32) {
+        self.record_draw();
         self.uses.retain(buffer.raw());
         self.raw.multi_draw_indexed_indirect(buffer, offset, count);
     }
@@ -467,6 +462,7 @@ impl RenderPass<'_> {
         count_offset: u64,
         max_count: u32,
     ) {
+        self.record_draw();
         self.uses.retain(buffer.raw());
         self.raw
             .multi_draw_indexed_indirect_count(buffer, offset, buffer, count_offset, max_count);
@@ -534,17 +530,17 @@ impl ComputePass<'_> {
         self.uses.retain(bindings);
         self.raw.set_pipeline(pipeline);
         self.raw.set_bind_group(0, bindings, &[]);
-        if self.uses.device.pipeline_profile().is_some()
-            && let Ok(object) = self.uses.device.lookup_object(pipeline)
-            && let Some(v) = object.profile_info().and_then(|i| i.instance.as_ref())
-        {
-            v.variant().used();
-        }
-        if let Some(h) = self.uses.device.history()
+        if (self.uses.device.pipeline_profile().is_some() || self.uses.device.history().is_some())
             && let Ok(o) = self.uses.device.lookup_object(pipeline)
-            && let Some(obs) = o.observation()
         {
-            h.used(obs);
+            let v = o
+                .profile_info()
+                .and_then(|i| i.instance.as_ref())
+                .map(|i| i.variant());
+            self.uses
+                .recording
+                .pipeline_uses
+                .record(&self.uses.device, o.observation(), v);
         }
         self.raw.dispatch_workgroups(groups[0], groups[1], 1);
     }
