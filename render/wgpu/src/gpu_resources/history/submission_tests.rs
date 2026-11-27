@@ -193,7 +193,24 @@ fn all_indirect_draw_commands_record_the_submitted_pipeline() {
 #[test]
 #[ignore = "requires a Vulkan adapter"]
 fn abandoned_compute_dispatches_do_not_count_toward_submitted_uses() {
-    let d = device(8 << 20);
+    use crate::capabilities::{NativeGpuUse, device_descriptor};
+    use crate::gpu_runtime::GpuBudgetConfig;
+    use futures::executor::block_on;
+
+    let mut options = wgpu::InstanceDescriptor::new_without_display_handle();
+    options.backends = wgpu::Backends::VULKAN;
+    let instance = wgpu::Instance::new(options);
+    let adapter = block_on(instance.request_adapter(&Default::default())).unwrap();
+    let (raw, queue) =
+        block_on(adapter.request_device(&device_descriptor(&adapter, NativeGpuUse::SharedStage)))
+            .unwrap();
+    let runtime = GpuRuntime::new(GpuBudgetConfig::for_adapter(
+        adapter.get_info().device_type,
+        false,
+    ))
+    .unwrap();
+    runtime.install_device_callbacks(&raw);
+    let d = Device::new(raw, queue, runtime);
     d.enable_pipeline_profile();
     let shader = d
         .create_shader_module(wgpu::ShaderModuleDescriptor {
