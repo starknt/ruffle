@@ -1,7 +1,7 @@
 use super::*;
 use crate::gpu_runtime::{GpuBudgetConfig, ResourceKind};
 
-fn device(limit: u64) -> Device {
+pub(super) fn device(limit: u64) -> Device {
     device_with_staging_budget(limit, 64 * 1024 * 1024)
 }
 

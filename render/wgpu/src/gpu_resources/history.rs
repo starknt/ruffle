@@ -989,3 +989,123 @@ impl History {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    #[ignore = "requires a Vulkan adapter and RUFFLE_PIPELINE_HISTORY=1"]
+    fn foreground_pressure_session_cancellation_and_loss_release_prewarm_work() {
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let path = dir.path().join("cache");
+        let device = super::super::tests::device(4 << 20);
+        // SAFETY: only this test owns the private directory.
+        unsafe {
+            device.enable_pipeline_cache(&path, "test");
+        }
+        let h = device.history().expect("set RUFFLE_PIPELINE_HISTORY=1");
+        let shader = device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Wgsl(
+                    "@vertex fn vs() -> @builtin(position) vec4f { return vec4f(0,0,0,1); }
+                     @fragment fn fs() -> @location(0) vec4f { return vec4f(1); }"
+                        .into(),
+                ),
+            })
+            .unwrap();
+        let create = || {
+            device.create_render_pipeline_for(
+                Family::Filter,
+                &wgpu::RenderPipelineDescriptor {
+                    label: None,
+                    layout: None,
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs"),
+                        targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: Default::default(),
+                    multisample: Default::default(),
+                    depth_stencil: None,
+                    multiview_mask: None,
+                    cache: None,
+                },
+            )
+        };
+        let barrier = || {
+            let (tx, rx) = mpsc::channel();
+            h.jobs
+                .send(Box::new(move || {
+                    tx.send(()).unwrap();
+                }))
+                .unwrap();
+            rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        };
+        let hold_worker = || {
+            let (tx, rx) = mpsc::channel();
+            let (ready, started) = mpsc::channel();
+            h.jobs
+                .send(Box::new(move || {
+                    ready.send(()).unwrap();
+                    rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }))
+                .unwrap();
+            started.recv_timeout(Duration::from_secs(10)).unwrap();
+            tx
+        };
+        h.begin(&device, 1, b"movie", "header", "High");
+        create().unwrap().profile_use();
+        h.end(Some(1));
+        let baseline = device.pipeline_compile_stats().0;
+        let hold = hold_worker();
+        h.begin(&device, 2, b"movie", "header", "High");
+        assert_eq!(h.state.lock().movie.as_ref().unwrap().wanted.len(), 1);
+        create().unwrap().profile_use();
+        h.end(Some(2));
+        hold.send(()).unwrap();
+        barrier();
+        assert_eq!(device.pipeline_compile_stats().0, baseline + 1);
+
+        let buffer = device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (4 << 20) - (16 << 10),
+                usage: wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+            .unwrap();
+        let retries = device.runtime().stats().creation_retries;
+        h.begin(&device, 3, b"movie", "header", "High");
+        barrier();
+        assert!(!device.speculation_fits());
+        assert_eq!(device.pipeline_compile_stats().0, baseline + 1);
+        assert_eq!(device.runtime().stats().creation_retries, retries);
+        drop(buffer);
+        create().unwrap().profile_use();
+        h.end(Some(3));
+
+        let hold = hold_worker();
+        h.begin(&device, 4, b"movie", "header", "High");
+        device.runtime().fail(RenderFailure::new(
+            RenderFailureKind::DeviceLost,
+            "test device lost",
+        ));
+        h.end(Some(4));
+        hold.send(()).unwrap();
+        barrier();
+        assert_eq!(create().unwrap_err().kind(), RenderFailureKind::DeviceLost);
+        let fresh = super::super::tests::device(4 << 20);
+        assert_ne!(fresh.runtime().generation(), device.runtime().generation());
+        assert!(fresh.runtime().check_health().is_ok());
+    }
+}
