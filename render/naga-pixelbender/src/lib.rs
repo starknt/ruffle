@@ -1298,36 +1298,69 @@ impl ShaderBuilder<'_> {
                             arg3: None,
                         }),
                         Opcode::Sign => {
-                            // FP returns 0 for sign(NaN). Avoid relying on the
-                            // backend's sign() semantics (which may propagate NaN)
-                            // by computing it as (x > 0) - (x < 0).
-
-                            let gt_zero = self.evaluate_expr(Expression::Binary {
+                            // Classify IEEE bits: Flash returns zero for either zero and
+                            // every NaN. Some Vulkan drivers fold ordered float comparisons
+                            // back into sign(), which can return -1 for a NaN.
+                            let bits = self.evaluate_expr(Expression::As {
+                                expr: src,
+                                kind: ScalarKind::Sint,
+                                convert: None,
+                            });
+                            let mut splat = |value| {
+                                let scalar = self.func.expressions.append(
+                                    Expression::Literal(Literal::I32(value)),
+                                    Span::UNDEFINED,
+                                );
+                                self.evaluate_expr(Expression::Splat {
+                                    size: VectorSize::Quad,
+                                    value: scalar,
+                                })
+                            };
+                            let zero = splat(0);
+                            let mask = splat(i32::MAX);
+                            let infinity = splat(f32::INFINITY.to_bits() as i32);
+                            let magnitude = self.evaluate_expr(Expression::Binary {
+                                op: BinaryOperator::And,
+                                left: bits,
+                                right: mask,
+                            });
+                            let nonzero = self.evaluate_expr(Expression::Binary {
                                 op: BinaryOperator::Greater,
-                                left: src,
-                                right: self.zerovec4f,
+                                left: magnitude,
+                                right: zero,
                             });
-                            let lt_zero = self.evaluate_expr(Expression::Binary {
+                            let ordered = self.evaluate_expr(Expression::Binary {
+                                op: BinaryOperator::LessEqual,
+                                left: magnitude,
+                                right: infinity,
+                            });
+                            let negative = self.evaluate_expr(Expression::Binary {
                                 op: BinaryOperator::Less,
-                                left: src,
-                                right: self.zerovec4f,
+                                left: bits,
+                                right: zero,
                             });
-
-                            let gt_f = self.evaluate_expr(Expression::As {
-                                expr: gt_zero,
-                                kind: ScalarKind::Float,
-                                convert: Some(4),
+                            let one = self.evaluate_expr(Expression::Splat {
+                                size: VectorSize::Quad,
+                                value: self.onef32,
                             });
-                            let lt_f = self.evaluate_expr(Expression::As {
-                                expr: lt_zero,
-                                kind: ScalarKind::Float,
-                                convert: Some(4),
+                            let minus_one = self.evaluate_expr(Expression::Unary {
+                                op: UnaryOperator::Negate,
+                                expr: one,
                             });
-
-                            self.evaluate_expr(Expression::Binary {
-                                op: BinaryOperator::Subtract,
-                                left: gt_f,
-                                right: lt_f,
+                            let sign = self.evaluate_expr(Expression::Select {
+                                condition: negative,
+                                accept: minus_one,
+                                reject: one,
+                            });
+                            let zero_or_sign = self.evaluate_expr(Expression::Select {
+                                condition: nonzero,
+                                accept: sign,
+                                reject: self.zerovec4f,
+                            });
+                            self.evaluate_expr(Expression::Select {
+                                condition: ordered,
+                                accept: zero_or_sign,
+                                reject: self.zerovec4f,
                             })
                         }
                         _ => {
