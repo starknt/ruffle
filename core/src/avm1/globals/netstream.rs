@@ -237,10 +237,12 @@ fn on_peer_connect<'gc>(
 
 fn close<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    _this: Object<'gc>,
+    this: Object<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm1_stub!(activation, "NetStream", "close");
+    if let NativeObject::NetStream(ns) = this.native() {
+        ns.close(activation.context);
+    }
     Ok(Value::Undefined)
 }
 

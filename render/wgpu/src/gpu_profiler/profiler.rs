@@ -394,10 +394,13 @@ impl GpuProfiler {
 
     /// Marks the end of a frame.
     ///
-    /// Needs to be called **after** submitting any encoder used in the current profiler frame.
+    /// Attach mappings to the final encoder after resolving this frame's queries.
     ///
     /// Fails if there are still open queries or unresolved queries.
-    pub fn end_frame(&mut self) -> Result<(), EndFrameError> {
+    pub fn end_frame(
+        &mut self,
+        encoder: &crate::gpu_resources::CommandEncoder,
+    ) -> Result<(), EndFrameError> {
         self.device.runtime().check_health()?;
         let started = std::time::Instant::now();
         while self.pending_frames.len() >= self.settings.max_num_pending_frames {
@@ -436,7 +439,6 @@ impl GpuProfiler {
         let query_pools = self.active_frame.query_pools.get_mut();
 
         let mut new_pending_frame = PendingFrame {
-            started: std::time::Instant::now(),
             query_pools: std::mem::take(&mut query_pools.used_pools),
             closed_query_by_parent_handle: HashMap::new(),
             mapped_buffers: Arc::new(AtomicU32::new(0)),
@@ -482,22 +484,21 @@ impl GpuProfiler {
         for pool in new_pending_frame.query_pools.iter_mut() {
             let mapped_buffers = new_pending_frame.mapped_buffers.clone();
             let health = self.device.runtime().health().clone();
-            pool.read_buffer
-                .slice(0..(pool.num_used_queries.load(Ordering::Relaxed) * wgpu::QUERY_SIZE) as u64)
-                .map_async(
-                    wgpu::MapMode::Read,
-                    move |mapping_result| match mapping_result {
-                        Err(error) => {
-                            health.fail(crate::gpu_runtime::RenderFailure::new(
-                                crate::gpu_runtime::RenderFailureKind::MapFailed,
-                                error.to_string(),
-                            ));
-                        }
-                        Ok(()) => {
-                            mapped_buffers.fetch_add(1, std::sync::atomic::Ordering::Release);
-                        }
-                    },
-                );
+            encoder.map_read_on_submit(
+                &pool.read_buffer,
+                u64::from(pool.num_used_queries.load(Ordering::Relaxed) * wgpu::QUERY_SIZE),
+                move |mapping_result| match mapping_result {
+                    Err(error) => {
+                        health.fail(crate::gpu_runtime::RenderFailure::new(
+                            crate::gpu_runtime::RenderFailureKind::MapFailed,
+                            error.to_string(),
+                        ));
+                    }
+                    Ok(()) => {
+                        mapped_buffers.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    }
+                },
+            );
         }
 
         // Enqueue
@@ -525,19 +526,8 @@ impl GpuProfiler {
             return None;
         }
         let frame = self.pending_frames.first_mut()?;
-        if frame.started.elapsed() >= std::time::Duration::from_secs(2)
-            && frame.mapped_buffers.load(Ordering::Acquire) != frame.query_pools.len() as u32
-        {
-            self.device
-                .runtime()
-                .fail(crate::gpu_runtime::RenderFailure::new(
-                    crate::gpu_runtime::RenderFailureKind::Timeout,
-                    "GPU profiling readback timed out",
-                ));
-            return None;
-        }
-
-        // We only process if all mappings succeed.
+        // Mapping begins at submission. A nonblocking observation can see a
+        // queued encoder of any age. end_frame bounds an actual drain wait.
         if frame
             .mapped_buffers
             .load(std::sync::atomic::Ordering::Acquire)
@@ -550,19 +540,14 @@ impl GpuProfiler {
             query_pools,
             mut closed_query_by_parent_handle,
             mapped_buffers: _,
-            started: _,
         } = self.pending_frames.remove(0);
 
-        let results = {
-            let timestamp_to_sec = timestamp_period as f64 / 1000.0 / 1000.0 / 1000.0;
-
-            Self::process_timings_recursive(
-                self.device.runtime().health(),
-                timestamp_to_sec,
-                &mut closed_query_by_parent_handle,
-                ROOT_QUERY_HANDLE,
-            )
-        };
+        let results = Self::process_timings_recursive(
+            self.device.runtime().health(),
+            timestamp_period,
+            &mut closed_query_by_parent_handle,
+            ROOT_QUERY_HANDLE,
+        );
 
         // Ensure that closed queries no longer hold references to the query pools.
         // `process_timings_recursive` should have handled this already.
@@ -792,7 +777,7 @@ impl GpuProfiler {
 
     fn process_timings_recursive(
         health: &crate::gpu_runtime::RendererHealth,
-        timestamp_to_sec: f64,
+        timestamp_period: f32,
         closed_scope_by_parent_handle: &mut HashMap<GpuTimerQueryTreeHandle, Vec<GpuProfilerQuery>>,
         parent_handle: GpuTimerQueryTreeHandle,
     ) -> Vec<GpuTimerQueryResult> {
@@ -840,10 +825,11 @@ impl GpuProfiler {
                     Some(start_raw..end_raw)
                 });
 
-                let time = time_raw.as_ref().map(|time_raw| {
-                    (time_raw.start as f64 * timestamp_to_sec)
-                        ..(time_raw.end as f64 * timestamp_to_sec)
-                });
+                let time_ns =
+                    time_raw.and_then(|ticks| super::time_range_ns(ticks, timestamp_period));
+                let time = time_ns
+                    .as_ref()
+                    .map(|ns| ns.start as f64 * 1e-9..ns.end as f64 * 1e-9);
 
                 #[cfg(feature = "profile-with-tracy")]
                 if let (Some(tracy_scope), Some(time_raw)) = (&scope.tracy_scope, &time_raw) {
@@ -852,7 +838,7 @@ impl GpuProfiler {
 
                 let nested_queries = Self::process_timings_recursive(
                     health,
-                    timestamp_to_sec,
+                    timestamp_period,
                     closed_scope_by_parent_handle,
                     scope.handle,
                 );
@@ -865,6 +851,7 @@ impl GpuProfiler {
                 GpuTimerQueryResult {
                     label: std::mem::take(&mut scope.label),
                     time,
+                    time_ns,
                     nested_queries,
                     pid: scope.pid,
                     tid: scope.tid,
@@ -992,7 +979,6 @@ struct ActiveFrame {
 }
 
 struct PendingFrame {
-    started: std::time::Instant,
     query_pools: Vec<Arc<QueryPool>>,
     closed_query_by_parent_handle: HashMap<GpuTimerQueryTreeHandle, Vec<GpuProfilerQuery>>,
 

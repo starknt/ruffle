@@ -57,8 +57,58 @@ impl CommandEncoder {
         if let Some(queries) = desc.occlusion_query_set {
             uses.retain(queries);
         }
+        let diagnostic = self
+            .device
+            .0
+            .inner()
+            .diagnostics
+            .as_ref()
+            .and_then(|_| diagnostics::Pending::raster(&self.device, desc));
+        let statistics = diagnostic.as_ref().is_some_and(|p| p.statistics.is_some());
+        let coverage = diagnostic.as_ref().is_some_and(|p| p.coverage.is_some());
+        let mut raw = if let Some(p) = &diagnostic {
+            let time = p
+                .time
+                .as_ref()
+                .map(|(set, start, end)| wgpu::RenderPassTimestampWrites {
+                    query_set: set,
+                    beginning_of_pass_write_index: Some(*start),
+                    end_of_pass_write_index: Some(*end),
+                });
+            let mut attachments: smallvec::SmallVec<[_; 2]> =
+                desc.color_attachments.iter().cloned().collect();
+            if let Some(c) = &p.coverage {
+                attachments.push(Some(wgpu::RenderPassColorAttachment {
+                    view: &c.view,
+                    depth_slice: None,
+                    resolve_target: c.resolve.as_ref(),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }));
+            }
+            self.raw.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &attachments,
+                timestamp_writes: time.or_else(|| desc.timestamp_writes.clone()),
+                ..desc.clone()
+            })
+        } else {
+            self.raw.begin_render_pass(desc)
+        };
+        let diagnostic = if let Some(p) = diagnostic {
+            if let Some(set) = &p.statistics {
+                raw.begin_pipeline_statistics_query(set, 0);
+            }
+            self.diagnostics.push(p);
+            self.diagnostics.last_mut()
+        } else {
+            None
+        };
         RenderPass {
-            raw: self.raw.begin_render_pass(desc),
+            raw,
+            statistics,
+            coverage: diagnostic.filter(|_| coverage),
             uses,
             state: PassState::default(),
             changes: StateChanges::default(),
@@ -68,14 +118,51 @@ impl CommandEncoder {
         &mut self,
         desc: &wgpu::ComputePassDescriptor<'_>,
     ) -> ComputePass<'_> {
+        self.compute_pass(desc, None)
+    }
+    pub(crate) fn begin_filter_compute_pass(
+        &mut self,
+        size: (u32, u32),
+        desc: &wgpu::ComputePassDescriptor<'_>,
+    ) -> ComputePass<'_> {
+        self.compute_pass(desc, Some(size))
+    }
+    fn compute_pass(
+        &mut self,
+        desc: &wgpu::ComputePassDescriptor<'_>,
+        size: Option<(u32, u32)>,
+    ) -> ComputePass<'_> {
         let mut uses = Uses::new(self.device.clone(), &self.uses);
         if let Some(writes) = &desc.timestamp_writes {
             uses.retain(writes.query_set);
         }
-        ComputePass {
-            raw: self.raw.begin_compute_pass(desc),
-            uses,
-        }
+        let diagnostic = self
+            .device
+            .0
+            .inner()
+            .diagnostics
+            .as_ref()
+            .and(size)
+            .and_then(|s| diagnostics::Pending::compute(&self.device, s, desc));
+        let raw = if let Some(p) = diagnostic {
+            let time = p
+                .time
+                .as_ref()
+                .map(|(set, start, end)| wgpu::ComputePassTimestampWrites {
+                    query_set: set,
+                    beginning_of_pass_write_index: Some(*start),
+                    end_of_pass_write_index: Some(*end),
+                });
+            let raw = self.raw.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                timestamp_writes: time.or_else(|| desc.timestamp_writes.clone()),
+                ..desc.clone()
+            });
+            self.diagnostics.push(p);
+            raw
+        } else {
+            self.raw.begin_compute_pass(desc)
+        };
+        ComputePass { raw, uses }
     }
     pub fn copy_buffer_to_buffer(
         &mut self,
@@ -143,6 +230,9 @@ impl CommandEncoder {
         self.raw
             .map_buffer_on_submit(buffer, wgpu::MapMode::Read, ..size, callback);
     }
+    pub fn on_submitted_work_done(&self, callback: impl FnOnce() + Send + 'static) {
+        self.raw.on_submitted_work_done(callback);
+    }
     pub fn resolve_query_set(
         &mut self,
         queries: &wgpu::QuerySet,
@@ -209,6 +299,8 @@ struct PassState {
 }
 
 pub struct RenderPass<'a> {
+    statistics: bool,
+    coverage: Option<&'a mut diagnostics::Pending>,
     raw: wgpu::RenderPass<'a>,
     uses: Uses<'a>,
     state: PassState,
@@ -216,6 +308,9 @@ pub struct RenderPass<'a> {
 }
 impl Drop for RenderPass<'_> {
     fn drop(&mut self) {
+        if self.statistics {
+            self.raw.end_pipeline_statistics_query();
+        }
         let c = self.state_changes();
         ruffle_render::profile::work(|w| {
             w.native_pipeline_changes += c.pipelines;
@@ -253,7 +348,31 @@ impl RenderPass<'_> {
                     .and_then(|i| i.instance.as_ref())
                     .map(|v| v.variant().clone())
             });
-        self.raw.set_pipeline(pipeline);
+        if let Some(p) = &mut self.coverage {
+            let variant = self
+                .uses
+                .device
+                .0
+                .inner()
+                .diagnostics
+                .as_ref()
+                .and_then(|d| d.variant(pipeline));
+            if let Some((variant, counts)) = variant {
+                self.raw.set_pipeline(&variant);
+                if !counts {
+                    p.row.status = "coverage-shader-unavailable";
+                }
+            } else {
+                // A lazy pipeline failed after this MRT pass was already opened.
+                // Propagate a failed replay instead of submitting an incorrect draw.
+                self.uses.device.runtime().fail(RenderFailure::new(
+                    RenderFailureKind::Validation,
+                    "missing additive coverage pipeline for diagnostic replay",
+                ));
+            }
+        } else {
+            self.raw.set_pipeline(pipeline);
+        }
         self.state.pipeline = Some(pipeline.clone());
         // Conservatively rebind after any pipeline-layout change.
         self.state.bindings.clear();
@@ -332,6 +451,25 @@ impl RenderPass<'_> {
             v.used();
         }
         self.raw.draw_indexed(indices, base_vertex, instances);
+    }
+    pub fn draw_indexed_indirect(&mut self, buffer: &Buffer, offset: u64) {
+        self.uses.retain(buffer.raw());
+        self.raw.draw_indexed_indirect(buffer, offset);
+    }
+    pub fn multi_draw_indexed_indirect(&mut self, buffer: &Buffer, offset: u64, count: u32) {
+        self.uses.retain(buffer.raw());
+        self.raw.multi_draw_indexed_indirect(buffer, offset, count);
+    }
+    pub fn multi_draw_indexed_indirect_count(
+        &mut self,
+        buffer: &Buffer,
+        offset: u64,
+        count_offset: u64,
+        max_count: u32,
+    ) {
+        self.uses.retain(buffer.raw());
+        self.raw
+            .multi_draw_indexed_indirect_count(buffer, offset, buffer, count_offset, max_count);
     }
     pub fn set_stencil_reference(&mut self, value: u32) {
         if self.state.stencil == Some(value) {

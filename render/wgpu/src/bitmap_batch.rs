@@ -59,17 +59,22 @@ struct State {
     entries: LruCache<Key, (Arc<Binding>, u64)>,
 }
 pub(crate) struct BitmapBatchCache {
+    pub(crate) mode: crate::capabilities::BitmapBindings,
     state: Arc<Mutex<State>>,
     scheduler: ResourceScheduler,
 }
 impl BitmapBatchCache {
-    pub fn new(runtime: &GpuRuntime) -> Self {
+    pub fn new(runtime: &GpuRuntime, mode: crate::capabilities::BitmapBindings) -> Self {
         let state = Arc::new(Mutex::new(State {
             entries: LruCache::new(NonZeroUsize::new(64).unwrap()),
         }));
         let scheduler = runtime.scheduler().clone();
         scheduler.register(ReclaimClass::Cache, state.clone());
-        Self { state, scheduler }
+        Self {
+            state,
+            scheduler,
+            mode,
+        }
     }
     pub fn get_or_create(
         &self,
@@ -90,24 +95,32 @@ impl BitmapBatchCache {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((binding, age)) = state.entries.get_mut(&key) {
-                if let Some((group, _)) = &*binding
+            if let Some((binding, age)) = state.entries.get_mut(&key)
+                && let Some((group, _)) = &*binding
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                {
-                    *age = self.scheduler.tick();
-                    return Ok(group.clone());
-                }
+            {
+                *age = self.scheduler.tick();
+                return Ok(group.clone());
             }
         }
-        let mut entries: Vec<_> = views
-            .iter()
-            .enumerate()
-            .map(|(i, view)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: wgpu::BindingResource::TextureView(view),
-            })
-            .collect();
+        let array_views;
+        let mut entries: Vec<_> = if self.mode == crate::capabilities::BitmapBindings::Array {
+            array_views = views.each_ref().map(|view| view.raw());
+            vec![wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureViewArray(&array_views),
+            }]
+        } else {
+            views
+                .iter()
+                .enumerate()
+                .map(|(i, view)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: wgpu::BindingResource::TextureView(view),
+                })
+                .collect()
+        };
         entries.push(wgpu::BindGroupEntry {
             binding: BITMAP_BATCH_TEXTURES as u32,
             resource: wgpu::BindingResource::Sampler(sampler),

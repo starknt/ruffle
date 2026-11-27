@@ -26,11 +26,15 @@ fn do_ping(context: &UpdateContext<'_>, _args: &[ExternalValue]) -> ExternalValu
 fn do_reentry(context: &mut UpdateContext<'_>, _args: &[ExternalValue]) -> ExternalValue {
     context.avm_trace("[ExternalInterface] starting reentry");
     if let Some(callback) = context.external_interface.get_callback("callWith") {
-        callback.call(
+        let result = callback.call(
             context,
             "callWith",
             ["trace".into(), "successful reentry!".into()],
-        )
+        );
+        context.avm_trace(&format!(
+            "[ExternalInterface] callback returned: {result:?}"
+        ));
+        result
     } else {
         ExternalValue::Null
     }

@@ -362,13 +362,20 @@ fn avm2_to_convolution_filter<'gc>(
     activation: &mut Activation<'_, 'gc>,
     object: Object<'gc>,
 ) -> Result<Filter, Error<'gc>> {
-    let mut matrix = vec![];
+    let matrix_x = object
+        .get_slot(convolution_filter_slots::_MATRIX_X)
+        .coerce_to_number(activation)? as u8;
+    let matrix_y = object
+        .get_slot(convolution_filter_slots::_MATRIX_Y)
+        .coerce_to_number(activation)? as u8;
+    let matrix_len = usize::from(matrix_x) * usize::from(matrix_y);
+    let mut matrix = Vec::with_capacity(matrix_len);
     if let Some(matrix_object) = object
         .get_slot(convolution_filter_slots::MATRIX)
         .as_object()
         && let Some(array) = matrix_object.as_array_storage()
     {
-        for value in array.iter() {
+        for value in array.iter().take(matrix_len) {
             matrix.push(
                 value
                     .unwrap_or(Value::Undefined)
@@ -391,12 +398,6 @@ fn avm2_to_convolution_filter<'gc>(
     let divisor = object
         .get_slot(convolution_filter_slots::DIVISOR)
         .coerce_to_number(activation)?;
-    let matrix_x = object
-        .get_slot(convolution_filter_slots::MATRIX_X)
-        .coerce_to_u32(activation)?;
-    let matrix_y = object
-        .get_slot(convolution_filter_slots::MATRIX_Y)
-        .coerce_to_u32(activation)?;
     let preserve_alpha = object
         .get_slot(convolution_filter_slots::PRESERVE_ALPHA)
         .coerce_to_boolean();
@@ -405,14 +406,14 @@ fn avm2_to_convolution_filter<'gc>(
     if preserve_alpha {
         flags |= ConvolutionFilterFlags::PRESERVE_ALPHA;
     }
-    matrix.resize((matrix_x * matrix_y) as usize, 0.0f32);
+    matrix.resize(matrix_len, 0.0);
     Ok(Filter::ConvolutionFilter(ConvolutionFilter {
         bias: bias as f32,
         default_color: Color::from_rgb(color, (alpha * 255.0) as u8),
         divisor: divisor as f32,
         matrix,
-        num_matrix_cols: matrix_x.clamp(0, 255) as u8,
-        num_matrix_rows: matrix_y.clamp(0, 255) as u8,
+        num_matrix_cols: matrix_x,
+        num_matrix_rows: matrix_y,
         flags,
     }))
 }

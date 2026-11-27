@@ -1,0 +1,5 @@
+closed
+reconnected
+replacement result true
+replacement status false
+closing in responder true

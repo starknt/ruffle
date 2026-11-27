@@ -68,7 +68,9 @@ use gc_arena::lock::GcRefLock;
 use gc_arena::{Collect, DynamicRootSet, Mutation, Rootable};
 use ruffle_common::duration::FloatDuration;
 use ruffle_macros::istr;
-use ruffle_render::backend::{RenderBackend, ViewportDimensions, null::NullRenderer};
+use ruffle_render::backend::{
+    BitmapCacheEntry, RenderBackend, ViewportDimensions, null::NullRenderer,
+};
 use ruffle_render::commands::CommandList;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::TransformStack;
@@ -344,6 +346,10 @@ impl PlayerSession {
 
     pub fn poll_tasks(&mut self) {
         self.executor.run();
+    }
+
+    pub fn pending_tasks(&self) -> usize {
+        self.executor.pending_tasks()
     }
 }
 
@@ -2458,8 +2464,63 @@ impl Player {
     pub fn render(
         &mut self,
     ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
+        self.render_opportunity()?;
+        self.render_stage()
+    }
+
+    /// Dispatch a pending realtime RENDER on the VM thread. Hosts with a bounded
+    /// output queue call this once per redraw opportunity, even without a target.
+    /// Fixed-step sessions dispatch at the authored frame boundary in `run_frame`.
+    pub fn render_opportunity(&mut self) -> Result<(), ruffle_render::error::RenderFailure> {
         self.check_render_health()?;
-        let result = self.render_inner();
+        if self.playback.sample_time.is_none() {
+            self.broadcast_render_if_invalidated();
+        }
+        self.check_render_health()
+    }
+
+    /// Extract and submit the stage after the host has driven the render opportunity.
+    /// The host may defer this step until its presentation target has capacity.
+    pub fn render_stage(
+        &mut self,
+    ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
+        self.extract_stage(|renderer, clear, commands, caches| {
+            renderer.submit_prepared_frame(clear, commands, caches)
+        })
+        .map(|submission| {
+            submission.map_or(ruffle_render::backend::FrameOutcome::Deferred, Into::into)
+        })
+    }
+
+    /// Extract one reserved picture on the VM owner. The consumer can capture an
+    /// owned packet or submit immediately. A missing output leaves the stage dirty.
+    pub fn extract_stage<R>(
+        &mut self,
+        consume: impl FnOnce(
+            &mut dyn RenderBackend,
+            Color,
+            CommandList,
+            Vec<BitmapCacheEntry>,
+        ) -> Result<R, ruffle_render::error::RenderFailure>,
+    ) -> Result<Option<R>, ruffle_render::error::RenderFailure> {
+        self.try_extract_stage(|renderer, clear, commands, caches| {
+            consume(renderer, clear, commands, caches).map(Some)
+        })
+    }
+
+    /// A consumer without enough queue capacity can defer just the picture.
+    /// Reliable writes already encoded during extraction remain ordered.
+    pub fn try_extract_stage<R>(
+        &mut self,
+        consume: impl FnOnce(
+            &mut dyn RenderBackend,
+            Color,
+            CommandList,
+            Vec<BitmapCacheEntry>,
+        ) -> Result<Option<R>, ruffle_render::error::RenderFailure>,
+    ) -> Result<Option<R>, ruffle_render::error::RenderFailure> {
+        self.check_render_health()?;
+        let result = self.extract_stage_inner(consume);
         if let Err(error) = &result {
             self.renderer.health().fail(error.clone());
         }
@@ -2475,19 +2536,22 @@ impl Player {
                 let stage = context.stage;
                 stage.broadcast_render(context);
             });
+            self.needs_render = true;
         }
     }
 
-    fn render_inner(
+    fn extract_stage_inner<R>(
         &mut self,
-    ) -> Result<ruffle_render::backend::FrameOutcome, ruffle_render::error::RenderFailure> {
-        if self.playback.sample_time.is_none() {
-            self.broadcast_render_if_invalidated();
-        }
-
+        consume: impl FnOnce(
+            &mut dyn RenderBackend,
+            Color,
+            CommandList,
+            Vec<BitmapCacheEntry>,
+        ) -> Result<Option<R>, ruffle_render::error::RenderFailure>,
+    ) -> Result<Option<R>, ruffle_render::error::RenderFailure> {
         if !self.renderer.prepare_frame()? {
             self.needs_render = true;
-            return Ok(ruffle_render::backend::FrameOutcome::Deferred);
+            return Ok(None);
         }
 
         self.render_epoch = self.render_epoch.wrapping_add(1);
@@ -2538,12 +2602,15 @@ impl Player {
         });
 
         self.check_render_health()?;
-        let outcome =
-            self.renderer
-                .submit_prepared_frame(background_color, commands, cache_draws)?;
+        let picture = consume(
+            self.renderer.as_mut(),
+            background_color,
+            commands,
+            cache_draws,
+        )?;
         self.check_render_health()?;
-        self.needs_render = false;
-        Ok(outcome.into())
+        self.needs_render = picture.is_none();
+        Ok(picture)
     }
 
     /// The current frame of the main timeline, if available.
@@ -3454,7 +3521,14 @@ impl PlayerBuilder {
 
     /// A headless session owns its executor until the host drops the session.
     pub fn build_session(self) -> PlayerSession {
-        let executor = crate::backend::tasks::LocalExecutor::new();
+        self.build_session_with_executor(crate::backend::tasks::LocalExecutor::new())
+    }
+
+    /// Keeps navigator and VM futures on the host's single ordered local executor.
+    pub fn build_session_with_executor(
+        self,
+        executor: crate::backend::tasks::LocalExecutor,
+    ) -> PlayerSession {
         let player = self.build_with_spawner(executor.spawner());
         PlayerSession { player, executor }
     }
@@ -3810,6 +3884,19 @@ mod tests {
             ruffle_render::backend::FrameOutcome::NoOutput
         );
         assert!(!player.needs_render());
+    }
+
+    #[test]
+    fn an_invalidation_between_opportunity_and_extraction_waits_for_the_next_opportunity() {
+        let session = PlayerBuilder::new().build();
+        let mut player = session.lock().unwrap();
+        player.render_opportunity().unwrap();
+        player.mutate_with_update_context(|ctx| ctx.stage.set_invalidated(true));
+        player.render_stage().unwrap();
+        assert!(player.mutate_with_update_context(|ctx| ctx.stage.invalidated()));
+        player.render_opportunity().unwrap();
+        assert!(!player.mutate_with_update_context(|ctx| ctx.stage.invalidated()));
+        assert!(player.needs_render());
     }
 
     #[test]

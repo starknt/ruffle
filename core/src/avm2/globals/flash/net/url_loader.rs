@@ -32,12 +32,6 @@ fn spawn_fetch<'gc>(
         loader_object.as_script_object().unwrap(),
         request,
     );
-    let player = activation.context.player_handle();
-    let future =
-        activation
-            .context
-            .load_manager
-            .cancellable_read(loader_object, &player, None, future);
     activation.context.spawn_future(future);
     Ok(Value::Undefined)
 }

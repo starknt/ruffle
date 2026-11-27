@@ -19,10 +19,20 @@ package flash.filters {
         public var matrix:Array;
 
         [Ruffle(NativeAccessible)]
-        public var matrixX:Number;
+        private var _matrixX:int;
+
+        public function get matrixX():Number { return this._matrixX; }
+        public function set matrixX(value:Number):void {
+            this._matrixX = Math.max(0, Math.min(15, value));
+        }
 
         [Ruffle(NativeAccessible)]
-        public var matrixY:Number;
+        private var _matrixY:int;
+
+        public function get matrixY():Number { return this._matrixY; }
+        public function set matrixY(value:Number):void {
+            this._matrixY = Math.max(0, Math.min(15, value));
+        }
 
         [Ruffle(NativeAccessible)]
         public var preserveAlpha:Boolean;
@@ -53,11 +63,11 @@ package flash.filters {
             return new ConvolutionFilter(
                 this.matrixX,
                 this.matrixY,
-                this.matrixull,
+                this.matrix == null ? null : this.matrix.AS3::concat(),
                 this.divisor,
                 this.bias,
-                this.preserveAlpharue,
-                this.clamprue,
+                this.preserveAlpha,
+                this.clamp,
                 this.color,
                 this.alpha
             );

@@ -250,7 +250,7 @@ pub fn load_bytes<'gc>(
     activation.context.load_manager.close_read(this);
 
     let arg0 = args.get_object(activation, 0, "data")?;
-    let bytes = arg0.as_bytearray().unwrap().bytes().to_vec();
+    let bytes = arg0.as_bytearray_mut().unwrap().snapshot();
     let context = args.try_get_object(1);
 
     let loader_info = this
@@ -334,4 +334,32 @@ pub fn unload<'gc>(
     Ok(Value::Undefined)
 }
 
-pub use crate::avm2::globals::flash::net::url_loader::close;
+pub fn close<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: FunctionArgs<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    let owner = this.as_object().unwrap();
+    if activation.context.load_manager.read_id(owner).is_some() {
+        activation.context.load_manager.close_read(owner);
+        let info = owner
+            .get_slot(loader_slots::_CONTENT_LOADER_INFO)
+            .as_object()
+            .unwrap()
+            .as_loader_info_object()
+            .unwrap();
+        // A deferred frame can leave the unpublished pixels or SWF rooted in LoaderInfo.
+        if let LoaderStream::NotYetLoaded(movie, Some(_), false) = info.loader_stream() {
+            let summary = SwfMovieData::fake_with_compressed_len(
+                movie.version(),
+                movie.loader_url().map(str::to_owned),
+                movie.compressed_len(),
+            );
+            info.set_loader_stream(
+                LoaderStream::NotYetLoaded(SwfMovie::new(activation.gc(), summary), None, false),
+                activation.gc(),
+            );
+        }
+    }
+    Ok(Value::Undefined)
+}

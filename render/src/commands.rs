@@ -71,6 +71,7 @@ struct Retention {
     device: Cell<Option<u64>>,
     charge: RefCell<Option<StorageCharge>>,
     prepared: RefCell<Option<PreparedData>>,
+    snapshot: RefCell<Option<PreparedData>>,
     observed: Cell<bool>,
     required_bytes: Cell<usize>,
 }
@@ -90,6 +91,28 @@ struct StorageCharge {
 impl Drop for StorageCharge {
     fn drop(&mut self) {
         self.budget.set(self.budget.get() - self.bytes);
+    }
+}
+
+impl PreparedData {
+    fn charge(
+        value: Rc<dyn std::any::Any>,
+        bytes: usize,
+        owner: &StorageCharge,
+    ) -> Result<Self, usize> {
+        let bytes = bytes.saturating_add(size_of::<Self>() + 64);
+        if bytes > owner.limit.saturating_sub(owner.budget.get()) {
+            return Err(bytes);
+        }
+        owner.budget.set(owner.budget.get() + bytes);
+        Ok(Self {
+            value,
+            _charge: StorageCharge {
+                limit: owner.limit,
+                budget: owner.budget.clone(),
+                bytes,
+            },
+        })
     }
 }
 
@@ -155,28 +178,42 @@ impl CommandList {
         self.retention().required_bytes.set(usize::MAX);
     }
 
+    /// Cache the renderer's immutable CPU description on an admitted VM page.
+    /// Mutating or cloning the list discards its retention state.
+    pub fn cached_snapshot<T: std::any::Any>(&self) -> Option<Rc<T>> {
+        self.retention
+            .get()?
+            .snapshot
+            .borrow()
+            .as_ref()?
+            .value
+            .clone()
+            .downcast()
+            .ok()
+    }
+
+    pub fn store_snapshot<T: std::any::Any>(&self, value: Rc<T>, bytes: usize) {
+        let state = self.retention();
+        let mut slot = state.snapshot.borrow_mut();
+        slot.take();
+        if let Some(charge) = state.charge.borrow().as_ref() {
+            *slot = PreparedData::charge(value, bytes, charge).ok();
+        }
+    }
+
     pub fn store_draws<T: std::any::Any>(&self, value: Rc<T>, bytes: usize) {
         let state = self.retention();
-        state.prepared.borrow_mut().take();
-        let charge = state.charge.borrow();
-        let Some(charge) = charge.as_ref() else {
-            return;
-        };
-        let bytes = bytes.saturating_add(size_of::<PreparedData>() + 64);
-        if bytes > charge.limit.saturating_sub(charge.budget.get()) {
-            state.required_bytes.set(bytes);
-            return;
+        let mut slot = state.prepared.borrow_mut();
+        slot.take();
+        if let Some(charge) = state.charge.borrow().as_ref() {
+            match PreparedData::charge(value, bytes, charge) {
+                Ok(data) => {
+                    state.required_bytes.set(0);
+                    *slot = Some(data);
+                }
+                Err(required) => state.required_bytes.set(required),
+            }
         }
-        charge.budget.set(charge.budget.get() + bytes);
-        state.required_bytes.set(0);
-        *state.prepared.borrow_mut() = Some(PreparedData {
-            value,
-            _charge: StorageCharge {
-                budget: charge.budget.clone(),
-                bytes,
-                limit: charge.limit,
-            },
-        });
     }
     pub fn temporary_inputs(&self) -> usize {
         self.temporary_inputs

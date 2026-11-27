@@ -162,6 +162,7 @@ impl BlurFilter {
         staging_belt: &mut StagingBelt,
         source: &FilterSource,
         filter: &BlurFilterArgs,
+        destination: Option<FilterSource<'_>>,
     ) -> Result<Option<CommandTarget>, crate::gpu_runtime::RenderFailure> {
         if filter.num_passes() == 0
             || (filter.blur_x.to_f32() <= 1.0 && filter.blur_y.to_f32() <= 1.0)
@@ -172,38 +173,42 @@ impl BlurFilter {
         let format = source.texture.format();
         let pipeline = self.pipeline(descriptors, sample_count, format)?;
 
-        let mut flip = CommandTarget::new(
-            descriptors,
-            texture_pool,
-            wgpu::Extent3d {
-                width: source.size.0,
-                height: source.size.1,
-                depth_or_array_layers: 1,
-            },
-            format,
-            sample_count,
-            RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
-            draw_encoder,
-        )?;
-        let mut flop = CommandTarget::new(
-            descriptors,
-            texture_pool,
-            wgpu::Extent3d {
-                width: source.size.0,
-                height: source.size.1,
-                depth_or_array_layers: 1,
-            },
-            format,
-            sample_count,
-            RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
-            draw_encoder,
-        )?;
+        // The first pass reads the original texture and writes flop. An even
+        // number of passes finishes in flip, so the cache may safely back flip
+        // even if it held our input. An odd chain may use flop only when its
+        // input already resides in a different attachment.
+        let axes =
+            u32::from(filter.blur_x.to_f32() > 1.0) + u32::from(filter.blur_y.to_f32() > 1.0);
+        let even = (axes * u32::from(filter.num_passes())).is_multiple_of(2);
+        let destination = destination.filter(|out| even || out.texture != source.texture);
+        let mut target = |use_destination| {
+            let mode = match destination.filter(|_| use_destination) {
+                Some(out) => {
+                    RenderTargetMode::ExistingWithView(out.view.clone(), wgpu::Color::TRANSPARENT)
+                }
+                None => RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
+            };
+            CommandTarget::new(
+                descriptors,
+                texture_pool,
+                wgpu::Extent3d {
+                    width: source.size.0,
+                    height: source.size.1,
+                    depth_or_array_layers: 1,
+                },
+                format,
+                sample_count,
+                mode,
+                draw_encoder,
+            )
+        };
+        let mut flip = target(even)?;
+        let mut flop = target(!even)?;
 
         staging_belt
             .write_buffer(draw_encoder, &self.vertex_buffer, 0, self.vertices_size)?
             .copy_from_slice(bytemuck::cast_slice(&[source.vertices()]));
 
-        let source_view = source.texture.create_view(&Default::default())?;
         let mut first = true;
         for _ in 0..(filter.num_passes() as usize) {
             for i in 0..2 {
@@ -223,7 +228,7 @@ impl BlurFilter {
                 let (previous_view, previous_vertices, previous_width, previous_height) = if first {
                     first = false;
                     (
-                        &source_view,
+                        source.view,
                         self.vertex_buffer.slice(..),
                         source.texture.width() as f32,
                         source.texture.height() as f32,
@@ -350,7 +355,7 @@ impl BlurFilter {
         });
         render_pass.set_pipeline(pipeline);
 
-        render_pass.set_bind_group(0, (&filter_group).raw(), &[]);
+        render_pass.set_bind_group(0, filter_group.raw(), &[]);
 
         render_pass.set_vertex_buffer(0, vertices);
         render_pass.set_index_buffer(

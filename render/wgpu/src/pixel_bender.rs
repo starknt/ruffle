@@ -35,6 +35,7 @@ use crate::{
 
 #[derive(Debug)]
 pub struct PixelBenderWgpuShader {
+    _lifetime: crate::render_snapshot::ResourceLifetime,
     device: crate::gpu_resources::Device,
     program: Arc<Program>,
     float_parameters_buffer: crate::gpu_resources::Buffer,
@@ -158,6 +159,7 @@ impl PixelBenderWgpuShader {
     pub fn new(
         descriptors: &Descriptors,
         shader: PixelBenderShader,
+        operations: &crate::render_snapshot::OperationSequence,
     ) -> Result<PixelBenderWgpuShader, crate::gpu_runtime::RenderFailure> {
         let device = descriptors.device.with_owner(
             descriptors
@@ -198,6 +200,7 @@ impl PixelBenderWgpuShader {
         })?;
 
         Ok(Self {
+            _lifetime: operations.create_resource()?,
             program,
             float_parameters_buffer,
             int_parameters_buffer,
@@ -409,7 +412,8 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
         &self,
         shader: PixelBenderShader,
     ) -> Result<PixelBenderShaderHandle, BitmapError> {
-        let handle = PixelBenderWgpuShader::new(&self.descriptors, shader)?;
+        let handle =
+            PixelBenderWgpuShader::new(&self.descriptors, shader, &self.active_frame.operations)?;
         Ok(PixelBenderShaderHandle(Arc::new(handle)))
     }
 }
@@ -568,7 +572,8 @@ pub(super) fn run_pixelbender_shader_impl(
                                     repeating_nearest: Default::default(),
                                     clamped_linear: Default::default(),
                                     clamped_nearest: Default::default(),
-                                    copy_count: Default::default(),
+                                    access: Default::default(),
+                                    _lifetime: None,
                                     version: Default::default(),
                                 },
                             )))
@@ -744,7 +749,7 @@ pub(super) fn run_pixelbender_shader_impl(
         depth_stencil_attachment: stencil.map(|(_, attachment)| attachment),
         ..Default::default()
     });
-    render_pass.set_bind_group(0, (&bind_group).raw(), &[]);
+    render_pass.set_bind_group(0, bind_group.raw(), &[]);
     render_pass.set_pipeline(&pipeline);
     if let Some(mask) = mask {
         mask.apply_stencil_reference(&mut render_pass);

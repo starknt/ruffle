@@ -6,6 +6,7 @@ mod menu_bar;
 mod movie;
 mod picker;
 mod pipeline_cache;
+mod presentation;
 mod theme;
 mod widgets;
 

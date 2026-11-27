@@ -41,6 +41,7 @@ successful reentry!
 Traced!
 
 /// callWith() end
+[ExternalInterface] callback returned: Undefined
 undefined
 
 TypeError: Error #2023: Class Test$ must inherit from Sprite to link to the root.

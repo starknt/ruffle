@@ -1,9 +1,12 @@
 //! URL navigation, resource loading, and sockets.
 
+pub use bytes::Bytes;
+pub use ruffle_render::bitmap::LoaderRequest;
+
 use crate::loader::Error;
-use crate::socket::{ConnectionState, SocketAction, SocketHandle};
+use crate::socket::{ConnectionState, SocketAction, SocketActionSender, SocketHandle, SocketWrite};
 use crate::string::WStr;
-use async_channel::{Receiver, Sender};
+use async_channel::Receiver;
 use encoding_rs::Encoding;
 use enumset::EnumSetType;
 use indexmap::IndexMap;
@@ -135,27 +138,18 @@ pub struct Request {
     /// to give us a consistent order - hopefully, no servers depend on
     /// the order of headers.
     headers: IndexMap<String, String>,
+    loader_request: Option<LoaderRequest>,
 }
 
 impl Request {
     /// Construct a GET request.
     pub fn get(url: String) -> Self {
-        Self {
-            url,
-            method: NavigationMethod::Get,
-            body: None,
-            headers: Default::default(),
-        }
+        Self::request(NavigationMethod::Get, url, None)
     }
 
     /// Construct a POST request.
     pub fn post(url: String, body: Option<(Vec<u8>, String)>) -> Self {
-        Self {
-            url,
-            method: NavigationMethod::Post,
-            body,
-            headers: Default::default(),
-        }
+        Self::request(NavigationMethod::Post, url, body)
     }
 
     /// Construct a request with the given method and data
@@ -166,7 +160,16 @@ impl Request {
             method,
             body,
             headers: Default::default(),
+            loader_request: None,
         }
+    }
+
+    pub fn loader_request(&self) -> Option<LoaderRequest> {
+        self.loader_request
+    }
+
+    pub fn set_loader_request(&mut self, request: LoaderRequest) {
+        self.loader_request = Some(request);
     }
 
     /// Retrieve the URL of this request.
@@ -214,6 +217,17 @@ pub trait SuccessResponse {
     /// This method consumes the response.
     fn body(self: Box<Self>) -> OwnedFuture<Vec<u8>, Error>;
 
+    /// Shared transport bytes for consumers that can retain an immutable body.
+    fn body_bytes(self: Box<Self>) -> OwnedFuture<Bytes, Error> {
+        let body = self.body();
+        Box::pin(async move { body.await.map(Bytes::from) })
+    }
+
+    /// Optional logical reader identity echoed by a tag-aware backend.
+    fn loader_request(&self) -> Option<LoaderRequest> {
+        None
+    }
+
     /// The text encoding listed in the HTTP response header if existing.
     fn text_encoding(&self) -> Option<&'static Encoding>;
 
@@ -234,6 +248,12 @@ pub trait SuccessResponse {
     /// Mixing `next_chunk` and `body` is not supported and may yield errors.
     /// Use one or the other.
     fn next_chunk(&mut self) -> OwnedFuture<Option<Vec<u8>>, Error>;
+
+    /// Upper bound when the response already owns its complete, immutable body.
+    /// Movie loaders can share their memory allowance between these responses.
+    fn buffered_body_len(&self) -> Option<usize> {
+        None
+    }
 
     /// Estimate the expected length of the response body.
     ///
@@ -349,8 +369,8 @@ pub trait NavigatorBackend: Any {
         port: u16,
         timeout: Duration,
         handle: SocketHandle,
-        receiver: Receiver<Vec<u8>>,
-        sender: Sender<SocketAction>,
+        receiver: Receiver<SocketWrite>,
+        sender: SocketActionSender,
     );
 }
 
@@ -387,7 +407,14 @@ impl NavigatorBackend for FileNavigator {
                 "no local movie directory",
             )));
         };
-        fetch_path_in_directory(self, "FileNavigator", request.url(), None, Some(directory))
+        fetch_path_in_directory(
+            self,
+            "FileNavigator",
+            request.url(),
+            None,
+            Some(directory),
+            request.loader_request(),
+        )
     }
 
     fn fetch_root(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
@@ -408,8 +435,8 @@ impl NavigatorBackend for FileNavigator {
         _port: u16,
         _timeout: Duration,
         handle: SocketHandle,
-        _receiver: Receiver<Vec<u8>>,
-        sender: Sender<SocketAction>,
+        _receiver: Receiver<SocketWrite>,
+        sender: SocketActionSender,
     ) {
         sender
             .try_send(SocketAction::Connect(handle, ConnectionState::Failed))
@@ -496,7 +523,7 @@ pub fn fetch_path<NavigatorType: NavigatorBackend>(
     url: &str,
     base_path: Option<&Path>,
 ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
-    fetch_path_in_directory(navigator, navigator_name, url, base_path, None)
+    fetch_path_in_directory(navigator, navigator_name, url, base_path, None, None)
 }
 
 fn fetch_path_in_directory<N: NavigatorBackend>(
@@ -505,16 +532,21 @@ fn fetch_path_in_directory<N: NavigatorBackend>(
     url: &str,
     base_path: Option<&Path>,
     directory: Option<&Path>,
+    loader_request: Option<LoaderRequest>,
 ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
     struct LocalResponse {
         url: String,
         path: PathBuf,
         open_file: Option<File>,
+        loader_request: Option<LoaderRequest>,
         status: u16,
         redirected: bool,
     }
 
     impl SuccessResponse for LocalResponse {
+        fn loader_request(&self) -> Option<LoaderRequest> {
+            self.loader_request
+        }
         fn url(&self) -> Cow<'_, str> {
             Cow::Borrowed(&self.url)
         }
@@ -642,6 +674,7 @@ fn fetch_path_in_directory<N: NavigatorBackend>(
             url: url.to_string(),
             path,
             open_file,
+            loader_request,
             status: 0,
             redirected: false,
         });

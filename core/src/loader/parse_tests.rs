@@ -13,6 +13,62 @@ fn movie_bytes() -> Vec<u8> {
 }
 
 #[test]
+fn external_loader_image_uploads_its_actual_read_only_when_drawn() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tests/tests/swfs/avm2/loader_image/test.swf")
+        .canonicalize()
+        .unwrap();
+    let url = Url::from_file_path(&path).unwrap();
+    let movie =
+        SwfMovieData::from_data(&std::fs::read(path).unwrap(), url.into(), None, None).unwrap();
+    let mut generations = Vec::new();
+    for version in 1..=2 {
+        let renderer = crate::bitmap::symbol_pixels::tests::renderer(false);
+        let uploads = renderer.loader_uploads.clone();
+        let mut session = PlayerBuilder::new()
+            .with_movie(movie.clone())
+            .with_renderer(renderer)
+            .build();
+        session.lock().unwrap().run_frame();
+        let request = session.lock().unwrap().mutate_with_update_context(|uc| {
+            if version == 2 {
+                let [first] = uc.load_manager.active_reads.as_slice() else {
+                    panic!("expected one Loader.load")
+                };
+                let first_id = first.id;
+                let loader = uc.load_manager.get_loader(first.movie.unwrap()).unwrap();
+                let replacement = uc.load_movie_into_clip(
+                    loader.target_clip,
+                    Request::get("test.png".into()),
+                    None,
+                    loader.vm_data,
+                );
+                uc.spawn_future(replacement);
+                assert_ne!(uc.load_manager.active_reads[0].id, first_id);
+            }
+            let [read] = uc.load_manager.active_reads.as_slice() else {
+                panic!("expected one active Loader read")
+            };
+            LoaderRequest {
+                session_generation: uc.load_manager.session_generation,
+                request_id: read.id,
+                resource_version: version,
+            }
+        });
+        generations.push(request.session_generation);
+        session.poll_tasks();
+        assert!(
+            uploads.borrow().is_empty(),
+            "VM commit eagerly registered pixels"
+        );
+        session.lock().unwrap().render().unwrap();
+        session.lock().unwrap().render().unwrap();
+        assert_eq!(uploads.borrow().as_slice(), &[request]);
+    }
+    assert_ne!(generations[0], generations[1]);
+}
+
+#[test]
 fn headless_session_fetches_sibling_resources_from_the_installed_root() {
     let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../tests/tests/swfs/avm1/asnew/test.swf")
@@ -243,15 +299,15 @@ fn prepared_movie_is_installed_without_reparsing_transport_bytes() {
         let result = MovieLoader::movie_loader_data(
             handle,
             uc,
-            &[],
             transport.len(),
             "https://example.test/prepared.swf".into(),
             200,
             false,
             None,
-            Some(prepared),
+            PreparedContent::Movie(prepared),
             1,
             0,
+            None,
         );
         assert!(result.is_ok(), "prepared movie was reparsed: {result:?}");
         assert_eq!(clip.movie().data(), expected);
@@ -338,6 +394,14 @@ fn worker_returns_inner_swf_without_requiring_main_thread_swz_extraction() {
 }
 
 #[test]
+fn malformed_swz_with_trailing_der_keeps_its_unknown_body() {
+    let mut envelope = swz(&movie_bytes());
+    envelope.push(0x30); // incomplete second ASN.1 block
+    let result = prepare_swf_movie_data(envelope.clone(), String::new(), None, None, None).unwrap();
+    assert!(matches!(result, PreparedContent::Other(body) if body == envelope));
+}
+
+#[test]
 fn worker_parse_yields_before_work_can_run_on_a_single_thread_pool() {
     use std::future::Future;
     use std::task::Context;
@@ -381,7 +445,7 @@ fn inline_and_worker_preparation_preserve_bytes_metadata_and_shared_storage() {
             info,
         ))
         .unwrap();
-        let inline = prepare_swf_movie_data(body, url, origin, info).unwrap();
+        let inline = prepare_swf_movie_data(body, url, origin, info, None).unwrap();
         let (worker, inline) = (worker.into_movie().unwrap(), inline.into_movie().unwrap());
         assert_eq!(worker.data(), inline.data());
         assert_eq!(worker.url(), inline.url());
@@ -404,7 +468,7 @@ fn worker_preserves_non_movie_payload_and_rejects_malformed_swf() {
         None,
     ))
     .unwrap();
-    assert!(matches!(content, PreparedContent::Other(body) if body == image));
+    assert!(matches!(content, PreparedContent::Image {source, pixels: Err(_)} if source == image));
     for bytes in [b"FWS\x08\0\0\0\0".to_vec(), swz(b"FWS\x08\0\0\0\0")] {
         assert!(
             futures::executor::block_on(prepare_swf_movie(
@@ -457,17 +521,68 @@ fn removed_main_thread_parse_cost_benchmark() {
     );
 }
 
+#[derive(Default, Clone)]
+struct Trace(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+
+impl crate::backend::log::LogBackend for Trace {
+    fn avm_trace(&self, message: &str) {
+        self.0.borrow_mut().push(message.to_string());
+    }
+    fn avm_warning(&self, _: &str) {}
+}
+
+#[test]
+fn child_replacement_and_close_during_local_load_bytes_only_commit_the_replacement() {
+    let trace = Trace::default();
+    let renderer = crate::bitmap::symbol_pixels::tests::renderer(false);
+    let uploads = renderer.loader_uploads.clone();
+    let url = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tests/tests/swfs/avm2/loader_image/test.swf");
+    let movie = SwfMovieData::from_data(
+        include_bytes!("movie/tests/ChildCancellation.swf"),
+        Url::from_file_path(url.canonicalize().unwrap())
+            .unwrap()
+            .into(),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut session = PlayerBuilder::new()
+        .with_movie(movie)
+        .with_renderer(renderer)
+        .with_log(trace.clone())
+        .build();
+    for _ in 0..4 {
+        session.lock().unwrap().run_frame();
+        session.poll_tasks();
+    }
+    assert_eq!(*trace.0.borrow(), ["replacement bytes 0", "complete 100"]);
+    session.lock().unwrap().render().unwrap();
+    let uploads = uploads.borrow();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].resource_version, 2);
+    session.lock().unwrap().mutate_with_update_context(|uc| {
+        use crate::avm2::globals::slots::flash_display_loader as loader_slots;
+        assert_eq!(uc.load_manager.pending_counts(), (0, 0));
+        let root = uc.stage.root_clip().unwrap().as_container().unwrap();
+        let closed = root.child_by_index(1).unwrap().object2().unwrap();
+        let info = closed
+            .get_slot(loader_slots::_CONTENT_LOADER_INFO)
+            .as_object()
+            .unwrap()
+            .as_loader_info_object()
+            .unwrap();
+        assert!(
+            matches!(info.loader_stream(), LoaderStream::NotYetLoaded(_, None, _)),
+            "closed LoaderInfo retained its pending bitmap"
+        );
+        assert!(info.loader_stream().movie().data().is_empty());
+    });
+}
+
 #[test]
 fn closing_a_remote_load_bytes_retires_both_superseded_preparations() {
-    use std::{cell::RefCell, rc::Rc};
-    struct Log(Rc<RefCell<Vec<String>>>);
-    impl crate::backend::log::LogBackend for Log {
-        fn avm_trace(&self, message: &str) {
-            self.0.borrow_mut().push(message.to_string());
-        }
-        fn avm_warning(&self, _: &str) {}
-    }
-    let messages = Rc::new(RefCell::new(Vec::new()));
+    let trace = Trace::default();
     let movie = SwfMovieData::from_data(
         include_bytes!("../../../tests/tests/swfs/avm2/loader_reentrant_close/test.swf"),
         "https://example.test/loader.swf".into(),
@@ -477,7 +592,7 @@ fn closing_a_remote_load_bytes_retires_both_superseded_preparations() {
     .unwrap();
     let mut session = PlayerBuilder::new()
         .with_movie(movie)
-        .with_log(Log(messages.clone()))
+        .with_log(trace.clone())
         .build();
     session.lock().unwrap().run_frame();
     session
@@ -485,5 +600,5 @@ fn closing_a_remote_load_bytes_retires_both_superseded_preparations() {
         .unwrap()
         .mutate_with_update_context(|uc| assert_eq!(uc.load_manager.pending_counts(), (0, 0)));
     session.poll_tasks();
-    assert_eq!(&*messages.borrow(), &["closed byte loads"]);
+    assert_eq!(&*trace.0.borrow(), &["closed byte loads"]);
 }

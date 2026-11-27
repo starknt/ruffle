@@ -1,0 +1,14 @@
+[ExternalInterface] starting reentry
+[ExternalInterface] trace: [String("successful reentry!")]
+[ExternalInterface] callback returned: String("Traced!")
+outer received Traced!: true
+[ExternalInterface] starting reentry
+callback throwing
+bridge-sentinel
+	at Test/fail()
+	at flash.external::ExternalInterface$/call()
+	at Test()
+[ExternalInterface] callback returned: Null
+outer resumed with null: true
+[ExternalInterface] ping
+ping after throw: Pong!

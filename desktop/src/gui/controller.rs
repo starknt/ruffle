@@ -1,4 +1,5 @@
 use super::dialogs::export_bundle_dialog::ExportBundleDialogConfiguration;
+use super::presentation::DesktopSurface;
 use super::{DialogDescriptor, FilePicker};
 use crate::backends::DesktopUiBackend;
 use crate::custom_event::RuffleEvent;
@@ -17,6 +18,7 @@ use ruffle_render_wgpu::backend::{
     WgpuRenderBackend, create_wgpu_instance, request_adapter_and_device,
 };
 use ruffle_render_wgpu::descriptors::Descriptors;
+use ruffle_render_wgpu::gpu_resources::Device;
 use ruffle_render_wgpu::utils::{format_list, get_backend_names};
 use std::any::Any;
 use std::fs::File;
@@ -39,8 +41,7 @@ pub struct GuiController {
     window: Arc<Window>,
     last_update: Instant,
     repaint_after: Duration,
-    surface: wgpu::Surface<'static>,
-    surface_format: wgpu::TextureFormat,
+    surface: DesktopSurface,
     movie_view_renderer: Arc<MovieViewRenderer>,
     // Note that `window.get_inner_size` can change at any point on x11, even between two lines of code.
     // Use this instead.
@@ -85,37 +86,13 @@ impl GuiController {
             adapter_info.name,
             adapter_info.device_type
         );
-        let preferred_formats = [
-            // by egui
-            wgpu::TextureFormat::Rgba8Unorm,
-            wgpu::TextureFormat::Bgra8Unorm,
-        ];
-        let supported_formats = surface.get_capabilities(&adapter).formats;
-        let surface_format = preferred_formats
-            .iter()
-            .find(|format| supported_formats.contains(format))
-            .copied()
-            .or_else(|| supported_formats.first().copied())
-            .ok_or_else(|| anyhow!("surface has no supported format"))?;
-        tracing::info!("Using surface format {:?}", surface_format);
         let size = window.inner_size();
-        let device = ruffle_render_wgpu::gpu_resources::Device::new(device, queue, runtime);
+        let device = Device::new(device, queue, runtime);
         super::pipeline_cache::configure(&device);
         let descriptors = Descriptors::with_device(instance, adapter, device)?;
-        descriptors.device.configure_surface(
-            &surface,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format: surface_format,
-                color_space: wgpu::SurfaceColorSpace::Auto,
-                width: size.width,
-                height: size.height,
-                present_mode: Default::default(),
-                desired_maximum_frame_latency: 2,
-                alpha_mode: Default::default(),
-                view_formats: Default::default(),
-            },
-        )?;
+        let surface = DesktopSurface::new(&descriptors, surface, size)?;
+        let surface_format = surface.render_format();
+        tracing::info!("Using surface format {:?}", surface_format);
         let egui_ctx = Context::default();
 
         let theme_controller = futures::executor::block_on(ThemeController::new(
@@ -178,7 +155,6 @@ impl GuiController {
             last_update: Instant::now(),
             repaint_after: Duration::ZERO,
             surface,
-            surface_format,
             movie_view_renderer,
             size,
             no_gui,
@@ -211,25 +187,8 @@ impl GuiController {
         }
     }
 
-    pub fn reconfigure_surface(&self) {
-        if let Err(error) = self.descriptors.device.configure_surface(
-            &self.surface,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format: self.surface_format,
-                color_space: wgpu::SurfaceColorSpace::Auto,
-                width: self.size.width,
-                height: self.size.height,
-                present_mode: Default::default(),
-                desired_maximum_frame_latency: 2,
-                alpha_mode: Default::default(),
-                view_formats: Default::default(),
-            },
-        ) {
-            self.descriptors.runtime.fail(error.clone());
-            tracing::error!("GPU surface stopped: {error}");
-            return;
-        }
+    fn reconfigure_surface(&mut self) {
+        self.surface.resize(self.size);
         match self.movie_view_renderer.update_resolution(
             &self.descriptors,
             self.window.fullscreen().is_none() && !self.no_gui,
@@ -240,9 +199,8 @@ impl GuiController {
             Err(error) => {
                 self.descriptors.runtime.fail(error.clone());
                 tracing::error!("GPU rendering stopped: {error}");
-                return;
             }
-        };
+        }
     }
 
     #[must_use]
@@ -339,54 +297,11 @@ impl GuiController {
             tracing::error!("GPU rendering stopped: {error}");
             return;
         }
-        let surface_texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
-            wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
-                // The acquired texture is still usable - no reason to waste
-                // this frame. The surface should ideally be reconfigured
-                // before the next acquire; usually a resize event arrives and
-                // does that, but not always (e.g. on a display transform
-                // change) - we accept staying suboptimal in that case for now.
-                surface_texture
-            }
-            state @ (wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated) => {
-                // Reconfigure the surface if lost or outdated.
-                // Some sources suggest ignoring `Outdated` and waiting for the next frame,
-                // but I suspect this advice is related explicitly to resizing,
-                // because the future resize event will reconfigure the surface.
-                // However, resizing is not the only possible reason for the surface
-                // to become outdated (resolution / refresh rate change, some internal
-                // platform-specific reasons, wgpu bugs?).
-                // Testing on Vulkan shows that reconfiguring the surface works in that case.
-                tracing::warn!("Surface became unavailable: {:?}, reconfiguring", state);
-                self.reconfigure_surface();
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout => {
-                // Acquiring the frame took too long (a full second, as of wgpu 29).
-                // The best thing we can do is skip a frame and wait.
-                tracing::warn!("Surface acquisition timed out, skipping a frame");
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Occluded => {
-                // The window is occluded (e.g. minimized or fully covered by
-                // another window), so there is no point in drawing anything.
-                // We normally don't even get here, as `WindowEvent::Occluded`
-                // makes us skip rendering entirely - but the two can race, and
-                // not every platform reports occlusion through winit.
-                // Unlike `Timeout`, this returns immediately, so it would repeat
-                // at the movie's frame rate: keep it quiet, it's not an error.
-                tracing::trace!("Surface is occluded, skipping a frame");
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                // Generic error, not much we can do.
-                self.descriptors
-                    .runtime
-                    .fail(ruffle_render_wgpu::gpu_runtime::RenderFailure::new(
-                        ruffle_render_wgpu::gpu_runtime::RenderFailureKind::Validation,
-                        "acquiring a desktop surface texture failed",
-                    ));
+        let surface_texture = match self.surface.acquire(&self.descriptors, &self.window) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!("Desktop presentation failed: {error:#}");
                 return;
             }
         };
@@ -482,11 +397,10 @@ impl GuiController {
         //      behind a setting?
         if let Some(player) = player.as_deref_mut()
             && player.debug_ui().has_open_windows()
+            && let Err(error) = player.render()
         {
-            if let Err(error) = player.render() {
-                tracing::error!("GPU rendering stopped: {error}");
-                return;
-            }
+            tracing::error!("GPU rendering stopped: {error}");
+            return;
         }
 
         let movie_view = if let Some(player) = player.as_deref_mut() {
@@ -498,13 +412,12 @@ impl GuiController {
             None
         };
 
+        let surface_view = surface_texture.texture.create_view(&Default::default());
         {
-            let surface_view = surface_texture.texture.create_view(&Default::default());
-
             let mut render_pass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &surface_view,
+                        view: self.surface.render_view(&surface_view),
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -537,14 +450,16 @@ impl GuiController {
             }
         }
 
+        self.surface
+            .finish(&self.descriptors.device, &mut encoder, &surface_view);
         command_buffers.push(encoder.finish());
         if self.descriptors.runtime.check_health().is_err() {
             return;
         }
-        #[allow(unused_mut)]
         let mut leases = movie_view
             .map(MovieView::resource_leases)
             .unwrap_or_default();
+        leases.extend(self.surface.view_leases());
         #[cfg(feature = "tracy_images")]
         leases.extend(self.tracy_frame_captures.resource_leases());
         if let Err(error) = self

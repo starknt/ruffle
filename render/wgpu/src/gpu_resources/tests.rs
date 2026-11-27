@@ -1,6 +1,8 @@
 use super::*;
 use crate::gpu_runtime::{GpuBudgetConfig, ResourceKind};
 
+mod staging_pressure;
+
 pub(super) fn device(limit: u64) -> Device {
     device_with_staging_budget(limit, 64 * 1024 * 1024)
 }
@@ -23,6 +25,32 @@ fn device_with_staging_budget(limit: u64, staging: u64) -> Device {
     let runtime = GpuRuntime::new(config).unwrap();
     runtime.install_device_callbacks(&raw);
     Device::new(raw, queue, runtime)
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn submit_lock_timing_measures_waiting_for_the_shared_device() {
+    use ruffle_render::profile::{self, NativePhase, RenderMetrics};
+    let device = device(4096);
+    let shared = Arc::new(Mutex::new(()));
+    device.set_submission_lock(shared.clone());
+    let guard = shared.lock().unwrap();
+    let (started, entered) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let metrics = RenderMetrics::default();
+        let _scope = profile::enter(Some(&metrics));
+        started.send(()).unwrap();
+        device.queue().submit([]).unwrap();
+        metrics.snapshot().native_timings[NativePhase::SubmitLock as usize]
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    std::thread::sleep(Duration::from_millis(40));
+    drop(guard);
+    let timing = worker.join().unwrap();
+    assert!(
+        timing.samples > 0 && timing.nanos >= 20_000_000,
+        "{timing:?}"
+    );
 }
 
 #[test]
@@ -180,6 +208,39 @@ fn submitted_uploads_retire_only_after_gpu_completion() {
         .unwrap();
     assert_eq!(device.runtime().stats().total_bytes, 0);
     assert_eq!(device.runtime().stats().resources, 0);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn external_submissions_track_the_raw_commands_and_pending_writes() {
+    let device = device(4096);
+    let descriptor = wgpu::BufferDescriptor {
+        label: None,
+        size: 256,
+        usage: wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    };
+    let uploaded = device.create_buffer(&descriptor).unwrap();
+    let cleared = device.create_buffer(&descriptor).unwrap();
+    let queue = device.queue();
+    queue.write_buffer(&uploaded, 0, &[7; 256]).unwrap();
+    let mut encoder = device.raw().create_command_encoder(&Default::default());
+    encoder.clear_buffer(cleared.raw(), 0, None);
+    let index = queue
+        .submit_external([encoder.finish()], std::slice::from_ref(cleared.lease()))
+        .unwrap();
+    assert_eq!(device.runtime().stats().submitted, 1);
+    assert_eq!(uploaded.lease().last_submission(), 1);
+    assert_eq!(cleared.lease().last_submission(), 1);
+    drop((uploaded, cleared));
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: Some(Duration::from_secs(2)),
+        })
+        .unwrap();
+    assert_eq!(device.runtime().stats().completed, 1);
+    assert_eq!(device.runtime().stats().total_bytes, 0);
 }
 
 #[test]
@@ -359,8 +420,21 @@ fn profiler_queries_and_readback_storage_obey_the_device_ledger() {
     assert!(device.runtime().stats().kind_bytes[ResourceKind::QuerySet as usize] > 0);
     assert!(device.runtime().stats().kind_bytes[ResourceKind::ReadbackBuffer as usize] > 0);
     profiler.resolve_queries(&mut encoder);
+    profiler.end_frame(&encoder).unwrap();
+    // Its mapping cannot start while the stage worker still owns this encoder.
+    std::thread::sleep(Duration::from_millis(2100));
+    device.poll(wgpu::PollType::Poll).unwrap();
+    assert!(
+        profiler
+            .process_finished_frame(device.queue().get_timestamp_period())
+            .is_none(),
+        "a stage whose encoder is still on the worker queue has no GPU timings"
+    );
+    device
+        .runtime()
+        .check_health()
+        .expect("an unsubmitted query is still pending");
     let submission = device.queue().submit([encoder.finish().unwrap()]).unwrap();
-    profiler.end_frame().unwrap();
     device.runtime().purge_idle_and_cached_resources();
     assert!(
         device.runtime().stats().kind_bytes[ResourceKind::QuerySet as usize] > 0,
@@ -393,8 +467,8 @@ fn profiler_queries_and_readback_storage_obey_the_device_ledger() {
         let _scope = profiler.scope("measured after reclamation", &mut encoder);
     }
     profiler.resolve_queries(&mut encoder);
+    profiler.end_frame(&encoder).unwrap();
     let submission = device.queue().submit([encoder.finish().unwrap()]).unwrap();
-    profiler.end_frame().unwrap();
     device
         .poll(wgpu::PollType::Wait {
             submission_index: Some(submission),
@@ -984,9 +1058,10 @@ fn large_texture_upload_slices_padded_layers_in_the_same_operation() {
             data[start..start + 16].fill((z * 10 + y) as u8);
         }
     }
+    let mut writes = Vec::new();
     device
         .queue()
-        .write_texture(
+        .write_texture_observed(
             texture.as_image_copy(),
             &data,
             wgpu::TexelCopyBufferLayout {
@@ -995,8 +1070,10 @@ fn large_texture_upload_slices_padded_layers_in_the_same_operation() {
                 rows_per_image: Some(7),
             },
             size,
+            |payload, staging| writes.push((payload, staging)),
         )
         .unwrap();
+    assert_eq!(writes, [(16, 256); 10]);
     assert!(
         device.runtime().stats().submitted > 0,
         "mandatory upload must submit bounded slices"
@@ -1330,4 +1407,87 @@ fn changing_presentation_separates_normal_movie_manifests() {
             .all(|m| m["entries"].as_array().unwrap().len() == 1)
     );
     assert_ne!(manifests[0]["identity"], manifests[1]["identity"]);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn queued_stage_copy_precedes_a_later_upload_after_a_successor_is_cancelled() {
+    let device = device(2 * 1024 * 1024);
+    let queue = device.queue();
+    let source = device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    let saved = device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+        .unwrap();
+    queue.write_buffer(&source, 0, &[12; 4]).unwrap();
+    let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
+    encoder.copy_buffer_to_buffer(&source, 0, &saved, 0, 4);
+    let stage = encoder.into_stage_work().unwrap();
+    let successor = device
+        .create_command_encoder(&Default::default())
+        .unwrap()
+        .into_stage_work()
+        .unwrap();
+    drop(successor);
+    let (started, ready) = crossbeam_channel::bounded(1);
+    let (wrote, observed) = crossbeam_channel::bounded(1);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            started.send(()).unwrap();
+            queue.write_buffer(&source, 0, &[13; 4]).unwrap();
+            wrote.send(()).unwrap();
+            queue.submit([]).unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let early = observed.recv_timeout(Duration::from_millis(40)).is_ok();
+        stage.submit().unwrap();
+        assert!(!early, "a reliable upload overtook an accepted stage");
+    });
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    saved.map_async(wgpu::MapMode::Read, .., move |r| {
+        let _ = tx.send(r);
+    });
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    rx.recv().unwrap().unwrap();
+    assert_eq!(&*saved.get_mapped_range(..).unwrap(), &[12; 4]);
+    saved.unmap();
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn queued_submission_waiters_receive_the_first_device_failure() {
+    let device = device(2 * 1024 * 1024);
+    let queue = device.queue();
+    let first = queue.reserve_submission().unwrap();
+    let next = queue.reserve_submission().unwrap();
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            tx.send(next.submit([]).unwrap_err()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(40)).is_err());
+        device.runtime().fail(RenderFailure::new(
+            RenderFailureKind::DeviceLost,
+            "lost before stage submit",
+        ));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap().kind(),
+            RenderFailureKind::DeviceLost
+        );
+    });
+    assert_eq!(
+        first.submit([]).unwrap_err().kind(),
+        RenderFailureKind::DeviceLost
+    );
 }

@@ -94,8 +94,6 @@ pub enum SnapshotCommand {
     },
     Mask(MaskCommand),
     Shared(Arc<[SnapshotNode]>),
-    /// Index into the player-thread immutable block table for this capture.
-    Retained(usize),
     Blend {
         children: Arc<[SnapshotNode]>,
         mode: SnapshotBlend,
@@ -114,6 +112,100 @@ pub struct SnapshotNode {
 pub struct RenderSnapshot {
     pub commands: Arc<[SnapshotNode]>,
     pub recipes: Vec<ResourceRecipe>,
+}
+impl RenderSnapshot {
+    /// Put stage graph bounds and geometry in attachment pixels before allocating bounded layers.
+    /// Frozen display pages may also be used by an offscreen or another frame.
+    pub(super) fn project_stage(&mut self, scale: Matrix, backend: wgpu::Backend) {
+        for node in Arc::make_mut(&mut self.commands) {
+            node.project_stage(scale, backend);
+        }
+    }
+}
+
+impl SnapshotNode {
+    fn project_stage(&mut self, scale: Matrix, backend: wgpu::Backend) {
+        use swf::Twips;
+
+        if let RenderRegion::Finite([left, top, right, bottom]) = &mut self.region {
+            let (x, y) = (f64::from(scale.a), f64::from(scale.d));
+            *left *= x;
+            *right *= x;
+            *top *= y;
+            *bottom *= y;
+        }
+        if let SnapshotCommand::Bitmap {
+            transform,
+            pixel_snapping,
+            ..
+        } = &mut self.command
+        {
+            pixel_snapping.apply(&mut transform.matrix);
+            *pixel_snapping = PixelSnapping::Never;
+        }
+        let project = |children: &mut Arc<[Self]>| {
+            for child in Arc::make_mut(children) {
+                child.project_stage(scale, backend);
+            }
+        };
+        match &mut self.command {
+            SnapshotCommand::Shape { transform, .. }
+            | SnapshotCommand::Stage3D { transform, .. }
+            | SnapshotCommand::Bitmap { transform, .. } => {
+                transform.matrix = scale * transform.matrix;
+                // Globals normalizes depth by viewport width.
+                transform.tz *= f64::from(scale.a);
+            }
+            SnapshotCommand::Rect { matrix, .. } => *matrix = scale * *matrix,
+            SnapshotCommand::Line {
+                color,
+                matrix,
+                rectangle,
+            } if backend == wgpu::Backend::Dx12 => {
+                // DX12 builds a one-Flash-pixel quad around each line before projection.
+                let mut quads = CommandList::new();
+                if *rectangle {
+                    ruffle_render::lines::emulate_line_rect(&mut quads, *color, *matrix);
+                } else {
+                    ruffle_render::lines::emulate_line(&mut quads, *color, *matrix);
+                }
+                self.command = SnapshotCommand::Shared(
+                    quads
+                        .into_commands()
+                        .into_iter()
+                        .map(|quad| {
+                            let Command::DrawRect { color, matrix } = quad else {
+                                unreachable!("emulated line geometry")
+                            };
+                            Self {
+                                command: SnapshotCommand::Rect {
+                                    color,
+                                    matrix: scale * matrix,
+                                },
+                                region: self.region,
+                            }
+                        })
+                        .collect(),
+                );
+            }
+            SnapshotCommand::Line { matrix, .. } => {
+                // The line encoder adds half a pixel. Project that offset in Flash space.
+                matrix.tx += Twips::HALF_PX;
+                matrix.ty += Twips::HALF_PX;
+                *matrix = scale * *matrix;
+                matrix.tx -= Twips::HALF_PX;
+                matrix.ty -= Twips::HALF_PX;
+            }
+            SnapshotCommand::Shared(children) | SnapshotCommand::Blend { children, .. } => {
+                project(children)
+            }
+            SnapshotCommand::AlphaMask { maskee, mask } => {
+                project(maskee);
+                project(mask);
+            }
+            SnapshotCommand::Mask(_) => {}
+        }
+    }
 }
 #[derive(Clone)]
 enum Handle {
@@ -190,16 +282,180 @@ fn foreign() -> RenderFailure {
     )
 }
 
+/// CPU-owned stage data; the receiving renderer resolves the resource versions.
+pub struct FramePacket {
+    pub(crate) payload: Option<crate::gpu_runtime::OwnedPayload>,
+    pub(crate) key: PacketKey,
+    pub(crate) draw: Arc<Option<PacketDraw>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PacketDraw {
+    pub clear: Color,
+    pub snapshot: RenderSnapshot,
+    pub route: StageDrawRoute,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StageDrawRoute {
+    Graph,
+    AlignedBitmaps,
+    Resident,
+}
+
+impl FramePacket {
+    pub fn id(&self) -> u64 {
+        self.key
+            .reservation
+            .map_or(self.key.packet, |r| r.packet_id)
+    }
+
+    pub fn after_operation(&self) -> u64 {
+        self.key.operation
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PacketKey {
+    pub device: u64,
+    pub session: ResourceOwner,
+    pub target_generation: u64,
+    pub reservation: Option<crate::target::FrameReservation>,
+    pub packet: u64,
+    pub operation: u64,
+}
+
+/// The stage and its Context3D instances issue reliable work on the same
+/// owner thread. A packet records the last completed encoding operation.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OperationSequence(Arc<SessionOperations>);
+
+#[derive(Default, Debug)]
+struct SessionOperations {
+    closed: std::sync::atomic::AtomicBool,
+    applied: std::sync::atomic::AtomicU64,
+    health: ruffle_render::error::RendererHealth,
+}
+
+/// The last logical handle orders its release. Native storage is separately
+/// retired by the device after its last GPU submission completes.
+#[derive(Debug)]
+pub(crate) struct ResourceLifetime(OperationSequence);
+
+impl Drop for ResourceLifetime {
+    fn drop(&mut self) {
+        let _ = self.0.record();
+    }
+}
+impl OperationSequence {
+    pub fn new(health: &ruffle_render::error::RendererHealth) -> Self {
+        Self(Arc::new(SessionOperations {
+            closed: Default::default(),
+            applied: Default::default(),
+            health: health.clone(),
+        }))
+    }
+
+    pub fn close(&self) {
+        self.0
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn create_resource(&self) -> Result<ResourceLifetime, RenderFailure> {
+        self.record()?;
+        Ok(ResourceLifetime(self.clone()))
+    }
+
+    pub fn applied(&self) -> u64 {
+        self.0.applied.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn dependency(&self) -> OperationDependency {
+        OperationDependency {
+            session: self.clone(),
+            after_operation: self.applied(),
+        }
+    }
+
+    pub fn record(&self) -> Result<(), RenderFailure> {
+        use std::sync::atomic::Ordering;
+        self.0
+            .applied
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .map(|_| ())
+            .map_err(|_| {
+                self.0.health.record(RenderFailure::new(
+                    RenderFailureKind::Internal,
+                    "renderer operation sequence exhausted",
+                ))
+            })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OperationDependency {
+    session: OperationSequence,
+    after_operation: u64,
+}
+
+impl OperationDependency {
+    pub fn is_closed(&self) -> bool {
+        self.session
+            .0
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn check_open(&self) -> Result<(), RenderFailure> {
+        if self.is_closed() {
+            return Err(RenderFailure::new(
+                RenderFailureKind::Canceled,
+                "readback session closed",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn check(&self, executor: &OperationSequence) -> Result<(), RenderFailure> {
+        self.check_open()?;
+        if !Arc::ptr_eq(&self.session.0, &executor.0) || executor.applied() < self.after_operation {
+            return Err(RenderFailure::new(
+                RenderFailureKind::Validation,
+                "readback dependency belongs to another session or has not been applied",
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub struct PreparedSnapshot {
     pub snapshot: RenderSnapshot,
+    pub(crate) bindings: SnapshotBindings,
+}
+
+/// The endpoint pins the exact local handles until the picture is used or replaced.
+pub(crate) struct SnapshotBindings {
+    pub(crate) reads_stage3d: bool,
     resources: Vec<(ResourceVersion, Handle)>,
     resource_indices: HashMap<ResourceVersion, usize>,
-    retained: Vec<Rc<CommandList>>,
+}
+impl SnapshotBindings {
+    pub(crate) fn reads(&self, resource: ResourceVersion) -> bool {
+        self.resource_indices.contains_key(&resource)
+    }
+}
+// Only the VM cache carries local resource bindings. The shared node array
+// can outlive the originating page or any previous frame that used it.
+struct FrozenPage {
+    device: u64,
+    nodes: Arc<[SnapshotNode]>,
+    shapes: Vec<(ResourceVersion, Handle)>,
 }
 #[derive(Default)]
 struct Capture {
     device: Option<u64>,
-    retained: Vec<Rc<CommandList>>,
+    reads_stage3d: bool,
     known: HashMap<ResourceVersion, usize>,
     resources: Vec<(ResourceVersion, Handle)>,
     recipes: Vec<ResourceRecipe>,
@@ -289,6 +545,49 @@ impl Capture {
         self.resources.push((resource, handle));
         Ok(resource)
     }
+    fn frozen_page(
+        &mut self,
+        page: &CommandList,
+        device: u64,
+    ) -> Result<Option<Arc<[SnapshotNode]>>, RenderFailure> {
+        let frozen = if let Some(cached) = page.cached_snapshot::<FrozenPage>()
+            && cached.device == device
+        {
+            ruffle_render::profile::work(|w| w.prepared_chunk_hits += 1);
+            cached
+        } else {
+            // Cache leaf pages. A changed directory can still refer to the
+            // unchanged pages on either side of the edit.
+            if page.iter().any(|cmd| matches!(cmd, Command::Shared(_)))
+                || !Self::immutable(page, device)
+            {
+                return Ok(None);
+            }
+            let mut local = Self::default();
+            let nodes = local.commands(page)?;
+            let bytes = size_of::<FrozenPage>()
+                + size_of_val(&*nodes)
+                + local.resources.capacity() * size_of::<(ResourceVersion, Handle)>();
+            let frozen = Rc::new(FrozenPage {
+                device,
+                nodes,
+                shapes: local.resources,
+            });
+            page.store_snapshot(frozen.clone(), bytes);
+            frozen
+        };
+        // Certification admits only resident, untextured geometry and
+        // primitives. Every shape therefore has exactly one external input.
+        for (version, handle) in &frozen.shapes {
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.known.entry(*version) {
+                entry.insert(self.resources.len());
+                self.resources.push((*version, handle.clone()));
+                self.recipes.push(ResourceRecipe::Resident(*version));
+            }
+        }
+        Ok(Some(frozen.nodes.clone()))
+    }
+
     fn commands(&mut self, commands: &CommandList) -> Result<Arc<[SnapshotNode]>, RenderFailure> {
         let mut nodes = Vec::with_capacity(commands.iter().len());
         self.commands_into(commands, &mut nodes)?;
@@ -321,10 +620,13 @@ impl Capture {
                     resource: self.resource(Handle::Shape(shape.clone()))?,
                     transform: transform.clone(),
                 },
-                Command::RenderStage3D { bitmap, transform } => SnapshotCommand::Stage3D {
-                    resource: self.resource(Handle::Bitmap(bitmap.clone()))?,
-                    transform: transform.clone(),
-                },
+                Command::RenderStage3D { bitmap, transform } => {
+                    self.reads_stage3d = true;
+                    SnapshotCommand::Stage3D {
+                        resource: self.resource(Handle::Bitmap(bitmap.clone()))?,
+                        transform: transform.clone(),
+                    }
+                }
                 Command::DrawRect { color, matrix } => SnapshotCommand::Rect {
                     color: *color,
                     matrix: *matrix,
@@ -336,20 +638,13 @@ impl Capture {
                         rectangle: matches!(command, Command::DrawLineRect { .. }),
                     }
                 }
-                Command::Shared(children)
-                    if self.device.is_some_and(|d| Self::immutable(children, d)) =>
-                {
-                    let index = self.retained.len();
-                    self.retained.push(children.clone());
-                    ruffle_render::profile::work(|w| w.prepared_chunk_hits += 1);
-                    SnapshotCommand::Retained(index)
-                }
-                Command::Shared(children) if self.device.is_some() => {
-                    // An unprepared directory is just painter order. Expanding it
-                    // into this array avoids a worker allocation and scratch
-                    // reservation per logical slot on cold or volatile frames.
-                    self.commands_into(children, nodes)?;
-                    continue;
+                Command::Shared(children) if let Some(device) = self.device => {
+                    if let Some(page) = self.frozen_page(children, device)? {
+                        SnapshotCommand::Shared(page)
+                    } else {
+                        self.commands_into(children, nodes)?;
+                        continue;
+                    }
                 }
                 Command::Shared(children) => SnapshotCommand::Shared(self.commands(children)?),
                 Command::Blend(children, mode) => SnapshotCommand::Blend {
@@ -372,8 +667,7 @@ impl Capture {
             };
             leaves += u64::from(!matches!(
                 command,
-                SnapshotCommand::Retained(_)
-                    | SnapshotCommand::Shared(_)
+                SnapshotCommand::Shared(_)
                     | SnapshotCommand::Blend { .. }
                     | SnapshotCommand::AlphaMask { .. }
             ));
@@ -384,13 +678,74 @@ impl Capture {
     }
 }
 impl PreparedSnapshot {
+    /// Conservative retained weight while this snapshot waits in a session.
+    /// Shared display pages are counted once within a packet. Independent
+    /// live packets each reserve enough space to retain their dependencies.
+    pub(crate) fn packet_bytes(&self) -> u64 {
+        let mut bytes = size_of::<Option<PacketDraw>>() + size_of::<FramePacket>();
+        let mut seen = fnv::FnvHashSet::default();
+        let mut pending = vec![self.snapshot.commands.as_ref()];
+        while let Some(nodes) = pending.pop() {
+            if !seen.insert(nodes.as_ptr()) {
+                continue;
+            }
+            bytes = bytes.saturating_add(size_of_val(nodes));
+            for node in nodes {
+                match &node.command {
+                    SnapshotCommand::Shared(children) | SnapshotCommand::Blend { children, .. } => {
+                        pending.push(children)
+                    }
+                    SnapshotCommand::AlphaMask { maskee, mask } => {
+                        pending.extend([maskee.as_ref(), mask.as_ref()])
+                    }
+                    _ => (),
+                }
+            }
+        }
+        bytes = bytes
+            .saturating_add(
+                self.bindings.resources.capacity() * size_of::<(ResourceVersion, Handle)>(),
+            )
+            .saturating_add(
+                self.bindings.resource_indices.capacity() * size_of::<(ResourceVersion, usize)>(),
+            )
+            .saturating_add(self.snapshot.recipes.capacity() * size_of::<ResourceRecipe>());
+        for recipe in &self.snapshot.recipes {
+            match recipe {
+                ResourceRecipe::Bitmap {
+                    pixels, coverage, ..
+                } => {
+                    bytes = bytes
+                        .saturating_add(pixels.data().len())
+                        .saturating_add(coverage.mask_storage_bytes());
+                }
+                ResourceRecipe::Shape {
+                    geometry,
+                    bitmap_sizes,
+                    bitmaps,
+                    ..
+                } => {
+                    bytes = bytes
+                        .saturating_add(geometry.as_ref().map_or(0, |shape| shape.storage_bytes()))
+                        .saturating_add(
+                            bitmap_sizes.capacity()
+                                * size_of::<(u16, ruffle_render::bitmap::BitmapSize)>(),
+                        )
+                        .saturating_add(bitmaps.capacity() * size_of::<(u16, ResourceVersion)>());
+                }
+                ResourceRecipe::Resident(_) => (),
+            }
+        }
+        bytes as u64
+    }
+
     /// A filtered tile can be replayed only if this version describes every
     /// pixel input. Textured meshes may refer to mutable BitmapData.
     pub(super) fn single_tile_draw(&self) -> Option<&SnapshotCommand> {
         let [node] = &*self.snapshot.commands else {
             return None;
         };
-        let [(_, handle)] = self.resources.as_slice() else {
+        let [(_, handle)] = self.bindings.resources.as_slice() else {
             return None;
         };
         match (&node.command, handle) {
@@ -411,9 +766,10 @@ impl PreparedSnapshot {
     }
 
     fn handle(&self, resource: ResourceVersion) -> Result<&Handle, RenderFailure> {
-        self.resource_indices
+        self.bindings
+            .resource_indices
             .get(&resource)
-            .map(|index| &self.resources[*index].1)
+            .map(|index| &self.bindings.resources[*index].1)
             .ok_or_else(|| {
                 RenderFailure::new(
                     RenderFailureKind::Validation,
@@ -432,7 +788,6 @@ impl PreparedSnapshot {
     }
     pub fn leaf(&self, node: &SnapshotNode) -> Result<Command, RenderFailure> {
         Ok(match &node.command {
-            SnapshotCommand::Retained(index) => Command::Shared(self.retained[*index].clone()),
             SnapshotCommand::Bitmap {
                 resource,
                 transform,
@@ -499,30 +854,39 @@ impl PreparedSnapshot {
         })
     }
 
+    /// The direct stage routes accept only primitive draws or resident shapes
+    /// and bitmaps. Flatten owned pages at the endpoint in painter order.
+    pub(crate) fn direct_commands(&self) -> Result<CommandList, RenderFailure> {
+        fn append(
+            prepared: &PreparedSnapshot,
+            nodes: &[SnapshotNode],
+            output: &mut CommandList,
+        ) -> Result<(), RenderFailure> {
+            for node in nodes {
+                if let SnapshotCommand::Shared(children) = &node.command {
+                    append(prepared, children, output)?;
+                } else {
+                    output.push(prepared.leaf(node)?);
+                }
+            }
+            Ok(())
+        }
+        let mut commands = CommandList::new();
+        append(self, &self.snapshot.commands, &mut commands)?;
+        Ok(commands)
+    }
+
     pub fn capture(commands: &CommandList) -> Result<Self, RenderFailure> {
         Self::capture_for_device(commands, None)
     }
 
-    /// A dense frame can change every transform while all geometry is already
-    /// resident. Move a long, dependency-free command stream to the owner
-    /// table for this submission. The next submission supplies fresh commands.
-    pub(super) fn capture_owned(commands: CommandList, device: u64) -> Result<Self, RenderFailure> {
-        if commands.iter().len() >= 64 && Capture::immutable(&commands, device) {
-            let node = SnapshotNode {
-                command: SnapshotCommand::Retained(0),
-                region: commands.region(),
-            };
-            return Ok(Self {
-                snapshot: RenderSnapshot {
-                    commands: Arc::from([node]),
-                    recipes: Vec::new(),
-                },
-                resources: Vec::new(),
-                resource_indices: Default::default(),
-                retained: vec![Rc::new(commands)],
-            });
-        }
-        Self::capture_for_device(&commands, Some(device))
+    /// The synchronous encoder can consume certified draws directly at the
+    /// requested stage quality. This list never enters a queued snapshot.
+    pub(super) fn direct_resident_draws(commands: &CommandList, device: u64) -> bool {
+        !commands.is_empty()
+            && (commands.iter().len() >= 64
+                || commands.iter().all(|cmd| matches!(cmd, Command::Shared(_))))
+            && Capture::immutable(commands, device)
     }
 
     pub(super) fn capture_for_device(
@@ -532,7 +896,7 @@ impl PreparedSnapshot {
         let capacity = commands.iter().len().min(64);
         let mut capture = Capture {
             device,
-            retained: Vec::new(),
+            reads_stage3d: false,
             known: HashMap::with_capacity_and_hasher(capacity, Default::default()),
             resources: Vec::with_capacity(capacity),
             recipes: Vec::with_capacity(capacity),
@@ -543,18 +907,20 @@ impl PreparedSnapshot {
                 commands,
                 recipes: capture.recipes,
             },
-            resource_indices: capture.known,
-            resources: capture.resources,
-            retained: capture.retained,
+            bindings: SnapshotBindings {
+                reads_stage3d: capture.reads_stage3d,
+                resource_indices: capture.known,
+                resources: capture.resources,
+            },
         })
     }
-    fn validate<T: crate::target::RenderTarget>(
+    pub(crate) fn validate<T: crate::target::RenderTarget>(
         &self,
         backend: &crate::backend::WgpuRenderBackend<T>,
     ) -> Result<(), RenderFailure> {
         // Reject the whole snapshot before any candidate uploads or allocations.
         backend.descriptors.runtime.check_health()?;
-        for (version, handle) in &self.resources {
+        for (version, handle) in &self.bindings.resources {
             if version.key.device() != backend.descriptors.runtime.generation()
                 || handle.version()? != *version
             {
@@ -773,7 +1139,7 @@ impl PreparedSnapshot {
                 ));
             }
         }
-        for (_, handle) in &self.resources {
+        for (_, handle) in &self.bindings.resources {
             if let Handle::Bitmap(handle) = handle {
                 crate::as_texture(handle, &backend.descriptors.device)?;
             }
@@ -792,6 +1158,74 @@ impl PreparedSnapshot {
 mod stage_capture_tests {
     use super::*;
     use ruffle_render::commands::CommandHandler;
+
+    #[test]
+    fn replacement_frame_carries_immutable_draws_after_the_vm_and_first_capture_drop() {
+        let mut block = CommandList::new();
+        block.draw_rect(Color::RED, Matrix::IDENTITY);
+        let block = Rc::new(block);
+        let weak_source = Rc::downgrade(&block);
+        let mut frame = CommandList::new();
+        frame.push(Command::Shared(block.clone()));
+        drop(block);
+        let first = PreparedSnapshot::capture_for_device(&frame, Some(1)).unwrap();
+        frame.draw_rect(Color::BLUE, Matrix::IDENTITY);
+        let replacement = PreparedSnapshot::capture_for_device(&frame, Some(1)).unwrap();
+        drop(first);
+        drop(frame);
+        assert!(
+            weak_source.upgrade().is_none(),
+            "the frame still pins a VM command list"
+        );
+        let snapshot = replacement.snapshot;
+        std::thread::spawn(move || {
+            fn colors(nodes: &[SnapshotNode], out: &mut Vec<Color>) {
+                for node in nodes {
+                    match &node.command {
+                        SnapshotCommand::Rect { color, .. } => out.push(*color),
+                        SnapshotCommand::Shared(children) => colors(children, out),
+                        _ => panic!("the captured rectangle cannot be decoded independently"),
+                    }
+                }
+            }
+            let mut drawn = Vec::new();
+            colors(&snapshot.commands, &mut drawn);
+            assert_eq!(drawn, vec![Color::RED, Color::BLUE]);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn mixed_frames_share_the_owned_page_within_the_display_tree_budget() {
+        let mut page = CommandList::new();
+        page.draw_rect(Color::RED, Matrix::IDENTITY);
+        let page = Rc::new(page);
+        let budget = Rc::new(std::cell::Cell::new(0usize));
+        page.charge_storage(&budget, 1 << 20);
+        let make_frame = || {
+            let mut frame = CommandList::new();
+            frame.push(Command::Shared(page.clone()));
+            frame.push_mask();
+            frame.activate_mask();
+            frame.deactivate_mask();
+            frame.pop_mask();
+            PreparedSnapshot::capture_for_device(&frame, Some(3))
+                .unwrap()
+                .snapshot
+        };
+        let first = make_frame();
+        let before = budget.get();
+        let second = make_frame();
+        let nodes = |s: &RenderSnapshot| match &s.commands[0].command {
+            SnapshotCommand::Shared(nodes) => nodes.clone(),
+            _ => panic!("expected an owned shared page"),
+        };
+        assert!(Arc::ptr_eq(&nodes(&first), &nodes(&second)));
+        assert_eq!(budget.get(), before);
+        drop(page);
+        assert_eq!(budget.get(), 0);
+    }
 
     #[test]
     fn unprepared_stage_blocks_flatten_in_painter_order_for_workers() {

@@ -24,6 +24,7 @@ pub struct TestRenderer {
     managed: bool,
     retained: Option<BitmapHandle>,
     registrations: usize,
+    pub(crate) loader_uploads: Rc<std::cell::RefCell<Vec<ruffle_render::bitmap::LoaderRequest>>>,
     fail_upload: bool,
     regional: bool,
     reads: Vec<PixelRegion>,
@@ -99,6 +100,9 @@ impl RenderBackend for TestRenderer {
     }
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, Error> {
         self.registrations += 1;
+        if let Some(request) = bitmap.loader_request() {
+            self.loader_uploads.borrow_mut().push(request);
+        }
         Ok(BitmapHandle(Arc::new(TestBitmapHandle {
             width: bitmap.width(),
             pixels: std::cell::RefCell::new(bitmap.to_rgba().data().to_vec()),
@@ -302,6 +306,7 @@ pub(crate) fn renderer(managed: bool) -> TestRenderer {
         managed,
         retained: None,
         registrations: 0,
+        loader_uploads: Default::default(),
         fail_upload: false,
         regional: false,
         reads: vec![],
@@ -353,6 +358,37 @@ fn gpu_fill(handle: &BitmapHandle, region: PixelRegion, color: [u8; 4]) -> Box<d
         }
     }
     Box::new(snapshot(handle, region))
+}
+
+#[test]
+fn tracking_current_pixels_releases_a_redundant_version_reader() {
+    use crate::bitmap::{bitmap_data::BitmapData, operations::get_pixel32};
+    #[derive(Debug)]
+    struct Reader(BitmapHandle, Arc<()>);
+    impl SyncHandle for Reader {
+        fn can_read_current_without_token(&self, bitmap: &BitmapHandle) -> bool {
+            self.0 == *bitmap
+        }
+    }
+    gc_arena::arena::rootless_mutate(|mc| {
+        let bitmap = BitmapData::new(mc, 4, 1, true, 0xff000000);
+        let mut renderer = renderer(false);
+        renderer.regional = true;
+        let handle = bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+        let region = PixelRegion::for_whole_size(4, 1);
+        drop(gpu_fill(&handle, region, [10, 20, 30, 255]));
+        let reader = Reader(handle, Arc::new(()));
+        let live = Arc::downgrade(&reader.1);
+        bitmap.mark_gpu_dirty(mc, Box::new(reader), region);
+        assert!(
+            live.upgrade().is_none(),
+            "tracking current GPU pixels retained a version reader"
+        );
+        assert_eq!(
+            get_pixel32(bitmap, &mut renderer, 1, 0).unwrap(),
+            0xff0a141e
+        );
+    });
 }
 
 #[test]

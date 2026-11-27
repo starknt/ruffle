@@ -67,6 +67,8 @@ struct GpuRecord<'a> {
     event: &'static str,
     frame_id: Option<u64>,
     ns: u64,
+    stage_end_ns: Option<u64>,
+    ranges_ns: &'a [(u64, u64)],
     phase_ns: &'a [(String, u64)],
 }
 fn write_record(writer: &mut impl Write, record: &impl serde::Serialize) -> Result<()> {
@@ -81,6 +83,8 @@ fn write_gpu_record(writer: &mut impl Write, sample: &profile::GpuSample) -> Res
             event: "gpu",
             frame_id: sample.frame,
             ns: sample.nanos,
+            stage_end_ns: sample.stage_end_ns,
+            ranges_ns: &sample.ranges_ns,
             phase_ns: &sample.phases,
         },
     )
@@ -645,6 +649,8 @@ mod tests {
             &profile::GpuSample {
                 frame: Some(42),
                 nanos: 9001,
+                stage_end_ns: Some(133_700),
+                ranges_ns: vec![(126_700, 133_700)],
                 phases: vec![("render".into(), 7000)],
             },
         )
@@ -667,7 +673,7 @@ mod tests {
         assert_eq!(records[0]["rssBytes"], 1234);
         assert_eq!(
             records[1],
-            json!({"event":"gpu","frameId":42,"ns":9001,"phaseNs":[["render",7000]]})
+            json!({"event":"gpu","frameId":42,"ns":9001,"stageEndNs":133700,"rangesNs":[[126700,133700]],"phaseNs":[["render",7000]]})
         );
     }
 

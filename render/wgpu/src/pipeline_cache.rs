@@ -13,7 +13,7 @@ use writer::Writer;
 
 const MAGIC: &[u8; 8] = b"RFLWGPU1";
 // Bump when engine shaders or pipeline layouts change independently of the crate version.
-pub(crate) const ENGINE_ABI: &str = "ruffle-shaders-layouts-v2";
+pub(crate) const ENGINE_ABI: &str = "ruffle-shaders-layouts-v3";
 const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
 const HEADER_LEN: usize = 8 + 32 + 8 + 32;
 type Hash = Output<Sha256>;

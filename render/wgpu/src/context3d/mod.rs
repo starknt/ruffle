@@ -23,7 +23,6 @@ use crate::context3d::current_pipeline::{AGAL_FLOATS_PER_REGISTER, BoundTextureD
 use crate::descriptors::Descriptors;
 use crate::utils::supported_sample_count;
 
-use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::instrument;
@@ -32,6 +31,8 @@ mod current_pipeline;
 mod pipeline_cache;
 use pipeline_cache::VertexInputs;
 pub(crate) mod shader_pair;
+mod uploads;
+use uploads::{UploadLayout, UploadQueue, UploadTarget};
 #[cfg(test)]
 mod tests;
 
@@ -53,6 +54,10 @@ pub struct WgpuContext3D {
     profile: Context3DProfile,
 
     buffer_staging_belt: StagingBelt,
+    uploads: UploadQueue,
+    _lifetime: crate::render_snapshot::ResourceLifetime,
+    operations: crate::render_snapshot::OperationSequence,
+    owned_uploads: bool,
 
     current_texture_view: Option<crate::gpu_resources::TextureView>,
     current_texture_size: Option<Extent3d>,
@@ -77,18 +82,7 @@ pub struct WgpuContext3D {
     vertex_inputs: VertexInputs,
 
     buffer_command_encoder: crate::gpu_resources::CommandEncoder,
-    // We may re-create `render_pass` multiple times while processing
-    // `commands`. If we do, then we only want to perform a clear if there
-    // was an explicit `Clear` command. Otherwise, we want to preserve the
-    // contents of the previous render pass.
-    //
-    // This variable gets set to `Some` when we encounter a `Clear` command,
-    // and then gets set to `None` when we create a new render pass.
-    clear_color: Option<ClearColor>,
-    // After a call to 'present()', the Context3D API requires a call to 'clear'
-    // before any new calls to 'drawTriangles'. This tracks whether we've
-    // seen a `Context3DCommand::Clear` so far. Note that this is separate from
-    // `clear_color`, which may be `None` even if we've seen a `Clear` command.
+    // Flash requires a clear between present() and the next drawTriangles().
     seen_clear_command: bool,
 
     scissor_rectangle: Option<Rectangle<Twips>>,
@@ -98,6 +92,16 @@ impl WgpuContext3D {
     pub fn new(
         descriptors: Arc<Descriptors>,
         profile: Context3DProfile,
+    ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
+        let operations =
+            crate::render_snapshot::OperationSequence::new(descriptors.runtime.health());
+        Self::for_session(descriptors, profile, operations)
+    }
+
+    pub(crate) fn for_session(
+        descriptors: Arc<Descriptors>,
+        profile: Context3DProfile,
+        operations: crate::render_snapshot::OperationSequence,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let device = descriptors.device.with_owner(
             descriptors
@@ -131,7 +135,8 @@ impl WgpuContext3D {
                 clamped_nearest: Default::default(),
                 view: dummy_texture.create_view(&Default::default())?,
                 texture: dummy_texture,
-                copy_count: Default::default(),
+                access: Default::default(),
+                _lifetime: None,
                 version: Default::default(),
             })))
         };
@@ -148,11 +153,16 @@ impl WgpuContext3D {
                 label: create_debug_label!("Buffer command encoder").as_deref(),
             })?;
 
+        let uploads = UploadQueue::new(descriptors.runtime.clone());
         Ok(Self {
             profile,
             descriptors,
             device,
             buffer_staging_belt,
+            uploads,
+            _lifetime: operations.create_resource()?,
+            operations,
+            owned_uploads: std::env::var_os("RUFFLE_OWNED_FRAMES").as_deref() == Some("1".as_ref()),
             back_buffer_raw_texture_handle,
             front_buffer_raw_texture_handle,
             current_pipeline,
@@ -174,10 +184,43 @@ impl WgpuContext3D {
             front_buffer_resolve_texture_view: None,
 
             buffer_command_encoder,
-            clear_color: None,
             seen_clear_command: false,
             scissor_rectangle: None,
         })
+    }
+
+    fn upload(
+        &mut self,
+        target: UploadTarget,
+        layout: UploadLayout,
+        bytes: &[u8],
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        if self.owned_uploads {
+            match self.uploads.enqueue(target.clone(), layout, bytes) {
+                Ok(()) => return self.flush_uploads(),
+                Err(error)
+                    if error.kind() == crate::gpu_runtime::RenderFailureKind::BudgetExceeded =>
+                {
+                    // Drain predecessors before copying this required write
+                    // directly from the VM into bounded GPU staging pages.
+                    self.flush_uploads()?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        layout.encode(
+            &target,
+            bytes,
+            &mut self.buffer_staging_belt,
+            &mut self.buffer_command_encoder,
+        )
+    }
+
+    fn flush_uploads(&mut self) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.uploads.flush(
+            &mut self.buffer_staging_belt,
+            &mut self.buffer_command_encoder,
+        )
     }
 
     fn create_depth_texture(
@@ -186,8 +229,7 @@ impl WgpuContext3D {
         height: u32,
         sample_count: u32,
     ) -> Result<TextureView, crate::gpu_runtime::RenderFailure> {
-        Ok(self
-            .descriptors
+        self.descriptors
             .device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("Context3D depth texture"),
@@ -203,7 +245,7 @@ impl WgpuContext3D {
                 view_formats: &[wgpu::TextureFormat::Depth24PlusStencil8],
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             })?
-            .create_view(&Default::default())?)
+            .create_view(&Default::default())
     }
 
     // This restores rendering to our normal buffer. It can be triggered explicitly
@@ -222,14 +264,35 @@ impl WgpuContext3D {
             .update_target_format(TextureFormat::Rgba8Unorm);
     }
 
-    fn make_render_pass<'a>(
-        &'a mut self,
+    // Append the render pass after all uploads already staged for this context.
+    fn take_render_encoder(&mut self) -> Result<CommandEncoder, crate::gpu_runtime::RenderFailure> {
+        let next = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: create_debug_label!("Buffer command encoder").as_deref(),
+            })?;
+        self.buffer_staging_belt.finish();
+        Ok(std::mem::replace(&mut self.buffer_command_encoder, next))
+    }
+
+    fn submit_render_pass(
+        &mut self,
+        encoder: CommandEncoder,
+        writes_color: bool,
+    ) -> Result<(), crate::gpu_runtime::RenderFailure> {
+        self.descriptors.queue.submit([encoder.finish()?])?;
+        self.buffer_staging_belt.recall();
+        if writes_color && self.current_texture_view == self.back_buffer_texture_view {
+            crate::record_bitmap_write(&self.back_buffer_raw_texture_handle)?;
+        }
+        Ok(())
+    }
+
+    fn begin_target_pass<'a>(
+        &self,
         command_encoder: &'a mut CommandEncoder,
+        clear_color: Option<ClearColor>,
     ) -> RenderPass<'a> {
-        // Subsequent draw calls (without an intermediate 'clear()' call)
-        // will use a clear color of None. This ensures that by itself,
-        // re-creating the render pass has no effect on the output
-        let clear_color = self.clear_color.take();
         let color_load = match clear_color {
             Some(clear) if clear.mask & COLOR_MASK != 0 => wgpu::LoadOp::Clear(clear.rgb),
             _ => wgpu::LoadOp::Load,
@@ -261,7 +324,7 @@ impl WgpuContext3D {
             None
         };
 
-        let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Context3D render pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: self.current_texture_view.as_ref().unwrap(),
@@ -277,7 +340,10 @@ impl WgpuContext3D {
             })],
             depth_stencil_attachment,
             ..Default::default()
-        });
+        })
+    }
+
+    fn bind_draw_state(&mut self, pass: &mut RenderPass<'_>) {
         if let Some((pipeline, bindings)) = self.current_pipeline.active() {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bindings.raw(), &[]);
@@ -314,11 +380,11 @@ impl WgpuContext3D {
         for (slot, buffer) in self.vertex_inputs.buffers.iter().enumerate() {
             pass.set_vertex_buffer(slot as u32, buffer.buffer.slice(..));
         }
-        pass
     }
 }
 
 pub struct IndexBufferWrapper {
+    _lifetime: crate::render_snapshot::ResourceLifetime,
     pub buffer: crate::gpu_resources::Buffer,
     /// A cpu-side copy of the buffer data. This is used to allow us to
     /// perform unaligned writes to the GPU buffer, which is required by ActionScript.
@@ -327,12 +393,14 @@ pub struct IndexBufferWrapper {
 
 #[derive(Debug)]
 pub struct VertexBufferWrapper {
+    _lifetime: crate::render_snapshot::ResourceLifetime,
     pub buffer: crate::gpu_resources::Buffer,
     pub data_32_per_vertex: u8,
 }
 
 #[derive(Debug)]
 pub struct TextureWrapper {
+    _lifetime: crate::render_snapshot::ResourceLifetime,
     texture: crate::gpu_resources::Texture,
 }
 
@@ -391,11 +459,12 @@ impl Context3D for WgpuContext3D {
         let size = (u64::from(num_indices) * 2).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
         let buffer = self.device.create_buffer(&BufferDescriptor {
             label: None,
-            size: size as u64,
+            size,
             usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })?;
         Ok(Box::new(IndexBufferWrapper {
+            _lifetime: self.operations.create_resource()?,
             buffer,
             data: vec![0; size as usize],
         }))
@@ -415,6 +484,7 @@ impl Context3D for WgpuContext3D {
             mapped_at_creation: false,
         })?;
         Ok(Rc::new(VertexBufferWrapper {
+            _lifetime: self.operations.create_resource()?,
             buffer,
             data_32_per_vertex,
         }))
@@ -466,7 +536,10 @@ impl Context3D for WgpuContext3D {
             view_formats: &[format],
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | render_attachment,
         })?;
-        Ok(Rc::new(TextureWrapper { texture }))
+        Ok(Rc::new(TextureWrapper {
+            texture,
+            _lifetime: self.operations.create_resource()?,
+        }))
     }
 
     fn create_cube_texture(
@@ -504,7 +577,10 @@ impl Context3D for WgpuContext3D {
                 | TextureUsages::COPY_DST
                 | TextureUsages::RENDER_ATTACHMENT,
         })?;
-        Ok(Rc::new(TextureWrapper { texture }))
+        Ok(Rc::new(TextureWrapper {
+            texture,
+            _lifetime: self.operations.create_resource()?,
+        }))
     }
 
     fn upload_shaders(
@@ -513,7 +589,8 @@ impl Context3D for WgpuContext3D {
         vertex_shader_agal: Vec<u8>,
         fragment_shader_agal: Vec<u8>,
     ) -> Result<(), AgalError> {
-        let shader_pair = ShaderPairAgal::new(vertex_shader_agal, fragment_shader_agal)?;
+        let shader_pair =
+            ShaderPairAgal::new(vertex_shader_agal, fragment_shader_agal, &self.operations)?;
 
         self.device.register_agal(&shader_pair.program);
         *module.borrow_mut() = Some(Rc::new(shader_pair));
@@ -535,17 +612,25 @@ impl Context3D for WgpuContext3D {
                 stencil,
                 mask,
             } => {
-                self.clear_color = Some(ClearColor {
-                    rgb: wgpu::Color {
-                        r: red,
-                        g: green,
-                        b: blue,
-                        a: alpha,
-                    },
-                    mask,
-                    depth: depth as f32,
-                    stencil,
-                });
+                let writes_color = mask & COLOR_MASK != 0;
+                let writes_depth_stencil = self.current_depth_texture_view.is_some()
+                    && mask & (DEPTH_MASK | STENCIL_MASK) != 0;
+                if self.current_texture_view.is_some() && (writes_color || writes_depth_stencil) {
+                    let clear = ClearColor {
+                        rgb: wgpu::Color {
+                            r: red,
+                            g: green,
+                            b: blue,
+                            a: alpha,
+                        },
+                        mask,
+                        depth: depth as f32,
+                        stencil,
+                    };
+                    let mut encoder = self.take_render_encoder()?;
+                    drop(self.begin_target_pass(&mut encoder, Some(clear)));
+                    self.submit_render_pass(encoder, writes_color)?;
+                }
                 self.seen_clear_command = true;
             }
             Context3DCommand::ConfigureBackBuffer {
@@ -658,71 +743,40 @@ impl Context3D for WgpuContext3D {
                     .map(|t| t.create_view(&Default::default()))
                     .transpose()?;
 
-                if sample_count > 1 {
-                    self.current_texture_resolve_view = Some(
-                        back_buffer_resolve_texture
-                            .as_ref()
-                            .unwrap()
-                            .create_view(&Default::default())?,
-                    );
+                self.current_texture_resolve_view = self.back_buffer_resolve_texture_view.clone();
 
-                    // We always use a non-multisampled texture as our raw texture handle,
-                    // which is what the Stage rendering code expects. In multisample mode,
-                    // this is our resolve texture.
-                    self.back_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
+                // Stage rendering samples the single-sampled resolve texture for MSAA.
+                let make_handle = |texture, view| -> Result<_, crate::gpu_runtime::RenderFailure> {
+                    Ok(BitmapHandle(Arc::new(Texture {
                         _allocation: Default::default(),
-                        view: self.back_buffer_resolve_texture_view.clone().unwrap(),
-                        texture: back_buffer_resolve_texture.unwrap(),
+                        view,
+                        texture,
                         batch_source: Default::default(),
                         repeating_linear: Default::default(),
                         repeating_nearest: Default::default(),
                         clamped_linear: Default::default(),
                         clamped_nearest: Default::default(),
-                        copy_count: Default::default(),
+                        access: Default::default(),
+                        _lifetime: Some(self.operations.create_resource()?),
                         version: Default::default(),
-                    }));
-                    self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
-                        _allocation: Default::default(),
-                        view: self.front_buffer_resolve_texture_view.clone().unwrap(),
-                        texture: front_buffer_resolve_texture.unwrap(),
-                        batch_source: Default::default(),
-                        repeating_linear: Default::default(),
-                        repeating_nearest: Default::default(),
-                        clamped_linear: Default::default(),
-                        clamped_nearest: Default::default(),
-                        copy_count: Default::default(),
-                        version: Default::default(),
-                    }));
-                } else {
-                    // In non-multisample mode, we don't have a separate resolve buffer,
-                    // so our main texture gets used as the raw texture handle.
-
-                    self.back_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
-                        _allocation: Default::default(),
-                        view: self.back_buffer_texture_view.clone().unwrap(),
-                        texture: back_buffer_texture,
-                        batch_source: Default::default(),
-                        repeating_linear: Default::default(),
-                        repeating_nearest: Default::default(),
-                        clamped_linear: Default::default(),
-                        clamped_nearest: Default::default(),
-                        copy_count: Default::default(),
-                        version: Default::default(),
-                    }));
-                    self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
-                        _allocation: Default::default(),
-                        view: self.front_buffer_texture_view.clone().unwrap(),
-                        texture: front_buffer_texture,
-                        batch_source: Default::default(),
-                        repeating_linear: Default::default(),
-                        repeating_nearest: Default::default(),
-                        clamped_linear: Default::default(),
-                        clamped_nearest: Default::default(),
-                        copy_count: Default::default(),
-                        version: Default::default(),
-                    }));
-                    self.current_texture_resolve_view = None;
-                }
+                    })))
+                };
+                self.back_buffer_raw_texture_handle = make_handle(
+                    back_buffer_resolve_texture.unwrap_or(back_buffer_texture),
+                    self.back_buffer_resolve_texture_view
+                        .as_ref()
+                        .or(self.back_buffer_texture_view.as_ref())
+                        .unwrap()
+                        .clone(),
+                )?;
+                self.front_buffer_raw_texture_handle = make_handle(
+                    front_buffer_resolve_texture.unwrap_or(front_buffer_texture),
+                    self.front_buffer_resolve_texture_view
+                        .as_ref()
+                        .or(self.front_buffer_texture_view.as_ref())
+                        .unwrap()
+                        .clone(),
+                )?;
 
                 self.current_pipeline
                     .update_has_depth_texture(depth_and_stencil);
@@ -741,31 +795,19 @@ impl Context3D for WgpuContext3D {
                 }
                 let buffer: &mut IndexBufferWrapper = <dyn Any>::downcast_mut(buffer).unwrap();
 
-                // Unfortunately, ActionScript works with 2-byte indices, while wgpu requires
-                // copy offsets and sizes to have 4-byte alignment. To support this, we need
-                // to keep a copy of the data on the CPU side. We round *down* the offset to
-                // the closest multiple of 4 bytes, and round *up* the length to the closest
-                // multiple of 4 bytes. We then perform a copy from our CPU-side buffer, which
-                // which uses the existing data (at the beginning or end) to fill out the copy
-                // to the required length and offset. Without this, we would lose data in the CPU
-                // buffer whenever we performed a copy with an unalignd offset or length.
-                let offset_bytes = start_offset * std::mem::size_of::<u16>();
-                let rounded_down_offset =
-                    offset_bytes - (offset_bytes % COPY_BUFFER_ALIGNMENT as usize);
-                let rounded_up_length = align_copy_buffer_size(data.len());
-
-                buffer.data[offset_bytes..(offset_bytes + data.len())].copy_from_slice(data);
-                self.buffer_staging_belt
-                    .write_buffer(
-                        &mut self.buffer_command_encoder,
-                        &buffer.buffer,
-                        rounded_down_offset as u64,
-                        NonZeroU64::new(rounded_up_length as u64).unwrap(),
-                    )?
-                    .copy_from_slice(
-                        &buffer.data
-                            [rounded_down_offset..(rounded_down_offset + rounded_up_length)],
-                    );
+                // Flash writes 16-bit indices. Copy both aligned endpoints from
+                // the shadow buffer so adjacent indices keep their previous bytes.
+                let offset = start_offset * size_of::<u16>();
+                let start = offset - offset % COPY_BUFFER_ALIGNMENT as usize;
+                let end = align_copy_buffer_size(offset + data.len());
+                buffer.data[offset..offset + data.len()].copy_from_slice(data);
+                self.upload(
+                    UploadTarget::Buffer(buffer.buffer.clone()),
+                    UploadLayout::Buffer {
+                        offset: start as u64,
+                    },
+                    &buffer.data[start..end],
+                )?;
             }
 
             Context3DCommand::UploadToVertexBuffer {
@@ -783,16 +825,14 @@ impl Context3D for WgpuContext3D {
 
                 // ActionScript can only work with 32-bit chunks of data, so our `write_buffer`
                 // offset and size will always be a multiple of `COPY_BUFFER_ALIGNMENT` (4 bytes)
-                self.buffer_staging_belt
-                    .write_buffer(
-                        &mut self.buffer_command_encoder,
-                        &buffer.buffer,
-                        (start_vertex * (data32_per_vertex as usize) * std::mem::size_of::<f32>())
-                            as u64,
-                        NonZeroU64::new(data.len() as u64).unwrap(),
-                    )?
-                    .slice(..data.len())
-                    .copy_from_slice(data);
+                let offset = start_vertex * data32_per_vertex as usize * size_of::<f32>();
+                self.upload(
+                    UploadTarget::Buffer(buffer.buffer.clone()),
+                    UploadLayout::Buffer {
+                        offset: offset as u64,
+                    },
+                    data,
+                )?;
             }
 
             Context3DCommand::SetRenderToTexture {
@@ -910,25 +950,9 @@ impl Context3D for WgpuContext3D {
                     );
                 }
 
-                self.buffer_staging_belt.finish();
-                let new_encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: create_debug_label!("Buffer command encoder").as_deref(),
-                        })?;
-                let finished_buffer_command_encoder =
-                    std::mem::replace(&mut self.buffer_command_encoder, new_encoder);
-
-                // Note - we need to unconditionally re-create the render pass, since we had to submit the
-                // buffer command encoder above.
-
-                let mut render_command_encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: create_debug_label!("Render command encoder").as_deref(),
-                        })?;
-
-                let mut render_pass = self.make_render_pass(&mut render_command_encoder);
+                let mut encoder = self.take_render_encoder()?;
+                let mut render_pass = self.begin_target_pass(&mut encoder, None);
+                self.bind_draw_state(&mut render_pass);
 
                 render_pass
                     .set_index_buffer(index_buffer.buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -937,15 +961,8 @@ impl Context3D for WgpuContext3D {
                     render_pass.draw_indexed(indices, 0, 0..1);
                 }
 
-                // A `RenderPass` needs to hold references to several fields in `self`, so we can't
-                // easily re-use it across multiple `DrawTriangles` calls.
                 drop(render_pass);
-
-                self.descriptors.queue.submit([
-                    finished_buffer_command_encoder.finish()?,
-                    render_command_encoder.finish()?,
-                ])?;
-                self.buffer_staging_belt.recall();
+                self.submit_render_pass(encoder, can_draw)?;
             }
 
             Context3DCommand::SetVertexBufferAt {
@@ -993,18 +1010,12 @@ impl Context3D for WgpuContext3D {
                     * AGAL_FLOATS_PER_REGISTER
                     * std::mem::size_of::<f32>() as u64;
 
-                let mut buffer_view = self.buffer_staging_belt.write_buffer(
-                    &mut self.buffer_command_encoder,
-                    buffer,
-                    offset,
-                    NonZeroU64::new(std::mem::size_of_val(matrix_raw_data_column_major) as u64)
-                        .unwrap(),
+                // Flash's non-transposed constants use the existing column-major byte order.
+                self.upload(
+                    UploadTarget::Buffer(buffer.clone()),
+                    UploadLayout::Buffer { offset },
+                    matrix_raw_data_column_major.as_flattened(),
                 )?;
-                // Despite what the docs claim, we copy in *column* major order, rather than *row* major order.
-                // See this code in OpenFL: https://github.com/openfl/openfl/blob/971a4c9e43b5472fd84d73920a2b7c1b3d8d9257/src/openfl/display3D/Context3D.hx#L1532-L1550
-                // When the 'transposedMatrix' flag is false, it copies data *directly* from matrix.rawData,
-                // which is stored in column-major order
-                buffer_view.copy_from_slice(matrix_raw_data_column_major.as_flattened());
             }
             Context3DCommand::SetCulling { face } => {
                 self.current_pipeline.set_culling(face);
@@ -1024,25 +1035,18 @@ impl Context3D for WgpuContext3D {
                 // If we were to use `self.buffer_command_encoder.copy_texture_to_texture`, the
                 // BitmapData's gpu texture might be modified before we actually submit
                 // `buffer_command_encoder` to the device.
-                self.buffer_staging_belt.write_texture(
-                    &mut self.buffer_command_encoder,
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &dest.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: 0,
-                            y: 0,
-                            z: layer,
+                self.upload(
+                    UploadTarget::Texture(dest.texture.clone()),
+                    UploadLayout::Texture {
+                        layer,
+                        size: wgpu::Extent3d {
+                            width: source_width,
+                            height: source_height,
+                            depth_or_array_layers: 1,
                         },
-                        aspect: wgpu::TextureAspect::All,
+                        bgra: source_is_bgra,
                     },
                     source,
-                    source_is_bgra,
-                    wgpu::Extent3d {
-                        width: source_width,
-                        height: source_height,
-                        depth_or_array_layers: 1,
-                    },
                 )?;
             }
             Context3DCommand::SetTextureAt {
@@ -1199,7 +1203,7 @@ impl Context3D for WgpuContext3D {
             }
         }
 
-        Ok(())
+        self.operations.record()
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1223,7 +1227,7 @@ impl Context3D for WgpuContext3D {
 
         self.set_render_to_back_buffer();
         self.seen_clear_command = false;
-        self.clear_color = None;
+        let _ = self.operations.record();
     }
 }
 

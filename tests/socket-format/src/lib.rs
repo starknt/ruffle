@@ -8,6 +8,8 @@ use serde_json::from_reader;
 pub enum SocketEvent {
     /// Wait for input data that matches this.
     Receive { expected: Vec<u8> },
+    /// Expect a run of identical bytes without storing a large JSON byte array.
+    ReceiveRepeated { byte: u8, count: usize },
     /// Send data to client.
     Send { payload: Vec<u8> },
     /// Expect client to disconnect.

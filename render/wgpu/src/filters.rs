@@ -1,23 +1,24 @@
 mod bevel;
 mod blur;
 mod color_matrix;
+mod convolution;
 mod displacement_map;
 mod drop_shadow;
 mod glow;
+mod gradient_glow;
 pub(crate) mod graph;
 mod shader;
-
-use std::collections::HashSet;
-use std::sync::{LazyLock, Mutex};
 
 use crate::buffer_pool::TexturePool;
 use crate::descriptors::Descriptors;
 use crate::filters::bevel::BevelFilter;
 use crate::filters::blur::BlurFilter;
 use crate::filters::color_matrix::ColorMatrixFilter;
+use crate::filters::convolution::ConvolutionFilter;
 use crate::filters::displacement_map::DisplacementMapFilter;
 use crate::filters::drop_shadow::DropShadowFilter;
 use crate::filters::glow::GlowFilter;
+use crate::filters::gradient_glow::GradientGlowFilter;
 use crate::filters::shader::ShaderFilter;
 use crate::gpu_resources::StagingBelt;
 use crate::surface::target::CommandTarget;
@@ -55,17 +56,22 @@ impl FilterPipelines {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct FilterSource<'a> {
     pub texture: &'a crate::gpu_resources::Texture,
+    pub view: &'a crate::gpu_resources::TextureView,
     pub point: (u32, u32),
     pub size: (u32, u32),
 }
 
 impl<'a> FilterSource<'a> {
-    pub fn for_entire_texture(texture: &'a crate::gpu_resources::Texture) -> Self {
+    pub fn for_entire_texture(
+        texture: &'a crate::gpu_resources::Texture,
+        view: &'a crate::gpu_resources::TextureView,
+    ) -> Self {
         Self {
             texture,
+            view,
             point: (0, 0),
             size: (texture.width(), texture.height()),
         }
@@ -216,11 +222,35 @@ impl<'a> FilterSource<'a> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub(crate) enum GradientKind {
+    Glow = 0,
+    Bevel = 1,
+}
+
+impl GradientKind {
+    pub(crate) fn is_identity(self, filter: &swf::GradientFilter) -> bool {
+        match self {
+            Self::Glow => filter.colors.is_empty() || filter.strength <= swf::Fixed8::ZERO,
+            Self::Bevel => {
+                filter.colors.is_empty()
+                    && !filter.is_knockout()
+                    && filter
+                        .flags
+                        .contains(swf::GradientFilterFlags::COMPOSITE_SOURCE)
+            }
+        }
+    }
+}
+
 pub struct Filters {
     pub blur: BlurFilter,
     pub color_matrix: ColorMatrixFilter,
+    convolution: ConvolutionFilter,
     pub shader: ShaderFilter,
     pub glow: GlowFilter,
+    pub gradient_glow: GradientGlowFilter,
     pub bevel: BevelFilter,
     pub displacement_map: DisplacementMapFilter,
 }
@@ -232,8 +262,10 @@ impl Filters {
         Ok(Self {
             blur: BlurFilter::new(device)?,
             color_matrix: ColorMatrixFilter::new(device)?,
+            convolution: ConvolutionFilter::new(device)?,
             shader: ShaderFilter::new(),
             glow: GlowFilter::new(device)?,
+            gradient_glow: GradientGlowFilter::new(device)?,
             bevel: BevelFilter::new(device)?,
             displacement_map: DisplacementMapFilter::new(device)?,
         })
@@ -242,24 +274,49 @@ impl Filters {
     pub fn apply_chain(
         &self,
         descriptors: &Descriptors,
-        draw_encoder: &mut crate::gpu_resources::CommandEncoder,
+        scope: &mut crate::gpu_profiler::Scope<'_, crate::gpu_resources::CommandEncoder>,
         texture_pool: &mut TexturePool,
         staging_belt: &mut StagingBelt,
         source: FilterSource,
-        filters: Vec<Filter>,
+        filters: &[Filter],
+        plan: crate::pass_graph::FilterPasses,
+        destination: Option<FilterSource<'_>>,
     ) -> Result<Option<CommandTarget>, crate::gpu_runtime::RenderFailure> {
-        let graph = graph::FilterGraph::new(
-            &filters,
-            source.texture.sample_count() == 1
-                && source.texture.format() == wgpu::TextureFormat::Rgba8Unorm,
-        );
+        use crate::gpu_runtime::{RenderFailure, RenderFailureKind};
+        use crate::pass_graph::PassKind;
+        let invalid = || {
+            RenderFailure::new(
+                RenderFailureKind::Validation,
+                "invalid filter pass dependency",
+            )
+        };
+        let mut version = plan.source;
         let mut current: Option<CommandTarget> = None;
         let mut premultiplied = false;
-        for step in graph.steps {
-            draw_encoder.flush_uploads_if_needed(staging_belt.page_size())?;
-            let input = current
-                .as_ref()
-                .map(|target| FilterSource::for_entire_texture(target.color_texture()));
+        let pass_count = plan.passes.len();
+        for (index, pass) in plan.passes.into_iter().enumerate() {
+            let (PassKind::Filter { step, compute }, [output]) =
+                (pass.kind, pass.writes.as_slice())
+            else {
+                return Err(invalid());
+            };
+            if pass.reads.first() != Some(&version)
+                || pass.dependencies.iter().any(|&d| d >= plan.first + index)
+            {
+                return Err(invalid());
+            }
+            // A no-op aliases its input at this logical output version.
+            version = *output;
+            scope.flush_uploads_if_needed(staging_belt.page_size())?;
+            let label = step.profile_label(filters);
+            let _pass = descriptors
+                .device
+                .pass_context(crate::gpu_resources::diagnostics::Context::Filter(label));
+            let draw_encoder = &mut scope.scope(label);
+            let input = current.as_ref().map(|target| {
+                FilterSource::for_entire_texture(target.color_texture(), target.color_view())
+            });
+            let destination = destination.filter(|_| !compute && index + 1 == pass_count);
             let source = input.as_ref().unwrap_or(&source);
             let matrix_output = match &step {
                 graph::FilterStep::Pointwise(_) => true,
@@ -284,27 +341,31 @@ impl Filters {
                     {
                         continue;
                     }
-                    Some(self.color_matrix.apply_chain(
-                        descriptors,
-                        texture_pool,
-                        draw_encoder,
-                        staging_belt,
-                        source,
-                        &matrices,
-                    )?)
+                    Some(
+                        self.color_matrix.apply_chain(
+                            descriptors,
+                            texture_pool,
+                            draw_encoder,
+                            staging_belt,
+                            source,
+                            &matrices,
+                            compute,
+                            destination
+                                .filter(|output| output.texture != source.texture)
+                                .map(|output| output.view),
+                        )?,
+                    )
                 }
                 graph::FilterStep::Single(index) => self.apply(
                     descriptors,
                     draw_encoder,
                     texture_pool,
                     staging_belt,
-                    FilterSource {
-                        texture: source.texture,
-                        point: source.point,
-                        size: source.size,
-                    },
+                    *source,
                     filters[index].clone(),
                     premultiplied,
+                    false,
+                    destination,
                 )?,
             };
             // Encoding consumed the old input; returning its exact-key pool
@@ -326,7 +387,15 @@ impl Filters {
         source: FilterSource,
         filter: Filter,
         can_skip_identity: bool,
+        opaque_target: bool,
+        destination: Option<FilterSource<'_>>,
     ) -> Result<Option<CommandTarget>, crate::gpu_runtime::RenderFailure> {
+        let _pass =
+            descriptors
+                .device
+                .pass_context(crate::gpu_resources::diagnostics::Context::Filter(
+                    graph::filter_label(&filter),
+                ));
         let target = match filter {
             Filter::ColorMatrixFilter(filter)
                 if can_skip_identity && filter == Default::default() =>
@@ -341,6 +410,25 @@ impl Filters {
                 &source,
                 &filter,
             )?),
+            Filter::ConvolutionFilter(filter) => {
+                if filter.num_matrix_cols == 0
+                    || filter.num_matrix_rows == 0
+                    || source.size.0 == 0
+                    || source.size.1 == 0
+                {
+                    return Ok(None);
+                }
+                Some(self.convolution.apply(
+                    descriptors,
+                    texture_pool,
+                    draw_encoder,
+                    staging_belt,
+                    &source,
+                    &filter,
+                    opaque_target,
+                    destination,
+                )?)
+            }
             Filter::BlurFilter(filter) => descriptors.filters.blur.apply(
                 descriptors,
                 texture_pool,
@@ -348,6 +436,7 @@ impl Filters {
                 staging_belt,
                 &source,
                 &filter,
+                destination,
             )?,
             Filter::ShaderFilter(shader) => Some(descriptors.filters.shader.apply(
                 descriptors,
@@ -365,7 +454,32 @@ impl Filters {
                 &filter,
                 &self.blur,
                 (0.0, 0.0),
+                destination,
             )?),
+            Filter::GradientGlowFilter(ref params) | Filter::GradientBevelFilter(ref params) => {
+                let kind = if matches!(filter, Filter::GradientBevelFilter(_)) {
+                    GradientKind::Bevel
+                } else {
+                    GradientKind::Glow
+                };
+                if !opaque_target && kind.is_identity(params) {
+                    None
+                } else {
+                    Some(self.gradient_glow.apply(
+                        descriptors,
+                        texture_pool,
+                        draw_encoder,
+                        staging_belt,
+                        &source,
+                        [source.point.0 as i32, source.point.1 as i32],
+                        source.size,
+                        params,
+                        kind,
+                        opaque_target,
+                        destination,
+                    )?)
+                }
+            }
             Filter::DropShadowFilter(filter) => Some(DropShadowFilter::apply(
                 descriptors,
                 texture_pool,
@@ -375,6 +489,7 @@ impl Filters {
                 &filter,
                 &self.blur,
                 &self.glow,
+                destination,
             )?),
             Filter::BevelFilter(filter) => Some(descriptors.filters.bevel.apply(
                 descriptors,
@@ -393,28 +508,6 @@ impl Filters {
                 &source,
                 &filter,
             )?,
-            filter => {
-                static WARNED_FILTERS: LazyLock<Mutex<HashSet<&'static str>>> =
-                    LazyLock::new(Default::default);
-
-                let name = match filter {
-                    Filter::GradientGlowFilter(_) => "GradientGlowFilter",
-                    Filter::GradientBevelFilter(_) => "GradientBevelFilter",
-                    Filter::ConvolutionFilter(_) => "ConvolutionFilter",
-                    Filter::ColorMatrixFilter(_)
-                    | Filter::BlurFilter(_)
-                    | Filter::GlowFilter(_)
-                    | Filter::DropShadowFilter(_)
-                    | Filter::BevelFilter(_)
-                    | Filter::DisplacementMapFilter(_)
-                    | Filter::ShaderFilter(_) => unreachable!(),
-                };
-                // Only warn once per filter type
-                if WARNED_FILTERS.lock().unwrap().insert(name) {
-                    tracing::warn!("Unsupported filter {filter:?}");
-                }
-                None
-            }
         };
 
         let target = match target {

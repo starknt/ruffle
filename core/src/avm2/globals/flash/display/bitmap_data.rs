@@ -1166,8 +1166,8 @@ pub fn apply_filter<'gc>(
         }
 
         let source_point = (
-            source_rect.x_min.to_pixels().floor() as u32,
-            source_rect.y_min.to_pixels().floor() as u32,
+            source_rect.x_min.to_pixels().floor() as i64,
+            source_rect.y_min.to_pixels().floor() as i64,
         );
         let source_size = (
             source_rect.width().to_pixels().ceil() as u32,

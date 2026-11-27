@@ -43,6 +43,7 @@ successful reentry!
 Traced!
 
 /// callWith() end
+[ExternalInterface] callback returned: Undefined
 undefined
 
 /// parrot() start

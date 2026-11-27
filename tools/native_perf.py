@@ -41,6 +41,32 @@ def summarize(path):
         raise ValueError('invalid GPU timestamp duration')
     if len({r['frameId'] for r in gpu}) != len(gpu):
         raise ValueError('duplicate GPU frame identity')
+    # GPU reports can arrive late. Compare the stage ends on one device clock
+    # in source frame order, so idle time between submissions counts.
+    ends = [r.get('stageEndNs') for r in sorted(gpu, key=lambda r: r['frameId'])]
+    if any(end is not None and (type(end) is not int or end < 0) for end in ends):
+        raise ValueError('invalid GPU stage completion timestamp')
+    gaps = []
+    if len(ends) == len(frames) and all(end is not None for end in ends):
+        gaps = sorted(b-a for a,b in zip(ends, ends[1:]))
+        if gaps and gaps[0] <= 0:
+            raise ValueError('non-increasing GPU stage completion timestamp')
+    low_count = (len(gaps)+99)//100
+    gpu_phases = {}
+    for record in gpu:
+        seen = set()
+        intervals = record.get('phaseNs', [])
+        if not isinstance(intervals, list):
+            raise ValueError('invalid named GPU intervals')
+        for interval in intervals:
+            if not isinstance(interval, list) or len(interval) != 2:
+                raise ValueError('invalid named GPU interval')
+            name, ns = interval
+            if (not isinstance(name, str) or not name or name in seen or type(ns) not in (float, int)
+                    or not math.isfinite(ns) or ns < 0):
+                raise ValueError('duplicate or invalid named GPU interval')
+            seen.add(name)
+            gpu_phases.setdefault(name, []).append(ns / 1e6)
     phase_values = [dict(r.get('phaseNs', {}), **r.get('nativeNs', {})) for r in frames]
     phase_names = {key for r in phase_values for key in r}
     if any(not isinstance(r.get('cpuNs'), (float, int)) or not math.isfinite(r['cpuNs']) or r['cpuNs'] < 0 for r in frames):
@@ -53,17 +79,31 @@ def summarize(path):
         'paceFps': session.get('paceFps'),
         'profilingEnabled': session.get('profilingEnabled', True),
         'frames': len(frames), 'completedFrameMs': summary['completedNs']/len(frames)/1e6,
+        'frameIntervalP95Ms': percentile(gaps, .95)/1e6 if gaps else None,
+        'onePercentLowFps': 1e9*low_count/sum(gaps[-low_count:]) if gaps else None,
+        'intervalCount': len(gaps), 'lowIntervalCount': low_count,
         'cpuP95Ms': percentile([r['cpuNs']/1e6 for r in frames], .95),
         'cpuP99Ms': percentile([r['cpuNs']/1e6 for r in frames], .99),
         'gpuP95Ms': percentile([r['ns']/1e6 for r in gpu], .95),
         'gpuP99Ms': percentile([r['ns']/1e6 for r in gpu], .99),
         'gpuCoverage': len(gpu)/len(frames), 'peakRssBytes': summary.get('peakRssBytes'),
+        'gpuPhaseP95Ms': {name: percentile(times, .95) if len(times) == len(frames) else None
+                          for name, times in gpu_phases.items()},
         'phaseP95Ms': {key: percentile([r[key]/1e6 for r in phase_values], .95)
                        if all(key in r for r in phase_values) else None for key in phase_names},
         'resourcesAfterDrain': summary.get('resourcesAfterDrain'),
         'allocatorAfterDrain': summary.get('allocatorAfterDrain'),
         'workTotals': {key: sum(r.get('work', {}).get(key, 0) for r in frames)
                        for key in {key for r in frames for key in r.get('work', {})}},
+        'computeFilterFrames': sum(r.get('work', {}).get('compute_filter_passes', 0) > 0 for r in frames),
+        'filterDrawCopyFrames': sum(r.get('work', {}).get('filter_cache_draw_copies', 0) > 0 for r in frames),
+        'filterDirectFrames': sum(r.get('work', {}).get('filter_cache_direct_outputs', 0) > 0 for r in frames),
+        'filterTransferFrames': sum(r.get('work', {}).get('filter_cache_transfers', 0) > 0 for r in frames),
+        'bitmapArrayFrames': sum(r.get('work', {}).get('bitmap_binding_array_batches', 0) > 0 for r in frames),
+        'bitmapLayerFrames': sum(r.get('work', {}).get('bitmap_layer_batches', 0) > 0 for r in frames),
+        'bitmapIndirectFrames': sum(r.get('work', {}).get('bitmap_indirect_draws', 0) > 0 for r in frames),
+        'bitmapCullFrames': sum(r.get('work', {}).get('bitmap_cull_batches', 0) > 0 for r in frames),
+        'bitmapCountFrames': sum(r.get('work', {}).get('bitmap_count_batches', 0) > 0 for r in frames),
     }
 
 
@@ -109,14 +149,77 @@ def compare(baseline, candidate, phase, control=False):
     if phase == 'gpu':
         improvement = -gpu95
     else:
-        phases = [(b['phaseP95Ms'].get(phase), c['phaseP95Ms'].get(phase)) for b,c in zip(baseline,candidate)]
+        field, name = ('gpuPhaseP95Ms', phase[4:]) if phase.startswith('gpu:') else ('phaseP95Ms', phase)
+        phases = [(b.get(field, {}).get(name), c.get(field, {}).get(name)) for b,c in zip(baseline,candidate)]
         improvement = None if any(not b or c is None or not math.isfinite(c) or c < 0 for b,c in phases) else median(1-c/b for b,c in phases)
     stable = rss <= .05 and max(p95, p99, gpu95, gpu99) <= .03
-    accepted = stable and (median(ratios('completedFrameMs')) <= .03 if control else
-                           throughput >= .05 and improvement is not None and improvement >= .10)
+    complete_intervals = all(
+        run.get('intervalCount') == run['frames'] - 1
+        and run.get('lowIntervalCount') == (run['frames'] - 1 + 99) // 100
+        for run in runs
+    )
+    def pacing_change(key):
+        if not complete_intervals or any(type(r.get(key)) not in (float,int) or not math.isfinite(r[key]) or r[key] <= 0 for r in runs):
+            return None
+        return median(ratios(key))
+    interval = pacing_change('frameIntervalP95Ms')
+    low = pacing_change('onePercentLowFps')
+    if control:
+        accepted = (interval is not None and interval <= .03 and low is not None and low >= -.03
+                    and stable and median(ratios('completedFrameMs')) <= .03)
+    else:
+        accepted = (improvement is not None and interval is not None and low is not None
+                    and throughput > 0 and interval < 0 and low > 0)
     return {'accepted': accepted, 'throughputGain':throughput, 'cpuP95Regression':p95,
             'cpuP99Regression':p99, 'gpuP95Regression':gpu95, 'gpuP99Regression':gpu99,
-            'peakRssGrowth':rss, 'phase':phase, 'phaseP95Gain':improvement}
+            'peakRssGrowth':rss, 'phase':phase, 'phaseP95Gain':improvement,
+            'frameIntervalP95Regression':interval, 'onePercentLowGain':low}
+
+
+def compare_filter_cache(baseline, candidate, phase, path):
+    counters = {'draw': 'filterDrawCopyFrames', 'transfer': 'filterTransferFrames', 'direct': 'filterDirectFrames'}
+    for runs, selected in ((baseline, 'draw'), (candidate, path)):
+        for row in runs:
+            for mode, key in counters.items():
+                # Transfer traces written before direct output existed only have two counters.
+                count = row.get(key, 0 if mode == 'direct' and path == 'transfer' else None)
+                if count != (row['frames'] if mode == selected else 0):
+                    raise ValueError('cache comparison requires the selected output on every measured frame')
+    return compare(baseline, candidate, phase)
+
+
+def compare_filter_paths(baseline, candidate, phase, *, transfer=False):
+    if transfer:
+        return compare_filter_cache(baseline, candidate, phase, 'transfer')
+    if (any(run.get('computeFilterFrames') != 0 for run in baseline)
+            or any(run.get('computeFilterFrames') != run['frames'] for run in candidate)):
+        raise ValueError('filter comparison requires fragment and compute execution on every measured frame')
+    return compare(baseline, candidate, phase)
+
+
+def compare_bitmap_paths(baseline, candidate, phase, path='array'):
+    if path == 'layers':
+        if (any(r.get('bitmapArrayFrames') != r['frames'] or r.get('bitmapLayerFrames') != 0 for r in baseline)
+                or any(r.get('bitmapLayerFrames') != r['frames'] or r.get('bitmapArrayFrames') != 0 for r in candidate)):
+            raise ValueError('layer comparison requires binding arrays and layered textures on every measured frame')
+        return compare(baseline, candidate, phase)
+    if (any(run.get('bitmapArrayFrames') != 0 for run in baseline)
+            or any(run.get('bitmapArrayFrames') != run['frames'] for run in candidate)):
+        raise ValueError('binding array comparison requires the selected path on every measured frame')
+    return compare(baseline, candidate, phase)
+
+
+def compare_bitmap_draws(baseline, candidate, phase, mode):
+    for runs, selected in ((baseline, 'direct-control'), (candidate, mode)):
+        for run in runs:
+            for counter, enabled in (
+                ('bitmapIndirectFrames', selected in ('indirect', 'cull', 'count')),
+                ('bitmapCullFrames', selected in ('cull', 'count')),
+                ('bitmapCountFrames', selected == 'count'),
+            ):
+                if run.get(counter) != (run['frames'] if enabled else 0):
+                    raise ValueError(f'{selected} comparison has incomplete {counter}')
+    return compare(baseline, candidate, phase)
 
 
 @contextmanager
@@ -142,17 +245,44 @@ def main():
     parser.add_argument('--warmup', type=int, default=120)
     parser.add_argument('--frames', type=int, default=1200)
     parser.add_argument('--pairs', type=int, default=5)
-    parser.add_argument('--phase', default='gpu', help='gpu or CPU phase, e.g. preparation')
+    parser.add_argument('--phase', default='gpu', help='gpu, gpu:ColorMatrixFilter, or a CPU phase such as preparation')
     parser.add_argument('--control', action='store_true')
+    experiment = parser.add_mutually_exclusive_group()
+    experiment.add_argument('--compare-compute-filters', action='store_true',
+                            help='compare fragment with opt-in compute in the same binary')
+    experiment.add_argument('--compare-filter-cache-transfer', dest='filter_cache', action='store_const', const='transfer',
+                            help='compare a fullscreen draw with a texture transfer for full filtered caches')
+    experiment.add_argument('--compare-filter-cache-direct', dest='filter_cache', action='store_const', const='direct',
+                            help='compare a fullscreen copy draw with rendering the final filter into the cache')
+    experiment.add_argument('--compare-bitmap-bindings', action='store_true',
+                            help='compare sixteen explicit textures with the optional binding array')
+    experiment.add_argument('--compare-bitmap-layers', action='store_true',
+                            help='compare the binding array with ordered GPU copies to texture layers')
+    experiment.add_argument('--compare-bitmap-draw', choices=['indirect', 'cull', 'count'],
+                            help='compare GPU-generated ordered draws to direct draws on an identical device')
     parser.add_argument('--profile-off', action='store_true',
                         help='disable measurement instrumentation in both binaries')
     args = parser.parse_args()
+    if ((args.compare_compute_filters or args.filter_cache or args.compare_bitmap_bindings
+         or args.compare_bitmap_layers or args.compare_bitmap_draw)
+            and (not args.baseline.samefile(args.candidate) or args.control or args.profile_off)):
+        parser.error('path comparisons need the same executable and enabled target measurements')
     args.output.mkdir(parents=True, exist_ok=False)
     cases = args.case or [r['name'] for r in tomllib.loads(args.manifest.read_text())['case']]
     binaries = {'baseline': args.baseline.resolve(), 'candidate': args.candidate.resolve()}
     metadata = {label: {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
                 for label,path in binaries.items()}
     metadata['manifestSha256'] = hashlib.sha256(args.manifest.read_bytes()).hexdigest()
+    if args.compare_compute_filters:
+        metadata['filterPaths'] = {'baseline': 'fragment', 'candidate': 'compute'}
+    if args.filter_cache:
+        metadata['filterCacheCopy'] = {'baseline': 'draw', 'candidate': args.filter_cache}
+    if args.compare_bitmap_bindings:
+        metadata['bitmapBindings'] = {'baseline': 'explicit-on-array-device', 'candidate': 'array'}
+    if args.compare_bitmap_layers:
+        metadata['bitmapBindings'] = {'baseline': 'array', 'candidate': 'layers'}
+    if args.compare_bitmap_draw:
+        metadata['bitmapDraw'] = {'baseline': 'direct-control', 'candidate': args.compare_bitmap_draw}
     isolate_shader_cache = sys.platform.startswith('linux') and args.backend in ('vulkan', 'gl')
     metadata['shaderDiskCache'] = 'empty-per-process' if isolate_shader_cache else 'system'
     (args.output/'builds.json').write_text(json.dumps(metadata, indent=2)+'\n')
@@ -168,10 +298,35 @@ def main():
                 if args.profile_off:
                     command.append('--profile-off')
                 with path.with_suffix('.log').open('w') as log, driver_environment(isolate_shader_cache) as env:
+                    if args.compare_compute_filters:
+                        env = dict(os.environ if env is None else env,
+                                   RUFFLE_COMPUTE_FILTERS='1' if label == 'candidate' else '0')
+                    elif args.filter_cache:
+                        env = dict(os.environ if env is None else env, RUFFLE_COMPUTE_FILTERS='0',
+                                   RUFFLE_FILTER_CACHE_TRANSFER=({'transfer': '1', 'direct': 'direct'}[args.filter_cache]
+                                                                if label == 'candidate' else '0'))
+                    elif args.compare_bitmap_bindings or args.compare_bitmap_layers:
+                        env = dict(os.environ if env is None else env,
+                                   RUFFLE_BITMAP_BINDINGS=metadata['bitmapBindings'][label])
+                    elif args.compare_bitmap_draw:
+                        env = dict(os.environ if env is None else env,
+                                   RUFFLE_BITMAP_DRAW=metadata['bitmapDraw'][label])
                     subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=3600, env=env)
                 runs[label].append(summarize(path))
             print(f'{case}: pair {pair+1}/{args.pairs} complete', flush=True)
-        report[case] = {'runs':runs, 'comparison': compare(runs['baseline'], runs['candidate'], args.phase, args.control)}
+        if args.filter_cache:
+            comparison = compare_filter_cache(runs['baseline'], runs['candidate'], args.phase, args.filter_cache)
+        elif args.compare_compute_filters:
+            comparison = compare_filter_paths(runs['baseline'], runs['candidate'], args.phase)
+        elif args.compare_bitmap_bindings or args.compare_bitmap_layers:
+            comparison = compare_bitmap_paths(runs['baseline'], runs['candidate'], args.phase,
+                                              metadata['bitmapBindings']['candidate'])
+        elif args.compare_bitmap_draw:
+            comparison = compare_bitmap_draws(runs['baseline'], runs['candidate'], args.phase,
+                                              args.compare_bitmap_draw)
+        else:
+            comparison = compare(runs['baseline'], runs['candidate'], args.phase, args.control)
+        report[case] = {'runs':runs, 'comparison': comparison}
         (args.output/'summary.json').write_text(json.dumps(report,indent=2)+'\n')
 
 

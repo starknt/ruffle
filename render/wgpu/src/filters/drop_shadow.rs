@@ -23,12 +23,13 @@ impl DropShadowFilter {
         filter: &DropShadowFilterArgs,
         blur_filter: &BlurFilter,
         glow_filter: &GlowFilter,
+        destination: Option<FilterSource<'_>>,
     ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
         let distance = filter.distance.to_f32();
         let angle = filter.angle.to_f32();
         let x = angle.cos() * distance;
         let y = angle.sin() * distance;
-        Ok(glow_filter.apply(
+        glow_filter.apply(
             descriptors,
             texture_pool,
             draw_encoder,
@@ -37,6 +38,7 @@ impl DropShadowFilter {
             &filter.inner_glow_filter(),
             blur_filter,
             (-x, -y),
-        )?)
+            destination,
+        )
     }
 }

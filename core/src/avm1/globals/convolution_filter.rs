@@ -23,7 +23,7 @@ struct ConvolutionFilterData {
 
 impl ConvolutionFilterData {
     fn resize_matrix(&self) {
-        let new_len = (self.matrix_x.get() * self.matrix_y.get()) as usize;
+        let new_len = usize::from(self.matrix_x.get()) * usize::from(self.matrix_y.get());
         let mut matrix = self.matrix.borrow_mut();
         if new_len > matrix.len() {
             matrix.resize(new_len, 0.0);

@@ -9,7 +9,15 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use wgpu::Backend;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FilterCacheWriteback {
+    Draw,
+    Transfer,
+    FilterOutput,
+}
+
 pub struct Descriptors {
+    _progress: Arc<crate::gpu_runtime::GpuProgress>,
     pub runtime: crate::gpu_runtime::GpuRuntime,
     pub wgpu_instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -18,6 +26,9 @@ pub struct Descriptors {
     pub descriptor_owner: crate::gpu_runtime::ResourceOwner,
     pub(crate) persistent_device: crate::gpu_resources::Device,
     pub limits: wgpu::Limits,
+    pub capabilities: crate::capabilities::NativeCapabilities,
+    pub(crate) compute_filters: bool,
+    pub(crate) filter_cache_writeback: FilterCacheWriteback,
     pub backend: Backend,
     pub queue: crate::gpu_resources::Queue,
     pub bitmap_samplers: BitmapSamplers,
@@ -29,6 +40,8 @@ pub struct Descriptors {
     pub(crate) pbj_programs: crate::pixel_bender::Programs,
     pipelines: Mutex<FnvHashMap<(u32, wgpu::TextureFormat), Arc<Pipelines>>>,
     pub filters: Filters,
+    pub(crate) bitmap_draw: crate::capabilities::BitmapDraw,
+    pub(crate) bitmap_indirect: crate::surface::indirect::Pipeline,
     pub(crate) bitmap_batches: crate::bitmap_batch::BitmapBatchCache,
     pub(crate) direct_bitmap_blends: bool,
     pub(crate) blend_inputs: Option<Arc<crate::blend_inputs::BlendInputs>>,
@@ -82,18 +95,36 @@ impl Descriptors {
         let device = device.with_owner(runtime.issue_owner(crate::gpu_runtime::OwnerKind::Scene)?);
         let queue = device.queue();
         let limits = device.limits();
-        let bind_layouts = BindLayouts::new(&persistent_device)?;
+        device.configure_coverage(&adapter);
+        let capabilities = crate::capabilities::NativeCapabilities::granted(&adapter, &device);
+        use crate::capabilities::BitmapBindings;
+        let bindings = match BitmapBindings::requested() {
+            BitmapBindings::Array if BitmapBindings::supported(device.features(), &limits) => {
+                BitmapBindings::Array
+            }
+            BitmapBindings::Layers
+                if limits.max_texture_array_layers
+                    >= crate::layouts::BITMAP_BATCH_TEXTURES as u32 =>
+            {
+                BitmapBindings::Layers
+            }
+            _ => BitmapBindings::Explicit,
+        };
+        let bind_layouts = BindLayouts::new(&persistent_device, bindings)?;
         let bitmap_samplers = BitmapSamplers::new(&persistent_device)?;
-        let shaders = Shaders::new(&persistent_device)?;
+        let shaders = Shaders::new(&persistent_device, bindings)?;
         let quad = Quad::new(&persistent_device)?;
         let filters = Filters::new(&persistent_device)?;
         let backend = adapter.get_info().backend;
 
         runtime.check_health()?;
         let materials = crate::material_cache::MaterialCache::new(&runtime, 128);
-        let bitmap_batches = crate::bitmap_batch::BitmapBatchCache::new(&runtime);
+        let bitmap_batches = crate::bitmap_batch::BitmapBatchCache::new(&runtime, bindings);
         Ok(Self {
             pbj_programs: Default::default(),
+            _progress: runtime.progress_owner(&device)?,
+            bitmap_draw: crate::capabilities::BitmapDraw::granted(&adapter, &device),
+            bitmap_indirect: Default::default(),
             bitmap_batches,
             direct_bitmap_blends: std::env::var_os("RUFFLE_DIRECT_BITMAP_BLENDS").as_deref()
                 == Some(std::ffi::OsStr::new("1")),
@@ -108,6 +139,14 @@ impl Descriptors {
             descriptor_owner,
             persistent_device,
             limits,
+            capabilities,
+            compute_filters: capabilities.compute_rgba8
+                && crate::capabilities::compute_filters_requested(),
+            filter_cache_writeback: match std::env::var("RUFFLE_FILTER_CACHE_TRANSFER").as_deref() {
+                Ok("1") => FilterCacheWriteback::Transfer,
+                Ok("direct") => FilterCacheWriteback::FilterOutput,
+                _ => FilterCacheWriteback::Draw,
+            },
             backend,
             queue,
             bitmap_samplers,

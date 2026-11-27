@@ -1,0 +1,6 @@
+viewport 105 73
+draw 99 69 mismatches 0
+copy 37 27 mismatches 0
+pixel and hit ff00ff00 true false
+Stage3D scissor 83 61 mismatches 0
+drawToBitmapData 89 67 mismatches 0

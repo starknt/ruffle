@@ -11,6 +11,7 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+crossbeam-channel.workspace = true
 wgpu = { workspace = true, features = ["naga-ir", "serde"] }
 tracing = { workspace = true }
 ruffle_render = { path = "..", features = ["tessellator", "wgpu"] }

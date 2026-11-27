@@ -1691,7 +1691,12 @@ fn render_base_inner<'gc>(
         None
     };
 
-    let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
+    let use_cache = if context.use_bitmap_cache {
+        this.is_bitmap_cached()
+    } else {
+        !this.filters().is_empty()
+    };
+    let cache_info = if use_cache {
         if !context.is_offscreen
             && let Some(cache) = context.snapshots.as_deref_mut()
         {
@@ -1699,10 +1704,11 @@ fn render_base_inner<'gc>(
         }
         let mut cache_info: Option<DrawCacheInfo> = None;
         let base_transform = context.transform_stack.transform();
+        let view_matrix = context.filter_view_matrix();
         let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
             &base_transform.matrix,
             false, // we want to do the filter growth for this object ourselves, to know the offsets
-            &context.stage.view_matrix(),
+            &view_matrix,
         );
         let swf_version = this.swf_version();
         let base = this.base();
@@ -1713,6 +1719,14 @@ fn render_base_inner<'gc>(
             filters: source_filters,
             ..
         } = &mut *storage;
+        // Draw-local filters must not read or replace a raster retained by the stage.
+        let mut local_cache;
+        let cache = if context.use_bitmap_cache {
+            cache.as_mut()
+        } else {
+            local_cache = BitmapCache::default();
+            Some(&mut local_cache)
+        };
         if let Some(cache) = cache {
             let revision = context.renderer.display_sampling_revision();
             if revision != cache.display_sampling_revision {
@@ -1725,8 +1739,7 @@ fn render_base_inner<'gc>(
             if width <= u16::MAX as f64 && height <= u16::MAX as f64 {
                 let width = width as u32;
                 let height = height as u32;
-                let stage_matrix = context.stage.view_matrix();
-                let filter_space = (filter_revision, [stage_matrix.a, stage_matrix.d]);
+                let filter_space = (filter_revision, [view_matrix.a, view_matrix.d]);
                 if !source_filters.is_empty() && cache.filter_space != Some(filter_space) {
                     cache.make_dirty();
                     cache.filter_space = Some(filter_space);
@@ -1751,8 +1764,8 @@ fn render_base_inner<'gc>(
                         y_max: Twips::from_pixels_i32(height as i32),
                     };
                     for filter in &mut filters {
-                        // Scaling is done by *stage view matrix* only, nothing in-between
-                        filter.scale(stage_matrix.a, stage_matrix.d);
+                        // Intermediate display transforms affect the geometry, not the filter size.
+                        filter.scale(view_matrix.a, view_matrix.d);
                         filter_rect = filter.calculate_dest_rect(filter_rect);
                     }
                     let filter_rect = Rectangle {
@@ -1844,7 +1857,7 @@ fn render_base_inner<'gc>(
                 ui: context.ui,
                 transform_stack: &mut transform_stack,
                 is_offscreen: true,
-                use_bitmap_cache: true,
+                use_bitmap_cache: context.use_bitmap_cache,
                 stage: context.stage,
             };
             this.render_self(&mut offscreen_context);
@@ -1858,7 +1871,9 @@ fn render_base_inner<'gc>(
             ruffle_render::profile::work(|w| w.cache_hits += 1);
         }
 
-        if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
+        if context.use_bitmap_cache
+            && let Some(cache) = &mut *this.base().bitmap_cache_mut()
+        {
             cache.finish_frame(context.renderer);
         }
 
@@ -1894,7 +1909,7 @@ fn render_base_inner<'gc>(
             let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
                 &context.transform_stack.transform().matrix,
                 true,
-                &context.stage.view_matrix(),
+                &context.filter_view_matrix(),
             );
             context
                 .commands
@@ -2285,7 +2300,7 @@ pub trait TDisplayObject<'gc>:
     /// without applying the translation of this object's own scroll rect.
     #[no_dynamic]
     fn local_to_global_matrix_without_own_scroll_rect(self) -> Matrix {
-        snapshot::bounds::world(self.into(), || {
+        snapshot::bounds::world(self, || {
             ruffle_render::profile::work(|w| w.world_matrix_builds += 1);
             let mut node = self.parent();
             let mut matrix = self.base().matrix();
@@ -3402,7 +3417,7 @@ pub trait TDisplayObject<'gc>:
         if this.scroll_rect.replace(rect) != rect {
             // AS observes the previous scroll until pre_render commits the new one.
             this.snapshots.changed(snapshot::Change::TRANSFORM);
-            let mut current: Option<DisplayObject<'gc>> = Some(self.into());
+            let mut current: Option<DisplayObject<'gc>> = Some(self);
             while let Some(object) = current {
                 if !object.base().snapshots.invalidate_bounds() {
                     break;
@@ -3795,7 +3810,7 @@ pub trait TDisplayObject<'gc>:
     /// If this object or any ancestor is marked as cacheAsBitmap, it will invalidate that cache.
     #[no_dynamic]
     fn invalidate_cached_bitmap(self) {
-        invalidate_bitmap(self.into(), snapshot::Change::VISUAL);
+        invalidate_bitmap(self, snapshot::Change::VISUAL);
     }
 
     /// Retrieve a named property from the AVM1 object.

@@ -58,6 +58,7 @@ pub enum ObjectEncoding {
 #[derive(Debug)]
 enum Storage {
     Owned(Vec<u8>),
+    Frozen(bytes::Bytes),
     Movie(std::sync::Arc<ruffle_common::tag_utils::MovieBytes>),
     Private(ruffle_common::tag_utils::PrivatePages, usize),
 }
@@ -65,6 +66,7 @@ impl Clone for Storage {
     fn clone(&self) -> Self {
         match self {
             Self::Movie(m) => Self::Movie(m.clone()),
+            Self::Frozen(bytes) => Self::Frozen(bytes.clone()),
             s => Self::Owned(s.to_vec()),
         }
     }
@@ -74,6 +76,7 @@ impl std::ops::Deref for Storage {
     fn deref(&self) -> &[u8] {
         match self {
             Self::Owned(v) => v,
+            Self::Frozen(bytes) => bytes,
             Self::Movie(m) => m.file(),
             Self::Private(p, n) => &p[..*n],
         }
@@ -81,6 +84,9 @@ impl std::ops::Deref for Storage {
 }
 impl std::ops::DerefMut for Storage {
     fn deref_mut(&mut self) -> &mut [u8] {
+        if let Self::Frozen(bytes) = self {
+            *self = Self::Owned(std::mem::take(bytes).into());
+        }
         if let Self::Movie(m) = self {
             ruffle_render::profile::loader_bytes(2, m.file().len());
             *self = match m.private_pages() {
@@ -98,7 +104,31 @@ impl std::ops::DerefMut for Storage {
         }
     }
 }
+impl AsRef<[u8]> for Storage {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
 impl Storage {
+    /// Capture the complete value without changing the AS cursor. Mutation of
+    /// either side detaches it from the other pending loads of the same value.
+    fn snapshot(&mut self) -> bytes::Bytes {
+        // Loader.loadBytes charges the visible length of the snapshot.
+        let frozen = match self {
+            Self::Frozen(bytes) => return bytes.clone(),
+            Self::Movie(movie) if movie.file_capacity() == movie.file().len() => {
+                return bytes::Bytes::from_owner(Self::Movie(movie.clone()));
+            }
+            Self::Owned(bytes) => std::mem::take(bytes).into_boxed_slice().into(),
+            Self::Private(pages, len) if *len == pages.len() => {
+                bytes::Bytes::from_owner(std::mem::replace(self, Self::Owned(Vec::new())))
+            }
+            Self::Movie(_) | Self::Private(..) => bytes::Bytes::copy_from_slice(self),
+        };
+        *self = Self::Frozen(frozen.clone());
+        frozen
+    }
+
     fn resize(&mut self, n: usize, fill: u8) {
         if n == self.len() {
             return;
@@ -420,6 +450,10 @@ impl ByteArrayStorage {
     }
 
     #[inline]
+    pub fn snapshot(&mut self) -> bytes::Bytes {
+        self.bytes.snapshot()
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -566,8 +600,78 @@ impl_read!(read_float read_float_at 4; f32, read_double read_double_at 8; f64, r
 
 #[cfg(test)]
 mod shared_movie_tests {
-    use super::Storage;
-    use ruffle_common::tag_utils::SwfMovieData;
+    use super::{ByteArrayStorage, Storage};
+    use crate::player::PlayerBuilder;
+    use ruffle_common::tag_utils::{MovieBytes, SwfMovieData};
+    use std::sync::Arc;
+
+    const PNG: &[u8] = include_bytes!("../../../tests/tests/swfs/avm2/loader_load/test.png");
+
+    #[test]
+    fn shortened_owned_snapshot_retains_only_the_visible_bytes() {
+        let player = PlayerBuilder::new().build();
+        player.lock().unwrap().mutate_with_update_context(|uc| {
+            let mut array = ByteArrayStorage::new(uc);
+            array.set_length(4 * 1024 * 1024);
+            array.set_length(PNG.len());
+            array.write_bytes(PNG).unwrap();
+            let snapshot = array.snapshot();
+            assert_eq!(array.position(), PNG.len());
+            assert_eq!(array.snapshot().as_ptr(), snapshot.as_ptr());
+            array.set(0, 0);
+            assert_eq!(snapshot.as_ref(), PNG);
+            assert_eq!(snapshot.try_into_mut().unwrap().capacity(), PNG.len());
+        });
+    }
+
+    #[test]
+    fn shared_heap_snapshot_releases_oversized_backing() {
+        let mut file = Vec::with_capacity(4 * 1024 * 1024);
+        file.extend_from_slice(PNG);
+        let source = Arc::new(MovieBytes::from(file));
+        let backing = Arc::downgrade(&source);
+        let player = PlayerBuilder::new().build();
+        player.lock().unwrap().mutate_with_update_context(|uc| {
+            let mut array = ByteArrayStorage::new(uc);
+            array.set_shared_movie(source);
+            let snapshot = array.snapshot();
+            drop(array);
+            assert_eq!(snapshot.as_ref(), PNG);
+            assert!(backing.upgrade().is_none());
+        });
+    }
+
+    #[test]
+    fn private_snapshot_shares_full_mapping_and_detaches_shortened_mapping() {
+        let movie = SwfMovieData::from_data(
+            include_bytes!("../../../tests/tests/swfs/avm2/stage3d_bitmap/test.swf"),
+            "file:///mapped.swf".into(),
+            None,
+            None,
+        )
+        .unwrap()
+        .with_shared_bytes(true);
+        let source = movie.shared_file().unwrap();
+        assert!(source.private_pages().is_some());
+        let player = PlayerBuilder::new().build();
+        player.lock().unwrap().mutate_with_update_context(|uc| {
+            let mut array = ByteArrayStorage::new(uc);
+            array.set_shared_movie(source.clone());
+            assert_eq!(array.snapshot().as_ptr(), source.file().as_ptr());
+            array.set(0, source.file()[0]);
+            let full_mapping = array.bytes().as_ptr();
+            assert_eq!(array.snapshot().as_ptr(), full_mapping);
+
+            array.set_shared_movie(source);
+            array.set_length(PNG.len());
+            array.write_at(PNG, 0).unwrap();
+            let shortened_mapping = array.bytes().as_ptr();
+            let snapshot = array.snapshot();
+            assert_ne!(snapshot.as_ptr(), shortened_mapping);
+            array.set(0, 0);
+            assert_eq!(snapshot.as_ref(), PNG);
+        });
+    }
     #[test]
     fn writing_one_loader_info_array_never_changes_the_movie_or_another_array() {
         // A complete FWS large enough to exercise private page mappings on native builds.
@@ -598,5 +702,20 @@ mod shared_movie_tests {
         left.resize(2 * fws.len(), 0);
         assert_eq!(&left[..3], b"FWS");
         assert_eq!(right.len(), fws.len());
+    }
+    #[test]
+    fn load_bytes_snapshots_share_the_callers_allocation_until_a_write() {
+        let original = vec![7; 256 * 1024];
+        let address = original.as_ptr();
+        let mut bytes = Storage::Owned(original);
+        let first = bytes.snapshot();
+        let second = bytes.snapshot();
+        assert_eq!(address, first.as_ptr());
+        assert_eq!(first.as_ptr(), second.as_ptr());
+        bytes[0] = 23;
+        bytes.resize(1, 0);
+        assert_eq!(first.len(), 256 * 1024);
+        assert_eq!(second[0], 7);
+        assert_eq!(&*bytes, &[23]);
     }
 }

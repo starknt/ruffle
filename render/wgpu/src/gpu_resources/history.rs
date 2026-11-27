@@ -183,8 +183,17 @@ impl Recipe {
             ));
         }
 
+        let kernel_stage = match &self.pipeline {
+            Pipeline::Compute(stage) => Some(stage),
+            Pipeline::Render {
+                vertex,
+                fragment: Some((fragment, _)),
+                ..
+            } if vertex.module == fragment.module => Some(vertex),
+            _ => None,
+        };
         if self.family == Family::Upscale
-            && let Pipeline::Compute(stage) = &self.pipeline
+            && let Some(stage) = kernel_stage
             && let Some(layout) = &self.layout
             && let [Some(group)] = layout.groups.as_slice()
             && let Some(kernel) = sources.kernels.get(&(stage.module, *group))
@@ -353,8 +362,9 @@ impl Available {
                 recipe.compile(
                     d,
                     &Inputs {
+                        fragment: matches!(recipe.pipeline, Pipeline::Render { .. })
+                            .then(|| shader.clone()),
                         vertex: shader,
-                        fragment: None,
                         groups: vec![Some(group)],
                     },
                 )
@@ -912,7 +922,9 @@ impl History {
             warm: obs.warm_epoch == Some(self.epoch.load(Ordering::Acquire)),
             recipe: obs.recipe.clone(),
             uses: 0,
-            first: crate::pipeline_profile::current_frame().map_or(0, |f| f.frame_id),
+            first: crate::pipeline_profile::current_frame()
+                .and_then(|f| f.packet_id.or(f.frame_id))
+                .unwrap_or(0),
             ns: obs.ns,
         });
         if e.uses == 0 && obs.warm_epoch == Some(self.epoch.load(Ordering::Acquire)) {

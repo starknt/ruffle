@@ -13,8 +13,23 @@ pub trait RenderTargetFrame: Debug {
     fn view(&self) -> &crate::gpu_resources::TextureView;
 }
 
+/// Identity assigned by a host that reserves output images before stage extraction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameReservation {
+    pub packet_id: u64,
+    pub sample_id: Option<u32>,
+    pub window_generation: u64,
+    pub pool_generation: u64,
+    pub slot: usize,
+    pub lease: u64,
+}
+
 pub trait RenderTarget: Debug + 'static {
     type Frame: RenderTargetFrame;
+
+    fn frame_reservation(&self) -> Option<FrameReservation> {
+        None
+    }
 
     fn resize(
         &mut self,
@@ -22,6 +37,16 @@ pub trait RenderTarget: Debug + 'static {
         width: u32,
         height: u32,
     ) -> Result<(), Error>;
+
+    /// Replace the stage generation even when its rounded texture size is unchanged.
+    fn replace_stage(
+        &mut self,
+        device: &crate::gpu_resources::Device,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error> {
+        self.resize(device, width, height)
+    }
 
     fn format(&self) -> wgpu::TextureFormat;
 
@@ -34,6 +59,25 @@ pub trait RenderTarget: Debug + 'static {
     /// may attempt to recreate the swap chain via [`RenderTarget::resize`].
     fn get_next_texture(&mut self) -> Result<Option<Self::Frame>, Error>;
 
+    /// A native target may transfer the unfinished encoder to its submission
+    /// thread. The returned index always identifies an actual queue submission.
+    fn submit_encoder(
+        &self,
+        device: &crate::gpu_resources::Device,
+        queue: &crate::gpu_resources::Queue,
+        health: &RendererHealth,
+        encoder: crate::gpu_resources::CommandEncoder,
+        frame: Self::Frame,
+    ) -> Result<wgpu::SubmissionIndex, Error> {
+        let commands = {
+            let _timer = ruffle_render::profile::native_time(
+                ruffle_render::profile::NativePhase::EncoderFinish,
+            );
+            encoder.finish()?
+        };
+        self.submit(device, queue, health, [commands], frame)
+    }
+
     fn submit<I: IntoIterator<Item = crate::gpu_resources::CommandBuffer>>(
         &self,
         device: &crate::gpu_resources::Device,
@@ -44,10 +88,131 @@ pub trait RenderTarget: Debug + 'static {
     ) -> Result<wgpu::SubmissionIndex, Error>;
 }
 
+enum Acquisition {
+    Frame(wgpu::SurfaceTexture, bool),
+    Reconfigure,
+    Lost,
+    Skip,
+}
+
+fn surface_acquisition(status: wgpu::CurrentSurfaceTexture) -> Result<Acquisition, Error> {
+    use wgpu::CurrentSurfaceTexture as Status;
+    Ok(match status {
+        Status::Success(frame) => Acquisition::Frame(frame, false),
+        Status::Suboptimal(frame) => Acquisition::Frame(frame, true),
+        Status::Outdated => Acquisition::Reconfigure,
+        Status::Lost => Acquisition::Lost,
+        Status::Timeout | Status::Occluded => Acquisition::Skip,
+        Status::Validation => {
+            return Err(Error::new(
+                RenderFailureKind::Validation,
+                "surface acquisition failed",
+            ));
+        }
+    })
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    #[test]
+    fn a_lost_surface_requests_a_new_window_target_on_a_healthy_device() {
+        assert!(matches!(
+            surface_acquisition(wgpu::CurrentSurfaceTexture::Lost).unwrap(),
+            Acquisition::Lost
+        ));
+        assert!(matches!(
+            surface_acquisition(wgpu::CurrentSurfaceTexture::Outdated).unwrap(),
+            Acquisition::Reconfigure
+        ));
+        assert!(matches!(
+            surface_acquisition(wgpu::CurrentSurfaceTexture::Occluded).unwrap(),
+            Acquisition::Skip
+        ));
+    }
+}
+
+/// A window owns surface recreation. Device health is reported independently.
+#[derive(Debug)]
+pub struct PresentationSurface {
+    surface: Option<wgpu::Surface<'static>>,
+    config: wgpu::SurfaceConfiguration,
+    needs_configure: bool,
+}
+
+impl PresentationSurface {
+    pub fn new(
+        surface: wgpu::Surface<'static>,
+        config: wgpu::SurfaceConfiguration,
+        device: &crate::gpu_resources::Device,
+    ) -> Result<Self, Error> {
+        device.configure_surface(&surface, &config)?;
+        Ok(Self {
+            surface: Some(surface),
+            config,
+            needs_configure: false,
+        })
+    }
+
+    pub fn needs_recreation(&self) -> bool {
+        self.surface.is_none()
+    }
+
+    /// Release the native surface before its platform window is destroyed.
+    pub fn detach(&mut self) {
+        self.surface = None;
+    }
+
+    pub fn config(&self) -> &wgpu::SurfaceConfiguration {
+        &self.config
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.config.width = width;
+        self.config.height = height;
+        self.needs_configure = true;
+    }
+
+    pub fn acquire(
+        &mut self,
+        device: &crate::gpu_resources::Device,
+    ) -> Result<Option<wgpu::SurfaceTexture>, Error> {
+        device.runtime().check_health()?;
+        let Some(surface) = &self.surface else {
+            return Ok(None);
+        };
+        if self.needs_configure {
+            device.configure_surface(surface, &self.config)?;
+            self.needs_configure = false;
+        }
+        self.finish_acquire(surface.get_current_texture())
+    }
+
+    fn finish_acquire(
+        &mut self,
+        status: wgpu::CurrentSurfaceTexture,
+    ) -> Result<Option<wgpu::SurfaceTexture>, Error> {
+        match surface_acquisition(status)? {
+            Acquisition::Frame(frame, suboptimal) => {
+                self.needs_configure = suboptimal;
+                Ok(Some(frame))
+            }
+            Acquisition::Lost => {
+                self.detach();
+                Ok(None)
+            }
+            Acquisition::Reconfigure => {
+                self.needs_configure = true;
+                Ok(None)
+            }
+            Acquisition::Skip => Ok(None),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SwapChainTarget {
-    window_surface: wgpu::Surface<'static>,
-    surface_config: wgpu::SurfaceConfiguration,
+    window_surface: PresentationSurface,
     device: crate::gpu_resources::Device,
 }
 
@@ -68,6 +233,12 @@ impl RenderTargetFrame for SwapChainTargetFrame {
 }
 
 impl SwapChainTarget {
+    /// On a deferred acquisition the owner can supply its current native
+    /// window through `WgpuRenderBackend::recreate_surface_unsafe`.
+    pub fn needs_recreation(&self) -> bool {
+        self.window_surface.needs_recreation()
+    }
+
     pub fn new(
         surface: wgpu::Surface<'static>,
         adapter: &wgpu::Adapter,
@@ -128,10 +299,8 @@ impl SwapChainTarget {
                 vec![format, linear_format]
             },
         };
-        device.configure_surface(&surface, &surface_config)?;
         Ok(Self {
-            surface_config,
-            window_surface: surface,
+            window_surface: PresentationSurface::new(surface, surface_config, device)?,
             device: device.clone(),
         })
     }
@@ -142,57 +311,31 @@ impl RenderTarget for SwapChainTarget {
 
     fn resize(
         &mut self,
-        device: &crate::gpu_resources::Device,
+        _device: &crate::gpu_resources::Device,
         width: u32,
         height: u32,
     ) -> Result<(), Error> {
-        self.surface_config.width = width;
-        self.surface_config.height = height;
-        device.configure_surface(&self.window_surface, &self.surface_config)?;
-
+        self.window_surface.resize(width, height);
         Ok(())
     }
 
     fn format(&self) -> wgpu::TextureFormat {
-        remove_srgb(self.surface_config.format)
+        remove_srgb(self.window_surface.config().format)
     }
 
     fn width(&self) -> u32 {
-        self.surface_config.width
+        self.window_surface.config().width
     }
 
     fn height(&self) -> u32 {
-        self.surface_config.height
+        self.window_surface.config().height
     }
 
     fn get_next_texture(&mut self) -> Result<Option<Self::Frame>, Error> {
-        let texture = match self.window_surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
-            // The texture is still usable - no reason to waste an already
-            // acquired frame. Ideally the surface should also be reconfigured
-            // before the next acquire; we don't currently do that (matching
-            // pre-wgpu-29 behavior, which never checked the suboptimal flag).
-            wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => surface_texture,
-            wgpu::CurrentSurfaceTexture::Lost => {
-                return Err(Error::new(RenderFailureKind::DeviceLost, "surface lost"));
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(Error::new(
-                    RenderFailureKind::Validation,
-                    "surface acquisition failed",
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.device
-                    .configure_surface(&self.window_surface, &self.surface_config)?;
-                return Ok(None);
-            }
-            state => {
-                tracing::debug!("Couldn't acquire surface texture: {:?}", state);
-                return Ok(None);
-            }
+        let Some(texture) = self.window_surface.acquire(&self.device)? else {
+            return Ok(None);
         };
-        let view_format = remove_srgb(self.surface_config.format);
+        let view_format = remove_srgb(self.window_surface.config().format);
 
         let tracked = self.device.import_texture(
             texture.texture.clone(),
@@ -290,6 +433,41 @@ impl TextureTarget {
             format: texture.format(),
             texture,
             buffer: None,
+        }
+    }
+
+    /// Record the requested capture after the stage draw in the same ordering domain.
+    pub fn encode_readback(&self, encoder: &mut crate::gpu_resources::CommandEncoder) {
+        if let Some(TextureBufferInfo { buffer, copy_area }) = &self.buffer {
+            let (buffer, dimensions) = buffer.inner();
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: copy_area.x_min,
+                        y: copy_area.y_min,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(dimensions.padded_bytes_per_row),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: copy_area.width(),
+                    height: copy_area.height(),
+                    depth_or_array_layers: 1,
+                },
+            );
+            ruffle_render::profile::work(|w| {
+                w.copy_bytes += u64::from(copy_area.width()) * u64::from(copy_area.height()) * 4
+            });
         }
     }
 
@@ -430,41 +608,13 @@ impl RenderTarget for TextureTarget {
         _frame: Self::Frame,
     ) -> Result<wgpu::SubmissionIndex, Error> {
         health.check()?;
-        let index = if let Some(TextureBufferInfo { buffer, copy_area }) = &self.buffer {
+        let index = if self.buffer.is_some() {
             let label = create_debug_label!("Render target transfer encoder");
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: label.as_deref(),
             })?;
-            let (buffer, dimensions) = buffer.inner();
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: copy_area.x_min,
-                        y: copy_area.y_min,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(dimensions.padded_bytes_per_row),
-                        rows_per_image: None,
-                    },
-                },
-                wgpu::Extent3d {
-                    width: copy_area.width(),
-                    height: copy_area.height(),
-                    depth_or_array_layers: 1,
-                },
-            );
+            self.encode_readback(&mut encoder);
             let buffer = encoder.finish()?;
-            ruffle_render::profile::work(|w| {
-                w.copy_bytes += u64::from(copy_area.width()) * u64::from(copy_area.height()) * 4
-            });
             let _timer = ruffle_render::profile::native_time(
                 ruffle_render::profile::NativePhase::QueueSubmit,
             );

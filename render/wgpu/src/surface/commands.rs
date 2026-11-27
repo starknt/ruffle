@@ -51,7 +51,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     texture_pool: &'encoder mut TexturePool,
     mask_state: MaskState,
 ) -> Result<Vec<Chunk>, crate::gpu_runtime::RenderFailure> {
-    Ok(WgpuCommandHandler::new(
+    WgpuCommandHandler::new(
         display,
         descriptors,
         staging_belt,
@@ -67,7 +67,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         texture_pool,
         mask_state,
     )
-    .chunk_blends(commands)?)
+    .chunk_blends(commands)
 }
 
 // Exact, immutable solid geometry in the same target-local coordinate system.
@@ -364,6 +364,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             && let Some(prepared) = commands.prepared_draws::<PreparedDraws>()
             && prepared.key == key
         {
+            ruffle_render::profile::work(|w| w.prepared_chunk_hits += 1);
             self.replay_groups(&prepared);
             return;
         }
@@ -414,7 +415,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         smoothing: bool,
         pixel_snapping: PixelSnapping,
         region: PixelRegion,
-    ) -> () {
+    ) {
         if self.descriptors.runtime.check_health().is_err() {
             return;
         }
@@ -513,7 +514,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         }
     }
 
-    fn render_stage3d(&mut self, bitmap: BitmapHandle, mut transform: Transform) -> () {
+    fn render_stage3d(&mut self, bitmap: BitmapHandle, mut transform: Transform) {
         if self.descriptors.runtime.check_health().is_err() {
             return;
         }
@@ -756,7 +757,7 @@ impl WgpuCommandHandler<'_, '_> {
         commands: PlannedList,
         blend_mode: RenderBlendMode,
         region: RenderRect,
-    ) -> () {
+    ) {
         if self.descriptors.runtime.check_health().is_err() {
             return;
         }
@@ -1057,7 +1058,7 @@ impl WgpuCommandHandler<'_, '_> {
         maskee_commands: PlannedList,
         mask_commands: PlannedList,
         region: RenderRect,
-    ) -> () {
+    ) {
         if self.descriptors.runtime.check_health().is_err() {
             return;
         }

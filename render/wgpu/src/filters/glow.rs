@@ -169,6 +169,7 @@ impl GlowFilter {
         filter: &GlowFilterArgs,
         blur_filter: &BlurFilter,
         blur_offset: (f32, f32),
+        destination: Option<FilterSource<'_>>,
     ) -> Result<CommandTarget, crate::gpu_runtime::RenderFailure> {
         let sample_count = source.texture.sample_count();
         let format = source.texture.format();
@@ -180,15 +181,14 @@ impl GlowFilter {
             staging_belt,
             source,
             &filter.inner_blur_filter(),
+            None,
         )?;
-        let blurred_texture = if let Some(blurred) = &blurred {
+        let blurred_view = if let Some(blurred) = &blurred {
             blurred.ensure_cleared(draw_encoder);
-            blurred.color_texture()
+            blurred.color_view()
         } else {
-            source.texture
+            source.view
         };
-        let source_view = source.texture.create_view(&Default::default())?;
-        let blurred_view = blurred_texture.create_view(&Default::default())?;
 
         let target = CommandTarget::new(
             descriptors,
@@ -200,7 +200,12 @@ impl GlowFilter {
             },
             format,
             sample_count,
-            RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
+            match destination.filter(|out| out.texture != source.texture) {
+                Some(out) => {
+                    RenderTargetMode::ExistingWithView(out.view.clone(), wgpu::Color::TRANSPARENT)
+                }
+                None => RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
+            },
             draw_encoder,
         )?;
         staging_belt
@@ -228,7 +233,7 @@ impl GlowFilter {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&source_view),
+                    resource: wgpu::BindingResource::TextureView(source.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -242,7 +247,7 @@ impl GlowFilter {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&blurred_view),
+                    resource: wgpu::BindingResource::TextureView(blurred_view),
                 },
             ],
         })?;
@@ -262,7 +267,7 @@ impl GlowFilter {
         });
         render_pass.set_pipeline(pipeline);
 
-        render_pass.set_bind_group(0, (&filter_group).raw(), &[]);
+        render_pass.set_bind_group(0, filter_group.raw(), &[]);
 
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(

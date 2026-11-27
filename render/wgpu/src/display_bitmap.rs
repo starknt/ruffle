@@ -92,7 +92,8 @@ impl DisplaySample {
                 repeating_nearest: Default::default(),
                 clamped_linear: Default::default(),
                 clamped_nearest: Default::default(),
-                copy_count: Default::default(),
+                access: Default::default(),
+                _lifetime: None,
                 version: Default::default(),
             }),
             uv: [0., 0., 1., 1.],
@@ -119,5 +120,4 @@ pub trait DisplayBitmapEnhancer: std::fmt::Debug + Send + Sync {
         &self,
         encoder: &mut gpu_resources::CommandEncoder,
     ) -> Result<(), RenderFailure>;
-    fn submitted(&self, queue: &wgpu::Queue);
 }

@@ -267,6 +267,11 @@ impl CommandTarget {
                         | wgpu::TextureUsages::COPY_SRC
                         | wgpu::TextureUsages::COPY_DST
                         | wgpu::TextureUsages::TEXTURE_BINDING
+                        | if matches!(render_target_mode, RenderTargetMode::FreshStorage) {
+                            wgpu::TextureUsages::STORAGE_BINDING
+                        } else {
+                            wgpu::TextureUsages::empty()
+                        }
                 },
                 pool,
             )
@@ -593,6 +598,10 @@ impl CommandTarget {
             .as_ref()
             .map(|b| b.view())
             .unwrap_or_else(|| self.frame_buffer.view())
+    }
+
+    pub(super) fn raster_texture(&self) -> &crate::gpu_resources::Texture {
+        self.frame_buffer.texture()
     }
 
     pub fn color_texture(&self) -> &crate::gpu_resources::Texture {

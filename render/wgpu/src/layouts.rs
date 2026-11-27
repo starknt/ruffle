@@ -16,19 +16,33 @@ pub struct BindLayouts {
 }
 
 impl BindLayouts {
-    pub fn new(
+    pub(crate) fn new(
         device: &crate::gpu_resources::Device,
+        bindings: crate::capabilities::BitmapBindings,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
-        let mut batch_entries: Vec<_> = (0..BITMAP_BATCH_TEXTURES as u32)
+        use crate::capabilities::BitmapBindings;
+        let texture_bindings = match bindings {
+            BitmapBindings::Array | BitmapBindings::Layers => 1,
+            _ => BITMAP_BATCH_TEXTURES as u32,
+        };
+        let mut batch_entries: Vec<_> = (0..texture_bindings)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture {
                     multisampled: false,
                     sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
+                    view_dimension: if bindings == BitmapBindings::Layers {
+                        wgpu::TextureViewDimension::D2Array
+                    } else {
+                        wgpu::TextureViewDimension::D2
+                    },
                 },
-                count: None,
+                count: if bindings == BitmapBindings::Array {
+                    std::num::NonZeroU32::new(BITMAP_BATCH_TEXTURES as u32)
+                } else {
+                    None
+                },
             })
             .collect();
         batch_entries.push(wgpu::BindGroupLayoutEntry {

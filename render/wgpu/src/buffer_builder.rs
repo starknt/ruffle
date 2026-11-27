@@ -100,13 +100,11 @@ impl BufferBuilder {
         label: Option<String>,
         usage: wgpu::BufferUsages,
     ) -> Result<crate::gpu_resources::Buffer, crate::gpu_runtime::RenderFailure> {
-        Ok(
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: label.as_deref(),
-                contents: &self.inner,
-                usage,
-            })?,
-        )
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: label.as_deref(),
+            contents: &self.inner,
+            usage,
+        })
     }
 
     /// Append an already aligned immutable section without adding per-item padding.

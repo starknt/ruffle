@@ -30,10 +30,15 @@ work_counters!(
     blend_passes,
     mask_passes,
     filter_passes,
+    compute_filter_passes,
+    filter_cache_draw_copies,
+    filter_cache_transfers,
+    filter_cache_direct_outputs,
     filter_kind_blur,
     filter_kind_glow_shadow,
     filter_kind_bevel,
     filter_kind_color_matrix,
+    filter_kind_convolution,
     filter_kind_displacement,
     filter_kind_pixel_bender,
     filtered_tile_hits,
@@ -50,6 +55,20 @@ work_counters!(
     copy_bytes,
     pipeline_changes,
     material_binds,
+    bitmap_batch_runs,
+    bitmap_binding_array_batches,
+    bitmap_layer_batches,
+    bitmap_indirect_draws,
+    bitmap_cull_batches,
+    bitmap_count_batches,
+    bitmap_batched_instances,
+    bitmap_split_capacity,
+    bitmap_split_sampler,
+    bitmap_split_geometry,
+    bitmap_split_mask,
+    bitmap_split_blend,
+    bitmap_split_command,
+    bitmap_run_chunk_end,
     cache_hits,
     cache_redraws,
     tree_visits,
@@ -85,6 +104,10 @@ work_counters!(
 pub struct GpuSample {
     pub frame: Option<u64>,
     pub nanos: u64,
+    /// End of the stage query on this device's GPU clock, including gaps between frames.
+    pub stage_end_ns: Option<u64>,
+    /// Outermost measured intervals on the device clock. Gaps between roots are not GPU work.
+    pub ranges_ns: Vec<(u64, u64)>,
     /// Inclusive named query durations. Nested names must not be summed as total frame time.
     pub phases: Vec<(String, u64)>,
 }
@@ -99,9 +122,11 @@ pub enum NativePhase {
     QueueThrottle,
     Preparation,
     CommandPreparation,
+    StageCacheEncode,
+    StageSnapshotCapture,
 }
 impl NativePhase {
-    pub const NAMES: [&'static str; 8] = [
+    pub const NAMES: [&'static str; 10] = [
         "encoderFinish",
         "submitLock",
         "queueSubmit",
@@ -110,6 +135,8 @@ impl NativePhase {
         "queueThrottle",
         "preparation",
         "commandPreparation",
+        "stageCacheEncode",
+        "stageSnapshotCapture",
     ];
 }
 
@@ -120,6 +147,30 @@ pub fn work(f: impl FnOnce(&mut RenderWork)) {
             f(&mut metrics.0.borrow_mut().work);
         }
     });
+}
+
+/// Attribute a completed packet's worker counters to its caller's active frame.
+pub fn include_worker(work: RenderWork, timings: &[Timing; NativePhase::NAMES.len()]) {
+    CURRENT.with_borrow(|current| {
+        if let Some(metrics) = current {
+            metrics.0.borrow_mut().include_worker(work, timings);
+        }
+    });
+}
+
+impl Counters {
+    pub fn include_worker(
+        &mut self,
+        work: RenderWork,
+        timings: &[Timing; NativePhase::NAMES.len()],
+    ) {
+        self.work.add(work);
+        for (total, worker) in self.native_timings.iter_mut().zip(timings) {
+            total.samples += worker.samples;
+            total.nanos += worker.nanos;
+            total.max_nanos = total.max_nanos.max(worker.max_nanos);
+        }
+    }
 }
 
 pub struct NativeTimer(Option<(RenderMetrics, NativePhase, Instant)>);
@@ -312,6 +363,11 @@ pub struct Counters {
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct NativeResources {
+    pub in_flight_bytes: u64,
+    pub host_sampling_bytes: u64,
+    pub queued_upload_bytes: u64,
+    pub queued_frame_bytes: u64,
+    pub encoding_payload_bytes: u64,
     pub device_generation: u64,
     pub logical_bytes: u64,
     pub active_bytes: u64,
@@ -424,6 +480,8 @@ pub fn record_gpu(nanos: u64, frame: Option<u64>) {
     record_gpu_sample(GpuSample {
         frame,
         nanos,
+        stage_end_ns: None,
+        ranges_ns: Vec::new(),
         phases: Vec::new(),
     });
 }

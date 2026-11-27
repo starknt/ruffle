@@ -622,10 +622,10 @@ fn apply_filter<'gc>(
 
     let src_min_x = source_rect
         .get(istr!("x"), activation)?
-        .coerce_to_f64(activation)? as u32;
+        .coerce_to_f64(activation)? as i64;
     let src_min_y = source_rect
         .get(istr!("y"), activation)?
-        .coerce_to_f64(activation)? as u32;
+        .coerce_to_f64(activation)? as i64;
     let src_width = source_rect
         .get(istr!("width"), activation)?
         .coerce_to_f64(activation)? as u32;

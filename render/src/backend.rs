@@ -37,6 +37,7 @@ pub trait BitmapCacheLease: Debug {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BitmapUsage {
     Mutable,
+    OpaqueMutable,
     Symbol,
     Excluded,
 }
@@ -120,6 +121,16 @@ pub trait RenderBackend: Any {
         self.register_shape_with_scale(shape.as_ref().into(), bitmap_source, scale)
     }
 
+    /// Encode the draw-local filter caches in dependency order before their consumer.
+    fn render_offscreen_caches(
+        &mut self,
+        _entries: Vec<BitmapCacheEntry>,
+        _quality: StageQuality,
+    ) -> Result<Option<()>, Error> {
+        self.health().check()?;
+        Ok(None)
+    }
+
     fn render_offscreen(
         &mut self,
         handle: BitmapHandle,
@@ -127,6 +138,11 @@ pub trait RenderBackend: Any {
         quality: StageQuality,
         bounds: PixelRegion,
     ) -> Result<Option<Box<dyn SyncHandle>>, Error>;
+
+    /// Submit pending offscreen draws before an independent encoder can overwrite their inputs.
+    fn submit_offscreen_draws(&mut self) -> Result<(), RenderFailure> {
+        self.health().check()
+    }
 
     /// Applies the given filter with a `BitmapHandle` source onto a destination `BitmapHandle`.
     /// The `destination_rect` must be calculated by the caller and is assumed to be correct.
@@ -307,6 +323,37 @@ pub trait RenderBackend: Any {
             region,
             Box::new(|bytes, stride| read(bytes, stride, BitmapFormat::Rgba)),
         )
+    }
+
+    /// Read disjoint regions of one live bitmap version. Each callback starts
+    /// at the first pixel of its region. Other CPU-owned pixels stay untouched.
+    fn read_bitmap_regions_native(
+        &mut self,
+        handle: &BitmapHandle,
+        _bounds: PixelRegion,
+        regions: &[PixelRegion],
+        visit: crate::bitmap::BitmapRegionRead<'_>,
+    ) -> Result<Option<()>, Error> {
+        for &region in regions {
+            let mut result = None;
+            let available = self.read_bitmap_region_native(
+                handle,
+                region,
+                Box::new(|bytes, stride, format| {
+                    result = Some(visit(region, bytes, stride, format));
+                }),
+            )?;
+            if available.is_none() {
+                return Ok(None);
+            }
+            result.ok_or_else(|| {
+                RenderFailure::new(
+                    crate::error::RenderFailureKind::MapFailed,
+                    "bitmap readback returned no pixels",
+                )
+            })??;
+        }
+        Ok(Some(()))
     }
 
     fn resolve_sync_handle_native(

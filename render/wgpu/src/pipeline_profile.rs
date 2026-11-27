@@ -76,7 +76,8 @@ impl fmt::Display for Signature {
 pub struct Frame {
     pub device: u64,
     pub session: u64,
-    pub frame_id: u64,
+    pub frame_id: Option<u64>,
+    pub packet_id: Option<u64>,
 }
 
 thread_local! { static FRAME: Cell<Option<Frame>> = const { Cell::new(None) }; }
@@ -112,10 +113,13 @@ pub struct Counts {
     peak_resident: u64,
     first_use: Option<Frame>,
     creation_samples: Vec<CreationSample>,
+    creation_times_ns: Vec<(u64, u64)>,
+    unlisted_timed_calls: u64,
     unlisted_calls: u64,
 }
 
 pub struct Variant {
+    origin: Instant,
     device: u64,
     counts: Mutex<Counts>,
 }
@@ -131,6 +135,13 @@ impl Variant {
         let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let frame = self.frame();
         let mut c = self.counts.lock();
+        if c.creation_times_ns.len() < 128 {
+            let offset =
+                u64::try_from(start.duration_since(self.origin).as_nanos()).unwrap_or(u64::MAX);
+            c.creation_times_ns.push((offset, ns));
+        } else {
+            c.unlisted_timed_calls += 1;
+        }
         c.creates += 1;
         c.creation_ns = c.creation_ns.saturating_add(ns);
         if let Some(last) = c
@@ -189,10 +200,20 @@ pub(crate) struct ObjectInfo {
     pub instance: Option<Instance>,
 }
 
-#[derive(Default)]
 pub struct Profile {
+    origin: Instant,
     entries: Mutex<BTreeMap<(Family, Kind, Signature), Arc<Variant>>>,
     overflow: std::sync::atomic::AtomicU64,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+            entries: Default::default(),
+            overflow: Default::default(),
+        }
+    }
 }
 
 impl Profile {
@@ -214,6 +235,7 @@ impl Profile {
                 .entry((family, kind, key))
                 .or_insert_with(|| {
                     Arc::new(Variant {
+                        origin: self.origin,
                         device,
                         counts: Default::default(),
                     })
@@ -222,7 +244,7 @@ impl Profile {
         )
     }
 
-    pub fn snapshot(&self, device: u64) -> serde_json::Value {
+    pub fn snapshot(&self, device: u64, at: Instant) -> serde_json::Value {
         let variants: Vec<_> = self
             .entries
             .lock()
@@ -244,6 +266,8 @@ impl Profile {
                 }
             })
             .collect();
-        serde_json::json!({"device":device, "variants":variants, "overflow": self.overflow.load(std::sync::atomic::Ordering::Relaxed)})
+        let age_ns =
+            u64::try_from(at.saturating_duration_since(self.origin).as_nanos()).unwrap_or(u64::MAX);
+        serde_json::json!({"device":device, "profileAgeNs":age_ns, "variants":variants, "overflow": self.overflow.load(std::sync::atomic::Ordering::Relaxed)})
     }
 }

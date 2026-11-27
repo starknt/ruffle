@@ -182,7 +182,9 @@ pub fn send<'gc>(
         // The string needs to end with a null byte.
         data.push(0);
 
-        activation.context.sockets.send(handle, data);
+        if let Some(drain) = activation.context.sockets.send_xml(handle, &mut data) {
+            activation.context.spawn_future(drain);
+        }
     }
 
     Ok(Value::Undefined)

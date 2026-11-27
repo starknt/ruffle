@@ -1,0 +1,6 @@
+[
+  {"type":"ReceiveRepeated","byte":0,"count":8388625},
+  {"type":"Send","payload":[1]},
+  {"type":"Receive","expected":[114,101,116,114,121,32,111,110,99,101]},
+  {"type":"Disconnect"}
+]

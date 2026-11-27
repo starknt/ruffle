@@ -1,0 +1,36 @@
+display full exterior true true
+display full interior true true
+draw halo alone true true
+inner normal interior true
+inner knockout interior true
+inner normal exterior true
+inner knockout exterior true
+inner flat source alpha true true true true
+outer normal interior true
+outer knockout interior true
+outer normal exterior true
+outer knockout exterior true
+outer flat source alpha true true true true
+full normal interior true
+full knockout interior true
+full normal exterior true
+full knockout exterior true
+full flat source alpha true true true true
+translucent source weakens full bevel true
+translucent source masks knockout true true
+180 degrees swaps sides true true
+weaker bevel reduces edge alpha true
+offscreen source casts visible right edge true
+outside destination bounds preserved true
+in-place crop moves both edges true true
+in-place crop preserves distant pixel true
+zero strength middle stop ff00ff00 ff00ff00
+signed gray 1 128 128 127
+signed gray 127 191 128 64
+signed gray 128 192 128 64
+signed gray 192 224 128 32
+signed gray 254 255 128 1
+signed gray 255 255 128 0
+half pixel ramp colors ff00807e ff7f7f00
+empty ramp keeps source ff000000
+empty ramp knockout 0

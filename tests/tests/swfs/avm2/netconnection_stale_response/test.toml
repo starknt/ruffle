@@ -1,0 +1,8 @@
+# The stale-response expectations exercise Ruffle's connection lifetime with a local AMF reply.
+num_ticks = 6
+
+[[compilers]]
+type = "Asc"
+class = "Test"
+scripts = ["Test.as"]
+swf_version = 9

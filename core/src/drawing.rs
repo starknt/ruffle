@@ -248,7 +248,7 @@ impl Drawing {
         if let Some(handle) = self.render_handle.get() {
             return Some(handle.clone());
         }
-        let result = (|| {
+        let result = {
             let mut paths = Vec::with_capacity(self.paths.len());
 
             for path in &self.paths {
@@ -315,7 +315,7 @@ impl Drawing {
                 id: 0,
             };
             renderer.register_shape(shape, self)
-        })();
+        };
         match result {
             Ok(handle) => {
                 let _ = self.render_handle.set(handle.clone());

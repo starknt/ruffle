@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = ["native-tls"]
-cpal = ["dep:cpal", "dep:bytemuck", "ruffle_core/audio"]
+cpal = ["dep:cpal", "dep:bytemuck", "dep:rtrb", "ruffle_core/audio"]
 fs = []
 navigator = ["fs", "dep:async-io", "dep:tokio", "dep:futures"]
 ui = []
@@ -51,6 +51,7 @@ reqwest = { workspace = true, features = [
 ] }
 tokio = { workspace = true, features = ["net", "macros"], optional = true }
 cpal = { workspace = true, optional = true }
+rtrb = { version = "0.4.1", optional = true }
 bytemuck = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

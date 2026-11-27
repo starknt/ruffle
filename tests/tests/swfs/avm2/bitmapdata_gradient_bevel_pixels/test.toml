@@ -1,0 +1,15 @@
+num_ticks = 1
+
+[image_comparisons.output]
+# Adobe Flash Player 32.0.0.465 at the native stage size.
+tolerance = 0
+
+[player_options]
+with_renderer = { optional = false, quality = "high" }
+
+[[compilers]]
+type = "Asc"
+target = "test.swf"
+class = "Test"
+scripts = ["Test.as"]
+swf_version = 43

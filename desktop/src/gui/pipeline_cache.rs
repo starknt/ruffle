@@ -3,7 +3,7 @@ use std::fs::DirBuilder;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 // Bump when standalone player shaders or pipeline layouts change.
-const HOST_ABI: &str = "ruffle-desktop-shaders-layouts-v1";
+const HOST_ABI: &str = "ruffle-desktop-shaders-layouts-v2";
 
 pub(super) fn configure(device: &Device) {
     let (Some(cache), Ok(exe)) = (dirs::cache_dir(), std::env::current_exe()) else {

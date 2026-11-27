@@ -8,6 +8,29 @@ pub enum FilterStep {
     Pointwise(Range<usize>),
     Single(usize),
 }
+
+impl FilterStep {
+    pub fn profile_label(&self, filters: &[Filter]) -> &'static str {
+        let Self::Single(index) = self else {
+            return "ColorMatrixFilter";
+        };
+        filter_label(&filters[*index])
+    }
+}
+pub(crate) fn filter_label(filter: &Filter) -> &'static str {
+    match filter {
+        Filter::BlurFilter(_) => "BlurFilter",
+        Filter::ColorMatrixFilter(_) => "ColorMatrixFilter",
+        Filter::GlowFilter(_) => "GlowFilter",
+        Filter::BevelFilter(_) => "BevelFilter",
+        Filter::DropShadowFilter(_) => "DropShadowFilter",
+        Filter::DisplacementMapFilter(_) => "DisplacementMapFilter",
+        Filter::ConvolutionFilter(_) => "ConvolutionFilter",
+        Filter::GradientGlowFilter(_) => "GradientGlowFilter",
+        Filter::GradientBevelFilter(_) => "GradientBevelFilter",
+        Filter::ShaderFilter(_) => "ShaderFilter",
+    }
+}
 #[derive(Clone, Copy, Debug)]
 enum Sampling {
     Local([i64; 4]),
@@ -89,7 +112,7 @@ pub fn channel_permutation(filter: &swf::ColorMatrixFilter) -> Option<[u32; 3]> 
         return None;
     }
     let mut channels = [0; 3];
-    for (index, row) in filter.matrix[..15].chunks_exact(5).enumerate() {
+    for (index, row) in filter.matrix[..15].as_chunks::<5>().0.iter().enumerate() {
         let channel = row[..3].iter().position(|&value| value == 1.0)?;
         if row
             .iter()

@@ -209,7 +209,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "x11rb",
 ]
 
@@ -4657,6 +4657,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
+name = "rtrb"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5974e397833d890f2f74963408e0d4a6cd8eda2f6a445ae06750291b5d7a997e"
+
+[[package]]
 name = "ruffle_api_report"
 version = "0.1.0"
 source = "git+https://github.com/ruffle-rs/api-report?rev=5d9eab96fa1db90944e51450113c532505e52bd6#5d9eab96fa1db90944e51450113c532505e52bd6"
@@ -4697,6 +4703,7 @@ dependencies = [
  "build_playerglobal",
  "bytemuck",
  "byteorder",
+ "bytes",
  "chardetng",
  "chrono",
  "clap",
@@ -4746,6 +4753,7 @@ dependencies = [
  "smallvec",
  "swf 0.4.0",
  "symphonia",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4822,6 +4830,7 @@ dependencies = [
  "futures-lite",
  "macro_rules_attribute",
  "reqwest",
+ "rtrb",
  "ruffle_core",
  "ruffle_render",
  "tempfile",
@@ -4881,6 +4890,7 @@ dependencies = [
  "approx",
  "byteorder",
  "clap",
+ "crossbeam-channel",
  "enum-map",
  "flate2",
  "gif",
@@ -4914,6 +4924,7 @@ version = "0.7.1"
 dependencies = [
  "bytemuck",
  "clap",
+ "crossbeam-channel",
  "enum-map",
  "fnv",
  "futures",

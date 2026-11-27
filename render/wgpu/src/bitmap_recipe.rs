@@ -30,6 +30,7 @@ pub struct BitmapRecipe {
     pub(crate) detail: Option<crate::display_bitmap::BitmapDetail>,
     state: Mutex<State>,
     resident: OnceLock<Texture>,
+    _lifetime: crate::render_snapshot::ResourceLifetime,
 }
 impl BitmapHandleImpl for BitmapRecipe {
     fn retained_bytes(&self) -> Option<usize> {
@@ -43,24 +44,18 @@ impl BitmapHandleImpl for BitmapRecipe {
     }
 }
 impl BitmapRecipe {
-    #[cfg(test)]
-    pub fn new(pixels: Bitmap<'_>, device: &Device) -> Result<Arc<Self>, RenderFailure> {
-        Self::with_usage(
-            pixels,
-            device,
-            ruffle_render::backend::BitmapUsage::Mutable,
-            None,
-        )
-    }
     pub fn with_usage(
         pixels: Bitmap<'_>,
         device: &Device,
         usage: ruffle_render::backend::BitmapUsage,
         detail: Option<crate::display_bitmap::BitmapDetail>,
+        operations: &crate::render_snapshot::OperationSequence,
     ) -> Result<Arc<Self>, RenderFailure> {
         let owner = device.runtime().issue_owner(OwnerKind::BitmapData)?;
         let (width, height) = (pixels.width(), pixels.height());
+        let lifetime = operations.create_resource()?;
         Ok(Arc::new_cyclic(|weak_self| Self {
+            _lifetime: lifetime,
             owner,
             device_generation: device.runtime().generation(),
             format: pixels.format(),
@@ -272,7 +267,8 @@ impl BitmapRecipe {
                 repeating_nearest: Default::default(),
                 clamped_linear: Default::default(),
                 clamped_nearest: Default::default(),
-                copy_count: Default::default(),
+                access: Default::default(),
+                _lifetime: None,
                 version: Default::default(),
             })
         })?;
@@ -288,7 +284,7 @@ impl BitmapRecipe {
             pending
                 .coverage
                 .for_each(|region| -> Result<(), RenderFailure> {
-                    device.queue().write_texture(
+                    device.queue().write_texture_observed(
                         wgpu::TexelCopyTextureInfo {
                             texture: &texture.texture,
                             mip_level: 0,
@@ -311,6 +307,23 @@ impl BitmapRecipe {
                             width: region.width(),
                             height: region.height(),
                             depth_or_array_layers: 1,
+                        },
+                        |upload_bytes, staging_bytes| {
+                            if let Some(request) = pending.pixels.loader_request() {
+                                tracing::debug!(
+                                    target: "ruffle_loader",
+                                    stage = "gpu_upload",
+                                    session_generation = request.session_generation,
+                                    request_id = request.request_id,
+                                    resource_version = request.resource_version,
+                                    device_generation = self.device_generation,
+                                    bitmap_owner = self.owner.id,
+                                    bitmap_version = version,
+                                    upload_bytes,
+                                    staging_bytes,
+                                    "Loader image uploaded"
+                                );
+                            }
                         },
                     )?;
                     ruffle_render::profile::uploaded(

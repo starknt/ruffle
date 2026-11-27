@@ -124,6 +124,12 @@ impl<'gc> StreamManager<'gc> {
         }
     }
 
+    pub fn close_all(context: &mut UpdateContext<'gc>) {
+        for stream in std::mem::take(&mut context.stream_manager.active_streams) {
+            stream.close(context);
+        }
+    }
+
     /// Process all active media streams.
     ///
     /// This is an unlocked timestep; the `dt` parameter indicates how many
@@ -208,6 +214,9 @@ pub enum NetStreamType {
 #[derive(Clone, Debug, Collect)]
 #[collect(no_drop)]
 pub struct NetStreamSource {
+    #[collect(require_static)]
+    read: RefCell<Option<futures::future::AbortHandle>>,
+
     /// All data currently loaded in the stream.
     buffer: RefCell<Buffer>,
 
@@ -286,6 +295,7 @@ pub struct NetStreamData<'gc> {
 impl Default for NetStreamSource {
     fn default() -> Self {
         Self {
+            read: RefCell::new(None),
             buffer: RefCell::new(Buffer::new()),
             offset: Cell::new(0),
             expected_length: Cell::new(Some(0)),
@@ -359,6 +369,9 @@ impl<'gc> NetStream<'gc> {
     /// Externally visible AVM state must not be reinitialized here - i.e. the
     /// AS3 `client` doesn't go away because you played a new video file.
     fn reset_buffer(self, context: &mut UpdateContext<'gc>) {
+        if let Some(read) = self.source().read.take() {
+            read.abort();
+        }
         if let Some(instance) = self.source().sound_instance.get() {
             // We stop the sound twice because sounds may have either been
             // played through the audio manager or through the backend directly
@@ -476,12 +489,14 @@ impl<'gc> NetStream<'gc> {
     /// This function should be run during stream ticks and *not* called by AVM
     /// code to service seek requests.
     pub fn execute_seek(self, context: &mut UpdateContext<'gc>, offset: f64) {
+        let source = self.source();
         self.trigger_status_event(
             context,
             [("code", "NetStream.Seek.Notify"), ("level", "status")],
         );
-
-        let source = self.source();
+        if !Gc::ptr_eq(source, self.source()) {
+            return;
+        }
 
         // Ensure the container stream type is known before continuing.
         if source.stream_type.borrow().is_none() && !self.sniff_stream_type(context) {
@@ -604,10 +619,10 @@ impl<'gc> NetStream<'gc> {
                 Request::get(name.to_string())
             };
             self.0.url.replace(Some(request.url().to_string()));
-            self.source().preload_offset.set(0);
             self.reset_buffer(context);
-
-            let future = crate::loader::load_netstream(context, self, request);
+            let (read, registration) = futures::future::AbortHandle::new_pair();
+            self.source().read.replace(Some(read));
+            let future = crate::loader::load_netstream(context, self, request, registration);
 
             context.spawn_future(future);
         }
@@ -619,6 +634,12 @@ impl<'gc> NetStream<'gc> {
             context,
             [("code", "NetStream.Play.Start"), ("level", "status")],
         );
+    }
+
+    pub fn close(self, context: &mut UpdateContext<'gc>) {
+        self.reset_buffer(context);
+        self.0.playing.set(false);
+        StreamManager::deactivate(context, self);
     }
 
     /// Pause stream playback.
@@ -1150,6 +1171,9 @@ impl<'gc> NetStream<'gc> {
             // these methods, (e.g. NetStream::play), so we need to avoid holding a borrow
             // while the script data is being handled.
             let _ = self.handle_script_data(avm_object, context, var.name, var.data);
+            if !Gc::ptr_eq(source, self.source()) {
+                return;
+            }
             // Any errors while trying to lookup or call AVM2 properties are silently swallowed.
         }
 
@@ -1194,6 +1218,9 @@ impl<'gc> NetStream<'gc> {
         let seek_offset = source.queued_seek_time.take();
         if let Some(offset) = seek_offset {
             self.execute_seek(context, offset);
+            if !Gc::ptr_eq(source, self.source()) {
+                return;
+            }
         }
 
         // Paused streams deactivate themselves after seek processing.
@@ -1268,6 +1295,9 @@ impl<'gc> NetStream<'gc> {
                     }
                     FlvTagData::Script(script_data) if !is_lookahead_tag => {
                         self.flv_script_tag(context, script_data, tag_needs_preloading);
+                        if !Gc::ptr_eq(source, self.source()) {
+                            return;
+                        }
                     }
                     FlvTagData::Invalid(e) => {
                         tracing::error!("FLV data parsing failed: {}", e)
@@ -1301,6 +1331,9 @@ impl<'gc> NetStream<'gc> {
                 context,
                 [("code", "NetStream.Buffer.Flush"), ("level", "status")],
             );
+            if !Gc::ptr_eq(source, self.source()) {
+                return;
+            }
 
             if is_end_of_video {
                 self.trigger_status_event(
@@ -1316,7 +1349,7 @@ impl<'gc> NetStream<'gc> {
                     [("code", "NetStream.Buffer.Empty"), ("level", "status")],
                 );
 
-                if is_end_of_video {
+                if is_end_of_video && Gc::ptr_eq(source, self.source()) {
                     self.pause(context, false);
                 }
             }

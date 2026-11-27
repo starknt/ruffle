@@ -19,15 +19,18 @@ pub struct Shaders {
     pub alpha_mask_shader: crate::gpu_resources::ShaderModule,
     pub blend_shaders: EnumMap<ComplexBlend, crate::gpu_resources::ShaderModule>,
     pub color_matrix_filter: crate::gpu_resources::ShaderModule,
+    pub convolution_filter: crate::gpu_resources::ShaderModule,
     pub blur_filter: crate::gpu_resources::ShaderModule,
     pub glow_filter: crate::gpu_resources::ShaderModule,
+    pub gradient_glow_filter: crate::gpu_resources::ShaderModule,
     pub bevel_filter: crate::gpu_resources::ShaderModule,
     pub displacement_map_filter: crate::gpu_resources::ShaderModule,
 }
 
 impl Shaders {
-    pub fn new(
+    pub(crate) fn new(
         device: &crate::gpu_resources::Device,
+        bindings: crate::capabilities::BitmapBindings,
     ) -> Result<Self, crate::gpu_runtime::RenderFailure> {
         let max_transforms = transforms_per_draw(&device.limits());
         let color_shader = make_shader(
@@ -42,11 +45,25 @@ impl Shaders {
             include_str!("../shaders/bitmap.wgsl"),
             max_transforms,
         )?;
-        let bitmap_batch_shader = make_shader(
+        use crate::capabilities::BitmapBindings;
+        let bitmap_sampling = match bindings {
+            BitmapBindings::Array => include_str!("../shaders/bitmap_batch_binding_array.wgsl"),
+            BitmapBindings::Layers => include_str!("../shaders/bitmap_batch_layers.wgsl"),
+            _ => include_str!("../shaders/bitmap_batch_explicit.wgsl"),
+        };
+        let bitmap_batch_shader = make_shader_with_extensions(
             device,
             "bitmap_batch.wgsl",
-            include_str!("../shaders/bitmap_batch.wgsl"),
+            &format!(
+                "{bitmap_sampling}\n{}",
+                include_str!("../shaders/bitmap_batch.wgsl")
+            ),
             max_transforms,
+            if bindings == BitmapBindings::Array {
+                "enable wgpu_binding_array;"
+            } else {
+                ""
+            },
         )?;
         let copy_shader = make_shader(
             device,
@@ -59,6 +76,11 @@ impl Shaders {
             "filter/color_matrix.wgsl",
             include_str!("../shaders/filter/color_matrix.wgsl"),
         )?;
+        let convolution_filter = make_filter_shader(
+            device,
+            "filter/convolution.wgsl",
+            include_str!("../shaders/filter/convolution.wgsl"),
+        )?;
         let blur_filter = make_filter_shader(
             device,
             "filter/blur.wgsl",
@@ -68,6 +90,11 @@ impl Shaders {
             device,
             "filter/glow.wgsl",
             include_str!("../shaders/filter/glow.wgsl"),
+        )?;
+        let gradient_glow_filter = make_filter_shader(
+            device,
+            "filter/gradient_glow.wgsl",
+            include_str!("../shaders/filter/gradient_glow.wgsl"),
         )?;
         let bevel_filter = make_filter_shader(
             device,
@@ -113,8 +140,10 @@ impl Shaders {
             alpha_mask_shader,
             blend_shaders,
             color_matrix_filter,
+            convolution_filter,
             blur_filter,
             glow_filter,
+            gradient_glow_filter,
             bevel_filter,
             displacement_map_filter,
         })
@@ -127,21 +156,32 @@ fn make_shader(
     source: &str,
     max_transforms: u64,
 ) -> Result<crate::gpu_resources::ShaderModule, crate::gpu_runtime::RenderFailure> {
+    make_shader_with_extensions(device, name, source, max_transforms, "")
+}
+
+fn make_shader_with_extensions(
+    device: &crate::gpu_resources::Device,
+    name: &str,
+    source: &str,
+    max_transforms: u64,
+    extensions: &str,
+) -> Result<crate::gpu_resources::ShaderModule, crate::gpu_runtime::RenderFailure> {
     let common = include_str!("../shaders/common.wgsl");
-    Ok(device.create_shader_module(wgpu::ShaderModuleDescriptor {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: create_debug_label!("Shader {name}").as_deref(),
         source: wgpu::ShaderSource::Wgsl(
-            format!("{common}\nconst max_transforms = {max_transforms};\n{source}").into(),
+            format!("{extensions}\n{common}\nconst max_transforms = {max_transforms};\n{source}")
+                .into(),
         ),
-    })?)
+    })
 }
 fn make_filter_shader(
     device: &crate::gpu_resources::Device,
     name: &str,
     source: &str,
 ) -> Result<crate::gpu_resources::ShaderModule, crate::gpu_runtime::RenderFailure> {
-    Ok(device.create_shader_module(wgpu::ShaderModuleDescriptor {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: create_debug_label!("Shader {name}").as_deref(),
         source: wgpu::ShaderSource::Wgsl(format!("{SHADER_FILTER_COMMON}\n{source}").into()),
-    })?)
+    })
 }
