@@ -10,7 +10,7 @@ impl Coordinate for Twips {
 }
 
 /// A rectangular region defined by minimum and maximum x- and y-coordinate positions.
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
 pub struct Rectangle<T> {
     /// The minimum x-position of the rectangle.
     pub x_min: T,

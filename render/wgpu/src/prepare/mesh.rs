@@ -6,12 +6,13 @@ use ruffle_render::tessellator::{DrawType, Gradient, Mesh};
 
 #[derive(Clone)]
 pub struct ShapeInput {
+    pub(crate) cache: Option<std::sync::Arc<crate::pipeline_cache::mesh::MeshCache>>,
     pub geometry: std::sync::Arc<ruffle_render::shape_utils::OwnedDistilledShape>,
     pub scale: f32,
     pub bitmap_sizes: Vec<(u16, ruffle_render::bitmap::BitmapSize)>,
 }
-struct Sizes(Vec<(u16, ruffle_render::bitmap::BitmapSize)>);
-impl ruffle_render::bitmap::BitmapSource for Sizes {
+struct Sizes<'a>(&'a [(u16, ruffle_render::bitmap::BitmapSize)]);
+impl ruffle_render::bitmap::BitmapSource for Sizes<'_> {
     fn bitmap_size(&self, id: u16) -> Option<ruffle_render::bitmap::BitmapSize> {
         self.0
             .iter()
@@ -60,9 +61,20 @@ impl ShapeInput {
         tessellator: &mut ruffle_render::tessellator::ShapeTessellator,
         bytes: u64,
     ) -> Result<PreparedMesh, RenderFailure> {
+        if let Some(cache) = &self.cache {
+            cache.prepare(&self, bytes, || self.tessellate(tessellator, bytes))
+        } else {
+            self.tessellate(tessellator, bytes)
+        }
+    }
+    fn tessellate(
+        &self,
+        tessellator: &mut ruffle_render::tessellator::ShapeTessellator,
+        bytes: u64,
+    ) -> Result<PreparedMesh, RenderFailure> {
         let mesh = tessellator.tessellate_shape_with_scale_bounded(
             self.geometry.as_distilled(),
-            &Sizes(self.bitmap_sizes),
+            &Sizes(&self.bitmap_sizes),
             self.scale,
             bytes,
         )?;
@@ -249,6 +261,7 @@ fn native_preparation_rejects_tessellation_output_over_budget_without_partial_me
     use ruffle_render::shape_utils::{DrawCommand, FillRule, OwnedDistilledShape, OwnedDrawPath};
     let point = |x, y| swf::Point::new(swf::Twips::from_pixels(x), swf::Twips::from_pixels(y));
     let input = ShapeInput {
+        cache: None,
         geometry: std::sync::Arc::new(OwnedDistilledShape {
             id: 1,
             shape_bounds: Default::default(),

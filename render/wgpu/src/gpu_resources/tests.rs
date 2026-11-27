@@ -1289,3 +1289,45 @@ fn upload_page_reuse_waits_for_every_unsubmitted_encoder() {
     drop(mapped);
     target.unmap();
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter and RUFFLE_PIPELINE_HISTORY=record"]
+fn changing_presentation_separates_normal_movie_manifests() {
+    let d = device(8 << 20);
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    // SAFETY: this process exclusively owns this private temporary directory.
+    let path = dir.path().join("cache");
+    unsafe {
+        d.enable_pipeline_cache(&path, "test");
+    }
+    let history = d
+        .history()
+        .expect("run with RUFFLE_PIPELINE_HISTORY=record");
+    d.pipeline_history_presentation(|| "off".into());
+    history.begin(&d, 1, b"same movie", "header", "High");
+    let observe = |name: &str| {
+        let o = d
+            .ready_pipeline_history(Family::Compositor, || signature(format_args!("{name}")))
+            .unwrap();
+        d.use_ready_pipeline(&o);
+    };
+    observe("compositor");
+    d.pipeline_history_presentation(|| "FSR".into());
+    observe("upscale");
+    history.end(Some(1));
+    let manifests: Vec<_> = std::fs::read_dir(path)
+        .unwrap()
+        .flatten()
+        .filter(|f| f.path().extension().is_some_and(|x| x == "recipes"))
+        .map(|f| {
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(f.path()).unwrap()).unwrap()
+        })
+        .collect();
+    assert_eq!(manifests.len(), 2);
+    assert!(
+        manifests
+            .iter()
+            .all(|m| m["entries"].as_array().unwrap().len() == 1)
+    );
+    assert_ne!(manifests[0]["identity"], manifests[1]["identity"]);
+}

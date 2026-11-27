@@ -7,7 +7,7 @@ use swf::{CharacterId, FillStyle, LineStyle, Rectangle, Shape, ShapeRecord, Twip
 /// Controls the accuracy of the approximated quadratic curve, when splitting up a cubic curve
 const CUBIC_CURVE_TOLERANCE: f64 = 0.01;
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Hash)]
 pub enum FillRule {
     EvenOdd,
     NonZero,
@@ -139,14 +139,14 @@ pub struct DistilledShape<'a> {
 }
 
 /// Immutable owned geometry for native preparation after display traversal.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct OwnedDistilledShape {
     pub paths: Vec<OwnedDrawPath>,
     pub shape_bounds: Rectangle<Twips>,
     pub edge_bounds: Rectangle<Twips>,
     pub id: CharacterId,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub enum OwnedDrawPath {
     Stroke {
         style: LineStyle,
@@ -252,7 +252,7 @@ impl<'a> From<&'a swf::Shape> for DistilledShape<'a> {
 
 /// `DrawCommands` trace the outline of a path.
 /// Fills follow the even-odd fill rule, with opposite winding for holes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 #[cfg_attr(test, derive(Eq, PartialEq))]
 pub enum DrawCommand {
     MoveTo(swf::Point<Twips>),

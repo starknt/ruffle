@@ -1,4 +1,6 @@
 //! Native CPU preparation on the shared Rayon facility.
+#[cfg(test)]
+mod derived_costs;
 pub mod mesh;
 
 use ruffle_render::error::{RenderFailure, RenderFailureKind, RendererHealth};

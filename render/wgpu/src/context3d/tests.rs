@@ -228,4 +228,26 @@ fn resident_pipeline_survives_agal_specialization_eviction_and_stream_regrouping
     assert!(inputs.set(1, info(&first, Float4, 4)));
     assert_eq!(inputs.streams.len(), 2);
     assert!(Rc::ptr_eq(&inputs.buffers[1], &first));
+    pipeline.update_vertex_buffer_at(inputs.set(1, None));
+    pipeline.update_has_depth_texture(true);
+    pipeline.update_sample_count(4);
+    pipeline.update_target_format(TextureFormat::Bgra8Unorm);
+    pipeline.update_stencil_reference_value(3, 0xff, 0xff);
+    pipeline.rebuild_pipeline(&descriptors, &inputs).unwrap();
+    let aa = pipeline.active().unwrap().0.clone();
+    pipeline.update_stencil_reference_value(9, 0xff, 0xff);
+    pipeline.rebuild_pipeline(&descriptors, &inputs).unwrap();
+    assert_eq!(pipeline.stencil_ref_value(), 9);
+    assert_eq!(aa, *pipeline.active().unwrap().0);
+    pipeline.update_stencil_reference_value(9, 0x0f, 0xf0);
+    pipeline.rebuild_pipeline(&descriptors, &inputs).unwrap();
+    let masked = pipeline.active().unwrap().0.clone();
+    assert_ne!(aa, masked);
+    pipeline.update_sample_count(3);
+    assert!(pipeline.rebuild_pipeline(&descriptors, &inputs).is_err());
+    assert_eq!(masked, *pipeline.active().unwrap().0);
+    pipeline.update_sample_count(4);
+    pipeline.update_stencil_reference_value(1, 0xff, 0xff);
+    pipeline.rebuild_pipeline(&descriptors, &inputs).unwrap();
+    assert_eq!(aa, *pipeline.active().unwrap().0);
 }

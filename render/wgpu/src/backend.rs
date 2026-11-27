@@ -666,6 +666,17 @@ enum WgpuPixelBenderPending {
 }
 
 impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+    fn decode_bitmap_symbol(
+        &self,
+        source: ruffle_render::bitmap::EncodedBitmap<'_>,
+        size: ruffle_render::bitmap::BitmapSize,
+    ) -> Result<ruffle_render::bitmap::Bitmap<'static>, ruffle_render::error::Error> {
+        if let Some(store) = self.descriptors.device.decoded_store() {
+            store.decode(source, size)
+        } else {
+            source.decode()
+        }
+    }
     fn set_movie_pipeline_history(&mut self, data: &[u8], header: &swf::HeaderExt) {
         self.pipeline_session =
             self.descriptors
@@ -775,6 +786,9 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         )?;
 
         self.descriptors.runtime.check_health()?;
+        self.descriptors
+            .device
+            .pipeline_history_quality(self.pipeline_session, quality);
         Ok(())
     }
 
@@ -814,6 +828,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         }
         self.descriptors.runtime.check_health()?;
         Ok(ShapeHandle(Arc::new(crate::shape_recipe::ShapeRecipe {
+            static_definition: Default::default(),
             owner: self
                 .descriptors
                 .runtime
@@ -848,6 +863,11 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             !matches!(fill, swf::FillStyle::Bitmap { .. })
         });
         let handle = self.register_shape_with_scale(shape, bitmap_source, scale)?;
+        if let Some(recipe) =
+            (&*handle.0 as &dyn Any).downcast_ref::<crate::shape_recipe::ShapeRecipe>()
+        {
+            recipe.static_definition.set(true);
+        }
         if movie_independent {
             self.definition_meshes.insert(definition, scale, &handle);
         }

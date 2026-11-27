@@ -18,7 +18,7 @@ use std::{
     },
 };
 
-const SCHEMA: u32 = 3;
+const SCHEMA: u32 = 4;
 const MAX_ENTRIES: usize = 128;
 const MAX_JOBS: usize = 16;
 const MAX_FILE: u64 = 1024 * 1024;
@@ -472,21 +472,21 @@ pub(super) struct Observation {
     recipe: Recipe,
     key: Signature,
     ns: u64,
-    warm_session: Option<u64>,
+    warm_epoch: Option<u64>,
 }
 impl Observation {
-    pub fn new(recipe: Recipe, ns: u64, warm: bool) -> Arc<Self> {
+    pub fn new(recipe: Recipe, ns: u64, warm_epoch: Option<u64>) -> Arc<Self> {
         Arc::new(Self {
             key: recipe.key(),
             recipe,
             ns,
-            warm_session: warm
-                .then(|| crate::pipeline_profile::current_frame().map(|f| f.session))
-                .flatten(),
+            warm_epoch,
         })
     }
 }
 struct Movie {
+    content: [u8; 32],
+    quality: String,
     identity: String,
     session: u64,
     used: BTreeMap<Signature, Entry>,
@@ -525,6 +525,7 @@ pub(super) struct History {
     abi: String,
     consume: bool,
     state: Arc<Mutex<State>>,
+    transition: Mutex<()>,
     epoch: AtomicU64,
     jobs: mpsc::SyncSender<Job>,
 }
@@ -566,6 +567,7 @@ impl History {
             ),
             consume: mode == "1",
             state,
+            transition: Mutex::new(()),
             epoch: AtomicU64::new(0),
             jobs,
         })
@@ -620,17 +622,59 @@ impl History {
         register(&mut self.state.lock().sources.groups, key, group);
         self.schedule(d);
     }
-    pub fn presentation(&self, value: String) {
-        self.state.lock().presentation = value;
+    pub fn presentation(&self, d: &Device, value: String) {
+        let _transition = self.transition.lock();
+        {
+            let mut state = self.state.lock();
+            if state.presentation == value {
+                return;
+            }
+            state.presentation = value;
+        }
+        self.rotate(d, None);
+    }
+    pub fn quality(&self, d: &Device, session: u64, value: String) {
+        let _transition = self.transition.lock();
+        if self
+            .state
+            .lock()
+            .movie
+            .as_ref()
+            .is_some_and(|m| m.session == session && m.quality != value)
+        {
+            self.rotate(d, Some(value));
+        }
+    }
+    fn rotate(&self, d: &Device, quality: Option<String>) {
+        let Some(last) = self.take_movie(None, false) else {
+            return;
+        };
+        let _ = self.write(Self::snapshot(&last));
+        self.start(
+            d,
+            last.session,
+            last.content,
+            quality.unwrap_or(last.quality),
+        );
     }
     pub fn begin(&self, d: &Device, session: u64, content: &[u8], header: &str, quality: &str) {
-        self.end(None);
+        let _transition = self.transition.lock();
+        if let Some(last) = self.take_movie(None, true) {
+            let _ = self.write(Self::snapshot(&last));
+        }
+        let content = Sha256::new()
+            .chain_update(header.as_bytes())
+            .chain_update([0])
+            .chain_update(content)
+            .finalize()
+            .into();
+        self.start(d, session, content, quality.to_owned());
+    }
+    fn start(&self, d: &Device, session: u64, content: [u8; 32], quality: String) {
         let identity = format!(
             "{:x}",
             Sha256::new()
                 .chain_update(self.abi.as_bytes())
-                .chain_update([0])
-                .chain_update(header.as_bytes())
                 .chain_update([0])
                 .chain_update(self.state.lock().presentation.as_bytes())
                 .chain_update([0])
@@ -659,6 +703,8 @@ impl History {
             }
         }
         self.state.lock().movie = Some(Movie {
+            content,
+            quality,
             identity,
             session,
             used: BTreeMap::new(),
@@ -800,7 +846,7 @@ impl History {
                 } else {
                     start.elapsed().as_nanos() as u64
                 },
-                warm,
+                warm.then(|| self.epoch.load(Ordering::Acquire)),
             )
         });
         Ok(p)
@@ -846,7 +892,7 @@ impl History {
                 } else {
                     start.elapsed().as_nanos() as u64
                 },
-                warm,
+                warm.then(|| self.epoch.load(Ordering::Acquire)),
             )
         });
         Ok(p)
@@ -863,13 +909,13 @@ impl History {
             return;
         }
         let e = m.used.entry(obs.key).or_insert_with(|| Entry {
-            warm: obs.warm_session == Some(m.session),
+            warm: obs.warm_epoch == Some(self.epoch.load(Ordering::Acquire)),
             recipe: obs.recipe.clone(),
             uses: 0,
             first: crate::pipeline_profile::current_frame().map_or(0, |f| f.frame_id),
             ns: obs.ns,
         });
-        if e.uses == 0 && obs.warm_session == Some(m.session) {
+        if e.uses == 0 && obs.warm_epoch == Some(self.epoch.load(Ordering::Acquire)) {
             m.warm_uses += 1;
         }
         e.uses = e.uses.saturating_add(1);
@@ -896,18 +942,21 @@ impl History {
         }
     }
     pub fn end(&self, session: Option<u64>) {
-        let last = {
-            let mut state = self.state.lock();
-            if session.is_some_and(|id| state.movie.as_ref().is_none_or(|m| m.session != id)) {
-                return;
-            }
-            self.epoch.fetch_add(1, Ordering::AcqRel);
-            state.sources.agal.clear();
-            state.movie.take()
-        };
-        if let Some(last) = last {
+        let _transition = self.transition.lock();
+        if let Some(last) = self.take_movie(session, true) {
             let _ = self.write(Self::snapshot(&last));
         }
+    }
+    fn take_movie(&self, session: Option<u64>, clear_programs: bool) -> Option<Movie> {
+        let mut state = self.state.lock();
+        if session.is_some_and(|id| state.movie.as_ref().is_none_or(|m| m.session != id)) {
+            return None;
+        }
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        if clear_programs {
+            state.sources.agal.clear();
+        }
+        state.movie.take()
     }
     fn write(&self, mut m: Manifest) -> io::Result<()> {
         if m.entries.is_empty() {

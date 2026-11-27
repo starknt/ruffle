@@ -3910,6 +3910,7 @@ fn native_preparation_parallel_shapes_match_serial_pixels_and_join_before_encodi
                         .downcast_ref::<crate::shape_recipe::ShapeRecipe>()
                         .unwrap();
                     let input = crate::prepare::mesh::ShapeInput {
+                        cache: None,
                         geometry: recipe.geometry.borrow().as_ref().unwrap().clone(),
                         scale: recipe.scale,
                         bitmap_sizes: Vec::new(),
@@ -4230,6 +4231,73 @@ fn equal_pixelbender_programs_share_modules_but_keep_instance_identity() {
     assert_eq!(modules(), first);
     drop(b);
     assert_eq!(modules() + 2, first);
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn identical_shader_jobs_return_their_own_parameter_on_each_synchronous_readback() {
+    use ruffle_render::backend::{PixelBenderOutput, PixelBenderTarget};
+    use ruffle_render::pixel_bender::{
+        Opcode, Operation, PixelBenderParam, PixelBenderParamQualifier, PixelBenderReg,
+        PixelBenderRegChannel::*, PixelBenderRegKind, PixelBenderShader, PixelBenderType,
+        PixelBenderTypeOpcode,
+    };
+    use ruffle_render::pixel_bender_support::PixelBenderShaderArgument;
+    let descriptors = gpu();
+    let target = TextureTarget::new_without_readback(&descriptors.device, (1, 1)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    let reg = |index| PixelBenderReg {
+        index,
+        kind: PixelBenderRegKind::Float,
+        channels: vec![R, G, B, A],
+    };
+    let param = |index, qualifier, name: &str| PixelBenderParam::Normal {
+        qualifier,
+        param_type: PixelBenderTypeOpcode::TFloat4,
+        reg: reg(index),
+        name: name.into(),
+        metadata: vec![],
+    };
+    let shader = PixelBenderShader {
+        name: "job uniforms".into(),
+        version: 1,
+        metadata: vec![],
+        params: vec![
+            param(0, PixelBenderParamQualifier::Input, "color"),
+            param(1, PixelBenderParamQualifier::Output, "dst"),
+        ],
+        operations: vec![Operation::Normal {
+            opcode: Opcode::Mov,
+            dst: reg(1),
+            src: reg(0),
+        }],
+    };
+    let a = renderer.compile_pixelbender_shader(shader.clone()).unwrap();
+    let b = renderer.compile_pixelbender_shader(shader).unwrap();
+    for (instance, value) in [(a.clone(), 0.125_f32), (b, 0.875), (a, 0.25)] {
+        let arg = PixelBenderShaderArgument::ValueInput {
+            index: 0,
+            value: PixelBenderType::TFloat4(value, 0.5, 0.75, 1.),
+        };
+        let PixelBenderOutput::Bytes(bytes) = renderer
+            .run_pixelbender_shader(
+                instance,
+                &[arg],
+                &PixelBenderTarget::Bytes {
+                    width: 1,
+                    height: 1,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("expected synchronous bytes")
+        };
+        let expected: Vec<_> = [value, 0.5, 0.75, 1.]
+            .into_iter()
+            .flat_map(f32::to_ne_bytes)
+            .collect();
+        assert_eq!(bytes, expected);
+    }
 }
 
 #[test]

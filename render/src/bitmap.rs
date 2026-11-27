@@ -51,6 +51,24 @@ pub struct BitmapSize {
     pub height: u32,
 }
 
+/// Immutable compressed input as found in an SWF symbol.
+#[derive(Clone, Copy)]
+pub enum EncodedBitmap<'a> {
+    Jpeg {
+        data: &'a [u8],
+        alpha: Option<&'a [u8]>,
+    },
+    Lossless(&'a swf::DefineBitsLossless<'a>),
+}
+impl EncodedBitmap<'_> {
+    pub fn decode(&self) -> Result<Bitmap<'static>, crate::error::Error> {
+        match self {
+            Self::Jpeg { data, alpha } => crate::utils::decode_define_bits_jpeg(data, *alpha),
+            Self::Lossless(tag) => crate::utils::decode_define_bits_lossless(tag),
+        }
+    }
+}
+
 /// An object that returns a bitmap given an ID.
 ///
 /// This is used by render backends to get the bitmap used in a bitmap fill.

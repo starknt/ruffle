@@ -46,6 +46,7 @@ pub enum ResourceRecipe {
     },
     Shape {
         resource: ResourceVersion,
+        static_definition: bool,
         geometry: Option<Arc<OwnedDistilledShape>>,
         scale: f32,
         bitmap_sizes: Vec<(u16, ruffle_render::bitmap::BitmapSize)>,
@@ -266,6 +267,7 @@ impl Capture {
                     }
                     ResourceRecipe::Shape {
                         resource,
+                        static_definition: shape.static_definition.get(),
                         geometry: shape.geometry.borrow().clone(),
                         scale: shape.scale,
                         bitmap_sizes: shape
@@ -619,16 +621,23 @@ impl PreparedSnapshot {
         let parallel = crate::prepare::parallel_workload(commands, vertices);
         let output_budget =
             (backend.descriptors.runtime.config().staging_limit / 4).clamp(4096, 16 * 1024 * 1024);
+        let mesh_store = backend.descriptors.device.mesh_store().cloned();
         let mut shapes = self.snapshot.recipes.iter().filter_map(|r| match r {
             ResourceRecipe::Shape {
                 resource,
                 geometry: Some(geometry),
                 scale,
+                static_definition,
                 bitmap_sizes,
                 ..
             } => Some((
                 *resource,
                 ShapeInput {
+                    cache: if *static_definition {
+                        mesh_store.clone()
+                    } else {
+                        None
+                    },
                     geometry: geometry.clone(),
                     scale: *scale,
                     bitmap_sizes: bitmap_sizes.clone(),

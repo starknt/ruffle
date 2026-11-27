@@ -25,6 +25,7 @@ impl BitmapSource for FrozenBitmapSource {
 }
 #[derive(Debug)]
 pub struct ShapeRecipe {
+    pub static_definition: std::cell::Cell<bool>,
     pub owner: ResourceOwner,
     pub device_generation: u64,
     pub mesh: OnceCell<Arc<Mesh>>,

@@ -1,5 +1,8 @@
 //! Installation-private storage for native wgpu pipeline cache snapshots.
 
+pub(crate) mod decoded;
+pub(crate) mod derived;
+pub(crate) mod mesh;
 mod writer;
 use futures::FutureExt;
 use sha2::{Digest, Sha256, digest::Output};
@@ -10,7 +13,7 @@ use writer::Writer;
 
 const MAGIC: &[u8; 8] = b"RFLWGPU1";
 // Bump when engine shaders or pipeline layouts change independently of the crate version.
-pub(crate) const ENGINE_ABI: &str = "ruffle-shaders-layouts-v1";
+pub(crate) const ENGINE_ABI: &str = "ruffle-shaders-layouts-v2";
 const MAX_SNAPSHOT: u64 = 64 * 1024 * 1024;
 const HEADER_LEN: usize = 8 + 32 + 8 + 32;
 type Hash = Output<Sha256>;
@@ -213,6 +216,9 @@ impl CacheFile {
     }
 
     fn load(&self) -> io::Result<Vec<u8>> {
+        self.load_bounded(MAX_SNAPSHOT)
+    }
+    fn load_bounded(&self, limit: u64) -> io::Result<Vec<u8>> {
         self.checked_dir()?;
         let mut file = open_private_read(&self.path)?;
         let metadata = file.metadata()?;
@@ -221,7 +227,7 @@ impl CacheFile {
         let len = u64::from_le_bytes(header[40..48].try_into().expect("eight-byte length field"));
         if &header[..8] != MAGIC
             || header[8..40] != self.identity[..]
-            || !(1..=MAX_SNAPSHOT).contains(&len)
+            || !(1..=limit.min(MAX_SNAPSHOT)).contains(&len)
             || metadata.len() != HEADER_LEN as u64 + len
         {
             return Err(ErrorKind::InvalidData.into());

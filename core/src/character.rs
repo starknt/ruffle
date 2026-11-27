@@ -79,7 +79,8 @@ impl<'gc> BitmapCharacter<'gc> {
         if let Some(handle) = self.handle.get() {
             return Ok(handle.clone());
         }
-        let decoded = self.compressed.data.decode()?;
+        let data = &self.compressed.data;
+        let decoded = backend.decode_bitmap_symbol(data.encoded(), data.size())?;
         let new_handle = backend
             .register_bitmap_with_usage(decoded, ruffle_render::backend::BitmapUsage::Symbol)?;
         // FIXME - do we ever want to release this handle, to avoid taking up GPU memory?
@@ -116,17 +117,17 @@ impl CompressedBitmap {
             },
         }
     }
-    pub fn decode(&self) -> Result<RenderBitmap<'static>, RenderError> {
+    pub(crate) fn encoded(&self) -> ruffle_render::bitmap::EncodedBitmap<'_> {
+        use ruffle_render::bitmap::EncodedBitmap;
         match self {
-            CompressedBitmap::Jpeg {
+            Self::Jpeg { data, alpha, .. } => EncodedBitmap::Jpeg {
                 data,
-                alpha,
-                width: _,
-                height: _,
-            } => ruffle_render::utils::decode_define_bits_jpeg(data, alpha.as_deref()),
-            CompressedBitmap::Lossless(define_bits_lossless) => {
-                ruffle_render::utils::decode_define_bits_lossless(define_bits_lossless)
-            }
+                alpha: alpha.as_deref(),
+            },
+            Self::Lossless(tag) => EncodedBitmap::Lossless(tag),
         }
+    }
+    pub fn decode(&self) -> Result<RenderBitmap<'static>, RenderError> {
+        self.encoded().decode()
     }
 }

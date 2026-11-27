@@ -208,6 +208,8 @@ struct DeviceInner {
     pipeline_cache: OnceLock<PipelineCacheState>,
     pipeline_profile: OnceLock<Profile>,
     movie_session: std::sync::atomic::AtomicU64,
+    decoded: OnceLock<Option<crate::pipeline_cache::decoded::Store>>,
+    meshes: OnceLock<Option<Arc<crate::pipeline_cache::mesh::MeshCache>>>,
     history: OnceLock<Option<history::History>>,
     pipeline_compile_stats: parking_lot::Mutex<(u64, u64)>,
     raw: wgpu::Device,
@@ -296,6 +298,8 @@ impl Device {
                 pipeline_cache: Default::default(),
                 pipeline_profile: Default::default(),
                 movie_session: Default::default(),
+                decoded: Default::default(),
+                meshes: Default::default(),
                 history: Default::default(),
                 pipeline_compile_stats: Default::default(),
                 raw,
@@ -357,6 +361,14 @@ impl Device {
     pub unsafe fn enable_pipeline_cache(&self, dir: &Path, host_abi: &str) -> PipelineCacheStatus {
         self.0
             .inner()
+            .meshes
+            .get_or_init(|| crate::pipeline_cache::mesh::MeshCache::from_env(dir).map(Arc::new));
+        self.0
+            .inner()
+            .decoded
+            .get_or_init(|| crate::pipeline_cache::decoded::Store::from_env(dir));
+        self.0
+            .inner()
             .history
             .get_or_init(|| history::History::open(self, dir, host_abi));
         self.0
@@ -369,6 +381,18 @@ impl Device {
             .status()
     }
 
+    pub(crate) fn mesh_store(&self) -> Option<&Arc<crate::pipeline_cache::mesh::MeshCache>> {
+        self.0.inner().meshes.get()?.as_ref()
+    }
+    pub fn static_mesh_cache_stats(&self) -> Option<(u64, u64)> {
+        self.mesh_store().map(|s| s.stats())
+    }
+    pub(crate) fn decoded_store(&self) -> Option<&crate::pipeline_cache::decoded::Store> {
+        self.0.inner().decoded.get()?.as_ref()
+    }
+    pub fn bitmap_decode_cache_stats(&self) -> Option<(u64, u64)> {
+        self.decoded_store().map(|s| s.stats())
+    }
     pub fn register_history_kernel(
         &self,
         name: &'static str,
@@ -384,7 +408,7 @@ impl Device {
     }
     pub fn pipeline_history_presentation(&self, settings: impl FnOnce() -> String) {
         if let Some(h) = self.history() {
-            h.presentation(settings());
+            h.presentation(self, settings());
         }
     }
     /// The native compositor builds its mandatory pipeline while attaching its window.
@@ -397,7 +421,7 @@ impl Device {
             ExternalHistory(history::Observation::new(
                 history::Recipe::ready(family, key()),
                 0,
-                false,
+                None,
             ))
         })
     }
@@ -432,6 +456,15 @@ impl Device {
             );
         }
         session
+    }
+    pub(crate) fn pipeline_history_quality(
+        &self,
+        session: u64,
+        quality: ruffle_render::quality::StageQuality,
+    ) {
+        if let Some(h) = self.history() {
+            h.quality(self, session, format!("{quality:?}"));
+        }
     }
     pub(crate) fn end_movie_session(&self, session: u64) {
         use std::sync::atomic::Ordering;

@@ -27,7 +27,7 @@ impl Coordinate for Twips {
 }
 
 /// A 2D position defined by x and y coordinates.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Point<T: Coordinate> {
     pub x: T,
     pub y: T,

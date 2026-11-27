@@ -753,7 +753,7 @@ pub struct StyleChangeData {
     pub new_styles: Option<ShapeStyles>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum FillStyle {
     Color(Color),
     LinearGradient(Gradient),
@@ -819,7 +819,7 @@ pub struct GradientRecord {
     pub color: Color,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct LineStyle {
     pub(crate) width: Twips,
     pub(crate) fill_style: FillStyle,
@@ -973,7 +973,7 @@ impl Default for LineStyle {
 }
 
 bitflags! {
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
     pub struct LineStyleFlag: u16 {
         // First byte.
         const PIXEL_HINTING = 1 << 0;
