@@ -298,7 +298,9 @@ impl CacheFile {
                 break;
             }
             let active = private_lock(&old.path.with_extension("active"))?;
-            if active.try_lock().is_ok() && old.load().is_ok() {
+            // An idle file in our private snapshot namespace is disposable even if
+            // its payload is corrupt. Recheck the file after taking its active lock.
+            if active.try_lock().is_ok() && open_private_read(&old.path).is_ok() {
                 fs::remove_file(&old.path)?;
                 used = used.saturating_sub(size);
             }
@@ -491,6 +493,33 @@ mod tests {
         assert!(!files[1].path.exists());
         assert_eq!(files[2].load().unwrap(), bytes);
         assert!(dir.join("unrelated.bin").exists());
+    }
+
+    #[test]
+    fn corrupt_inactive_snapshot_cannot_exhaust_another_keys_budget() {
+        let root = private_test_root();
+        let dir = root.path().join("gpu");
+        let old = CacheFile::new(&dir, [10; 32].into()).unwrap();
+        let new = CacheFile::new(&dir, [11; 32].into()).unwrap();
+        let budget = 1024;
+        for size in [3, MAX_SNAPSHOT + 4096] {
+            old.store(b"previous driver").unwrap();
+            File::options()
+                .write(true)
+                .open(&old.path)
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+            let active = private_lock(&old.path.with_extension("active")).unwrap();
+            active.lock_shared().unwrap();
+            let payload = vec![7; (budget - HEADER_LEN as u64) as usize];
+            assert!(new.store_budgeted(&payload, budget).is_err());
+            assert!(old.path.exists());
+            drop(active);
+            new.store_budgeted(&payload, budget).unwrap();
+            assert!(!old.path.exists());
+            assert_eq!(new.load().unwrap(), payload);
+        }
     }
 
     #[test]
