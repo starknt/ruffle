@@ -229,6 +229,18 @@ class NativePerfTest(unittest.TestCase):
         self.assertEqual(row['status'], 'pendingOptimization')
         self.assertEqual(row['pendingOptimizationPairs'], [4, 5])
 
+    def test_memory_comparison_flags_cpu_and_gpu_frame_time_regressions(self):
+        before, after = NativeWgpuAcceptanceTest().paired()
+        keys = ('cpuP95Ms', 'cpuP99Ms', 'gpuP95Ms', 'gpuP99Ms')
+        for index, (baseline, candidate) in enumerate(zip(before, after)):
+            baseline.update(case='memory_soak', **dict.fromkeys(keys, 10))
+            candidate.update(case='memory_soak', **dict.fromkeys(keys, 12 if index < 3 else 8))
+        metrics = compare(before, after, 'gpu')['memoryMetrics']
+        for key in keys:
+            with self.subTest(key=key):
+                self.assertEqual(metrics.get(key, {}).get('status'), 'pendingOptimization')
+                self.assertEqual(metrics[key]['pendingOptimizationPairs'], [1, 2, 3])
+
     def test_named_gpu_phases_remain_inclusive_and_require_every_frame(self):
         with tempfile.TemporaryDirectory() as d:
             path = self.trace(d)

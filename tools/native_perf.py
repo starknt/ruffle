@@ -218,8 +218,9 @@ def compare(baseline, candidate, phase, control=False):
 def compare_memory_metrics(baseline, candidate):
     metrics = {}
     higher_is_better = ('completedFps', 'onePercentLowFps')
-    for key in (*higher_is_better, 'frameIntervalP95Ms', 'gcP99Ms', 'rssMedianBytes',
-                'peakRssBytes', 'gpuLogicalMedianBytes', 'gpuLogicalPeakBytes',
+    for key in (*higher_is_better, 'frameIntervalP95Ms', 'cpuP95Ms', 'cpuP99Ms',
+                'gpuP95Ms', 'gpuP99Ms', 'gcP99Ms', 'rssMedianBytes', 'peakRssBytes',
+                'gpuLogicalMedianBytes', 'gpuLogicalPeakBytes',
                 'gpuAllocatedMedianBytes', 'gpuReservedMedianBytes'):
         before = [run.get(key) for run in baseline]
         after = [run.get(key) for run in candidate]
