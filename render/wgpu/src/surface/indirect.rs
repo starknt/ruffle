@@ -198,7 +198,12 @@ mod tests {
             };
             let mut transform = Transform::default();
             transform.matrix.tx = swf::Twips::from_pixels_i32(x);
-            chunk.add_transform(&transform).unwrap();
+            chunk
+                .add_transform(
+                    &transform,
+                    &crate::surface::buffers::DrawVertices::PosUvQuad,
+                )
+                .unwrap();
         }
         let mut encoder = device.create_command_encoder(&Default::default()).unwrap();
         let mut staging = StagingBelt::new(device.clone(), 65536);

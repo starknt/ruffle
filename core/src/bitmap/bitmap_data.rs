@@ -399,6 +399,10 @@ impl<'gc> BitmapData<'gc> {
         self.0.render(smoothing, context, pixel_snapping);
     }
 
+    pub(crate) fn release_display_texture(&self, context: &crate::context::UpdateContext<'gc>) {
+        self.0.release_display_texture(context);
+    }
+
     pub fn can_read(&self, read_area: PixelRegion) -> bool {
         self.0.can_read(read_area)
     }
@@ -439,6 +443,9 @@ pub struct BitmapRawData<'gc> {
     /// initialization has not yet happened.
     #[collect(require_static)]
     bitmap_handle: Option<BitmapHandle>,
+    // Graphics fills, filters and asynchronous jobs may retain an exported handle.
+    // Later writes must still update the same texture.
+    handle_exported: bool,
 
     #[collect(require_static)]
     loader_request: Option<LoaderRequest>,
@@ -584,6 +591,7 @@ mod wrapper {
                     disposed: true,
                     loader_request: None,
                     bitmap_handle: None,
+                    handle_exported: false,
                     avm2_object: None,
                     display_objects: vec![],
                     validity: BitmapValidity::new(0, 0),
@@ -611,6 +619,7 @@ mod wrapper {
                 disposed: data.disposed,
                 loader_request: None,
                 bitmap_handle: None,
+                handle_exported: false,
                 avm2_object: None,
                 display_objects: vec![],
                 // We have no GPU texture, so there's no need to mark as dirty
@@ -789,8 +798,9 @@ mod wrapper {
             renderer: &mut dyn RenderBackend,
         ) -> Result<BitmapHandle, RenderFailure> {
             let mut bitmap_data = self.0.borrow_mut(gc_context);
-            bitmap_data.update_dirty_texture(renderer)?;
-            bitmap_data.bitmap_handle(renderer)
+            let handle = bitmap_data.update_dirty_texture(renderer)?;
+            bitmap_data.handle_exported = true;
+            Ok(handle)
         }
 
         pub fn mark_gpu_dirty(
@@ -907,9 +917,58 @@ mod wrapper {
             context: &mut RenderContext<'_, 'gc>,
             pixel_snapping: PixelSnapping,
         ) {
+            let mut transform = context.transform_stack.transform();
             let mut inner_bitmap_data = self.0.borrow_mut(context.gc());
-            if inner_bitmap_data.disposed() {
+            let data = &mut *inner_bitmap_data;
+            if data.disposed() {
                 return;
+            }
+            if data.bitmap_handle.is_none()
+                && data.validity.gpu.is_empty()
+                && data.validity.pending.is_none()
+                && data.validity.failure.is_none()
+                && transform.tz == 0.0
+                && transform.perspective_projection.is_none()
+                && context
+                    .renderer
+                    .supports_compact_bitmap(data.width, data.height)
+            {
+                if transform.color_transform == swf::ColorTransform::IDENTITY
+                    && let Some(color) = data.pixels.solid_color()
+                {
+                    pixel_snapping.apply(&mut transform.matrix);
+                    transform.matrix *=
+                        ruffle_render::matrix::Matrix::scale(data.width as f32, data.height as f32);
+                    context
+                        .commands
+                        .draw_bitmap_rect(color.into(), transform.matrix);
+                    return;
+                }
+                if !smoothing {
+                    match data.pixels.nearest_view(context.renderer) {
+                        Ok(Some((handle, [bx, by], region))) => {
+                            pixel_snapping.apply(&mut transform.matrix);
+                            transform.matrix *=
+                                ruffle_render::matrix::Matrix::scale(bx as f32, by as f32);
+                            context.commands.render_bitmap(
+                                handle,
+                                transform,
+                                false,
+                                PixelSnapping::Never,
+                                region,
+                            );
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            context
+                                .renderer
+                                .health()
+                                .record(error.into_render_failure());
+                            return;
+                        }
+                    }
+                }
             }
 
             // Note - we do a CPU -> GPU sync, but we do *not* do a GPU -> CPU sync
@@ -932,27 +991,37 @@ mod wrapper {
             };
             let handle = match view {
                 Some(handle) => handle,
-                None => {
-                    if inner_bitmap_data
-                        .update_dirty_texture(context.renderer)
-                        .is_err()
-                    {
-                        return;
-                    }
-                    match inner_bitmap_data.bitmap_handle(context.renderer) {
-                        Ok(handle) => handle,
-                        Err(_) => return,
-                    }
-                }
+                None => match inner_bitmap_data.update_dirty_texture(context.renderer) {
+                    Ok(handle) => handle,
+                    Err(_) => return,
+                },
             };
 
             context.commands.render_bitmap(
                 handle,
-                context.transform_stack.transform(),
+                transform,
                 smoothing,
                 pixel_snapping,
                 inner_bitmap_data.full_region(),
             );
+        }
+
+        pub fn release_display_texture(&self, context: &crate::context::UpdateContext<'gc>) {
+            use crate::display_object::TDisplayObject;
+            let mut data = self.0.borrow_mut(context.gc());
+            if !data.handle_exported
+                && data.validity.gpu.is_empty()
+                && data.validity.pending.is_none()
+                && data.validity.failure.is_none()
+                && !data
+                    .display_objects
+                    .iter()
+                    .filter_map(|object| object.upgrade(context.gc()))
+                    .any(|object| object.is_on_stage(context))
+            {
+                data.bitmap_handle = None;
+                data.pixels.release_view();
+            }
         }
 
         pub fn can_read(&self, read_area: PixelRegion) -> bool {
@@ -1018,6 +1087,7 @@ impl<'gc> BitmapRawData<'gc> {
             disposed: false,
             loader_request: None,
             bitmap_handle: None,
+            handle_exported: false,
             avm2_object: None,
             display_objects: vec![],
             validity: BitmapValidity::new(width, height),
@@ -1039,6 +1109,7 @@ impl<'gc> BitmapRawData<'gc> {
             transparency,
             loader_request: None,
             bitmap_handle: None,
+            handle_exported: false,
             avm2_object: None,
             disposed: false,
             validity: BitmapValidity::new(width, height),
@@ -1062,7 +1133,7 @@ impl<'gc> BitmapRawData<'gc> {
         self.disposed = true;
     }
 
-    pub fn try_bitmap_handle(
+    fn try_bitmap_handle(
         &mut self,
         renderer: &mut dyn RenderBackend,
     ) -> Result<BitmapHandle, ruffle_render::error::Error> {
@@ -1086,17 +1157,10 @@ impl<'gc> BitmapRawData<'gc> {
         let bitmap_handle = renderer.register_bitmap_with_usage(bitmap, usage);
         if let Ok(ref handle) = bitmap_handle {
             self.validity = BitmapValidity::new(self.width, self.height);
+            self.pixels.release_view();
             self.bitmap_handle = Some(handle.clone());
         }
         bitmap_handle
-    }
-
-    pub fn bitmap_handle(
-        &mut self,
-        renderer: &mut dyn RenderBackend,
-    ) -> Result<BitmapHandle, RenderFailure> {
-        self.try_bitmap_handle(renderer)
-            .map_err(|error| renderer.health().record(error.into_render_failure()))
     }
 
     pub fn transparency(&self) -> bool {
@@ -1190,11 +1254,9 @@ impl<'gc> BitmapRawData<'gc> {
     }
 
     #[inline]
-    pub fn set_pixel32_row_raw(&mut self, x1: u32, x2: u32, y: u32, color: Color) {
-        let p1 = (x1 + y * self.width) as usize;
-        let p2 = (x2 + y * self.width) as usize;
-        let slice = &mut self.pixels[p1..p2];
-        slice.fill(color);
+    pub fn fill_rect(&mut self, region: PixelRegion, color: Color) {
+        self.pixels
+            .fill_rect(self.width, self.height, region, color);
     }
 
     #[inline]
@@ -1217,13 +1279,17 @@ impl<'gc> BitmapRawData<'gc> {
 
     // Updates the data stored with our `BitmapHandle` if this `BitmapRawData`
     // is dirty
-    pub fn update_dirty_texture(
+    pub(crate) fn update_dirty_texture(
         &mut self,
         renderer: &mut dyn RenderBackend,
-    ) -> Result<(), RenderFailure> {
-        renderer.health().check()?;
-        let handle = self.bitmap_handle(renderer)?;
+    ) -> Result<BitmapHandle, RenderFailure> {
         self.validity.check()?;
+        let handle = self
+            .try_bitmap_handle(renderer)
+            .map_err(|error| renderer.health().record(error.into_render_failure()))?;
+        if self.validity.cpu.is_empty() {
+            return Ok(handle);
+        }
         self.validity.cpu.for_each(|region| {
             renderer
                 .update_texture(
@@ -1239,7 +1305,7 @@ impl<'gc> BitmapRawData<'gc> {
                 .map_err(|error| renderer.health().record(error.into_render_failure()))
         })?;
         self.validity.cpu = Coverage::empty(self.width, self.height);
-        Ok(())
+        Ok(handle)
     }
 
     fn inform_display_objects(&self, gc_context: &Mutation<'gc>) {

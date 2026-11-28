@@ -149,6 +149,7 @@ fn slot_command(block: Block) -> Command {
     match block.iter().as_slice() {
         [
             cmd @ (Command::RenderShape { .. }
+            | Command::DrawBitmapRect { .. }
             | Command::DrawRect { .. }
             | Command::DrawLine { .. }
             | Command::DrawLineRect { .. }

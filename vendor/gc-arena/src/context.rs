@@ -281,6 +281,19 @@ impl Context {
         run_until: RunUntil,
         stop: Stop,
     ) {
+        unsafe { self.do_collection_until(root, run_until, stop, || false) }
+    }
+
+    // Same root reachability requirement as do_collection. A yield only happens between
+    // complete collector steps, with the mark and sweep cursors ready for another call.
+    #[deny(unsafe_op_in_unsafe_fn)]
+    pub(crate) unsafe fn do_collection_until<'gc, R: Collect<'gc> + ?Sized>(
+        &mut self,
+        root: &R,
+        run_until: RunUntil,
+        stop: Stop,
+        mut should_yield: impl FnMut() -> bool,
+    ) {
         let mut cx = PhaseGuard::enter(self, None);
 
         if run_until == RunUntil::PayDebt && !(cx.metrics.allocation_debt() > 0.0) {
@@ -346,7 +359,9 @@ impl Context {
                 Phase::Drop => unreachable!(),
             }
 
-            if run_until == RunUntil::PayDebt && !(cx.metrics.allocation_debt() > 0.0) {
+            if (run_until == RunUntil::PayDebt && !(cx.metrics.allocation_debt() > 0.0))
+                || should_yield()
+            {
                 break;
             }
         }

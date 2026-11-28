@@ -1127,6 +1127,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     fn display_sampling_revision(&self) -> u64 {
         self.display_enhancer.as_ref().map_or(0, |e| e.revision())
     }
+    fn supports_compact_bitmap(&self, width: u32, height: u32) -> bool {
+        let max = self.descriptors.limits.max_texture_dimension_2d;
+        (1..=max).contains(&width)
+            && (1..=max).contains(&height)
+            && !self.display_enhancer.as_ref().is_some_and(|e| e.enabled())
+    }
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, BitmapError> {
         self.register_bitmap_with_usage(bitmap, ruffle_render::backend::BitmapUsage::Mutable)
     }

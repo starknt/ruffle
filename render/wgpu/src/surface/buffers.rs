@@ -68,6 +68,7 @@ pub enum DrawVertices<'a> {
     CustomPosUvQuad(&'a [u8]),
     PosUvQuad,
     PosColorQuad,
+    BitmapColorQuad(swf::Color),
     PosQuad,
     Line,
     RectLine,
@@ -146,7 +147,24 @@ impl ChunkBufferBuilder {
         let range = self.transforms.add(bytes)?;
         Ok((range.start / size_of::<Transforms>() as u64) as u32)
     }
-    pub fn add_transform(&mut self, transform: &Transform) -> Result<u32, BufferFull> {
+    pub fn add_transform(
+        &mut self,
+        transform: &Transform,
+        vertices: &DrawVertices<'_>,
+    ) -> Result<u32, BufferFull> {
+        let mult_color = if let DrawVertices::BitmapColorQuad(color) = vertices {
+            // Match the bitmap shader: sample UNORM8, divide by alpha, then
+            // let the color shader premultiply at the original 8-bit alpha.
+            let a = f32::from(color.a) / 255.0;
+            if color.a == 0 {
+                [0.0; 4]
+            } else {
+                let straight = |v| (f32::from(v) / 255.0) / a;
+                [straight(color.r), straight(color.g), straight(color.b), a]
+            }
+        } else {
+            transform.color_transform.mult_rgba_normalized()
+        };
         let instance = Transforms {
             world_matrix: [
                 [transform.matrix.a, transform.matrix.b, 0.0, 0.0],
@@ -159,7 +177,7 @@ impl ChunkBufferBuilder {
                     1.0,
                 ],
             ],
-            mult_color: transform.color_transform.mult_rgba_normalized(),
+            mult_color,
             add_color: transform.color_transform.add_rgba_normalized(),
         };
         let address = self.transforms.add(&[instance])?;
@@ -191,7 +209,7 @@ impl ChunkBufferBuilder {
                 indices: quad.indices_quad.clone(),
                 instances,
             },
-            DrawVertices::PosColorQuad => DrawOffsets {
+            DrawVertices::PosColorQuad | DrawVertices::BitmapColorQuad(_) => DrawOffsets {
                 vertex_buffer: Some(quad.vertex_buffer.clone()),
                 index_buffer: quad.index_buffer.clone(),
                 vertices: quad.vertices_pos_color.clone(),

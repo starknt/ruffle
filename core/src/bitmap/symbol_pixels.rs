@@ -7,7 +7,7 @@ use crate::character::CompressedBitmap;
 use ruffle_memory::{MemoryBuffer, MemoryKind, MemoryScope};
 use ruffle_render::{
     backend::RenderBackend,
-    bitmap::{BitmapHandle, BitmapHandleImpl},
+    bitmap::{Bitmap, BitmapFormat, BitmapHandle, BitmapHandleImpl, PixelRegion},
     profile::BitmapAllocation,
 };
 use std::{
@@ -117,10 +117,45 @@ struct SolidFill {
     expanded: RefCell<std::rc::Weak<PixelBacking>>,
 }
 
+/// A rectangle painted on a uniform image. Each texel of the compact view
+/// stands for a power-of-two block of equal pixels in the logical bitmap.
+struct RectFill {
+    background: Rc<SolidFill>,
+    color: Color,
+    region: PixelRegion,
+    width: u32,
+    block: [u32; 2],
+    expanded: RefCell<std::rc::Weak<PixelBacking>>,
+}
+
+impl RectFill {
+    fn pixel(&self, x: u32, y: u32) -> Color {
+        if (self.region.x_min..self.region.x_max).contains(&x)
+            && (self.region.y_min..self.region.y_max).contains(&y)
+        {
+            self.color
+        } else {
+            self.background.color
+        }
+    }
+
+    fn expand(&self) -> PixelBacking {
+        let stride = self.width as usize;
+        let mut pixels = vec![self.background.color; self.background.len];
+        for y in self.region.y_min..self.region.y_max {
+            let row = y as usize * stride;
+            pixels[row + self.region.x_min as usize..row + self.region.x_max as usize]
+                .fill(self.color);
+        }
+        PixelBacking::new(&self.background.scope, pixels)
+    }
+}
+
 #[derive(Clone)]
 enum PixelSource {
     Owned,
     Solid(Rc<SolidFill>),
+    Rect(Rc<RectFill>),
     Symbol(Rc<SymbolImage>),
 }
 
@@ -157,14 +192,99 @@ impl Pixels {
             data: OnceCell::new(),
         }
     }
+    pub fn solid_color(&self) -> Option<Color> {
+        match &self.source {
+            PixelSource::Solid(fill) => Some(fill.color),
+            _ => None,
+        }
+    }
+
     #[inline]
     pub fn pixel(&self, index: usize) -> Color {
-        if let PixelSource::Solid(fill) = &self.source {
-            assert!(index < fill.len);
-            fill.color
-        } else {
-            self[index]
+        match &self.source {
+            PixelSource::Solid(fill) => {
+                assert!(index < fill.len);
+                fill.color
+            }
+            PixelSource::Rect(fill) => {
+                assert!(index < fill.background.len);
+                fill.pixel(
+                    (index % fill.width as usize) as u32,
+                    (index / fill.width as usize) as u32,
+                )
+            }
+            _ => self[index],
         }
+    }
+
+    pub fn fill_rect(&mut self, width: u32, height: u32, rect: PixelRegion, color: Color) {
+        if let PixelSource::Solid(fill) = &self.source
+            && self.data.get().is_none()
+        {
+            if fill.color == color {
+                return;
+            }
+            let block_x = 1 << (width | rect.x_min | rect.x_max).trailing_zeros();
+            let block_y = 1 << (height | rect.y_min | rect.y_max).trailing_zeros();
+            // Bound the compact upload to 1 KiB and require it to save storage.
+            if (block_x > 1 || block_y > 1)
+                && u64::from(width / block_x) * u64::from(height / block_y) <= 256
+            {
+                self.source = PixelSource::Rect(Rc::new(RectFill {
+                    background: fill.clone(),
+                    color,
+                    region: rect,
+                    width,
+                    block: [block_x, block_y],
+                    expanded: Default::default(),
+                }));
+                return;
+            }
+        }
+        let pixels = self.deref_mut();
+        for y in rect.y_min..rect.y_max {
+            let row = y as usize * width as usize;
+            pixels[row + rect.x_min as usize..row + rect.x_max as usize].fill(color);
+        }
+    }
+
+    pub fn nearest_view(
+        &mut self,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<Option<(BitmapHandle, [u32; 2], PixelRegion)>, ruffle_render::error::Error> {
+        let PixelSource::Rect(fill) = &self.source else {
+            return Ok(None);
+        };
+        let [bx, by] = fill.block;
+        let w = fill.width / bx;
+        let h = (fill.background.len / fill.width as usize) as u32 / by;
+        let handle = if let Some(handle) = &self.view {
+            handle.clone()
+        } else {
+            let bytes: Vec<u8> = (0..h)
+                .flat_map(|y| {
+                    (0..w).flat_map(move |x| {
+                        let c = fill.pixel(x * bx, y * by);
+                        [c.red(), c.green(), c.blue(), c.alpha()]
+                    })
+                })
+                .collect();
+            let handle = renderer.register_bitmap_with_usage(
+                Bitmap::new(w, h, BitmapFormat::Rgba, bytes),
+                ruffle_render::backend::BitmapUsage::Excluded,
+            )?;
+            self.view = Some(handle.clone());
+            handle
+        };
+        Ok(Some((
+            handle,
+            fill.block,
+            PixelRegion::for_whole_size(w, h),
+        )))
+    }
+
+    pub fn release_view(&mut self) {
+        self.view = None;
     }
 
     pub fn fill(&mut self, color: Color) {
@@ -206,6 +326,7 @@ impl Pixels {
             PixelSource::Solid(fill) => PixelBacking::cached(&fill.expanded, || {
                 PixelBacking::new(&fill.scope, vec![fill.color; fill.len])
             }),
+            PixelSource::Rect(fill) => PixelBacking::cached(&fill.expanded, || fill.expand()),
             PixelSource::Symbol(symbol) => PixelBacking::cached(&symbol.decoded, || {
                 let decoded = symbol.data.decode().expect("Failed to decode BitmapData");
                 PixelBacking::new(

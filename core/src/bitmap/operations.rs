@@ -56,9 +56,7 @@ pub fn fill_rect<'gc>(
     if is_full {
         write.fill(color);
     } else {
-        for y in rect.y_min..rect.y_max {
-            write.set_pixel32_row_raw(rect.x_min, rect.x_max, y, color);
-        }
+        write.fill_rect(rect, color);
     }
     write.set_cpu_dirty(mc, rect);
 

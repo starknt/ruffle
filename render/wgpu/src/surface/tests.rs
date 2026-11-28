@@ -312,6 +312,67 @@ fn measurement_counts_mask_passes_not_mask_inputs() {
 
 #[test]
 #[ignore = "requires a real native adapter"]
+fn uniform_bitmap_rects_match_sampled_premultiplied_textures() {
+    use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
+    use ruffle_render::transform::Transform;
+    let descriptors = gpu();
+    let target = TextureTarget::new(&descriptors.device, (70, 24)).unwrap();
+    let mut renderer = WgpuRenderBackend::with_options(descriptors, target, false).unwrap();
+    for quality in [StageQuality::Low, StageQuality::High] {
+        renderer.set_quality(quality).unwrap();
+        let mut reference = CommandList::new();
+        let mut rectangles = CommandList::new();
+        for (i, a) in [0u8, 1, 2, 63, 127, 176, 254, 255].into_iter().enumerate() {
+            let rgba = [a / 3, a / 2, a, a];
+            let handle = renderer
+                .register_bitmap(Bitmap::new(9, 13, BitmapFormat::Rgba, rgba.repeat(9 * 13)))
+                .unwrap();
+            let matrix = Matrix {
+                a: 1.15,
+                b: 0.1,
+                c: -0.2,
+                d: 1.0,
+                tx: Twips::from_pixels(2.25 + 7.0 * i as f64),
+                ty: Twips::from_pixels(3.75),
+            };
+            reference.render_bitmap(
+                handle,
+                Transform {
+                    matrix,
+                    ..Default::default()
+                },
+                true,
+                PixelSnapping::Never,
+                PixelRegion::for_whole_size(9, 13),
+            );
+            rectangles.draw_bitmap_rect(
+                Color {
+                    r: rgba[0],
+                    g: rgba[1],
+                    b: rgba[2],
+                    a,
+                },
+                matrix * Matrix::scale(9.0, 13.0),
+            );
+        }
+        let mut capture = |commands| {
+            renderer
+                .submit_frame(Color::from_rgb(0x274a81, 255), commands, vec![])
+                .unwrap();
+            renderer.capture_frame().unwrap().unwrap().into_raw()
+        };
+        let first = capture(reference);
+        let second = capture(rectangles);
+        assert_eq!(
+            first.iter().zip(&second).position(|(a, b)| a != b),
+            None,
+            "{quality:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a real native adapter"]
 fn adjacent_bitmap_updates_and_unequal_extents_keep_the_source_pixels() {
     use ruffle_render::bitmap::{Bitmap, BitmapFormat, PixelRegion, PixelSnapping};
     use ruffle_render::transform::Transform;
@@ -1134,10 +1195,13 @@ fn chunk_uniform_windows_reuse_the_same_buffer_binding() {
     for x in [3.0, 19.0, 7.0] {
         let mut chunk = super::buffers::ChunkBufferBuilder::new(&buffers, &descriptors.limits);
         chunk
-            .add_transform(&ruffle_render::transform::Transform {
-                matrix: Matrix::translate(Twips::from_pixels(x), Twips::ZERO),
-                ..Default::default()
-            })
+            .add_transform(
+                &ruffle_render::transform::Transform {
+                    matrix: Matrix::translate(Twips::from_pixels(x), Twips::ZERO),
+                    ..Default::default()
+                },
+                &super::buffers::DrawVertices::PosUvQuad,
+            )
             .unwrap();
         chunk
             .copy_to(&mut staging, &descriptors, &mut encoder, &mut buffers)
@@ -1167,7 +1231,9 @@ fn builtin_quad_draws_do_not_upload_immutable_vertices_again() {
     let mut buffers = ChunkBuffers::new(&descriptors).unwrap();
     let original_dynamic = buffers.vertex_buffer.lease().id();
     let mut chunk = ChunkBufferBuilder::new(&buffers, &descriptors.limits);
-    let instance = chunk.add_transform(&Default::default()).unwrap();
+    let instance = chunk
+        .add_transform(&Default::default(), &DrawVertices::PosUvQuad)
+        .unwrap();
     for vertices in [
         DrawVertices::PosUvQuad,
         DrawVertices::PosColorQuad,

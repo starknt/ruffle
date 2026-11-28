@@ -94,6 +94,11 @@ pub trait RenderBackend: Any {
         self.register_bitmap(bitmap)
     }
 
+    /// Whether solid and nearest-sampled repeated pixels can use compact display geometry.
+    fn supports_compact_bitmap(&self, _width: u32, _height: u32) -> bool {
+        false
+    }
+
     fn health(&self) -> &RendererHealth;
 
     fn viewport_dimensions(&self) -> ViewportDimensions;

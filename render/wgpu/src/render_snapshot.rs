@@ -83,6 +83,10 @@ pub enum SnapshotCommand {
         resource: ResourceVersion,
         transform: Transform,
     },
+    BitmapRect {
+        color: Color,
+        matrix: Matrix,
+    },
     Rect {
         color: Color,
         matrix: Matrix,
@@ -156,7 +160,9 @@ impl SnapshotNode {
                 // Globals normalizes depth by viewport width.
                 transform.tz *= f64::from(scale.a);
             }
-            SnapshotCommand::Rect { matrix, .. } => *matrix = scale * *matrix,
+            SnapshotCommand::BitmapRect { matrix, .. } | SnapshotCommand::Rect { matrix, .. } => {
+                *matrix = scale * *matrix
+            }
             SnapshotCommand::Line {
                 color,
                 matrix,
@@ -464,7 +470,8 @@ impl Capture {
     fn immutable(commands: &CommandList, device: u64) -> bool {
         commands.certify_immutable(device, || {
             commands.iter().all(|cmd| match cmd {
-                Command::DrawRect { .. }
+                Command::DrawBitmapRect { .. }
+                | Command::DrawRect { .. }
                 | Command::DrawLine { .. }
                 | Command::DrawLineRect { .. } => true,
                 Command::Shared(block) => Self::immutable(block, device),
@@ -627,6 +634,10 @@ impl Capture {
                         transform: transform.clone(),
                     }
                 }
+                Command::DrawBitmapRect { color, matrix } => SnapshotCommand::BitmapRect {
+                    color: *color,
+                    matrix: *matrix,
+                },
                 Command::DrawRect { color, matrix } => SnapshotCommand::Rect {
                     color: *color,
                     matrix: *matrix,
@@ -823,6 +834,10 @@ impl PreparedSnapshot {
                     transform: transform.clone(),
                 },
                 _ => return Err(foreign()),
+            },
+            SnapshotCommand::BitmapRect { color, matrix } => Command::DrawBitmapRect {
+                color: *color,
+                matrix: *matrix,
             },
             SnapshotCommand::Rect { color, matrix } => Command::DrawRect {
                 color: *color,

@@ -3,6 +3,44 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 #[test]
+fn aligned_rect_fill_can_be_read_and_cloned_before_expanding_pixels() {
+    use crate::bitmap::{bitmap_data::BitmapData, operations};
+    let manager = ruffle_memory::MemoryManager::new(32 << 20);
+    manager.player().enter(|| {
+        gc_arena::arena::rootless_mutate(|mc| {
+            let mut gpu = renderer(false);
+            let source = BitmapData::new(mc, 512, 256, true, 0xff123456);
+            let patched = source.clone_data(mc, &mut gpu).unwrap();
+            operations::fill_rect(mc, &mut gpu, patched, 128, 64, 256, 128, 0xffabcdef).unwrap();
+            let other = patched.clone_data(mc, &mut gpu).unwrap();
+            let sample = |data, gpu: &mut TestRenderer, x, y| {
+                operations::get_pixel32(data, gpu, x, y).unwrap()
+            };
+            assert_eq!(sample(patched, &mut gpu, 383, 191), 0xffabcdef);
+            assert_eq!(sample(other, &mut gpu, 384, 191), 0xff123456);
+            assert_eq!(sample(source, &mut gpu, 128, 64), 0xff123456);
+            assert_eq!(
+                manager.snapshot().active_bytes,
+                0,
+                "aligned fill expanded all CPU pixels"
+            );
+            operations::set_pixel32(mc, &mut gpu, patched, 128, 64, 0xff012345).unwrap();
+            assert_eq!(sample(other, &mut gpu, 128, 64), 0xffabcdef);
+            let handle = patched.bitmap_handle(mc, &mut gpu).unwrap();
+            assert_eq!(test_handle(&handle).pixels.borrow().len(), 512 * 256 * 4);
+            for (x, y, color) in [
+                (128, 64, [1, 35, 69, 255]),
+                (383, 191, [171, 205, 239, 255]),
+                (384, 191, [18, 52, 86, 255]),
+            ] {
+                let i = 4 * (y * 512 + x);
+                assert_eq!(&test_handle(&handle).pixels.borrow()[i..i + 4], &color);
+            }
+        })
+    });
+}
+
+#[test]
 fn owned_bitmap_clone_shares_storage_until_first_pixel_write() {
     let mut first = super::Pixels::owned(vec![super::Color::from(0xff123456); 16]);
     let other = first.clone();
@@ -568,7 +606,7 @@ fn failed_bitmap_upload_preserves_dirty_cpu_pixels() {
     let mut renderer = renderer(false);
     gc_arena::arena::rootless_mutate(|mc| {
         let mut raw = BitmapRawData::new(1, 1, true, 0xff123456);
-        raw.bitmap_handle(&mut renderer).unwrap();
+        raw.update_dirty_texture(&mut renderer).unwrap();
         raw.set_cpu_dirty(mc, PixelRegion::for_whole_size(1, 1));
         renderer.fail_upload = true;
         let error = raw.update_dirty_texture(&mut renderer).unwrap_err();

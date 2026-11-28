@@ -306,7 +306,9 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         };
         let result = match *instance {
             Some(existing) => Ok(existing),
-            None => self.chunk_buffer_builder.add_transform(transform),
+            None => self
+                .chunk_buffer_builder
+                .add_transform(transform, &vertices),
         };
         let result = match result {
             Ok(new_instance) => {
@@ -334,7 +336,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
                 // in the new one - so we must write it again.
                 let new_instance = self
                     .chunk_buffer_builder
-                    .add_transform(transform)
+                    .add_transform(transform, &vertices)
                     .expect("Buffer must be able to fit a new transform, it was just emptied");
                 *instance = Some(new_instance);
                 let offsets = self
@@ -657,6 +659,18 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                 }
             }
         }
+    }
+
+    fn draw_bitmap_rect(&mut self, color: Color, matrix: Matrix) {
+        self.add_to_current(
+            &Transform {
+                matrix,
+                ..Default::default()
+            },
+            &mut None,
+            DrawVertices::BitmapColorQuad(color),
+            |draw_offsets| DrawCommand::DrawColor { draw_offsets },
+        );
     }
 
     fn draw_rect(&mut self, color: Color, matrix: Matrix) {

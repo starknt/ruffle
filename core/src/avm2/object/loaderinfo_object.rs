@@ -360,6 +360,16 @@ impl<'gc> LoaderInfoObject<'gc> {
                 clip.avm1_unload(context);
             }
             loader.remove_child(context, child);
+            if !child.is_on_stage(context) {
+                let mut detached = vec![child];
+                while let Some(object) = detached.pop() {
+                    if let Some(bitmap) = object.as_bitmap() {
+                        bitmap.bitmap_data().release_display_texture(context);
+                    } else if let Some(container) = object.as_container() {
+                        detached.extend(container.iter_render_list());
+                    }
+                }
+            }
         }
     }
 }

@@ -481,6 +481,7 @@ impl History {
                     SnapshotCommand::Shared(children) => flatten(children, nodes)?,
                     SnapshotCommand::Bitmap { .. }
                     | SnapshotCommand::Shape { .. }
+                    | SnapshotCommand::BitmapRect { .. }
                     | SnapshotCommand::Rect { .. }
                     | SnapshotCommand::Line { .. } => nodes.push(node.clone()),
                     // Stencil, ancestor Layer, shaders and Stage3D are indivisible

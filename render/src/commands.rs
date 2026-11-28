@@ -26,6 +26,8 @@ pub trait CommandHandler {
     fn render_shape(&mut self, shape: ShapeHandle, transform: Transform);
     fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList);
     fn draw_rect(&mut self, color: Color, matrix: Matrix);
+    /// A uniform BitmapData sample in premultiplied, 8-bit texture space.
+    fn draw_bitmap_rect(&mut self, color: Color, matrix: Matrix);
     fn draw_line(&mut self, color: Color, matrix: Matrix);
     fn draw_line_rect(&mut self, color: Color, matrix: Matrix);
     fn push_mask(&mut self);
@@ -337,6 +339,9 @@ impl CommandList {
                     handler.render_shape(shape.clone(), transform.clone())
                 }
                 Command::DrawRect { color, matrix } => handler.draw_rect(*color, *matrix),
+                Command::DrawBitmapRect { color, matrix } => {
+                    handler.draw_bitmap_rect(*color, *matrix)
+                }
                 Command::DrawLine { color, matrix } => handler.draw_line(*color, *matrix),
                 Command::DrawLineRect { color, matrix } => handler.draw_line_rect(*color, *matrix),
                 // Shared lists from other producers still preserve all commands.
@@ -453,6 +458,7 @@ impl Command {
             | Command::PushMask
             | Command::ActivateMask
             | Command::Shared(_)
+            | Command::DrawBitmapRect { .. }
             | Command::DrawRect { .. }
             | Command::DrawLine { .. }
             | Command::DrawLineRect { .. } => Some(0),
@@ -483,6 +489,7 @@ impl Command {
                 handler.render_stage3d(bitmap, transform)
             }
             Command::DrawRect { color, matrix } => handler.draw_rect(color, matrix),
+            Command::DrawBitmapRect { color, matrix } => handler.draw_bitmap_rect(color, matrix),
             Command::DrawLine { color, matrix } => handler.draw_line(color, matrix),
             Command::DrawLineRect { color, matrix } => handler.draw_line_rect(color, matrix),
             Command::PushMask => handler.push_mask(),
@@ -541,6 +548,12 @@ impl CommandHandler for CommandList {
         }
     }
 
+    #[inline]
+    fn draw_bitmap_rect(&mut self, color: Color, matrix: Matrix) {
+        if self.maskers_in_progress <= 1 {
+            self.push(Command::DrawBitmapRect { color, matrix });
+        }
+    }
     #[inline]
     fn draw_rect(&mut self, color: Color, matrix: Matrix) {
         if self.maskers_in_progress <= 1 {
@@ -629,6 +642,10 @@ pub enum Command {
         transform: Transform,
     },
     RenderAlphaMask(Box<AlphaMaskInputs>),
+    DrawBitmapRect {
+        color: Color,
+        matrix: Matrix,
+    },
     DrawRect {
         color: Color,
         matrix: Matrix,
@@ -676,7 +693,8 @@ impl Command {
                     RenderRegion::transformed(b, &transform.matrix)
                 })
             }
-            Self::DrawRect { matrix, .. }
+            Self::DrawBitmapRect { matrix, .. }
+            | Self::DrawRect { matrix, .. }
             | Self::DrawLine { matrix, .. }
             | Self::DrawLineRect { matrix, .. } => {
                 RenderRegion::transformed([0.0, 0.0, 1.0, 1.0], matrix)

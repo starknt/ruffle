@@ -3020,7 +3020,23 @@ impl Player {
         } else {
             self.external_gc
                 .schedule(arena.metrics(), external, pressure.level);
-            arena.collect_debt();
+            let debt = arena.metrics().allocation_debt();
+            if pressure.level >= ruffle_memory::PressureLevel::High
+                || debt >= arena.metrics().total_gc_count() as f64
+            {
+                // A heap-sized backlog (including a forced collection) needs immediate service.
+                arena.collect_debt();
+            } else if debt > 0.0 {
+                let started = Instant::now();
+                let budget = Duration::from_micros(
+                    if pressure.level == ruffle_memory::PressureLevel::Moderate {
+                        400
+                    } else {
+                        200
+                    },
+                );
+                arena.collect_debt_until(|| started.elapsed() >= budget);
+            }
         }
         self.gc_memory
             .resize(arena.metrics().total_gc_bytes() as u64);
@@ -3941,6 +3957,32 @@ pub enum PlayerMode {
 mod tests {
     use super::*;
     use ruffle_render::error::{RenderFailure, RenderFailureKind};
+
+    #[test]
+    fn allocation_burst_leaves_work_for_later_updates_and_explicit_gc_can_finish() {
+        let session = PlayerBuilder::new().build();
+        let mut player = session.lock().unwrap();
+        player.gc_arena.borrow_mut().finish_cycle();
+        player.update(|context| {
+            for _ in 0..32_768 {
+                gc_arena::Gc::new(context.gc(), 42_u32);
+            }
+        });
+        let debt = || player.gc_arena.borrow().metrics().allocation_debt();
+        assert!(
+            debt() > 0.0,
+            "a burst consumed its entire GC debt in one update"
+        );
+        let initial = debt();
+        player.update(|_| {});
+        assert!(player.gc_arena.borrow().metrics().allocation_debt() < initial);
+
+        player.update(|context| {
+            let metrics = context.gc().metrics();
+            metrics.adjust_debt(metrics.total_gc_count() as f64 * 4.0 + 1024.0);
+        });
+        assert_eq!(player.gc_arena.borrow().metrics().allocation_debt(), 0.0);
+    }
 
     #[test]
     fn sustained_external_growth_wakes_incremental_gc_over_multiple_updates() {

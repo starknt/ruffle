@@ -283,6 +283,21 @@ where
         }
     }
 
+    /// Pay allocation debt until it is settled or the caller asks to yield.
+    /// The predicate is polled after every 64 collector steps, so even an
+    /// expired time slice makes progress. Outstanding debt remains in the arena.
+    #[inline]
+    pub fn collect_debt_until(&mut self, mut should_yield: impl FnMut() -> bool) {
+        let mut steps = 0u8;
+        unsafe {
+            self.context
+                .do_collection_until(&self.root, RunUntil::PayDebt, Stop::Full, || {
+                    steps = (steps + 1) % 64;
+                    steps == 0 && should_yield()
+                });
+        }
+    }
+
     /// Run only the *marking* part of incremental garbage collection until allocation debt is zero.
     ///
     /// This does *not* transition collection past the [`CollectionPhase::Marked`]
