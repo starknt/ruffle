@@ -168,12 +168,18 @@ impl Pixels {
     }
 
     pub fn fill(&mut self, color: Color) {
-        if let PixelSource::Solid(fill) = &self.source {
-            if fill.color != color {
+        match &self.source {
+            PixelSource::Solid(fill) if fill.color == color => {}
+            PixelSource::Solid(fill)
+                if !self
+                    .data
+                    .get()
+                    .is_some_and(|data| Rc::strong_count(data) == 1) =>
+            {
                 *self = Self::solid(fill.len, color, fill.scope.clone());
             }
-        } else {
-            self.deref_mut().fill(color);
+            // Displayed bitmaps typically have a private upload backing. Refill it in place.
+            _ => self.deref_mut().fill(color),
         }
     }
     pub fn view(

@@ -55,6 +55,40 @@ fn uniform_bitmap_only_allocates_pixels_for_the_modified_clone() {
 }
 
 #[test]
+fn uploaded_uniform_bitmap_reuses_its_pixels_on_full_refills() {
+    use crate::bitmap::{bitmap_data::BitmapData, operations};
+    use ruffle_memory::MemoryManager;
+
+    let manager = MemoryManager::new(32 << 20);
+    let scope = manager.player();
+    scope.enter(|| {
+        gc_arena::arena::rootless_mutate(|mc| {
+            let mut renderer = renderer(false);
+            let bitmap = BitmapData::new(mc, 128, 128, false, 0xff123456);
+            let clone = bitmap.clone_data(mc, &mut renderer).unwrap();
+            let handle = bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+            let data = bitmap.sync(&mut renderer).unwrap();
+            let ptr = data.borrow().pixels().as_ptr();
+            for color in [0xff446688, 0xff224466] {
+                operations::fill_rect(mc, &mut renderer, bitmap, 0, 0, 128, 128, color).unwrap();
+                assert_eq!(manager.snapshot().active_bytes, 128 * 128 * 4);
+                bitmap.bitmap_handle(mc, &mut renderer).unwrap();
+                assert_eq!(data.borrow().pixels().as_ptr(), ptr);
+                let [a, r, g, b] = color.to_be_bytes();
+                assert_eq!(&test_handle(&handle).pixels.borrow()[..4], &[r, g, b, a]);
+            }
+            let cold = clone.sync(&mut renderer).unwrap();
+            assert!(
+                cold.borrow()
+                    .pixels()
+                    .iter()
+                    .all(|p| u32::from(*p) == 0xff123456)
+            );
+        })
+    });
+}
+
+#[test]
 fn uniform_bitmap_clones_share_bulk_reads_and_detach_on_write() {
     use crate::bitmap::{bitmap_data::BitmapData, operations};
     let manager = ruffle_memory::MemoryManager::new(32 << 20);
