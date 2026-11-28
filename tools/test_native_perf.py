@@ -165,6 +165,20 @@ class NativePerfTest(unittest.TestCase):
             self.assertEqual(result['cpuP95Ms'], 2)
             self.assertIsNone(result['gpuP95Ms'])
 
+    def test_peak_rss_includes_observed_samples_and_the_process_high_water_mark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.trace(directory)
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows[1]['rssBytes'] = 300
+            rows[2]['rssBytes'] = None
+            for high_water, last_rss, expected in [
+                (250, 150, 300), (400, 150, 400), (250, 350, 350), (None, 150, None),
+            ]:
+                with self.subTest(high_water=high_water, last_rss=last_rss):
+                    rows[-1].update(peakRssBytes=high_water, rssBytes=last_rss)
+                    path.write_text('\n'.join(map(json.dumps, rows)))
+                    self.assertEqual(summarize(path)['peakRssBytes'], expected)
+
     def test_memory_soak_reports_gc_and_keeps_sampled_rss_and_gpu_memory_separate(self):
         with tempfile.TemporaryDirectory() as directory:
             path = self.trace(directory, frames=100)

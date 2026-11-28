@@ -19,7 +19,7 @@ def percentile(values, fraction):
     return values[max(0, math.ceil(len(values) * fraction)-1)] if values else None
 
 
-def memory_run_metrics(frames, summary):
+def memory_run_metrics(frames, summary, rss_samples):
     def samples(values, *, every_frame=False):
         present = [value for value in values if value is not None]
         if any(type(value) is not int or value < 0 for value in present):
@@ -38,7 +38,7 @@ def memory_run_metrics(frames, summary):
     return {
         'completedFps': len(frames) * 1e9 / summary['completedNs'],
         'gcP99Ms': percentile(gc, .99) / 1e6 if gc else None,
-        'rssMedianBytes': median_or_none(samples(r.get('rssBytes') for r in frames)),
+        'rssMedianBytes': median_or_none(rss_samples),
         'gpuLogicalMedianBytes': median_or_none(logical),
         'gpuLogicalPeakBytes': (summary.get('resourcesAfterDrain') or {}).get('peak_bytes'),
         'gpuAllocatedMedianBytes': median_or_none(samples(r.get('allocatedBytes') for r in allocators)),
@@ -98,8 +98,16 @@ def summarize(path):
     phase_names = {key for r in phase_values for key in r}
     if any(not isinstance(r.get('cpuNs'), (float, int)) or not math.isfinite(r['cpuNs']) or r['cpuNs'] < 0 for r in frames):
         raise ValueError('invalid CPU frame duration')
+    rss_samples = [r['rssBytes'] for r in frames if r.get('rssBytes') is not None]
+    closing = [summary[key] for key in ('rssBytes', 'peakRssBytes') if summary.get(key) is not None]
+    rss_readings = rss_samples + closing
+    if any(type(value) is not int or value < 0 for value in rss_readings):
+        raise ValueError('invalid RSS sample')
+    # Linux may report a closing VmHWM below an earlier VmRSS. Periodic RSS
+    # readings alone do not cover setup or intervals between samples.
+    peak_rss = max(rss_readings) if summary.get('peakRssBytes') is not None else None
     return {
-        **(memory_run_metrics(frames, summary) if session['case'] == 'memory_soak' else {}),
+        **(memory_run_metrics(frames, summary, rss_samples) if session['case'] == 'memory_soak' else {}),
         'warmup': session.get('warmup'), 'driver': session.get('driver'),
         'runId': session.get('runId'), 'settings': session.get('settings'),
         'workloadSha256': session.get('workloadSha256'),
@@ -114,7 +122,7 @@ def summarize(path):
         'cpuP99Ms': percentile([r['cpuNs']/1e6 for r in frames], .99),
         'gpuP95Ms': percentile([r['ns']/1e6 for r in gpu], .95),
         'gpuP99Ms': percentile([r['ns']/1e6 for r in gpu], .99),
-        'gpuCoverage': len(gpu)/len(frames), 'peakRssBytes': summary.get('peakRssBytes'),
+        'gpuCoverage': len(gpu)/len(frames), 'peakRssBytes': peak_rss,
         'gpuPhaseP95Ms': {name: percentile(times, .95) if len(times) == len(frames) else None
                           for name, times in gpu_phases.items()},
         'phaseP95Ms': {key: percentile([r[key]/1e6 for r in phase_values], .95)
