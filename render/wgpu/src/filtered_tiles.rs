@@ -13,9 +13,10 @@ use ruffle_render::{filters::Filter, quality::StageQuality};
 use std::sync::Arc;
 
 const TILE: u32 = 32;
-const SIDE: u32 = 2048;
-const COLUMNS: u32 = SIDE / TILE;
-const SLOTS: usize = (COLUMNS * COLUMNS) as usize;
+const PAGE_SIDE: u32 = 512;
+const COLUMNS: u32 = PAGE_SIDE / TILE;
+const SLOTS_PER_PAGE: usize = (COLUMNS * COLUMNS) as usize;
+const MAX_PAGES: usize = 16;
 const MAX_FILTERS: usize = 3;
 const BUSY_DRAWS: usize = 8;
 const QUIET_FRAMES: u32 = 120;
@@ -89,11 +90,55 @@ impl Input {
     }
 }
 
-struct Atlas {
+struct Page {
     texture: Texture,
+    _budget: CacheTicket,
+}
+
+impl Page {
+    fn try_new(
+        device: &Device,
+        scheduler: &ResourceScheduler,
+    ) -> Result<Option<Self>, RenderFailure> {
+        if device.limits().max_texture_dimension_2d < PAGE_SIDE {
+            return Ok(None);
+        }
+        let texture_bytes = u64::from(PAGE_SIDE) * u64::from(PAGE_SIDE) * 4;
+        let metadata = SLOTS_PER_PAGE
+            * (size_of::<Input>()
+                + size_of::<Placement>()
+                + MAX_FILTERS * size_of::<FilterKey>()
+                + 128);
+        let Some(ticket) =
+            scheduler.admit_optional(ReclaimClass::Cache, texture_bytes + metadata as u64)
+        else {
+            return Ok(None);
+        };
+        let texture = device.try_create_cache_texture(&wgpu::TextureDescriptor {
+            label: Some("Small filtered draws"),
+            size: wgpu::Extent3d {
+                width: PAGE_SIDE,
+                height: PAGE_SIDE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        })?;
+        Ok(texture.map(|texture| Self {
+            texture,
+            _budget: ticket,
+        }))
+    }
+}
+
+struct Atlas {
+    pages: Vec<Page>,
     slots: LruCache<Placement, (Input, usize, u64)>,
     last_use: u64,
-    _budget: CacheTicket,
 }
 
 impl Reclaim for Mutex<Option<Atlas>> {
@@ -109,6 +154,7 @@ pub(super) struct FilteredTiles {
     atlas: Arc<Mutex<Option<Atlas>>>,
     scheduler: ResourceScheduler,
     draws: usize,
+    attempted_page: bool,
     quiet: u32,
 }
 
@@ -120,6 +166,7 @@ impl FilteredTiles {
             atlas,
             scheduler: scheduler.clone(),
             draws: 0,
+            attempted_page: false,
             quiet: 0,
         }
     }
@@ -134,6 +181,7 @@ impl FilteredTiles {
             self.atlas.lock().take();
         }
         self.draws = 0;
+        self.attempted_page = false;
     }
 
     pub fn replay(
@@ -151,7 +199,7 @@ impl FilteredTiles {
         }
         copy(
             encoder,
-            &atlas.texture,
+            &atlas.pages[*slot / SLOTS_PER_PAGE].texture,
             origin(*slot),
             destination,
             wgpu::Origin3d::ZERO,
@@ -168,49 +216,37 @@ impl FilteredTiles {
         device: &Device,
         encoder: &mut CommandEncoder,
     ) -> Result<Option<u64>, RenderFailure> {
-        if self.atlas.lock().is_none() {
-            if self.draws < BUSY_DRAWS || device.limits().max_texture_dimension_2d < SIDE {
-                return Ok(None);
-            }
-            // Admission may invoke our own eviction hook. Never hold the atlas
-            // lock across admission or device allocation.
-            let metadata = SLOTS
-                * (size_of::<Input>()
-                    + size_of::<Placement>()
-                    + MAX_FILTERS * size_of::<FilterKey>()
-                    + 128);
-            let bytes = u64::from(SIDE) * u64::from(SIDE) * 4 + metadata as u64;
-            let Some(ticket) = self.scheduler.admit(ReclaimClass::Cache, bytes) else {
-                return Ok(None);
-            };
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Small filtered draws"),
-                size: wgpu::Extent3d {
-                    width: SIDE,
-                    height: SIDE,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            })?;
-            *self.atlas.lock() = Some(Atlas {
-                texture,
-                slots: LruCache::unbounded(),
-                last_use: self.scheduler.tick(),
-                _budget: ticket,
-            });
-        }
         let mut state = self.atlas.lock();
+        if self.draws >= BUSY_DRAWS
+            && !self.attempted_page
+            && state.as_ref().is_none_or(|atlas| {
+                atlas.pages.len() < MAX_PAGES
+                    && atlas.slots.len() == atlas.pages.len() * SLOTS_PER_PAGE
+                    && !atlas.slots.contains(&input.placement)
+            })
+        {
+            self.attempted_page = true;
+            // A trim can release the atlas during allocation. Recheck under the lock.
+            drop(state);
+            let page = Page::try_new(device, &self.scheduler)?;
+            state = self.atlas.lock();
+            if let Some(page) = page {
+                state
+                    .get_or_insert_with(|| Atlas {
+                        pages: Vec::new(),
+                        slots: LruCache::unbounded(),
+                        last_use: self.scheduler.tick(),
+                    })
+                    .pages
+                    .push(page);
+            }
+        }
         let Some(atlas) = state.as_mut() else {
             return Ok(None);
         };
         let slot = if let Some((_, slot, _)) = atlas.slots.pop(&input.placement) {
             slot
-        } else if atlas.slots.len() == SLOTS {
+        } else if atlas.slots.len() == atlas.pages.len() * SLOTS_PER_PAGE {
             atlas.slots.pop_lru().unwrap().1.1
         } else {
             atlas.slots.len()
@@ -219,7 +255,7 @@ impl FilteredTiles {
             encoder,
             source,
             wgpu::Origin3d::ZERO,
-            &atlas.texture,
+            &atlas.pages[slot / SLOTS_PER_PAGE].texture,
             origin(slot),
             input.placement.size,
         );
@@ -237,7 +273,7 @@ impl FilteredTiles {
 fn origin(slot: usize) -> wgpu::Origin3d {
     wgpu::Origin3d {
         x: slot as u32 % COLUMNS * TILE,
-        y: slot as u32 / COLUMNS * TILE,
+        y: (slot % SLOTS_PER_PAGE) as u32 / COLUMNS * TILE,
         z: 0,
     }
 }

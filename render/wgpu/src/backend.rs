@@ -383,12 +383,12 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             &descriptors.runtime,
             descriptors.runtime.config().cache_limit,
         );
-        let filtered_tiles = (std::env::var_os("RUFFLE_FILTERED_TILES").as_deref()
-            == Some(std::ffi::OsStr::new("1")))
-        .then(|| crate::filtered_tiles::FilteredTiles::new(descriptors.runtime.scheduler()));
-        let retained_bitmaps = (std::env::var_os("RUFFLE_INDEXED_BITMAP_LEASES").as_deref()
-            == Some(std::ffi::OsStr::new("1")))
-        .then(|| crate::bitmap_cache::RetainedBitmaps::new(descriptors.runtime.scheduler()));
+        let filtered_tiles = std::env::var_os("RUFFLE_FILTERED_TILES")
+            .is_none_or(|value| value == "1")
+            .then(|| crate::filtered_tiles::FilteredTiles::new(descriptors.runtime.scheduler()));
+        let retained_bitmaps = std::env::var_os("RUFFLE_INDEXED_BITMAP_LEASES")
+            .is_none_or(|value| value == "1")
+            .then(|| crate::bitmap_cache::RetainedBitmaps::new(descriptors.runtime.scheduler()));
         descriptors.runtime.check_health()?;
         Ok(Self {
             budget: budget.clone(),
@@ -456,13 +456,6 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
                 &self.descriptors.runtime,
                 limit,
             ))
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn enable_indexed_bitmap_leases(&mut self) {
-        self.retained_bitmaps.get_or_insert_with(|| {
-            crate::bitmap_cache::RetainedBitmaps::new(self.descriptors.runtime.scheduler())
         });
     }
 

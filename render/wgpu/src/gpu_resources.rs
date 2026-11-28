@@ -800,16 +800,21 @@ impl Device {
                     "prewarm skipped under pressure",
                 ));
             }
-            let reservation = self.runtime().reserve(kind, self.1, bytes)?;
-            let raw = self.scoped(create)?;
-            return Ok((raw, reservation.commit(dependencies)?));
+            return self.allocate_once(kind, bytes, dependencies, create);
         }
         self.reclaim_soft(bytes);
-        self.recover(|| {
-            let reservation = self.runtime().reserve(kind, self.1, bytes)?;
-            let raw = self.scoped(&mut create)?;
-            Ok((raw, reservation.commit(dependencies)?))
-        })
+        self.recover(|| self.allocate_once(kind, bytes, dependencies, &mut create))
+    }
+    fn allocate_once<T>(
+        &self,
+        kind: ResourceKind,
+        bytes: u64,
+        dependencies: &[ResourceLease],
+        create: impl FnMut(&wgpu::Device) -> Result<T, RenderFailure>,
+    ) -> Result<(T, ResourceLease), RenderFailure> {
+        let reservation = self.runtime().reserve(kind, self.1, bytes)?;
+        let raw = self.scoped(create)?;
+        Ok((raw, reservation.commit(dependencies)?))
     }
     fn recover<T>(
         &self,
@@ -1073,6 +1078,31 @@ impl Device {
         desc: &wgpu::TextureDescriptor<'_>,
     ) -> Result<Texture, RenderFailure> {
         self.create_texture_with_kind(desc, ResourceKind::Texture)
+    }
+    /// An optional cache miss already has valid pixels. Never evict foreground
+    /// resources or wait for the queue to drain just to keep a copy.
+    pub(crate) fn try_create_cache_texture(
+        &self,
+        desc: &wgpu::TextureDescriptor<'_>,
+    ) -> Result<Option<Texture>, RenderFailure> {
+        let bytes = texture_storage_bytes(desc)?;
+        let runtime = self.runtime();
+        runtime.check_health()?;
+        if runtime.pressure() >= ruffle_memory::PressureLevel::High
+            || runtime.stats().total_bytes.saturating_add(bytes) > runtime.config().soft_limit
+        {
+            return Ok(None);
+        }
+        match self.allocate_once(ResourceKind::Texture, bytes, &[], |device| {
+            Ok(device.create_texture(desc))
+        }) {
+            Ok((texture, lease)) => Ok(Some(self.wrap(texture, lease))),
+            Err(error) if retryable(&error) => {
+                runtime.check_health()?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
     pub fn create_texture_with_kind(
         &self,

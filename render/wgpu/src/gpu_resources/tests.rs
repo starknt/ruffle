@@ -81,6 +81,40 @@ fn native_creation_failures_refund_reserved_storage() {
 
 #[test]
 #[ignore = "requires a Vulkan adapter"]
+fn optional_texture_yields_to_foreground_storage_and_propagates_device_failure() {
+    let device = device(4096);
+    let desc = wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 32,
+            height: 32,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    };
+    let foreground = device.create_texture(&desc).unwrap();
+    assert!(device.try_create_cache_texture(&desc).unwrap().is_none());
+    let stats = device.runtime().stats();
+    assert_eq!((stats.total_bytes, stats.resources), (4096, 1));
+    assert_eq!((stats.budget_rejections, stats.creation_retries), (0, 0));
+    drop(foreground);
+    let _page = device.try_create_cache_texture(&desc).unwrap().unwrap();
+    device
+        .runtime()
+        .fail(RenderFailure::new(RenderFailureKind::DeviceLost, "lost"));
+    assert_eq!(
+        device.try_create_cache_texture(&desc).unwrap_err().kind(),
+        RenderFailureKind::DeviceLost,
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
 fn native_bindings_keep_storage_charged_without_double_counting_clones() {
     let device = device(4096);
     let buffer = device

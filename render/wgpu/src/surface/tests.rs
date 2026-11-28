@@ -3500,13 +3500,17 @@ fn repeated_small_filtered_draws_match_fresh_pixels_after_edits_and_idle() {
         let target = TextureTarget::new(&descriptors.device, (96, 24)).unwrap();
         let mut renderer =
             WgpuRenderBackend::with_options(descriptors.clone(), target, false).unwrap();
-        renderer.set_filtered_tiles(reuse);
+        if !reuse {
+            renderer.set_filtered_tiles(false);
+        }
         renderer.set_quality(StageQuality::High).unwrap();
         let pixels = |rgba: [u8; 4]| Bitmap::new(4, 4, BitmapFormat::Rgba, rgba.repeat(16));
         let source = renderer.register_bitmap(pixels([255, 0, 40, 255])).unwrap();
         let metrics = ruffle_render::profile::RenderMetrics::default();
         let _scope = ruffle_render::profile::enter(Some(&metrics));
-        for frame in 0..7 {
+        // After the edits, cycle 33 groups of eight distinct subpixel placements.
+        // Replaying the cycle exercises more than one atlas page.
+        for frame in 0usize..73 {
             if frame == 2 {
                 renderer
                     .update_texture(
@@ -3536,7 +3540,7 @@ fn repeated_small_filtered_draws_match_fresh_pixels_after_edits_and_idle() {
                     Transform {
                         matrix: Matrix::translate(
                             Twips::from_pixels(3.0 + f64::from(i) / 8.0),
-                            Twips::from_pixels(5.0),
+                            Twips::new(100 + frame.saturating_sub(6) as i32 % 33),
                         ),
                         ..Default::default()
                     },
@@ -3575,7 +3579,20 @@ fn repeated_small_filtered_draws_match_fresh_pixels_after_edits_and_idle() {
                     assert_eq!(work.filtered_tile_hits, 0, "frame {frame}");
                 }
                 if frame == 6 {
-                    assert!(work.filtered_tile_hits > 0);
+                    assert!(
+                        work.filtered_tile_hits > 0,
+                        "repeated particles reran their filters"
+                    );
+                    assert!(
+                        descriptors.runtime.stats().cache_retained_bytes < 3 * 1024 * 1024,
+                        "a small particle animation should fit in a small cache"
+                    );
+                }
+                if frame >= 40 {
+                    assert_eq!(
+                        work.filtered_tile_hits, 8,
+                        "rerendered animation frame {frame}"
+                    );
                 }
             } else {
                 if matches!(frame, 2 | 3) {
@@ -5869,7 +5886,6 @@ fn retained_bitmaps_share_one_reclaimer_and_keep_exact_lru_order() {
         false,
     )
     .unwrap();
-    renderer.enable_indexed_bitmap_leases();
     let scheduler = descriptors.runtime.scheduler();
     scheduler.reclaim();
     let before = scheduler.live_reclaimers(ReclaimClass::Cache);
