@@ -1129,7 +1129,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     }
     fn supports_compact_bitmap(&self, width: u32, height: u32) -> bool {
         let max = self.descriptors.limits.max_texture_dimension_2d;
-        (1..=max).contains(&width)
+        self.stage_render_scale_percent == 100
+            && (1..=max).contains(&width)
             && (1..=max).contains(&height)
             && !self.display_enhancer.as_ref().is_some_and(|e| e.enabled())
     }

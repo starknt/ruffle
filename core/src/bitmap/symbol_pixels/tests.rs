@@ -3,6 +3,42 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 #[test]
+fn nearest_bitmap_blocks_require_pixel_aligned_boundaries_even_after_caching() {
+    use ruffle_render::{bitmap::PixelRegion, matrix::Matrix};
+    let mut gpu = renderer(false);
+    let mut pixels = super::Pixels::solid(
+        1024 * 1024,
+        super::Color::from(0xff337755),
+        ruffle_memory::MemoryScope::current(),
+    );
+    pixels.fill_rect(
+        1024,
+        1024,
+        PixelRegion::for_region(0, 0, 256, 256),
+        super::Color::from(0xff6584ab),
+    );
+    let aligned = Matrix::scale(0.25, 0.25);
+    let (image, blocks, region) = pixels.nearest_view(&mut gpu, &aligned).unwrap().unwrap();
+    assert_eq!(blocks, [8, 8]);
+    assert_eq!(region, PixelRegion::for_whole_size(128, 128));
+    let texels = test_handle(&image).pixels.borrow();
+    assert_eq!(
+        &texels[4 * 31..4 * 33],
+        &[101, 132, 171, 255, 51, 119, 85, 255]
+    );
+    for matrix in [
+        Matrix::scale(0.35, 0.35),
+        Matrix {
+            tx: swf::Twips::HALF_PX,
+            ..aligned
+        },
+        Matrix { b: 0.1, ..aligned },
+    ] {
+        assert!(pixels.nearest_view(&mut gpu, &matrix).unwrap().is_none());
+    }
+}
+
+#[test]
 fn aligned_rect_fill_can_be_read_and_cloned_before_expanding_pixels() {
     use crate::bitmap::{bitmap_data::BitmapData, operations};
     let manager = ruffle_memory::MemoryManager::new(32 << 20);
@@ -606,7 +642,7 @@ fn failed_bitmap_upload_preserves_dirty_cpu_pixels() {
     let mut renderer = renderer(false);
     gc_arena::arena::rootless_mutate(|mc| {
         let mut raw = BitmapRawData::new(1, 1, true, 0xff123456);
-        raw.update_dirty_texture(&mut renderer).unwrap();
+        raw.bitmap_handle(&mut renderer).unwrap();
         raw.set_cpu_dirty(mc, PixelRegion::for_whole_size(1, 1));
         renderer.fail_upload = true;
         let error = raw.update_dirty_texture(&mut renderer).unwrap_err();

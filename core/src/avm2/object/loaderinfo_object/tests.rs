@@ -117,7 +117,7 @@ fn loader_unload_retires_display_uploads_and_preserves_exported_handles() {
             let raw = display.sync(context.renderer).unwrap();
             let upload = Arc::downgrade(
                 &raw.borrow_mut(context.gc())
-                    .update_dirty_texture(context.renderer)
+                    .display_handle(context.renderer)
                     .unwrap()
                     .0,
             );
@@ -143,7 +143,7 @@ fn loader_unload_retires_display_uploads_and_preserves_exported_handles() {
             );
             container.insert_at_index(context, clip.into(), 0);
             raw.borrow_mut(context.gc())
-                .update_dirty_texture(context.renderer)
+                .display_handle(context.renderer)
                 .unwrap();
             assert_eq!(
                 exported,

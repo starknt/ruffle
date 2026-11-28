@@ -802,7 +802,7 @@ mod wrapper {
             renderer: &mut dyn RenderBackend,
         ) -> Result<BitmapHandle, RenderFailure> {
             let mut bitmap_data = self.0.borrow_mut(gc_context);
-            let handle = bitmap_data.update_dirty_texture(renderer)?;
+            let handle = bitmap_data.display_handle(renderer)?;
             bitmap_data.handle_exported = true;
             Ok(handle)
         }
@@ -949,9 +949,11 @@ mod wrapper {
                     return;
                 }
                 if !smoothing {
-                    match data.pixels.nearest_view(context.renderer) {
+                    let mut snapped = transform.matrix;
+                    pixel_snapping.apply(&mut snapped);
+                    match data.pixels.nearest_view(context.renderer, &snapped) {
                         Ok(Some((handle, [bx, by], region))) => {
-                            pixel_snapping.apply(&mut transform.matrix);
+                            transform.matrix = snapped;
                             transform.matrix *=
                                 ruffle_render::matrix::Matrix::scale(bx as f32, by as f32);
                             context.commands.render_bitmap(
@@ -995,7 +997,7 @@ mod wrapper {
             };
             let handle = match view {
                 Some(handle) => handle,
-                None => match inner_bitmap_data.update_dirty_texture(context.renderer) {
+                None => match inner_bitmap_data.display_handle(context.renderer) {
                     Ok(handle) => handle,
                     Err(_) => return,
                 },
@@ -1146,7 +1148,7 @@ impl<'gc> BitmapRawData<'gc> {
         self.disposed = true;
     }
 
-    fn try_bitmap_handle(
+    fn ensure_bitmap_handle(
         &mut self,
         renderer: &mut dyn RenderBackend,
     ) -> Result<BitmapHandle, ruffle_render::error::Error> {
@@ -1174,6 +1176,23 @@ impl<'gc> BitmapRawData<'gc> {
             self.bitmap_handle = Some(handle.clone());
         }
         bitmap_handle
+    }
+
+    pub fn try_bitmap_handle(
+        &mut self,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<BitmapHandle, ruffle_render::error::Error> {
+        let handle = self.ensure_bitmap_handle(renderer)?;
+        self.handle_exported = true;
+        Ok(handle)
+    }
+
+    pub fn bitmap_handle(
+        &mut self,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<BitmapHandle, RenderFailure> {
+        self.try_bitmap_handle(renderer)
+            .map_err(|error| renderer.health().record(error.into_render_failure()))
     }
 
     pub fn transparency(&self) -> bool {
@@ -1267,6 +1286,12 @@ impl<'gc> BitmapRawData<'gc> {
     }
 
     #[inline]
+    pub fn set_pixel32_row_raw(&mut self, x1: u32, x2: u32, y: u32, color: Color) {
+        let row = y as usize * self.width as usize;
+        self.pixels[row + x1 as usize..row + x2 as usize].fill(color);
+    }
+
+    #[inline]
     pub fn fill_rect(&mut self, region: PixelRegion, color: Color) {
         self.pixels
             .fill_rect(self.width, self.height, region, color);
@@ -1292,13 +1317,20 @@ impl<'gc> BitmapRawData<'gc> {
 
     // Updates the data stored with our `BitmapHandle` if this `BitmapRawData`
     // is dirty
-    pub(crate) fn update_dirty_texture(
+    pub fn update_dirty_texture(
+        &mut self,
+        renderer: &mut dyn RenderBackend,
+    ) -> Result<(), RenderFailure> {
+        self.display_handle(renderer).map(drop)
+    }
+
+    pub(crate) fn display_handle(
         &mut self,
         renderer: &mut dyn RenderBackend,
     ) -> Result<BitmapHandle, RenderFailure> {
         self.validity.check()?;
         let handle = self
-            .try_bitmap_handle(renderer)
+            .ensure_bitmap_handle(renderer)
             .map_err(|error| renderer.health().record(error.into_render_failure()))?;
         if self.validity.cpu.is_empty() {
             return Ok(handle);

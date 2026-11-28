@@ -8,6 +8,7 @@ use ruffle_memory::{MemoryBuffer, MemoryKind, MemoryScope};
 use ruffle_render::{
     backend::RenderBackend,
     bitmap::{Bitmap, BitmapFormat, BitmapHandle, BitmapHandleImpl, PixelRegion},
+    matrix::Matrix,
     profile::BitmapAllocation,
 };
 use std::{
@@ -226,7 +227,7 @@ impl Pixels {
             }
             let block_x = 1 << (width | rect.x_min | rect.x_max).trailing_zeros();
             let block_y = 1 << (height | rect.y_min | rect.y_max).trailing_zeros();
-            // Bound the compact upload to 1 KiB and require it to save storage.
+            // Keep a rectangular fill only when at most 256 equal-color blocks describe the image.
             if (block_x > 1 || block_y > 1)
                 && u64::from(width / block_x) * u64::from(height / block_y) <= 256
             {
@@ -251,11 +252,28 @@ impl Pixels {
     pub fn nearest_view(
         &mut self,
         renderer: &mut dyn RenderBackend,
+        matrix: &Matrix,
     ) -> Result<Option<(BitmapHandle, [u32; 2], PixelRegion)>, ruffle_render::error::Error> {
         let PixelSource::Rect(fill) = &self.source else {
             return Ok(None);
         };
-        let [bx, by] = fill.block;
+        // Point filtering can round a fractional texel boundary differently on
+        // different devices. Align blocks to attachment pixels and keep the
+        // sample center well inside even the least precise sampler's texel.
+        let [bx, by] = fill.block.map(|n| n.min(8));
+        let aligned = |scale: f32, block: u32| {
+            let size = scale * block as f32;
+            (1.0..=4.0).contains(&size) && size.fract() == 0.0
+        };
+        if matrix.b != 0.0
+            || matrix.c != 0.0
+            || matrix.tx.get() % swf::Twips::TWIPS_PER_PIXEL != 0
+            || matrix.ty.get() % swf::Twips::TWIPS_PER_PIXEL != 0
+            || !aligned(matrix.a, bx)
+            || !aligned(matrix.d, by)
+        {
+            return Ok(None);
+        }
         let w = fill.width / bx;
         let h = (fill.background.len / fill.width as usize) as u32 / by;
         let handle = if let Some(handle) = &self.view {
@@ -276,11 +294,7 @@ impl Pixels {
             self.view = Some(handle.clone());
             handle
         };
-        Ok(Some((
-            handle,
-            fill.block,
-            PixelRegion::for_whole_size(w, h),
-        )))
+        Ok(Some((handle, [bx, by], PixelRegion::for_whole_size(w, h))))
     }
 
     pub fn has_view(&self) -> bool {
