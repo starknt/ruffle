@@ -4,6 +4,7 @@
 //! and all modified CPU buffers are private to the BitmapData.
 use super::bitmap_data::Color;
 use crate::character::CompressedBitmap;
+use ruffle_memory::{MemoryBuffer, MemoryKind, MemoryScope};
 use ruffle_render::{
     backend::RenderBackend,
     bitmap::{BitmapHandle, BitmapHandleImpl},
@@ -76,49 +77,103 @@ impl SymbolImage {
     }
 }
 struct PixelBacking {
-    colors: ruffle_memory::MemoryBuffer<Color>,
+    colors: MemoryBuffer<Color>,
     _profile: BitmapAllocation,
 }
 
 impl PixelBacking {
-    fn new(pixels: Vec<Color>) -> Self {
-        let profile = BitmapAllocation::new(pixels.capacity() * size_of::<Color>());
+    fn new(scope: &MemoryScope, pixels: Vec<Color>) -> Self {
+        Self::from_buffer(MemoryBuffer::new(scope, MemoryKind::BitmapPixels, pixels))
+    }
+
+    fn from_buffer(colors: MemoryBuffer<Color>) -> Self {
+        let profile = BitmapAllocation::new(colors.capacity() * size_of::<Color>());
         Self {
-            colors: ruffle_memory::MemoryBuffer::new(
-                &ruffle_memory::MemoryScope::current(),
-                ruffle_memory::MemoryKind::BitmapPixels,
-                pixels,
-            ),
+            colors,
             _profile: profile,
         }
+    }
+
+    fn cached(cache: &RefCell<std::rc::Weak<Self>>, create: impl FnOnce() -> Self) -> Rc<Self> {
+        if let Some(pixels) = cache.borrow().upgrade() {
+            return pixels;
+        }
+        let pixels = Rc::new(create());
+        *cache.borrow_mut() = Rc::downgrade(&pixels);
+        pixels
     }
 }
 
 impl Clone for PixelBacking {
     fn clone(&self) -> Self {
-        Self::new(self.colors.to_vec())
+        Self::from_buffer(self.colors.clone())
     }
+}
+
+struct SolidFill {
+    len: usize,
+    color: Color,
+    scope: MemoryScope,
+    expanded: RefCell<std::rc::Weak<PixelBacking>>,
+}
+
+#[derive(Clone)]
+enum PixelSource {
+    Owned,
+    Solid(Rc<SolidFill>),
+    Symbol(Rc<SymbolImage>),
 }
 
 #[derive(Clone)]
 pub struct Pixels {
-    symbol: Option<Rc<SymbolImage>>,
+    source: PixelSource,
     view: Option<BitmapHandle>,
     data: OnceCell<Rc<PixelBacking>>,
 }
 impl Pixels {
     pub fn owned(p: Vec<Color>) -> Self {
         Self {
-            symbol: None,
+            source: PixelSource::Owned,
             view: None,
-            data: OnceCell::from(Rc::new(PixelBacking::new(p))),
+            data: OnceCell::from(Rc::new(PixelBacking::new(&MemoryScope::current(), p))),
+        }
+    }
+    pub fn solid(len: usize, color: Color, scope: MemoryScope) -> Self {
+        Self {
+            source: PixelSource::Solid(Rc::new(SolidFill {
+                len,
+                color,
+                scope,
+                expanded: RefCell::default(),
+            })),
+            view: None,
+            data: OnceCell::new(),
         }
     }
     pub fn symbol(s: Rc<SymbolImage>) -> Self {
         Self {
-            symbol: Some(s),
+            source: PixelSource::Symbol(s),
             view: None,
             data: OnceCell::new(),
+        }
+    }
+    #[inline]
+    pub fn pixel(&self, index: usize) -> Color {
+        if let PixelSource::Solid(fill) = &self.source {
+            assert!(index < fill.len);
+            fill.color
+        } else {
+            self[index]
+        }
+    }
+
+    pub fn fill(&mut self, color: Color) {
+        if let PixelSource::Solid(fill) = &self.source {
+            if fill.color != color {
+                *self = Self::solid(fill.len, color, fill.scope.clone());
+            }
+        } else {
+            self.deref_mut().fill(color);
         }
     }
     pub fn view(
@@ -126,7 +181,7 @@ impl Pixels {
         renderer: &mut dyn RenderBackend,
     ) -> Result<Option<BitmapHandle>, ruffle_render::error::Error> {
         renderer.health().check()?;
-        let Some(s) = self.symbol.as_ref() else {
+        let PixelSource::Symbol(s) = &self.source else {
             return Ok(None);
         };
         if let Some(view) = &self.view {
@@ -141,20 +196,18 @@ impl Pixels {
         Ok(Some(view))
     }
     fn materialize(&self) -> &Rc<PixelBacking> {
-        self.data.get_or_init(|| {
-            let symbol = self
-                .symbol
-                .as_ref()
-                .expect("unmaterialized bitmap has a symbol");
-            if let Some(pixels) = symbol.decoded.borrow().upgrade() {
-                return pixels;
-            }
-            let decoded = symbol.data.decode().expect("Failed to decode BitmapData");
-            let pixels = Rc::new(PixelBacking::new(
-                decoded.as_colors().map(Color::from).collect(),
-            ));
-            *symbol.decoded.borrow_mut() = Rc::downgrade(&pixels);
-            pixels
+        self.data.get_or_init(|| match &self.source {
+            PixelSource::Solid(fill) => PixelBacking::cached(&fill.expanded, || {
+                PixelBacking::new(&fill.scope, vec![fill.color; fill.len])
+            }),
+            PixelSource::Symbol(symbol) => PixelBacking::cached(&symbol.decoded, || {
+                let decoded = symbol.data.decode().expect("Failed to decode BitmapData");
+                PixelBacking::new(
+                    &MemoryScope::current(),
+                    decoded.as_colors().map(Color::from).collect(),
+                )
+            }),
+            PixelSource::Owned => unreachable!("owned pixels have a backing"),
         })
     }
 }
@@ -167,7 +220,7 @@ impl Deref for Pixels {
 impl DerefMut for Pixels {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.materialize();
-        self.symbol = None;
+        self.source = PixelSource::Owned;
         self.view = None;
         &mut Rc::make_mut(self.data.get_mut().unwrap()).colors
     }

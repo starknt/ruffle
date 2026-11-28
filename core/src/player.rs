@@ -353,9 +353,56 @@ impl PlayerSession {
     }
 }
 
+#[derive(Default)]
+struct ExternalGcPacing {
+    observed_bytes: u64,
+    /// Backing growth still to charge. Keep bytes so a pressure change can reprice it.
+    pending_bytes: f64,
+}
+
+impl ExternalGcPacing {
+    fn schedule(
+        &mut self,
+        metrics: &gc_arena::metrics::Metrics,
+        live_bytes: u64,
+        pressure: ruffle_memory::PressureLevel,
+    ) {
+        use ruffle_memory::PressureLevel;
+        let (bytes_per_unit, slice) = match pressure {
+            PressureLevel::Normal => (2048.0, 512.0),
+            PressureLevel::Moderate => (2048.0, 1024.0),
+            PressureLevel::High | PressureLevel::Critical => (1024.0, 2048.0),
+        };
+        let previous = std::mem::replace(&mut self.observed_bytes, live_bytes);
+        let released = previous.saturating_sub(live_bytes) as f64;
+        let mut retained = (self.pending_bytes - released).max(0.0);
+        // At normal and moderate pressure, charge growth that survives an update.
+        self.pending_bytes = live_bytes.saturating_sub(previous) as f64;
+        if pressure >= PressureLevel::High {
+            retained += std::mem::take(&mut self.pending_bytes);
+        }
+        if retained == 0.0 {
+            return;
+        }
+
+        // A single large backing need not schedule more work than the current heap.
+        let eligible = (retained / bytes_per_unit).min(metrics.total_gc_count() as f64);
+        // Paying the collector's sleep threshold does no tracing or sweeping. Count all
+        // retained growth towards waking it, then defer only work above this update's
+        // allowance. The arena's own allocation debt and explicit GC requests take priority.
+        let natural = metrics.allocation_debt();
+        metrics.adjust_debt(eligible);
+        let deferred = (metrics.allocation_debt() - natural.max(slice)).clamp(0.0, eligible);
+        if deferred > 0.0 {
+            metrics.adjust_debt(-deferred);
+            self.pending_bytes += deferred * bytes_per_unit;
+        }
+    }
+}
+
 pub struct Player {
     gc_memory: ruffle_memory::MemoryLease,
-    last_external_bytes: u64,
+    external_gc: ExternalGcPacing,
     render_epoch: u64,
     snapshots: crate::display_object::snapshot::Cache,
     /// The version of the player we're emulating.
@@ -2964,21 +3011,15 @@ impl Player {
             )
         });
         let (external, pressure, emergency) = self.gc_memory.scope().gc_pressure();
-        let growth = external.saturating_sub(self.last_external_bytes);
-        self.last_external_bytes = external;
         if emergency {
             arena.finish_cycle();
-        } else {
-            // gc-arena expresses work in objects. Bound the extra debt per update so
-            // a single large external allocation does not turn an ordinary tick into a full GC.
-            let unit = if pressure.level >= ruffle_memory::PressureLevel::High {
-                1024
-            } else {
-                4096
+            self.external_gc = ExternalGcPacing {
+                observed_bytes: external,
+                pending_bytes: 0.0,
             };
-            arena
-                .metrics()
-                .adjust_debt((growth / unit).min(2048) as f64);
+        } else {
+            self.external_gc
+                .schedule(arena.metrics(), external, pressure.level);
             arena.collect_debt();
         }
         self.gc_memory
@@ -3630,7 +3671,7 @@ impl PlayerBuilder {
         let player = Arc::new_cyclic(|self_ref| {
             Mutex::new(Player {
                 gc_memory: scope.track(ruffle_memory::MemoryKind::GcHeap, 0),
-                last_external_bytes: 0,
+                external_gc: ExternalGcPacing::default(),
                 render_epoch: 0,
                 snapshots: Default::default(),
                 // Backends
@@ -3900,6 +3941,71 @@ pub enum PlayerMode {
 mod tests {
     use super::*;
     use ruffle_render::error::{RenderFailure, RenderFailureKind};
+
+    #[test]
+    fn sustained_external_growth_wakes_incremental_gc_over_multiple_updates() {
+        use gc_arena::{arena::CollectionPhase, metrics::Pacing};
+        use ruffle_memory::{MemoryKind, MemoryManager};
+
+        let session = PlayerBuilder::new()
+            .with_memory_manager(MemoryManager::new(256 << 20))
+            .build();
+        let mut player = session.lock().unwrap();
+        player.gc_arena.borrow().metrics().set_pacing(Pacing {
+            sleep_factor: 0.0,
+            min_sleep: 3072,
+            ..Pacing::default()
+        });
+        player.gc_arena.borrow_mut().finish_cycle();
+
+        let scope = player.memory_scope().clone();
+        let temporary = scope.track(MemoryKind::ByteArray, 8 << 20);
+        player.update(|_| {});
+        assert_eq!(
+            player.gc_arena.borrow().collection_phase(),
+            CollectionPhase::Sleeping
+        );
+        drop(temporary);
+        for _ in 0..16 {
+            player.update(|_| {});
+            assert_eq!(
+                player.gc_arena.borrow().collection_phase(),
+                CollectionPhase::Sleeping
+            );
+        }
+
+        player.gc_arena.borrow_mut().finish_cycle();
+        let _live = scope.track(MemoryKind::ByteArray, 8 << 20);
+        assert!(
+            (0..2).any(|_| {
+                player.update(|_| {});
+                player.gc_arena.borrow().collection_phase() != CollectionPhase::Sleeping
+            }),
+            "retained external bytes should pay the sleep threshold before work is sliced"
+        );
+    }
+
+    #[test]
+    fn external_growth_survives_a_partial_release_and_pressure_change() {
+        use gc_arena::metrics::Pacing;
+        use ruffle_memory::PressureLevel;
+
+        let session = PlayerBuilder::new().build();
+        let player = session.lock().unwrap();
+        let mut arena = player.gc_arena.borrow_mut();
+        arena.metrics().set_pacing(Pacing {
+            sleep_factor: 0.0,
+            min_sleep: 256,
+            ..Pacing::default()
+        });
+        arena.finish_cycle();
+        let metrics = arena.metrics();
+        let mut pacing = ExternalGcPacing::default();
+        pacing.schedule(metrics, 2 << 20, PressureLevel::Normal);
+        assert_eq!(metrics.allocation_debt(), 0.0);
+        pacing.schedule(metrics, 1 << 20, PressureLevel::High);
+        assert_eq!(metrics.allocation_debt(), 768.0);
+    }
 
     #[test]
     fn default_session_retains_tasks_until_the_host_polls() {

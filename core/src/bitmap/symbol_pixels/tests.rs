@@ -12,6 +12,80 @@ fn owned_bitmap_clone_shares_storage_until_first_pixel_write() {
     assert_eq!(u32::from(other[0]), 0xff123456);
 }
 
+#[test]
+fn uniform_bitmap_only_allocates_pixels_for_the_modified_clone() {
+    use crate::bitmap::{bitmap_data::BitmapData, operations};
+    use ruffle_memory::{MemoryKind, MemoryManager};
+
+    let manager = MemoryManager::new(32 << 20);
+    let scope = manager.player();
+    let pixel_bytes = || {
+        manager.snapshot().players[0]
+            .active
+            .get(&MemoryKind::BitmapPixels)
+            .copied()
+            .unwrap_or(0)
+    };
+    gc_arena::arena::rootless_mutate(|mc| {
+        let mut renderer = renderer(false);
+        let source = scope.enter(|| BitmapData::new(mc, 128, 128, false, 0x00123456));
+        let copy = source.clone_data(mc, &mut renderer).unwrap();
+        let read = |image, renderer: &mut TestRenderer| {
+            operations::get_pixel32(image, renderer, 1, 1).unwrap()
+        };
+        assert_eq!(read(source, &mut renderer), 0xff123456);
+        assert_eq!(pixel_bytes(), 0, "single-pixel reads of a solid fill");
+        operations::fill_rect(mc, &mut renderer, copy, 0, 0, 4, 4, 0xff337755).unwrap();
+        assert_eq!(
+            pixel_bytes(),
+            128 * 128 * 4,
+            "charge the allocating bitmap's scope"
+        );
+        assert_eq!(read(source, &mut renderer), 0xff123456);
+        assert_eq!(read(copy, &mut renderer), 0xff337755);
+        assert_eq!(
+            operations::get_pixel32(copy, &mut renderer, 4, 4).unwrap(),
+            0xff123456
+        );
+        operations::fill_rect(mc, &mut renderer, source, 0, 0, 128, 128, 0xff224466).unwrap();
+        assert_eq!(read(source, &mut renderer), 0xff224466);
+        copy.dispose(mc);
+        assert_eq!(pixel_bytes(), 0);
+    });
+}
+
+#[test]
+fn uniform_bitmap_clones_share_bulk_reads_and_detach_on_write() {
+    use crate::bitmap::{bitmap_data::BitmapData, operations};
+    let manager = ruffle_memory::MemoryManager::new(32 << 20);
+    let scope = manager.player();
+    scope.enter(|| {
+        gc_arena::arena::rootless_mutate(|mc| {
+            let mut renderer = renderer(false);
+            let source = BitmapData::new(mc, 128, 128, true, 0x80800000);
+            let copy = source.clone_data(mc, &mut renderer).unwrap();
+            assert_eq!(manager.snapshot().active_bytes, 0);
+            let source_data = source.sync(&mut renderer).unwrap();
+            let copy_data = copy.sync(&mut renderer).unwrap();
+            assert_eq!(
+                source_data.borrow().pixels().as_ptr(),
+                copy_data.borrow().pixels().as_ptr()
+            );
+            assert_eq!(manager.snapshot().active_bytes, 128 * 128 * 4);
+            operations::set_pixel32(mc, &mut renderer, copy, 0, 0, 0xff447755).unwrap();
+            assert_ne!(
+                source_data.borrow().pixels()[0],
+                copy_data.borrow().pixels()[0]
+            );
+            assert_eq!(
+                source_data.borrow().pixels()[0],
+                copy_data.borrow().pixels()[1]
+            );
+            assert_eq!(manager.snapshot().active_bytes, 2 * 128 * 128 * 4);
+        })
+    });
+}
+
 use ruffle_render::backend::{
     BitmapCacheEntry, RenderBackend, ShapeHandle, ShapeHandleImpl, ViewportDimensions,
 };

@@ -1007,14 +1007,11 @@ impl std::fmt::Debug for BitmapRawData<'_> {
 impl<'gc> BitmapRawData<'gc> {
     pub fn new(width: u32, height: u32, transparency: bool, fill_color: u32) -> Self {
         Self {
-            pixels: crate::bitmap::symbol_pixels::Pixels::owned(vec![
-                Color::bgra_u32(fill_color)
-                    .to_premultiplied_alpha(
-                        transparency
-                    );
-                width as usize
-                    * height as usize
-            ]),
+            pixels: crate::bitmap::symbol_pixels::Pixels::solid(
+                width as usize * height as usize,
+                Color::bgra_u32(fill_color).to_premultiplied_alpha(transparency),
+                ruffle_memory::MemoryScope::current(),
+            ),
             width,
             height,
             transparency,
@@ -1207,7 +1204,7 @@ impl<'gc> BitmapRawData<'gc> {
 
     #[inline]
     pub fn get_pixel32_raw(&self, x: u32, y: u32) -> Color {
-        self.pixels[(x + y * self.width()) as usize]
+        self.pixels.pixel((x + y * self.width()) as usize)
     }
 
     pub fn raw_pixels_mut(&mut self) -> &mut [Color] {
