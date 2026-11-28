@@ -5,10 +5,16 @@ pub(crate) mod derived;
 pub(crate) mod mesh;
 mod writer;
 use futures::FutureExt;
+#[cfg(all(test, unix))]
+use ruffle_memory::private_cache::android_private_group;
+use ruffle_memory::private_cache::{
+    check_ancestry, check_private_dir, check_private_file, private_lock,
+};
+pub(crate) use ruffle_memory::private_cache::{open_private_read, private_dir};
 use sha2::{Digest, Sha256, digest::Output};
-use std::fs::{self, File, Metadata};
+use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use writer::Writer;
 
 const MAGIC: &[u8; 8] = b"RFLWGPU1";
@@ -178,27 +184,6 @@ struct CacheFile {
     identity: Hash,
 }
 
-pub(crate) fn private_dir(dir: &Path) -> io::Result<PathBuf> {
-    if dir.components().any(|c| c == Component::ParentDir) {
-        return Err(ErrorKind::InvalidInput.into());
-    }
-    // A trailing slash forces Unix lstat to follow even a final directory symlink.
-    let dir: PathBuf = std::path::absolute(dir)?.components().collect();
-    let parent = dir.parent().ok_or(ErrorKind::InvalidInput)?;
-    check_ancestry(parent)?;
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    match builder.create(&dir) {
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-        result => result?,
-    }
-    check_private_dir(&dir)?;
-    // A private directory can still be unwritable due to ACLs or a read-only mount.
-    tempfile::NamedTempFile::new_in(&dir)?.close()?;
-    Ok(dir)
-}
-
 impl CacheFile {
     fn new(dir: &Path, identity: Hash) -> io::Result<Self> {
         let dir = private_dir(dir)?;
@@ -279,7 +264,7 @@ impl CacheFile {
                 .collect();
             let Some(identity) = identity else { continue };
             let metadata = fs::symlink_metadata(&path)?;
-            if check_private_file(&metadata).is_err() {
+            if check_private_file(&path, &metadata).is_err() {
                 continue;
             }
             used = used.saturating_add(metadata.len());
@@ -318,11 +303,11 @@ impl CacheFile {
         }
         let dir = self.checked_dir()?;
         match fs::symlink_metadata(&self.path) {
-            Ok(metadata) => check_private_file(&metadata)?,
+            Ok(metadata) => check_private_file(&self.path, &metadata)?,
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        let mut temp = ruffle_memory::private_cache::private_tempfile(dir)?;
         temp.write_all(MAGIC)?;
         temp.write_all(&self.identity)?;
         temp.write_all(&len.to_le_bytes())?;
@@ -342,130 +327,6 @@ const SNAPSHOT_BUDGET: u64 = if cfg!(target_os = "android") {
     * 1024;
 
 // Stable lock files are never unlinked: all processes lock the same inode across replacement.
-pub(crate) fn open_private_read(path: &Path) -> io::Result<File> {
-    check_private_file(&fs::symlink_metadata(path)?)?;
-    #[cfg(unix)]
-    let file = {
-        use rustix::fs::{Mode, OFlags, open};
-        File::from(open(
-            path,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-            Mode::empty(),
-        )?)
-    };
-    #[cfg(not(unix))]
-    let file = {
-        let mut options = File::options();
-        #[cfg(windows)]
-        // FILE_FLAG_OPEN_REPARSE_POINT lets us validate the opened object itself.
-        std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x0020_0000);
-        options.read(true).open(path)?
-    };
-    let metadata = file.metadata()?;
-    check_private_file(&metadata)?;
-    Ok(file)
-}
-
-fn private_lock(path: &Path) -> io::Result<File> {
-    let mut options = File::options();
-    options.create(true).truncate(false).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(
-            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
-        );
-    }
-    #[cfg(windows)]
-    std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x0020_0000);
-    let f = options.open(path)?;
-    check_private_file(&f.metadata()?)?;
-    Ok(f)
-}
-
-fn check_ancestry(path: &Path) -> io::Result<()> {
-    for ancestor in path.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor)?;
-        if !metadata.is_dir() || is_link(&metadata) {
-            return Err(ErrorKind::PermissionDenied.into());
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            // Android's system account (AID_SYSTEM) manages the app data hierarchy.
-            let system = |id| id == 0 || (cfg!(target_os = "android") && id == 1000);
-            let uid = rustix::process::geteuid().as_raw();
-            let trusted_owner = system(metadata.uid()) || metadata.uid() == uid;
-            let mode = metadata.mode();
-            let gid = metadata.gid();
-            let trusted_group =
-                cfg!(target_os = "android") && (system(gid) || android_private_group(uid, gid));
-            let group_writable = mode & 0o020 != 0 && !trusted_group;
-            if !trusted_owner || (mode & 0o1000 == 0 && (mode & 0o002 != 0 || group_writable)) {
-                return Err(ErrorKind::PermissionDenied.into());
-            }
-        }
-    }
-    Ok(())
-}
-
-// Android assigns each app a private GID and a cache GID in the same user profile.
-#[cfg(any(unix, test))]
-fn android_private_group(uid: u32, gid: u32) -> bool {
-    (10_000..20_000).contains(&(uid % 100_000))
-        && (gid == uid || gid.checked_sub(10_000) == Some(uid))
-}
-
-fn check_private_dir(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() {
-        return Err(ErrorKind::PermissionDenied.into());
-    }
-    #[cfg(unix)]
-    if std::os::unix::fs::MetadataExt::mode(&metadata) & 0o300 != 0o300 {
-        return Err(ErrorKind::PermissionDenied.into());
-    }
-    check_private(&metadata)
-}
-
-fn check_private_file(metadata: &Metadata) -> io::Result<()> {
-    if !metadata.is_file() {
-        return Err(ErrorKind::PermissionDenied.into());
-    }
-    #[cfg(unix)]
-    if std::os::unix::fs::MetadataExt::nlink(metadata) > 1 {
-        return Err(ErrorKind::PermissionDenied.into());
-    }
-    check_private(metadata)
-}
-
-fn check_private(metadata: &Metadata) -> io::Result<()> {
-    if is_link(metadata) {
-        return Err(ErrorKind::PermissionDenied.into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
-            return Err(ErrorKind::PermissionDenied.into());
-        }
-    }
-    Ok(())
-}
-
-fn is_link(metadata: &Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        // FILE_ATTRIBUTE_REPARSE_POINT includes junctions as well as symbolic links.
-        metadata.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.is_symlink()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,7 +376,9 @@ mod tests {
             let payload = vec![7; (budget - HEADER_LEN as u64) as usize];
             assert!(new.store_budgeted(&payload, budget).is_err());
             assert!(old.path.exists());
-            drop(active);
+            // A concurrent test may spawn a child between fork and exec.
+            // Release the lock even when that child briefly holds a duplicate fd.
+            active.unlock().unwrap();
             new.store_budgeted(&payload, budget).unwrap();
             assert!(!old.path.exists());
             assert_eq!(new.load().unwrap(), payload);

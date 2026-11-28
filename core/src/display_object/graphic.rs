@@ -158,11 +158,14 @@ impl<'gc> Graphic<'gc> {
             .library
             .library_for_movie(shared.movie, context.gc_context)
             .expect("Graphic's movie has a library");
-        let new_handle = context.renderer.register_swf_shape(
-            &shared.shape,
-            &MovieLibrarySource { library: &library },
-            current_scale,
-        )?;
+        let new_handle =
+            ruffle_memory::SymbolId::enter(Some(shared.movie.symbol_id(shared.id)), || {
+                context.renderer.register_swf_shape(
+                    &shared.shape,
+                    &MovieLibrarySource { library: &library },
+                    current_scale,
+                )
+            })?;
 
         {
             let mut cache = shared.scaled_handle.borrow_mut();
@@ -172,7 +175,10 @@ impl<'gc> Graphic<'gc> {
                 current_scale,
                 cache.len()
             );
-            cache.insert(current_scale, new_handle.clone());
+            cache.insert(
+                current_scale,
+                context.renderer.retain_static_shape(new_handle.clone()),
+            );
         }
 
         Ok(new_handle)

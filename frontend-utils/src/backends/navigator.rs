@@ -14,9 +14,11 @@ use ruffle_core::backend::navigator::{
 };
 use ruffle_core::indexmap::IndexMap;
 use ruffle_core::loader::Error;
+use ruffle_core::memory::MemoryScope;
 use ruffle_core::socket::{
     ConnectionState, SocketAction, SocketActionSender, SocketHandle, SocketWrite,
 };
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs::File;
 use std::future::Future;
@@ -105,6 +107,7 @@ pub struct ExternalNavigatorBackend<F: TaskSpawner, I: NavigatorInterface> {
     client: Option<Rc<reqwest::Client>>,
 
     cookies: Arc<SessionCookies>,
+    memory: Rc<RefCell<MemoryScope>>,
     assets: Option<AssetScheduler>,
 
     socket_allowed: HashSet<String>,
@@ -121,7 +124,7 @@ pub struct ExternalNavigatorBackend<F: TaskSpawner, I: NavigatorInterface> {
 impl<F: TaskSpawner, I: NavigatorInterface> ExternalNavigatorBackend<F, I> {
     /// Scope public whole-body reuse and connection limits to this navigator.
     pub fn configure_buffered_assets(&mut self, allow: fn(&Url) -> bool) -> AssetScheduler {
-        let scheduler = AssetScheduler::new(allow);
+        let scheduler = AssetScheduler::new(allow, self.memory.clone());
         self.assets = Some(scheduler.clone());
         scheduler
     }
@@ -214,6 +217,7 @@ impl<F: TaskSpawner, I: NavigatorInterface> ExternalNavigatorBackend<F, I> {
         Self {
             future_spawner,
             cookies,
+            memory: Rc::new(RefCell::new(MemoryScope::current())),
             assets: None,
             client,
             base_url,
@@ -229,6 +233,10 @@ impl<F: TaskSpawner, I: NavigatorInterface> ExternalNavigatorBackend<F, I> {
 impl<F: TaskSpawner + 'static, I: NavigatorInterface> NavigatorBackend
     for ExternalNavigatorBackend<F, I>
 {
+    fn set_memory_scope(&mut self, scope: &MemoryScope) {
+        self.memory.replace(scope.clone());
+    }
+
     fn navigate_to_url(
         &self,
         url: &str,
@@ -288,6 +296,7 @@ impl<F: TaskSpawner + 'static, I: NavigatorInterface> NavigatorBackend
 
         let client = self.client.clone();
         let loader_request = request.loader_request();
+        let scope = self.memory.borrow().clone();
 
         match processed_url.scheme() {
             "file" => {
@@ -305,9 +314,18 @@ impl<F: TaskSpawner + 'static, I: NavigatorInterface> NavigatorBackend
                     let contents = content.get_local_file(&processed_url, interface).await;
 
                     let response: Box<dyn SuccessResponse> = Box::new(Response {
+                        allows_movie_cache: true,
                         url: response_url.to_string(),
                         loader_request,
-                        response_body: ResponseBody::File(contents.map(Into::into)),
+                        response_body: ResponseBody::File(contents.map(|data| {
+                            Some(assets::AssetBytes::new(
+                                ruffle_core::memory::MemoryBuffer::new(
+                                    &scope,
+                                    ruffle_core::memory::MemoryKind::Network,
+                                    data,
+                                ),
+                            ))
+                        })),
                         text_encoding: None,
                         status: 0,
                         redirected: false,
@@ -365,9 +383,13 @@ impl<F: TaskSpawner + 'static, I: NavigatorInterface> NavigatorBackend
                 }
 
                 let response: Box<dyn SuccessResponse> = Box::new(Response {
+                    allows_movie_cache: false,
                     url,
                     loader_request,
-                    response_body: ResponseBody::Network(Arc::new(Mutex::new(Some(response)))),
+                    response_body: ResponseBody::Network(
+                        Arc::new(Mutex::new(Some(response))),
+                        scope,
+                    ),
                     text_encoding,
                     status,
                     redirected,

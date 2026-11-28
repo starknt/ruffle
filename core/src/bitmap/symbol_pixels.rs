@@ -20,18 +20,46 @@ use std::{
 pub(crate) mod tests;
 
 #[derive(Debug)]
+pub struct EncodedSymbol {
+    data: CompressedBitmap,
+    _charge: ruffle_memory::MemoryLease,
+}
+impl Deref for EncodedSymbol {
+    type Target = CompressedBitmap;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+#[derive(Debug)]
 pub struct SymbolImage {
-    pub data: CompressedBitmap,
+    pub data: std::sync::Arc<EncodedSymbol>,
+    symbol: Option<ruffle_memory::SymbolId>,
+    decoded: RefCell<std::rc::Weak<PixelBacking>>,
     view: RefCell<Option<Weak<dyn BitmapHandleImpl>>>,
 }
 impl SymbolImage {
-    pub fn new(data: CompressedBitmap) -> Self {
+    pub fn new(symbol: Option<ruffle_memory::SymbolId>, data: CompressedBitmap) -> Self {
+        let scope = ruffle_memory::MemoryScope::current();
+        let store = scope.manager().resources::<EncodedSymbol>();
+        let data = store.intern(data.shared_key(), || {
+            let charge = scope.manager().shared().track(
+                ruffle_memory::MemoryKind::EncodedBitmap,
+                data.capacity() as u64,
+            );
+            std::sync::Arc::new(EncodedSymbol {
+                data,
+                _charge: charge,
+            })
+        });
         Self {
             data,
+            symbol,
+            decoded: Default::default(),
             view: Default::default(),
         }
     }
-    fn view(
+    pub(crate) fn view(
         &self,
         renderer: &mut dyn RenderBackend,
     ) -> Result<BitmapHandle, ruffle_render::error::Error> {
@@ -39,24 +67,51 @@ impl SymbolImage {
             return Ok(BitmapHandle(h));
         }
         let decoded = renderer.decode_bitmap_symbol(self.data.encoded(), self.data.size())?;
-        let h = renderer
-            .register_bitmap_with_usage(decoded, ruffle_render::backend::BitmapUsage::Symbol)?;
+        let h = ruffle_memory::SymbolId::enter(self.symbol, || {
+            renderer
+                .register_bitmap_with_usage(decoded, ruffle_render::backend::BitmapUsage::Symbol)
+        })?;
         *self.view.borrow_mut() = Some(std::sync::Arc::downgrade(&h.0));
         Ok(h)
     }
 }
+struct PixelBacking {
+    colors: ruffle_memory::MemoryBuffer<Color>,
+    _profile: BitmapAllocation,
+}
+
+impl PixelBacking {
+    fn new(pixels: Vec<Color>) -> Self {
+        let profile = BitmapAllocation::new(pixels.capacity() * size_of::<Color>());
+        Self {
+            colors: ruffle_memory::MemoryBuffer::new(
+                &ruffle_memory::MemoryScope::current(),
+                ruffle_memory::MemoryKind::BitmapPixels,
+                pixels,
+            ),
+            _profile: profile,
+        }
+    }
+}
+
+impl Clone for PixelBacking {
+    fn clone(&self) -> Self {
+        Self::new(self.colors.to_vec())
+    }
+}
+
+#[derive(Clone)]
 pub struct Pixels {
     symbol: Option<Rc<SymbolImage>>,
     view: Option<BitmapHandle>,
-    data: OnceCell<(Vec<Color>, BitmapAllocation)>,
+    data: OnceCell<Rc<PixelBacking>>,
 }
 impl Pixels {
     pub fn owned(p: Vec<Color>) -> Self {
-        let a = BitmapAllocation::new(p.capacity() * size_of::<Color>());
         Self {
             symbol: None,
             view: None,
-            data: OnceCell::from((p, a)),
+            data: OnceCell::from(Rc::new(PixelBacking::new(p))),
         }
     }
     pub fn symbol(s: Rc<SymbolImage>) -> Self {
@@ -85,34 +140,28 @@ impl Pixels {
         }
         Ok(Some(view))
     }
-    fn materialize(&self) -> &(Vec<Color>, BitmapAllocation) {
+    fn materialize(&self) -> &Rc<PixelBacking> {
         self.data.get_or_init(|| {
-            let decoded = self
+            let symbol = self
                 .symbol
                 .as_ref()
-                .unwrap()
-                .data
-                .decode()
-                .expect("Failed to decode BitmapData");
-            let p: Vec<_> = decoded.as_colors().map(Color::from).collect();
-            let a = BitmapAllocation::new(p.capacity() * size_of::<Color>());
-            (p, a)
+                .expect("unmaterialized bitmap has a symbol");
+            if let Some(pixels) = symbol.decoded.borrow().upgrade() {
+                return pixels;
+            }
+            let decoded = symbol.data.decode().expect("Failed to decode BitmapData");
+            let pixels = Rc::new(PixelBacking::new(
+                decoded.as_colors().map(Color::from).collect(),
+            ));
+            *symbol.decoded.borrow_mut() = Rc::downgrade(&pixels);
+            pixels
         })
     }
 }
-impl Clone for Pixels {
-    fn clone(&self) -> Self {
-        if let Some(s) = &self.symbol {
-            Self::symbol(s.clone())
-        } else {
-            Self::owned(self.deref().clone())
-        }
-    }
-}
 impl Deref for Pixels {
-    type Target = Vec<Color>;
+    type Target = [Color];
     fn deref(&self) -> &Self::Target {
-        &self.materialize().0
+        &self.materialize().colors
     }
 }
 impl DerefMut for Pixels {
@@ -120,6 +169,6 @@ impl DerefMut for Pixels {
         self.materialize();
         self.symbol = None;
         self.view = None;
-        &mut self.data.get_mut().unwrap().0
+        &mut Rc::make_mut(self.data.get_mut().unwrap()).colors
     }
 }

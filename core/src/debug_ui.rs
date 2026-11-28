@@ -39,6 +39,7 @@ pub struct DebugUi {
     queued_messages: Vec<Message>,
     items_to_save: Vec<ItemToSave>,
     movie_list: Option<MovieListWindow>,
+    memory_open: bool,
     domain_list: Option<DomainListWindow>,
     display_object_search: Option<DisplayObjectSearchWindow>,
 }
@@ -55,6 +56,7 @@ pub enum Message {
     TrackStage,
     TrackTopLevelMovie,
     ShowKnownMovies,
+    ShowMemory,
     ShowDomains,
     SaveFile(ItemToSave),
     SearchForDisplayObject,
@@ -69,6 +71,54 @@ impl DebugUi {
         movie_offset: f64,
     ) {
         let mut messages = std::mem::take(&mut self.queued_messages);
+
+        if self.memory_open {
+            egui::Window::new("Memory")
+                .open(&mut self.memory_open)
+                .show(egui_ctx, |ui| {
+                    let scope = ruffle_memory::MemoryScope::current();
+                    let manager = scope.manager();
+                    let snapshot = manager.snapshot();
+                    ui.label(format!(
+                        "CPU budget {} MiB · {:?}",
+                        snapshot.budget_bytes >> 20,
+                        snapshot.pressure.level
+                    ));
+                    for player in std::iter::once(&snapshot.shared).chain(&snapshot.players) {
+                        ui.collapsing(
+                            if player.id == 0 {
+                                "Shared".into()
+                            } else {
+                                format!("Player {}", player.id)
+                            },
+                            |ui| {
+                                for (kind, bytes) in &player.active {
+                                    ui.label(format!(
+                                        "{kind:?}   {:.2} MiB",
+                                        *bytes as f64 / 1048576.0
+                                    ));
+                                }
+                            },
+                        );
+                    }
+                    for gpu in &snapshot.devices {
+                        ui.label(format!(
+                            "GPU {}   {} / {} MiB · {:?}",
+                            gpu.id,
+                            gpu.logical_bytes >> 20,
+                            gpu.budget_bytes >> 20,
+                            gpu.pressure.level
+                        ));
+                    }
+                    if ui.button("Export memory snapshot").clicked() {
+                        let value = context.memory_report();
+                        messages.push(Message::SaveFile(ItemToSave {
+                            suggested_name: "ruffle-memory.json".into(),
+                            data: value.to_string().into_bytes(),
+                        }));
+                    }
+                });
+        }
 
         self.display_objects.retain(|object, window| {
             let object = object.fetch(context.dynamic_root);
@@ -152,6 +202,7 @@ impl DebugUi {
                 Message::SaveFile(file) => {
                     self.items_to_save.push(file);
                 }
+                Message::ShowMemory => self.memory_open = true,
                 Message::ShowKnownMovies => {
                     self.movie_list = Some(Default::default());
                 }
@@ -182,6 +233,7 @@ impl DebugUi {
             || !self.avm2_classes.is_empty()
             || !self.domains.is_empty()
             || !self.fonts.is_empty()
+            || self.memory_open
             || self.movie_list.is_some()
             || self.domain_list.is_some()
             || self.display_object_search.is_some()

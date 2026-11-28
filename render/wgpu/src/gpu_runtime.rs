@@ -112,13 +112,18 @@ pub enum OwnerKind {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub struct ResourceOwner {
+    pub symbol: Option<ruffle_memory::SymbolId>,
     pub kind: OwnerKind,
     pub id: u64,
 }
 
 impl ResourceOwner {
     pub const fn new(kind: OwnerKind, id: u64) -> Self {
-        Self { kind, id }
+        Self {
+            kind,
+            id,
+            symbol: None,
+        }
     }
 }
 
@@ -171,6 +176,7 @@ pub enum ResourcePriority {
 
 #[derive(Clone, Debug)]
 pub struct ResourceInfo {
+    shared_mesh: bool,
     visited: u64,
     host_readers: usize,
     pub id: ResourceId,
@@ -213,6 +219,7 @@ pub struct GpuMemoryStats {
 
 #[derive(Default)]
 struct Ledger {
+    pressure: ruffle_memory::PressureState,
     owned_messages: usize,
     // At most two submissions can be outstanding. Each bucket contains the
     // unique bytes whose most recent use is that serial.
@@ -233,6 +240,86 @@ struct Inner {
     ledger: Mutex<Ledger>,
     failure: RendererHealth,
     progress: Mutex<std::sync::Weak<GpuProgress>>,
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceMemory")
+            .field("device", &self.device)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ruffle_memory::DeviceMemory for Inner {
+    fn id(&self) -> u64 {
+        self.device
+    }
+    fn snapshot(&self) -> ruffle_memory::DeviceSnapshot {
+        let mut ledger = self.ledger();
+        let stats = ledger.stats;
+        ledger.pressure.update(
+            stats.total_bytes,
+            self.config.hard_limit,
+            ruffle_memory::PressureLevel::Normal,
+        );
+        ruffle_memory::DeviceSnapshot {
+            id: self.device,
+            budget_bytes: self.config.hard_limit,
+            logical_bytes: stats.total_bytes,
+            active_bytes: stats.active_bytes,
+            reserved_bytes: stats.reserved_bytes,
+            idle_bytes: stats.idle_bytes,
+            retiring_bytes: stats.retiring_bytes,
+            in_flight_bytes: stats.in_flight_bytes,
+            host_sampling_bytes: stats.host_sampling_bytes,
+            peak_bytes: stats.peak_bytes,
+            pressure: ledger.pressure.reading(),
+            classes: ResourceKind::NAMES
+                .iter()
+                .zip(stats.kind_bytes)
+                .map(|(name, bytes)| ((*name).into(), bytes))
+                .collect(),
+        }
+    }
+    fn resources(&self) -> Vec<ruffle_memory::ResourceSnapshot> {
+        let ledger = self.ledger();
+        let mut records: Vec<_> = ledger
+            .records
+            .values()
+            .map(|r| ruffle_memory::ResourceSnapshot {
+                id: r.id.index,
+                symbol: r.owner.symbol.filter(|_| !r.shared_mesh),
+                owner_id: r.owner.id,
+                owner_kind: if r.shared_mesh {
+                    "sharedMesh"
+                } else {
+                    match r.owner.kind {
+                        OwnerKind::Renderer => "renderer",
+                        OwnerKind::Movie => "movie",
+                        OwnerKind::BitmapData => "bitmapData",
+                        OwnerKind::Graphic => "graphic",
+                        OwnerKind::Glyph => "glyph",
+                        OwnerKind::Filter => "filter",
+                        OwnerKind::BitmapCache => "bitmapCache",
+                        OwnerKind::ShaderJob => "shaderJob",
+                        OwnerKind::Scene => "scene",
+                        OwnerKind::Host => "host",
+                    }
+                },
+                kind: ResourceKind::NAMES[r.kind as usize],
+                bytes: r.bytes,
+                last_submission: r.last_submission,
+                state: match r.state {
+                    ResourceState::Reserved => "reserved",
+                    ResourceState::Active => "active",
+                    ResourceState::Idle => "idle",
+                    ResourceState::Retiring => "retiring",
+                },
+            })
+            .collect();
+        records.sort_unstable_by_key(|r| r.id);
+        records
+    }
 }
 
 impl Inner {
@@ -263,6 +350,7 @@ pub(crate) struct OwnedPayload {
     runtime: GpuRuntime,
     bytes: u64,
     encoding: bool,
+    _cpu_charge: ruffle_memory::MemoryLease,
 }
 
 impl PayloadKind {
@@ -369,7 +457,7 @@ impl GpuRuntime {
                 )
             })?;
         let failure = RendererHealth::default();
-        Ok(Self(Arc::new(Inner {
+        let runtime = Self(Arc::new(Inner {
             preparation: crate::prepare::NativePreparation::for_device(
                 config.staging_limit,
                 failure.clone(),
@@ -383,7 +471,25 @@ impl GpuRuntime {
             ledger: Mutex::default(),
             failure,
             progress: Default::default(),
-        })))
+        }));
+        ruffle_memory::MemoryScope::current()
+            .manager()
+            .register_device(runtime.memory_device());
+        Ok(runtime)
+    }
+
+    pub fn memory_device(&self) -> Arc<dyn ruffle_memory::DeviceMemory> {
+        self.0.clone()
+    }
+
+    pub(crate) fn pressure(&self) -> ruffle_memory::PressureLevel {
+        let mut ledger = self.0.ledger();
+        let used = ledger.stats.total_bytes;
+        ledger.pressure.update(
+            used,
+            self.0.config.hard_limit,
+            ruffle_memory::PressureLevel::Normal,
+        )
     }
 
     /// Share the worker between the native owner and all renderer sessions.
@@ -457,6 +563,8 @@ impl GpuRuntime {
             runtime: self.clone(),
             bytes,
             encoding: false,
+            _cpu_charge: ruffle_memory::MemoryScope::current()
+                .track(ruffle_memory::MemoryKind::Pending, bytes),
         })
     }
 
@@ -490,7 +598,11 @@ impl GpuRuntime {
                 "resource owner identity space exhausted",
             )
         })?;
-        Ok(ResourceOwner::new(kind, ledger.next_owner))
+        Ok(ResourceOwner {
+            kind,
+            id: ledger.next_owner,
+            symbol: ruffle_memory::SymbolId::current(),
+        })
     }
 
     pub fn reserve(
@@ -542,6 +654,7 @@ impl GpuRuntime {
         };
         let created_submission = ledger.stats.submitted;
         ledger.insert(ResourceInfo {
+            shared_mesh: false,
             visited: 0,
             host_readers: 0,
             id,
@@ -971,6 +1084,18 @@ impl Drop for UnsubmittedUse {
 }
 
 impl ResourceLease {
+    pub(crate) fn note_mesh_use(&self, symbol: Option<ruffle_memory::SymbolId>) {
+        let mut ledger = self.0.runtime.0.ledger();
+        let record = &ledger.records[&self.id()];
+        if record.shared_mesh || record.owner.symbol == symbol {
+            return;
+        }
+        let owner = record.owner;
+        for record in ledger.records.values_mut().filter(|r| r.owner == owner) {
+            record.shared_mesh = true;
+        }
+    }
+
     pub fn host_sample(&self) -> HostSample {
         let mut ledger = self.0.runtime.0.ledger();
         let record = ledger

@@ -71,7 +71,11 @@ impl DynamicMapKey for &str {
 /// needed for correct iteration when entries are added or removed mid-iteration.
 #[derive(Debug, Clone, Collect)]
 #[collect(no_drop)]
-pub struct DynamicMap<K, V> {
+pub struct DynamicMap<K, V>(Option<Box<PropertyTable<K, V>>>);
+
+#[derive(Debug, Clone, Collect)]
+#[collect(no_drop)]
+struct PropertyTable<K, V> {
     table: HashTable<(K, DynamicProperty<V>)>,
     #[collect(require_static)]
     hasher: FnvBuildHasher,
@@ -85,8 +89,11 @@ pub struct DynamicMap<K, V> {
 
 impl<V> DynamicMap<DynamicKey<'_>, V> {
     pub fn prune_dropped_weak_keys(&mut self) {
-        self.table
-            .retain(|(key, _)| !matches!(key, DynamicKey::WeakObject(w) if w.is_dropped()));
+        if let Some(storage) = &mut self.0 {
+            storage
+                .table
+                .retain(|(key, _)| !matches!(key, DynamicKey::WeakObject(w) if w.is_dropped()));
+        }
     }
 }
 
@@ -97,11 +104,70 @@ impl<K: DynamicMapKey, V> Default for DynamicMap<K, V> {
 }
 
 impl<K: DynamicMapKey, V> DynamicMap<K, V> {
-    fn hash_key(&self, key: &K) -> u64 {
-        key.hash_with(&self.hasher)
+    pub fn new() -> Self {
+        Self(None)
     }
 
-    pub fn new() -> Self {
+    pub fn get(&self, key: &K) -> Option<&DynamicProperty<V>> {
+        let storage = self.0.as_ref()?;
+        storage
+            .table
+            .find(key.hash_with(&storage.hasher), |(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &DynamicProperty<V>)> {
+        self.0
+            .iter()
+            .flat_map(|storage| storage.table.iter())
+            .map(|(k, v)| (k, v))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.iter().map(|(k, _)| k)
+    }
+    pub fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, |storage| storage.table.len())
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn next(&self, index: usize) -> Option<usize> {
+        self.0.as_ref()?.next(index)
+    }
+    pub fn pair_at(&self, index: usize) -> Option<&(K, DynamicProperty<V>)> {
+        self.0.as_ref()?.pair_at(index)
+    }
+    pub fn key_at(&self, index: usize) -> Option<&K> {
+        self.pair_at(index).map(|(k, _)| k)
+    }
+    pub fn value_at(&self, index: usize) -> Option<&V> {
+        self.pair_at(index).map(|(_, p)| &p.value)
+    }
+
+    pub fn insert(&mut self, key: K, value: V) {
+        ruffle_memory::MemoryScope::sample_layout("dynamicPropertiesBeforeInsert", self.len());
+        self.0
+            .get_or_insert_with(|| Box::new(PropertyTable::default()))
+            .insert(key, value);
+    }
+    pub fn remove(&mut self, key: &K) -> Option<DynamicProperty<V>> {
+        self.0.as_mut()?.remove(key)
+    }
+    pub fn set_enumerable(&mut self, key: &K, enumerable: bool) {
+        if let Some(storage) = &mut self.0 {
+            storage.set_enumerable(key, enumerable);
+        }
+    }
+}
+
+impl<K, V> Default for PropertyTable<K, V> {
+    fn default() -> Self {
         Self {
             table: HashTable::new(),
             hasher: FnvBuildHasher::default(),
@@ -109,41 +175,9 @@ impl<K: DynamicMapKey, V> DynamicMap<K, V> {
             real_index: Cell::new(0),
         }
     }
+}
 
-    pub fn get(&self, key: &K) -> Option<&DynamicProperty<V>> {
-        if self.table.is_empty() {
-            return None;
-        }
-        let hash = self.hash_key(key);
-
-        self.table.find(hash, |(k, _)| k == key).map(|(_, v)| v)
-    }
-
-    pub fn contains_key(&self, key: &K) -> bool {
-        if self.table.is_empty() {
-            return false;
-        }
-        let hash = self.hash_key(key);
-
-        self.table.find(hash, |(k, _)| k == key).is_some()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&K, &DynamicProperty<V>)> {
-        self.table.iter().map(|(k, v)| (k, v))
-    }
-
-    pub fn keys(&self) -> impl Iterator<Item = &K> {
-        self.table.iter().map(|(k, _)| k)
-    }
-
-    pub fn len(&self) -> usize {
-        self.table.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.table.is_empty()
-    }
-
+impl<K: DynamicMapKey, V> PropertyTable<K, V> {
     /// Gets the bucket index from the current public index.
     /// Returns `None` if the index is out of bounds.
     fn public_to_real_index(&self, index: usize) -> Option<usize> {
@@ -166,7 +200,7 @@ impl<K: DynamicMapKey, V> DynamicMap<K, V> {
     }
 
     pub fn insert(&mut self, key: K, new_value: V) {
-        let hash = self.hash_key(&key);
+        let hash = key.hash_with(&self.hasher);
         let hasher = &self.hasher;
 
         match self
@@ -191,7 +225,7 @@ impl<K: DynamicMapKey, V> DynamicMap<K, V> {
     }
 
     pub fn remove(&mut self, key: &K) -> Option<DynamicProperty<V>> {
-        let hash = self.hash_key(key);
+        let hash = key.hash_with(&self.hasher);
 
         match self.table.find_entry(hash, |(k, _)| k == key) {
             Ok(occupied) => Some(occupied.remove().0.1),
@@ -264,16 +298,8 @@ impl<K: DynamicMapKey, V> DynamicMap<K, V> {
         self.table.get_bucket(real_index)
     }
 
-    pub fn key_at(&self, index: usize) -> Option<&K> {
-        self.pair_at(index).map(|(k, _)| k)
-    }
-
-    pub fn value_at(&self, index: usize) -> Option<&V> {
-        self.pair_at(index).map(|(_, p)| &p.value)
-    }
-
     pub fn set_enumerable(&mut self, key: &K, enumerable: bool) {
-        let hash = self.hash_key(key);
+        let hash = key.hash_with(&self.hasher);
 
         if let Some((_, prop)) = self.table.find_mut(hash, |(k, _)| k == key) {
             prop.enumerable = enumerable;
@@ -294,6 +320,11 @@ mod tests {
         fn hash_with(&self, _hasher: &FnvBuildHasher) -> u64 {
             panic!("empty dynamic maps should not hash lookup keys");
         }
+    }
+
+    #[test]
+    fn empty_dynamic_storage_uses_only_a_pointer() {
+        assert_eq!(size_of::<DynamicMap<&str, i32>>(), size_of::<usize>());
     }
 
     #[test]

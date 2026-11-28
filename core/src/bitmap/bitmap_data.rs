@@ -1210,7 +1210,7 @@ impl<'gc> BitmapRawData<'gc> {
         self.pixels[(x + y * self.width()) as usize]
     }
 
-    pub fn raw_pixels_mut(&mut self) -> &mut Vec<Color> {
+    pub fn raw_pixels_mut(&mut self) -> &mut [Color] {
         &mut self.pixels
     }
 

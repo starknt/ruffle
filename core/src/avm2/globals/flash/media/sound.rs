@@ -40,7 +40,7 @@ pub fn init<'gc>(
                 .library_for_movie_mut(movie, activation.context.gc_context)
                 .character_by_id(symbol)
             {
-                sound_object.set_sound(activation.context, sound);
+                sound_object.set_sound(activation.context, (*sound).clone());
             } else {
                 tracing::warn!(
                     "Attempted to construct subclass of Sound, {}, which is associated with non-Sound character {}",

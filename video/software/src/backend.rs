@@ -5,14 +5,11 @@ use ruffle_video::VideoStreamHandle;
 use ruffle_video::backend::VideoBackend;
 use ruffle_video::error::Error;
 use ruffle_video::frame::{EncodedFrame, FrameDependency};
-use slotmap::SlotMap;
 use swf::{VideoCodec, VideoDeblocking};
 
 /// Software video backend that proxies to CPU-only codec implementations that
 /// ship with Ruffle.
-pub struct SoftwareVideoBackend {
-    streams: SlotMap<VideoStreamHandle, VideoStream>,
-}
+pub struct SoftwareVideoBackend;
 
 impl Default for SoftwareVideoBackend {
     fn default() -> Self {
@@ -22,9 +19,7 @@ impl Default for SoftwareVideoBackend {
 
 impl SoftwareVideoBackend {
     pub fn new() -> Self {
-        Self {
-            streams: SlotMap::with_key(),
-        }
+        Self
     }
 }
 
@@ -49,8 +44,7 @@ impl VideoBackend for SoftwareVideoBackend {
             other => return Err(Error::UnsupportedCodec(other)),
         };
         let stream = VideoStream::new(decoder);
-        let stream_handle = self.streams.insert(stream);
-        Ok(stream_handle)
+        Ok(VideoStreamHandle::new(stream))
     }
 
     fn preload_video_stream_frame(
@@ -58,10 +52,8 @@ impl VideoBackend for SoftwareVideoBackend {
         stream: VideoStreamHandle,
         encoded_frame: EncodedFrame<'_>,
     ) -> Result<FrameDependency, Error> {
-        let stream = self
-            .streams
-            .get_mut(stream)
-            .ok_or(Error::VideoStreamIsNotRegistered)?;
+        let mut stream = stream.borrow_mut::<VideoStream>()?;
+        let stream = &mut *stream;
 
         stream.decoder.preload_frame(encoded_frame)
     }
@@ -81,10 +73,8 @@ impl VideoBackend for SoftwareVideoBackend {
         encoded_frame: EncodedFrame<'_>,
         renderer: &mut dyn RenderBackend,
     ) -> Result<BitmapInfo, Error> {
-        let stream = self
-            .streams
-            .get_mut(stream)
-            .ok_or(Error::VideoStreamIsNotRegistered)?;
+        let mut stream = stream.borrow_mut::<VideoStream>()?;
+        let stream = &mut *stream;
 
         stream.decoder.decode_frame(encoded_frame, |frame| {
             let width = frame.width();
@@ -126,5 +116,33 @@ impl VideoStream {
             decoder,
             bitmap: None,
         }
+    }
+}
+
+#[cfg(all(test, feature = "screenvideo"))]
+mod tests {
+    use super::*;
+    use ruffle_memory::MemoryManager;
+
+    #[test]
+    fn independent_stream_reference_keeps_decoder_until_last_release() {
+        let manager = MemoryManager::new(16 << 20);
+        let mut backend = SoftwareVideoBackend::new();
+        let player = manager.player();
+        let stream = player
+            .enter(|| {
+                backend.register_video_stream(
+                    1,
+                    (16, 16),
+                    VideoCodec::ScreenVideo,
+                    VideoDeblocking::UseVideoPacketValue,
+                )
+            })
+            .unwrap();
+        let script = stream.clone();
+        drop((player, stream));
+        assert_eq!(manager.snapshot().players.len(), 1);
+        drop(script);
+        assert!(manager.snapshot().players.is_empty());
     }
 }

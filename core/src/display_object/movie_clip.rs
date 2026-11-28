@@ -3881,14 +3881,17 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         let define_bits_lossless = reader.read_define_bits_lossless(version)?;
         let bitmap = Gc::new(
             context.gc(),
-            BitmapCharacter::new(CompressedBitmap::Lossless(DefineBitsLossless {
-                id: define_bits_lossless.id,
-                format: define_bits_lossless.format,
-                width: define_bits_lossless.width,
-                height: define_bits_lossless.height,
-                version: define_bits_lossless.version,
-                data: Cow::Owned(define_bits_lossless.data.into_owned()),
-            })),
+            BitmapCharacter::new(
+                self.movie().symbol_id(define_bits_lossless.id),
+                CompressedBitmap::Lossless(DefineBitsLossless {
+                    id: define_bits_lossless.id,
+                    format: define_bits_lossless.format,
+                    width: define_bits_lossless.width,
+                    height: define_bits_lossless.height,
+                    version: define_bits_lossless.version,
+                    data: Cow::Owned(define_bits_lossless.data.into_owned()),
+                }),
+            ),
         );
         self.library_mut(context)
             .register_character(define_bits_lossless.id, Character::Bitmap(bitmap));
@@ -4011,12 +4014,15 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         let (width, height) = ruffle_render::utils::decode_define_bits_jpeg_dimensions(&jpeg_data)?;
         let bitmap = Character::Bitmap(Gc::new(
             mc,
-            BitmapCharacter::new(CompressedBitmap::Jpeg {
-                data: jpeg_data,
-                alpha: None,
-                width,
-                height,
-            }),
+            BitmapCharacter::new(
+                self.movie().symbol_id(id),
+                CompressedBitmap::Jpeg {
+                    data: jpeg_data,
+                    alpha: None,
+                    width,
+                    height,
+                },
+            ),
         ));
         library.register_character(id, bitmap);
         Ok(())
@@ -4032,12 +4038,15 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         let (width, height) = ruffle_render::utils::decode_define_bits_jpeg_dimensions(jpeg_data)?;
         let bitmap = Character::Bitmap(Gc::new(
             context.gc(),
-            BitmapCharacter::new(CompressedBitmap::Jpeg {
-                data: jpeg_data.to_owned(),
-                alpha: None,
-                width,
-                height,
-            }),
+            BitmapCharacter::new(
+                self.movie().symbol_id(id),
+                CompressedBitmap::Jpeg {
+                    data: jpeg_data.to_owned(),
+                    alpha: None,
+                    width,
+                    height,
+                },
+            ),
         ));
         self.library_mut(context).register_character(id, bitmap);
         Ok(())
@@ -4055,12 +4064,15 @@ impl<'gc, 'a> MovieClipShared<'gc> {
 
         let bitmap = Character::Bitmap(Gc::new(
             context.gc(),
-            BitmapCharacter::new(CompressedBitmap::Jpeg {
-                data: jpeg.data.to_owned(),
-                alpha: Some(jpeg.alpha_data.to_owned()),
-                width,
-                height,
-            }),
+            BitmapCharacter::new(
+                self.movie().symbol_id(jpeg.id),
+                CompressedBitmap::Jpeg {
+                    data: jpeg.data.to_owned(),
+                    alpha: Some(jpeg.alpha_data.to_owned()),
+                    width,
+                    height,
+                },
+            ),
         ));
         self.library_mut(context)
             .register_character(jpeg.id, bitmap);
@@ -4216,10 +4228,10 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         };
         let font_object = Font::from_swf_tag(
             context.gc(),
-            context.renderer,
             font,
             reader.encoding(),
             FontType::Embedded,
+            Some(self.movie().symbol_id(font_id)),
         );
         self.library_mut(context)
             .register_character(font_id, Character::Font(font_object));
@@ -4236,10 +4248,10 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         let font_id = font.id;
         let font_object = Font::from_swf_tag(
             context.gc(),
-            context.renderer,
             font,
             reader.encoding(),
             FontType::Embedded,
+            Some(self.movie().symbol_id(font_id)),
         );
         self.library_mut(context)
             .register_character(font_id, Character::Font(font_object));
@@ -4256,10 +4268,10 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         let font_id = font.id;
         let font_object = Font::from_swf_tag(
             context.gc(),
-            context.renderer,
             font,
             reader.encoding(),
             FontType::Embedded,
+            Some(self.movie().symbol_id(font_id)),
         );
         self.library_mut(context)
             .register_character(font_id, Character::Font(font_object));
@@ -4308,6 +4320,7 @@ impl<'gc, 'a> MovieClipShared<'gc> {
     ) -> Result<(), Error> {
         let sound = reader.read_define_sound()?;
         if let Ok(handle) = context.audio.register_sound(&sound) {
+            let handle = Gc::new(context.gc(), handle);
             self.library_mut(context)
                 .register_character(sound.id, Character::Sound(handle));
         } else {

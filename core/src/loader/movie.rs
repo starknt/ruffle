@@ -4,6 +4,7 @@ mod snapshot;
 use super::{ContentType, Error, Instant, LoadBytesInfo, SwfMovieData};
 use crate::backend::navigator::LoaderRequest;
 use payload::MoviePayload;
+use ruffle_memory::{MemoryBuffer, MemoryKind, MemoryScope};
 
 pub(super) enum PreparedContent {
     Movie(SwfMovieData),
@@ -19,7 +20,7 @@ pub(super) struct ImagePixels {
     pub height: u32,
     pub transparency: bool,
     pub loader_request: Option<LoaderRequest>,
-    pub colors: Vec<crate::bitmap::bitmap_data::Color>,
+    pub colors: MemoryBuffer<crate::bitmap::bitmap_data::Color>,
 }
 
 impl ImagePixels {
@@ -34,10 +35,14 @@ impl ImagePixels {
             width: bitmap.width(),
             height: bitmap.height(),
             transparency: bitmap.format().supports_transparency(),
-            colors: bitmap
-                .as_colors()
-                .map(crate::bitmap::bitmap_data::Color::from)
-                .collect(),
+            colors: MemoryBuffer::new(
+                &MemoryScope::current(),
+                MemoryKind::Decode,
+                bitmap
+                    .as_colors()
+                    .map(crate::bitmap::bitmap_data::Color::from)
+                    .collect(),
+            ),
         })
     }
 }
@@ -67,6 +72,7 @@ const PAGE_BYTES: usize = 64 * 1024;
 // Semaphore units control admission. The charge travels with the payload and
 // can exceed the shared window when one subject owns every unit.
 pub(super) struct ByteCharge {
+    admission: ruffle_memory::Admission,
     permits: OwnedSemaphorePermit,
     pub bytes: usize,
 }
@@ -78,13 +84,17 @@ pub(super) struct Delivery {
 
 #[derive(Clone)]
 struct ByteWindow {
+    kind: MemoryKind,
+    scope: MemoryScope,
     permits: Arc<Semaphore>,
     pages: u32,
 }
 
 impl ByteWindow {
-    fn new(pages: u32) -> Self {
+    fn new(kind: MemoryKind, pages: u32) -> Self {
         Self {
+            kind,
+            scope: MemoryScope::current(),
             permits: Arc::new(Semaphore::new(pages as usize)),
             pages,
         }
@@ -96,16 +106,27 @@ impl ByteWindow {
         })
     }
 
+    fn admission_units(&self, bytes: Option<usize>) -> u32 {
+        let requested = self.units(bytes);
+        match self.scope.manager().pressure().level {
+            ruffle_memory::PressureLevel::Normal => requested,
+            ruffle_memory::PressureLevel::Moderate => requested.max(self.pages.div_ceil(2)),
+            _ => self.pages,
+        }
+    }
+
     async fn reserve(&self, bytes: Option<usize>) -> ByteCharge {
         let permits = self
             .permits
             .clone()
-            .acquire_many_owned(self.units(bytes))
+            .acquire_many_owned(self.admission_units(bytes))
             .await
             .expect("permanent movie window");
+        let booked = bytes.unwrap_or(permits.num_permits() * PAGE_BYTES);
         ByteCharge {
             permits,
             bytes: bytes.unwrap_or(0),
+            admission: self.scope.admission(self.kind, booked as u64),
         }
     }
 
@@ -114,12 +135,18 @@ impl ByteWindow {
             .permits
             .split(self.units(Some(bytes)) as usize)
             .expect("admitted movie payload");
-        ByteCharge { permits, bytes }
+        charge.admission.resize(bytes as u64);
+        ByteCharge {
+            permits,
+            bytes,
+            admission: charge.admission,
+        }
     }
 }
 
 #[derive(Clone)]
 pub(super) struct MovieBudgets {
+    pub(super) cache: Option<ruffle_common::tag_utils::MovieCache>,
     input: ByteWindow,
     decoded: ByteWindow,
     pending: ByteWindow,
@@ -129,11 +156,28 @@ pub(super) struct MovieBudgets {
 
 impl Default for MovieBudgets {
     fn default() -> Self {
-        Self::new(1024, 2048)
+        let scope = MemoryScope::current();
+        let pages = (scope.manager().budget_bytes() / PAGE_BYTES as u64).max(1);
+        let mut budgets = Self::new(
+            (pages / 8).clamp(1, 1024) as u32,
+            (pages / 4).clamp(1, 2048) as u32,
+        );
+        let windows = scope.manager().resources::<Semaphore>();
+        for (window, label) in [
+            (&mut budgets.input, "network"),
+            (&mut budgets.decoded, "decode"),
+            (&mut budgets.pending, "pending"),
+        ] {
+            let key =
+                ruffle_memory::ContentId::from_parts(&[b"movie-loader-window", label.as_bytes()]);
+            window.permits = windows.intern(key, || window.permits.clone());
+        }
+        budgets
     }
 }
 
 pub(super) struct MovieInput {
+    allows_movie_cache: bool,
     pub bytes: bytes::Bytes,
     pub loader_request: Option<LoaderRequest>,
     pub abort: Option<futures::future::AbortHandle>,
@@ -143,9 +187,10 @@ pub(super) struct MovieInput {
 impl MovieBudgets {
     fn new(input_pages: u32, decoded_pages: u32) -> Self {
         Self {
-            input: ByteWindow::new(input_pages),
-            decoded: ByteWindow::new(decoded_pages),
-            pending: ByteWindow::new(decoded_pages),
+            cache: None,
+            input: ByteWindow::new(MemoryKind::Network, input_pages),
+            decoded: ByteWindow::new(MemoryKind::Decode, decoded_pages),
+            pending: ByteWindow::new(MemoryKind::Pending, decoded_pages),
             spill: Default::default(),
             transfers: Arc::new(Semaphore::new(MAX_PREPARATIONS)),
         }
@@ -155,6 +200,7 @@ impl MovieBudgets {
     async fn snapshot(&self, bytes: bytes::Bytes) -> MovieInput {
         let reservation = self.input.reserve(Some(bytes.len())).await;
         MovieInput {
+            allows_movie_cache: false,
             bytes,
             loader_request: None,
             abort: None,
@@ -184,6 +230,7 @@ impl MovieBudgets {
         {
             return Err(Error::FetchError("Mismatched Loader response".into()));
         }
+        let allows_movie_cache = response.allows_movie_cache();
         let buffered = response.buffered_body_len();
         let reservation = match reservation {
             Some(permit) => permit,
@@ -199,6 +246,7 @@ impl MovieBudgets {
         }
         let held = self.input.settle(reservation, bytes.len());
         Ok(MovieInput {
+            allows_movie_cache,
             bytes,
             loader_request,
             abort: None,
@@ -292,14 +340,27 @@ impl Preparation {
                 Ok(())
             }
         };
-        let work = move || {
+        let cache = if input.allows_movie_cache && info.is_none() {
+            budget.cache.clone()
+        } else {
+            None
+        };
+        let scope = window.scope.clone();
+        let prepare = move || {
             current()?;
             let payload = match sized {
                 Some(payload) => payload,
                 None => MoviePayload::inspect(input.bytes.clone())?,
             };
             let decoded = window.settle(decoded, payload.decode_peak);
-            let content = prepare_payload(&payload, url, loader_url, info, input.loader_request)?;
+            let content = prepare_payload(
+                &payload,
+                url,
+                loader_url,
+                info,
+                input.loader_request,
+                cache.as_ref(),
+            )?;
             current()?;
             let retained = payload.handoff_bytes(&content);
             if let Some(tag) = input.loader_request
@@ -315,6 +376,7 @@ impl Preparation {
             drop(input.reservation);
             Ok((content, retained, decoded))
         };
+        let work = move || scope.enter(prepare);
         let prepared = if inline {
             work()
         } else {
@@ -392,7 +454,14 @@ pub(super) fn prepare_swf_movie_data(
     loader_request: Option<LoaderRequest>,
 ) -> Result<PreparedContent, swf::error::Error> {
     let payload = MoviePayload::inspect(body.into())?;
-    prepare_payload(&payload, url, loader_url, load_bytes_info, loader_request)
+    prepare_payload(
+        &payload,
+        url,
+        loader_url,
+        load_bytes_info,
+        loader_request,
+        None,
+    )
 }
 
 fn prepare_payload(
@@ -401,6 +470,7 @@ fn prepare_payload(
     loader_url: Option<String>,
     load_bytes_info: Option<LoadBytesInfo>,
     loader_request: Option<LoaderRequest>,
+    cache: Option<&ruffle_common::tag_utils::MovieCache>,
 ) -> Result<PreparedContent, swf::error::Error> {
     let source = &payload.source;
     if payload.kind.is_image() {
@@ -416,9 +486,12 @@ fn prepare_payload(
     if payload.kind != ContentType::Swf {
         return Ok(PreparedContent::Other(source.clone()));
     }
-    let movie = SwfMovieData::from_data(source, url, loader_url, load_bytes_info)?
-        .with_shared_bytes(true)
-        .with_compressed_len(payload.transport_len);
+    let movie = match cache {
+        Some(cache) => cache.load(source, url, loader_url)?,
+        None => SwfMovieData::from_data(source, url, loader_url, load_bytes_info)?
+            .with_shared_bytes(true),
+    }
+    .with_compressed_len(payload.transport_len);
     // The movie records the original transport length for progress/bytesTotal;
     // do not send the transport buffer back through the loader channel.
     Ok(PreparedContent::Movie(movie))
@@ -437,6 +510,18 @@ mod tests {
         sync::atomic::{AtomicBool, Ordering},
         task::Context,
     };
+
+    #[test]
+    fn separate_players_observe_the_same_decode_window_until_delivery_or_cancel() {
+        let manager = ruffle_memory::MemoryManager::new(4 * PAGE_BYTES as u64);
+        let a = manager.player().enter(MovieBudgets::default);
+        let b = manager.player().enter(MovieBudgets::default);
+        let held = a.decoded.reserve(None).now_or_never().unwrap();
+        assert!(b.decoded.reserve(Some(1)).now_or_never().is_none());
+        assert!(b.pending.reserve(Some(1)).now_or_never().is_some());
+        drop(held);
+        assert!(b.decoded.reserve(None).now_or_never().is_some());
+    }
 
     #[test]
     fn two_pending_handoffs_backpressure_decode_and_cancel_refunds_each_owner() {

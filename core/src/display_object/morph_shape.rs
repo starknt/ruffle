@@ -257,12 +257,17 @@ impl<'gc> MorphShapeShared<'gc> {
                     .library
                     .library_for_movie(self.movie, context.gc_context)
                     .unwrap();
-                let handle = context.renderer.register_shape_with_scale(
-                    (&frame.shape).into(),
-                    &MovieLibrarySource { library: &library },
-                    scale,
-                )?;
-                frame.shape_cache.insert(scale, handle.clone());
+                let handle =
+                    ruffle_memory::SymbolId::enter(Some(self.movie.symbol_id(self.id)), || {
+                        context.renderer.register_shape_with_scale(
+                            (&frame.shape).into(),
+                            &MovieLibrarySource { library: &library },
+                            scale,
+                        )
+                    })?;
+                frame
+                    .shape_cache
+                    .insert(scale, context.renderer.retain_static_shape(handle.clone()));
                 handle
             },
         )

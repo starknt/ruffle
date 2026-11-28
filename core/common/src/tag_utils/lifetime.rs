@@ -10,20 +10,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Collect, Debug)]
 #[collect(require_static)]
-pub(super) struct MovieLifetime(u64);
+pub(super) struct MovieLifetime {
+    pub(super) id: u64,
+    log: bool,
+}
 
 impl MovieLifetime {
     pub fn new(movie: &SwfMovieData) -> Self {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
         if movie.data().is_empty()
             || !*ENABLED.get_or_init(|| {
                 std::env::var_os("RUFFLE_MOVIE_LIFETIMES").as_deref() == Some("1".as_ref())
             })
         {
-            return Self(0);
+            return Self { id, log: false };
         }
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let mut digest = DefaultHasher::new();
         movie.data().hash(&mut digest);
         let _ = writeln!(
@@ -33,16 +36,16 @@ impl MovieLifetime {
             digest.finish(),
             movie.data().len()
         );
-        Self(id)
+        Self { id, log: true }
     }
 
     pub fn record(&self, action: &str) {
-        if self.0 != 0 {
+        if self.log {
             let _ = writeln!(
                 std::io::stderr().lock(),
                 "movie_lifetime time_us={} id={} event={action}",
                 timestamp(),
-                self.0
+                self.id
             );
         }
     }

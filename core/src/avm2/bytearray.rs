@@ -57,7 +57,7 @@ pub enum ObjectEncoding {
 /// bytes can share storage with SwfSlice until the first actual write.
 #[derive(Debug)]
 enum Storage {
-    Owned(Vec<u8>),
+    Owned(ruffle_memory::MemoryBuffer<u8>),
     Frozen(bytes::Bytes),
     Movie(std::sync::Arc<ruffle_common::tag_utils::MovieBytes>),
     Private(ruffle_common::tag_utils::PrivatePages, usize),
@@ -67,7 +67,7 @@ impl Clone for Storage {
         match self {
             Self::Movie(m) => Self::Movie(m.clone()),
             Self::Frozen(bytes) => Self::Frozen(bytes.clone()),
-            s => Self::Owned(s.to_vec()),
+            s => Self::owned(s.to_vec()),
         }
     }
 }
@@ -85,7 +85,7 @@ impl std::ops::Deref for Storage {
 impl std::ops::DerefMut for Storage {
     fn deref_mut(&mut self) -> &mut [u8] {
         if let Self::Frozen(bytes) = self {
-            *self = Self::Owned(std::mem::take(bytes).into());
+            *self = Self::owned(std::mem::take(bytes).into());
         }
         if let Self::Movie(m) = self {
             ruffle_render::profile::loader_bytes(2, m.file().len());
@@ -94,7 +94,7 @@ impl std::ops::DerefMut for Storage {
                     let n = p.len();
                     Self::Private(p, n)
                 }
-                None => Self::Owned(m.file().to_vec()),
+                None => Self::owned(m.file().to_vec()),
             };
         }
         match self {
@@ -110,6 +110,13 @@ impl AsRef<[u8]> for Storage {
     }
 }
 impl Storage {
+    fn owned(bytes: Vec<u8>) -> Self {
+        Self::Owned(ruffle_memory::MemoryBuffer::new(
+            &ruffle_memory::MemoryScope::current(),
+            ruffle_memory::MemoryKind::ByteArray,
+            bytes,
+        ))
+    }
     /// Capture the complete value without changing the AS cursor. Mutation of
     /// either side detaches it from the other pending loads of the same value.
     fn snapshot(&mut self) -> bytes::Bytes {
@@ -119,11 +126,16 @@ impl Storage {
             Self::Movie(movie) if movie.file_capacity() == movie.file().len() => {
                 return bytes::Bytes::from_owner(Self::Movie(movie.clone()));
             }
-            Self::Owned(bytes) => std::mem::take(bytes).into_boxed_slice().into(),
-            Self::Private(pages, len) if *len == pages.len() => {
-                bytes::Bytes::from_owner(std::mem::replace(self, Self::Owned(Vec::new())))
+            Self::Owned(bytes) => {
+                bytes.shrink_to_fit();
+                bytes::Bytes::from_owner(std::mem::replace(self, Self::owned(Vec::new())))
             }
-            Self::Movie(_) | Self::Private(..) => bytes::Bytes::copy_from_slice(self),
+            Self::Private(pages, len) if *len == pages.len() => {
+                bytes::Bytes::from_owner(std::mem::replace(self, Self::owned(Vec::new())))
+            }
+            Self::Movie(_) | Self::Private(..) => {
+                bytes::Bytes::from_owner(Self::owned(self.to_vec()))
+            }
         };
         *self = Self::Frozen(frozen.clone());
         frozen
@@ -134,7 +146,7 @@ impl Storage {
             return;
         }
         if n == 0 && !matches!(self, Self::Owned(_)) {
-            *self = Self::Owned(Vec::new());
+            *self = Self::owned(Vec::new());
             return;
         }
         if let Self::Movie(m) = self
@@ -154,7 +166,7 @@ impl Storage {
             return;
         }
         if !matches!(self, Self::Owned(_)) {
-            *self = Self::Owned(self.to_vec());
+            *self = Self::owned(self.to_vec());
         }
         if let Self::Owned(v) = self {
             v.resize(n, fill);
@@ -181,7 +193,7 @@ impl ByteArrayStorage {
     /// Create a new ByteArrayStorage
     pub fn new(context: &mut UpdateContext<'_>) -> ByteArrayStorage {
         ByteArrayStorage {
-            bytes: Storage::Owned(Vec::new()),
+            bytes: Storage::owned(Vec::new()),
             position: Cell::new(0),
             endian: Endian::Big,
             object_encoding: context.avm2.default_bytearray_encoding,
@@ -190,14 +202,8 @@ impl ByteArrayStorage {
 
     /// Create a new ByteArrayStorage using an already existing vector
     pub fn from_vec(context: &mut UpdateContext<'_>, bytes: Vec<u8>) -> ByteArrayStorage {
-        if bytes.len() >= 64 * 1024 {
-            context
-                .gc()
-                .metrics()
-                .adjust_debt((bytes.capacity() / 1024) as f64);
-        }
         ByteArrayStorage {
-            bytes: Storage::Owned(bytes),
+            bytes: Storage::owned(bytes),
             position: Cell::new(0),
             endian: Endian::Big,
             object_encoding: context.avm2.default_bytearray_encoding,
@@ -398,7 +404,7 @@ impl ByteArrayStorage {
 
     #[inline]
     pub fn clear(&mut self) {
-        self.bytes.resize(0, 0);
+        self.bytes = Storage::owned(Vec::new());
         self.position.set(0)
     }
 
@@ -431,9 +437,9 @@ impl ByteArrayStorage {
     /// method sets the bytearray's `position` to 0.
     pub fn swap_storage_with(&mut self, new_data: &mut Vec<u8>) {
         self.position.set(0);
-        let old = std::mem::replace(&mut self.bytes, Storage::Owned(std::mem::take(new_data)));
+        let old = std::mem::replace(&mut self.bytes, Storage::owned(std::mem::take(new_data)));
         *new_data = match old {
-            Storage::Owned(v) => v,
+            Storage::Owned(v) => v.into_vec(),
             s => s.to_vec(),
         };
     }
@@ -609,8 +615,20 @@ mod shared_movie_tests {
 
     #[test]
     fn shortened_owned_snapshot_retains_only_the_visible_bytes() {
-        let player = PlayerBuilder::new().build();
+        use ruffle_memory::{MemoryKind, MemoryManager};
+        let manager = MemoryManager::new(32 << 20);
+        let player = PlayerBuilder::new()
+            .with_memory_manager(manager.clone())
+            .build();
         player.lock().unwrap().mutate_with_update_context(|uc| {
+            let active = || {
+                manager.snapshot().players[0]
+                    .active
+                    .get(&MemoryKind::ByteArray)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let baseline = active();
             let mut array = ByteArrayStorage::new(uc);
             array.set_length(4 * 1024 * 1024);
             array.set_length(PNG.len());
@@ -620,7 +638,10 @@ mod shared_movie_tests {
             assert_eq!(array.snapshot().as_ptr(), snapshot.as_ptr());
             array.set(0, 0);
             assert_eq!(snapshot.as_ref(), PNG);
-            assert_eq!(snapshot.try_into_mut().unwrap().capacity(), PNG.len());
+            drop(array);
+            assert_eq!(active() - baseline, PNG.len() as u64);
+            drop(snapshot);
+            assert_eq!(active(), baseline);
         });
     }
 
@@ -707,7 +728,7 @@ mod shared_movie_tests {
     fn load_bytes_snapshots_share_the_callers_allocation_until_a_write() {
         let original = vec![7; 256 * 1024];
         let address = original.as_ptr();
-        let mut bytes = Storage::Owned(original);
+        let mut bytes = Storage::owned(original);
         let first = bytes.snapshot();
         let second = bytes.snapshot();
         assert_eq!(address, first.as_ptr());

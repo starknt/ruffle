@@ -70,13 +70,15 @@ impl MovieBudgets {
         let reservation = input
             .permits
             .clone()
-            .try_acquire_many_owned(input.units(Some(length)));
+            .try_acquire_many_owned(input.admission_units(Some(length)));
         let snapshot = match reservation {
             Ok(reservation) => Ok(MovieInput {
+                allows_movie_cache: false,
                 bytes,
                 loader_request: None,
                 abort: None,
                 reservation: super::ByteCharge {
+                    admission: input.scope.admission(input.kind, length as u64),
                     permits: reservation,
                     bytes: length,
                 },
@@ -96,6 +98,7 @@ impl MovieBudgets {
                         let mut data = vec![0; length];
                         file.read_exact(&mut data)?;
                         Ok(MovieInput {
+                            allows_movie_cache: false,
                             bytes: data.into(),
                             loader_request: None,
                             abort: None,

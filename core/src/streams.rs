@@ -408,8 +408,8 @@ impl<'gc> NetStream<'gc> {
     /// Buffer loading can be done in chunks but must be done in such a way
     /// that all data is appended in the correct order and that data from
     /// separate streams is not mixed together.
-    pub fn load_buffer(self, context: &mut UpdateContext<'gc>, data: &mut Vec<u8>) {
-        self.source().buffer.borrow_mut().append(data);
+    pub fn load_buffer(self, context: &mut UpdateContext<'gc>, data: &[u8]) {
+        self.source().buffer.borrow_mut().extend_from_slice(data);
 
         StreamManager::activate(context, self);
 
@@ -951,12 +951,12 @@ impl<'gc> NetStream<'gc> {
         tag_needs_preloading: bool,
     ) {
         let source = self.source();
-        let (video_handle, frame_id) = match *source.stream_type.borrow() {
+        let (video_handle, frame_id) = match &*source.stream_type.borrow() {
             Some(NetStreamType::Flv {
                 video_stream,
                 frame_id,
                 ..
-            }) => (video_stream, frame_id),
+            }) => (video_stream.clone(), *frame_id),
             _ => unreachable!(),
         };
         let codec = VideoCodec::from_u8(video_data.codec_id as u8);
@@ -988,7 +988,7 @@ impl<'gc> NetStream<'gc> {
                             Ok(new_handle) => {
                                 match &mut *source.stream_type.borrow_mut() {
                                     Some(NetStreamType::Flv { video_stream, .. }) => {
-                                        *video_stream = Some(new_handle)
+                                        *video_stream = Some(new_handle.clone())
                                     }
                                     _ => unreachable!(),
                                 }
@@ -1027,7 +1027,7 @@ impl<'gc> NetStream<'gc> {
 
                     if let Err(e) = context
                         .video
-                        .preload_video_stream_frame(video_handle, encoded_frame)
+                        .preload_video_stream_frame(video_handle.clone(), encoded_frame)
                     {
                         tracing::error!("Preloading video frame {} failed: {}", frame_id, e);
                     }

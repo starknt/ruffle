@@ -521,7 +521,7 @@ impl FlashRemoting {
                 let response = fetch.await?;
                 let url = response.url().to_string();
                 let body = response
-                    .body()
+                    .body_bytes()
                     .await
                     .map_err(|error| ErrorResponse { url, error })?;
 

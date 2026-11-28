@@ -162,6 +162,7 @@ impl<'gc> ScriptObjectData<'gc> {
         vtable: VTable<'gc>,
     ) -> Self {
         let slot_table = vtable.slot_table();
+        ruffle_memory::MemoryScope::sample_layout("fixedSlotsAtCreation", slot_table.len());
 
         // We use `iter` and `collect` rather than setting elements of a Box<[]>
         // or pushing to a Vec for better performance

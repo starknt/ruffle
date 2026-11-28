@@ -26,7 +26,7 @@ pub enum Character<'gc> {
     Font(Font<'gc>),
     MorphShape(MorphShape<'gc>),
     Text(Text<'gc>),
-    Sound(#[collect(require_static)] SoundHandle),
+    Sound(Gc<'gc, SoundHandle>),
     Video(Video<'gc>),
     BinaryData(Gc<'gc, BinaryData>),
 }
@@ -45,9 +45,10 @@ pub struct BitmapCharacter<'gc> {
 }
 
 impl<'gc> BitmapCharacter<'gc> {
-    pub fn new(compressed: CompressedBitmap) -> Self {
+    pub fn new(symbol: ruffle_memory::SymbolId, compressed: CompressedBitmap) -> Self {
         Self {
             compressed: std::rc::Rc::new(crate::bitmap::symbol_pixels::SymbolImage::new(
+                Some(symbol),
                 compressed,
             )),
             handle: OnceCell::default(),
@@ -79,12 +80,10 @@ impl<'gc> BitmapCharacter<'gc> {
         if let Some(handle) = self.handle.get() {
             return Ok(handle.clone());
         }
-        let data = &self.compressed.data;
-        let decoded = backend.decode_bitmap_symbol(data.encoded(), data.size())?;
-        let new_handle = backend
-            .register_bitmap_with_usage(decoded, ruffle_render::backend::BitmapUsage::Symbol)?;
-        // FIXME - do we ever want to release this handle, to avoid taking up GPU memory?
-        self.handle.set(new_handle.clone()).unwrap();
+        let new_handle = self.compressed.view(backend)?;
+        if !backend.cache_immutable_bitmap(&new_handle) {
+            let _ = self.handle.set(new_handle.clone());
+        }
         Ok(new_handle)
     }
 }
@@ -105,6 +104,52 @@ pub enum CompressedBitmap {
 }
 
 impl CompressedBitmap {
+    pub(crate) fn shared_key(&self) -> ruffle_memory::ContentId {
+        use ruffle_memory::ContentId;
+        match self {
+            Self::Jpeg {
+                data,
+                alpha,
+                width,
+                height,
+            } => ContentId::from_parts(&[
+                b"jpeg",
+                &width.to_le_bytes(),
+                &height.to_le_bytes(),
+                &[u8::from(alpha.is_some())],
+                data,
+                alpha.as_deref().unwrap_or_default(),
+            ]),
+            Self::Lossless(tag) => {
+                let format = match tag.format {
+                    swf::BitmapFormat::ColorMap8 { num_colors } => [3, num_colors],
+                    swf::BitmapFormat::Rgb15 => [4, 0],
+                    swf::BitmapFormat::Rgb32 => [5, 0],
+                };
+                ContentId::from_parts(&[
+                    b"lossless",
+                    &[tag.version],
+                    &format,
+                    &tag.width.to_le_bytes(),
+                    &tag.height.to_le_bytes(),
+                    &tag.data,
+                ])
+            }
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        match self {
+            Self::Jpeg { data, alpha, .. } => {
+                data.capacity() + alpha.as_ref().map_or(0, Vec::capacity)
+            }
+            Self::Lossless(tag) => match &tag.data {
+                std::borrow::Cow::Owned(bytes) => bytes.capacity(),
+                std::borrow::Cow::Borrowed(_) => 0,
+            },
+        }
+    }
+
     pub fn size(&self) -> BitmapSize {
         match self {
             CompressedBitmap::Jpeg { width, height, .. } => BitmapSize {

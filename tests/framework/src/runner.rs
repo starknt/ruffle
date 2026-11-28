@@ -60,6 +60,11 @@ pub struct TestRunner {
 }
 
 impl TestRunner {
+    /// Streaming consumers drain completed trace lines instead of accumulating a long session in memory.
+    pub fn take_trace_output(&self) -> String {
+        self.log.trace_output()
+    }
+
     pub fn new(
         test: &Test,
         movie: SwfMovieData,
@@ -95,6 +100,11 @@ impl TestRunner {
         )?;
 
         let mut builder = PlayerBuilder::new()
+            .with_memory_manager(
+                ruffle_core::memory::MemoryScope::current()
+                    .manager()
+                    .clone(),
+            )
             .with_log(log.clone())
             .with_navigator(navigator)
             .with_locale(DeterministicLocaleBackend::default())

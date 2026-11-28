@@ -364,3 +364,43 @@ fn third_pending_submission_is_rejected_until_the_oldest_completes() {
     assert!(gpu.complete_submission(first));
     assert!(gpu.register_submission(&[]).is_ok());
 }
+
+#[test]
+fn shared_mesh_export_stops_attributing_live_buffers_to_one_movie() {
+    let gpu = runtime(64);
+    let first = ruffle_memory::SymbolId {
+        movie_id: 1,
+        character_id: 5,
+    };
+    let other = ruffle_memory::SymbolId {
+        movie_id: 2,
+        character_id: 8,
+    };
+    let owner = ruffle_memory::SymbolId::enter(Some(first), || {
+        gpu.issue_owner(OwnerKind::Graphic).unwrap()
+    });
+    let buffer = || {
+        gpu.reserve(ResourceKind::Buffer, owner, 16)
+            .unwrap()
+            .commit(&[])
+            .unwrap()
+    };
+    let vertices = buffer();
+    let _indices = buffer();
+    vertices.note_mesh_use(Some(first));
+    assert!(
+        gpu.memory_device()
+            .resources()
+            .iter()
+            .all(|r| r.symbol == Some(first))
+    );
+    vertices.note_mesh_use(Some(other));
+    let resources = gpu.memory_device().resources();
+    assert_eq!(resources.len(), 2);
+    assert!(
+        resources
+            .iter()
+            .all(|r| r.symbol.is_none() && r.owner_kind == "sharedMesh")
+    );
+    assert_eq!(gpu.stats().total_bytes, 32);
+}

@@ -285,7 +285,7 @@ impl<'gc> MovieLibrary<'gc> {
 
     pub fn get_sound(&self, id: CharacterId) -> Option<SoundHandle> {
         if let Some(Character::Sound(sound)) = self.characters.get(&id) {
-            Some(*sound)
+            Some((**sound).clone())
         } else {
             None
         }
@@ -665,13 +665,12 @@ impl<'gc> Library<'gc> {
     pub fn register_device_font(
         &mut self,
         gc_context: &Mutation<'gc>,
-        renderer: &mut dyn RenderBackend,
+        _renderer: &mut dyn RenderBackend,
         definition: FontDefinition<'_>,
     ) {
         match definition {
             FontDefinition::SwfTag(tag, encoding) => {
-                let font =
-                    Font::from_swf_tag(gc_context, renderer, tag, encoding, FontType::Device);
+                let font = Font::from_swf_tag(gc_context, tag, encoding, FontType::Device, None);
                 let name = font.descriptor().name().to_owned();
                 let is_bold = font.descriptor().bold();
                 let is_italic = font.descriptor().italic();

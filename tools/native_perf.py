@@ -19,6 +19,33 @@ def percentile(values, fraction):
     return values[max(0, math.ceil(len(values) * fraction)-1)] if values else None
 
 
+def memory_run_metrics(frames, summary):
+    def samples(values, *, every_frame=False):
+        present = [value for value in values if value is not None]
+        if any(type(value) is not int or value < 0 for value in present):
+            raise ValueError('invalid memory or GC sample')
+        return [] if every_frame and len(present) != len(frames) else present
+
+    def median_or_none(values):
+        return statistics.median(values) if values else None
+
+    gc = samples((r.get('phaseNs', {}).get('gc') for r in frames), every_frame=True)
+    logical = samples(((r.get('nativeResources') or {}).get('logical_bytes') for r in frames),
+                      every_frame=True)
+    # RSS and the wgpu allocator are sampled periodically. A frame between samples
+    # does not mean zero, and some backends do not expose allocator measurements.
+    allocators = [r['allocator'] for r in frames if r.get('allocator') is not None]
+    return {
+        'completedFps': len(frames) * 1e9 / summary['completedNs'],
+        'gcP99Ms': percentile(gc, .99) / 1e6 if gc else None,
+        'rssMedianBytes': median_or_none(samples(r.get('rssBytes') for r in frames)),
+        'gpuLogicalMedianBytes': median_or_none(logical),
+        'gpuLogicalPeakBytes': (summary.get('resourcesAfterDrain') or {}).get('peak_bytes'),
+        'gpuAllocatedMedianBytes': median_or_none(samples(r.get('allocatedBytes') for r in allocators)),
+        'gpuReservedMedianBytes': median_or_none(samples(r.get('reservedBytes') for r in allocators)),
+    }
+
+
 def summarize(path):
     records = [json.loads(line) for line in Path(path).read_text().splitlines()]
     sessions = [r for r in records if r.get('event') == 'session']
@@ -72,6 +99,7 @@ def summarize(path):
     if any(not isinstance(r.get('cpuNs'), (float, int)) or not math.isfinite(r['cpuNs']) or r['cpuNs'] < 0 for r in frames):
         raise ValueError('invalid CPU frame duration')
     return {
+        **(memory_run_metrics(frames, summary) if session['case'] == 'memory_soak' else {}),
         'warmup': session.get('warmup'), 'driver': session.get('driver'),
         'runId': session.get('runId'), 'settings': session.get('settings'),
         'workloadSha256': session.get('workloadSha256'),
@@ -170,10 +198,47 @@ def compare(baseline, candidate, phase, control=False):
     else:
         accepted = (improvement is not None and interval is not None and low is not None
                     and throughput > 0 and interval < 0 and low > 0)
-    return {'accepted': accepted, 'throughputGain':throughput, 'cpuP95Regression':p95,
+    result = {'accepted': accepted, 'throughputGain':throughput, 'cpuP95Regression':p95,
             'cpuP99Regression':p99, 'gpuP95Regression':gpu95, 'gpuP99Regression':gpu99,
             'peakRssGrowth':rss, 'phase':phase, 'phaseP95Gain':improvement,
             'frameIntervalP95Regression':interval, 'onePercentLowGain':low}
+    if baseline[0].get('case') == 'memory_soak':
+        result['memoryMetrics'] = compare_memory_metrics(baseline, candidate)
+    return result
+
+
+def compare_memory_metrics(baseline, candidate):
+    metrics = {}
+    higher_is_better = ('completedFps', 'onePercentLowFps')
+    for key in (*higher_is_better, 'frameIntervalP95Ms', 'gcP99Ms', 'rssMedianBytes',
+                'peakRssBytes', 'gpuLogicalMedianBytes', 'gpuLogicalPeakBytes',
+                'gpuAllocatedMedianBytes', 'gpuReservedMedianBytes'):
+        before = [run.get(key) for run in baseline]
+        after = [run.get(key) for run in candidate]
+        if any(value is None for value in before + after):
+            metrics[key] = {'status': 'unavailable'}
+            continue
+        if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+               for value in before + after):
+            raise ValueError(f'invalid memory comparison metric {key}')
+        pairs = list(zip(before, after))
+        # With a zero baseline only the absolute change has a meaningful direction.
+        relative = statistics.median(c / b - 1 for b, c in pairs) if all(before) else None
+        change = relative if relative is not None else statistics.median(c - b for b, c in pairs)
+        direction = 1 if key in higher_is_better else -1
+        before_median, after_median = statistics.median(before), statistics.median(after)
+        benefit = direction * change
+        median_benefit = direction * (after_median - before_median)
+        regressions = [i for i, (b, c) in enumerate(pairs, 1) if direction * (c - b) < 0]
+        status = 'unchanged'
+        if min(benefit, median_benefit) < 0:
+            status = 'pendingOptimization'
+        elif max(benefit, median_benefit) > 0:
+            status = 'improved'
+        metrics[key] = {'baselineMedian': before_median, 'candidateMedian': after_median,
+                        'pairedChange': relative, 'status': status,
+                        'pendingOptimizationPairs': regressions}
+    return metrics
 
 
 def compare_filter_cache(baseline, candidate, phase, path):

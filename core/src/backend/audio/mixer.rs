@@ -56,9 +56,6 @@ impl CircBuf {
 /// An `AudioBackend` can forward audio events to the `AudioMixer`, and it will track the state of
 // all sounds and mix the audio into an output buffer audio stream.
 pub struct AudioMixer {
-    /// The currently registered sounds.
-    sounds: SlotMap<SoundHandle, Sound>,
-
     /// The list of actively playing sound instances.
     sound_instances: Arc<Mutex<SlotMap<SoundInstanceHandle, SoundInstance>>>,
 
@@ -150,7 +147,7 @@ struct Sound {
     /// The audio data of this sound.
     ///
     /// This will be compressed in the format indicated by `format.compression`.
-    data: Arc<[u8]>,
+    data: bytes::Bytes,
 
     /// Number of samples in this audio.
     /// This does not include `skip_sample_frames`.
@@ -242,7 +239,6 @@ impl AudioMixer {
     /// Creates a new `AudioMixer` with the given number of channels and sample rate.
     pub fn new(num_output_channels: u8, output_sample_rate: u32) -> Self {
         Self {
-            sounds: SlotMap::with_key(),
             sound_instances: Arc::new(Mutex::new(SlotMap::with_key())),
             volume: Arc::new(RwLock::new(1.0)),
             num_output_channels,
@@ -298,7 +294,7 @@ impl AudioMixer {
     ///  * ActionScript sounds that may have a custom start and loop setting
     fn make_seekable_decoder(
         format: &swf::SoundFormat,
-        data: Cursor<ArcAsRef>,
+        data: Cursor<bytes::Bytes>,
     ) -> Result<Box<dyn SeekableDecoder>, decoders::Error> {
         let decoder: Box<dyn SeekableDecoder> = match format.compression {
             AudioCompression::UncompressedUnknownEndian => {
@@ -359,7 +355,7 @@ impl AudioMixer {
         &self,
         sound: &Sound,
         settings: &swf::SoundInfo,
-        data: Cursor<ArcAsRef>,
+        data: Cursor<bytes::Bytes>,
     ) -> Result<Box<dyn Stream>, DecodeError> {
         // Instantiate a decoder for the compression that the sound data uses.
         let decoder = Self::make_seekable_decoder(&sound.format, data)?;
@@ -524,17 +520,17 @@ impl AudioMixer {
 
         let sound = Sound {
             format: swf_sound.format.clone(),
-            data: Arc::from(data),
+            data: sound_bytes(data),
             num_sample_frames: swf_sound.num_samples,
             skip_sample_frames,
         };
-        Ok(self.sounds.insert(sound))
+        Ok(SoundHandle::new(sound))
     }
 
     /// Registers an external MP3 with the audio mixer.
     #[cfg(feature = "mp3")]
     pub fn register_mp3(&mut self, data: &[u8]) -> Result<SoundHandle, DecodeError> {
-        let data = Arc::from(data);
+        let data = sound_bytes(data);
         // Validate that this is actually MP3 data, and calculate duration and sample rate.
         let metadata = decoders::mp3_metadata(&data)?;
         let sound = Sound {
@@ -548,7 +544,7 @@ impl AudioMixer {
             num_sample_frames: metadata.num_sample_frames,
             skip_sample_frames: 0,
         };
-        Ok(self.sounds.insert(sound))
+        Ok(SoundHandle::new(sound))
     }
 
     #[cfg(not(feature = "mp3"))]
@@ -583,8 +579,10 @@ impl AudioMixer {
         sound_handle: SoundHandle,
         settings: &swf::SoundInfo,
     ) -> Result<SoundInstanceHandle, DecodeError> {
-        let sound = &self.sounds[sound_handle];
-        let data = Cursor::new(ArcAsRef(Arc::clone(&sound.data)));
+        let sound = sound_handle
+            .downcast_ref::<Sound>()
+            .expect("sound was registered by this mixer backend");
+        let data = Cursor::new(sound.data.clone());
         // Create a stream that decodes and resamples the sound.
         let stream = if sound.skip_sample_frames == 0
             && settings.in_sample.is_none()
@@ -672,7 +670,7 @@ impl AudioMixer {
     ///
     /// Returns `None` if the sound is not registered or invalid.
     pub fn get_sound_duration(&self, sound: SoundHandle) -> Option<FloatDuration> {
-        if let Some(sound) = self.sounds.get(sound) {
+        if let Some(sound) = sound.downcast_ref::<Sound>() {
             // AS duration does not subtract `skip_sample_frames`.
             let num_sample_frames: f64 = sound.num_sample_frames.into();
             let sample_rate: f64 = sound.format.sample_rate.into();
@@ -684,11 +682,11 @@ impl AudioMixer {
     }
 
     pub fn get_sound_size(&self, sound: SoundHandle) -> Option<u32> {
-        self.sounds.get(sound).map(|s| s.data.len() as u32)
+        sound.downcast_ref::<Sound>().map(|s| s.data.len() as u32)
     }
 
-    pub fn get_sound_format(&self, sound: SoundHandle) -> Option<&swf::SoundFormat> {
-        self.sounds.get(sound).map(|s| &s.format)
+    pub fn get_sound_format<'s>(&self, sound: &'s SoundHandle) -> Option<&'s swf::SoundFormat> {
+        sound.downcast_ref::<Sound>().map(|s| &s.format)
     }
 
     /// Sets the sound transform for the given playing sound.
@@ -765,21 +763,12 @@ impl AudioMixerProxy {
     }
 }
 
-/// A dummy wrapper struct to implement `AsRef<[u8]>` for `Arc<Vec<u8>>`.
-/// Not having this trait causes problems when trying to use `Cursor<Vec<u8>>`.
-struct ArcAsRef(Arc<[u8]>);
-
-impl AsRef<[u8]> for ArcAsRef {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl Default for ArcAsRef {
-    fn default() -> Self {
-        ArcAsRef(Arc::new([]))
-    }
+fn sound_bytes(data: &[u8]) -> bytes::Bytes {
+    bytes::Bytes::from_owner(ruffle_memory::MemoryBuffer::new(
+        &ruffle_memory::MemoryScope::current(),
+        ruffle_memory::MemoryKind::Audio,
+        data.to_vec(),
+    ))
 }
 
 /// A stream for event sound instances with custom envelopes, start/end point, or loop settings.
@@ -1132,7 +1121,7 @@ macro_rules! impl_audio_mixer_backend {
         }
 
         #[inline]
-        fn get_sound_format(&self, sound: SoundHandle) -> Option<&swf::SoundFormat> {
+        fn get_sound_format<'s>(&self, sound: &'s SoundHandle) -> Option<&'s swf::SoundFormat> {
             self.$mixer.get_sound_format(sound)
         }
 
@@ -1164,4 +1153,55 @@ macro_rules! impl_audio_mixer_backend {
             self.$mixer.get_sample_history()
         }
     };
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use ruffle_memory::{MemoryKind, MemoryManager};
+
+    #[test]
+    fn registered_bytes_follow_script_and_playback_owners() {
+        let manager = MemoryManager::new(16 << 20);
+        let scope = manager.player();
+        let mut mixer = AudioMixer::new(2, 44100);
+        let data = [128; 4096];
+        let sound = scope.enter(|| {
+            mixer
+                .register_sound(&swf::Sound {
+                    id: 1,
+                    format: swf::SoundFormat {
+                        compression: AudioCompression::Uncompressed,
+                        sample_rate: 44100,
+                        is_stereo: false,
+                        is_16_bit: false,
+                    },
+                    num_samples: data.len() as u32,
+                    data: &data,
+                })
+                .unwrap()
+        });
+        let instance = mixer
+            .start_sound(
+                sound.clone(),
+                &swf::SoundInfo {
+                    event: swf::SoundEvent::Event,
+                    in_sample: None,
+                    out_sample: None,
+                    num_loops: 1,
+                    envelope: None,
+                },
+            )
+            .unwrap();
+        drop(sound);
+        let active = || manager.snapshot().players[0].active[&MemoryKind::Audio];
+        assert_eq!(active(), data.len() as u64);
+        assert!(mixer.get_sound_position(instance).is_some());
+        mixer.stop_sound(instance);
+        assert_eq!(
+            active(),
+            0,
+            "the mixer outlives the last script and playback reference"
+        );
+    }
 }

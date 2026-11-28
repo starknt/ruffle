@@ -165,6 +165,56 @@ class NativePerfTest(unittest.TestCase):
             self.assertEqual(result['cpuP95Ms'], 2)
             self.assertIsNone(result['gpuP95Ms'])
 
+    def test_memory_soak_reports_gc_and_keeps_sampled_rss_and_gpu_memory_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.trace(directory, frames=100)
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows[0]['case'] = 'memory_soak'
+            for i, frame in enumerate(rows[1:-1]):
+                frame['phaseNs']['gc'] = (i + 1) * 1000
+                frame['nativeResources'] = {'logical_bytes': i + 1}
+            rows[1].update(rssBytes=100, allocator={'allocatedBytes': 200, 'reservedBytes': 800})
+            rows[2].update(rssBytes=300, allocator={'allocatedBytes': 400, 'reservedBytes': 800})
+            path.write_text('\n'.join(map(json.dumps, rows)))
+            report = summarize(path)
+            self.assertEqual(report.get('gcP99Ms'), 0.099)
+            self.assertEqual(report['rssMedianBytes'], 200)
+            self.assertEqual(report['gpuLogicalMedianBytes'], 50.5)
+            self.assertEqual(report['gpuAllocatedMedianBytes'], 300)
+            self.assertEqual(report['gpuReservedMedianBytes'], 800)
+            self.assertEqual(report['completedFps'], 12500)
+            del rows[2]['phaseNs']['gc']
+            path.write_text('\n'.join(map(json.dumps, rows)))
+            self.assertIsNone(summarize(path)['gcP99Ms'])
+
+    def test_memory_comparison_labels_lower_throughput_and_higher_rss_as_regressions(self):
+        before, after = NativeWgpuAcceptanceTest().paired()
+        for run in before + after:
+            run.update(case='memory_soak', completedFps=100., rssMedianBytes=100, gcP99Ms=2.)
+        for run in after:
+            run.update(completedFrameMs=12.5, completedFps=80., rssMedianBytes=130, gcP99Ms=1.)
+        comparison = compare(before, after, 'gpu')
+        self.assertIn('memoryMetrics', comparison)
+        metrics = comparison['memoryMetrics']
+        self.assertEqual(metrics['completedFps']['status'], 'pendingOptimization')
+        self.assertEqual(metrics['rssMedianBytes']['status'], 'pendingOptimization')
+        self.assertEqual(metrics['gcP99Ms']['status'], 'improved')
+        self.assertEqual(metrics['gcP99Ms']['baselineMedian'], 2.)
+        self.assertEqual(metrics['gcP99Ms']['candidateMedian'], 1.)
+        self.assertEqual(metrics['gcP99Ms']['pairedChange'], -.5)
+        self.assertEqual(metrics['gpuReservedMedianBytes']['status'], 'unavailable')
+
+    def test_memory_comparison_retains_regressing_pairs_even_when_the_typical_pair_improves(self):
+        before, after = NativeWgpuAcceptanceTest().paired()
+        for i, (b, c) in enumerate(zip(before, after)):
+            b.update(case='memory_soak', onePercentLowFps=[100, 200, 300, 400, 500][i])
+            c.update(case='memory_soak', onePercentLowFps=[110, 210, 310, 120, 180][i])
+        row = compare(before, after, 'gpu')['memoryMetrics']['onePercentLowFps']
+        self.assertGreater(row['pairedChange'], 0)
+        self.assertLess(row['candidateMedian'], row['baselineMedian'])
+        self.assertEqual(row['status'], 'pendingOptimization')
+        self.assertEqual(row['pendingOptimizationPairs'], [4, 5])
+
     def test_named_gpu_phases_remain_inclusive_and_require_every_frame(self):
         with tempfile.TemporaryDirectory() as d:
             path = self.trace(d)

@@ -1,4 +1,4 @@
-use ruffle_render::backend::ShapeHandle;
+use ruffle_render::backend::{CachedShape, ShapeHandle};
 
 /// The scale ratio threshold beyond which a graphic or a drawing will be retessellated.
 const RETESSELLATION_SCALE_THRESHOLD: f32 = 2.0;
@@ -12,7 +12,7 @@ const RETESSELLATION_CACHE_SIZE: usize = 4;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TessellationCache {
-    entries: [Option<(f32, ShapeHandle)>; RETESSELLATION_CACHE_SIZE],
+    entries: [Option<(f32, CachedShape)>; RETESSELLATION_CACHE_SIZE],
     len: usize,
 }
 
@@ -64,14 +64,20 @@ impl TessellationCache {
         }
 
         // If we found a suitable cached entry, move it to the most recently used position.
-        best_index.map(|index| self.touch_entry(index))
+        let index = best_index?;
+        if let Some(handle) = self.touch_entry(index).get() {
+            return Some(handle);
+        }
+        self.len -= 1;
+        self.entries[self.len] = None;
+        self.find_near_and_touch(target_scale)
     }
 
     /// Inserts a new cached shape handle with the given scale.
     ///
     /// If the cache is full, the least recently used entry will be evicted to make room for the new entry.
     /// We assume that the caller has already checked that the new entry is not too similar to existing entries.
-    pub(crate) fn insert(&mut self, scale: f32, handle: ShapeHandle) {
+    pub(crate) fn insert(&mut self, scale: f32, handle: CachedShape) {
         if self.len < RETESSELLATION_CACHE_SIZE {
             // If the cache is not full, simply add the new entry at the end.
             self.entries[self.len] = Some((scale, handle));
@@ -93,7 +99,7 @@ impl TessellationCache {
     }
 
     /// Moves the entry at the given index to the most recently used position and returns its shape handle.
-    fn touch_entry(&mut self, index: usize) -> ShapeHandle {
+    fn touch_entry(&mut self, index: usize) -> CachedShape {
         if index == self.len - 1 {
             // The entry is already the most recently used, so we can return its handle directly.
             return self.entries[index]
@@ -118,7 +124,7 @@ impl TessellationCache {
 #[cfg(test)]
 mod tests {
     use super::TessellationCache;
-    use ruffle_render::backend::{ShapeHandle, ShapeHandleImpl};
+    use ruffle_render::backend::{CachedShape, ShapeHandle, ShapeHandleImpl};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -136,8 +142,8 @@ mod tests {
         let first = shape(1);
         let second = shape(2);
         let mut cache = TessellationCache::new();
-        cache.insert(1.0, first.clone());
-        cache.insert(4.0, second);
+        cache.insert(1.0, CachedShape::Owned(first.clone()));
+        cache.insert(4.0, CachedShape::Owned(second));
 
         let reused = cache.find_near_and_touch(1.5).unwrap();
         assert!(Arc::ptr_eq(&reused.0, &first.0));
@@ -149,12 +155,12 @@ mod tests {
         let mut cache = TessellationCache::new();
         let first = shape(0);
         let second = shape(1);
-        cache.insert(1.0, first);
-        cache.insert(2.0, second.clone());
-        cache.insert(3.0, shape(2));
-        cache.insert(4.0, shape(3));
+        cache.insert(1.0, CachedShape::Owned(first));
+        cache.insert(2.0, CachedShape::Owned(second.clone()));
+        cache.insert(3.0, CachedShape::Owned(shape(2)));
+        cache.insert(4.0, CachedShape::Owned(shape(3)));
         let _ = cache.find_near_and_touch(1.0);
-        cache.insert(8.0, shape(8));
+        cache.insert(8.0, CachedShape::Owned(shape(8)));
 
         let nearby = cache.find_near_and_touch(2.0).unwrap();
         assert!(!Arc::ptr_eq(&nearby.0, &second.0));

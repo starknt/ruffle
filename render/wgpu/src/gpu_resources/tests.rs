@@ -1493,3 +1493,27 @@ fn queued_submission_waiters_receive_the_first_device_failure() {
         RenderFailureKind::DeviceLost
     );
 }
+
+#[test]
+#[ignore = "requires a Vulkan adapter"]
+fn compulsory_allocation_reclaims_a_cold_shape_in_the_same_frame() {
+    use ruffle_render::backend::{ShapeHandle, ShapeHandleImpl};
+    #[derive(Debug)]
+    struct ColdShape(#[allow(dead_code)] Buffer);
+    impl ShapeHandleImpl for ColdShape {}
+    let device = device(64 * 1024);
+    let mut cache = crate::shape_residency::ShapeCache::for_device(device.runtime().generation());
+    let buffer = |size| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shape residency test"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    };
+    let cached = cache.retain(ShapeHandle(Arc::new(ColdShape(buffer(48 * 1024).unwrap()))));
+    assert!(cached.get().is_some());
+    let replacement = buffer(32 * 1024).unwrap();
+    assert!(cached.get().is_none());
+    assert_eq!(replacement.size(), 32 * 1024);
+}

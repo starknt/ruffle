@@ -133,6 +133,18 @@ impl ActivePlayer {
         file_picker: FilePicker,
     ) -> Self {
         let player_id = PlayerId::new();
+        static RSS_SAMPLER: std::sync::Once = std::sync::Once::new();
+        RSS_SAMPLER.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("ruffle-rss".into())
+                .spawn(|| {
+                    loop {
+                        let rss = memory_stats::memory_stats().map(|m| m.physical_mem as u64);
+                        ruffle_core::memory::MemoryManager::process().sample_rss(rss);
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                });
+        });
         let mut builder = PlayerBuilder::new();
 
         match CpalAudioBackend::new(preferences.output_device_name().as_deref()) {
@@ -357,6 +369,10 @@ impl ActivePlayer {
             let mut player_lock = player.lock().expect("Player lock must be available");
             CALLSTACK.with(|callstack| {
                 *callstack.borrow_mut() = Some(player_lock.callstack());
+            });
+            player_lock.mutate_with_update_context(|ctx| {
+                ctx.load_manager
+                    .set_movie_cache_directory(&opt.cache_directory.join("swf-v1"), 256 << 20)
             });
             player_lock.fetch_root_movie(
                 movie_url.to_string(),

@@ -12,6 +12,7 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+ruffle_memory = { path = "../memory" }
 bytes = "1.12.1"
 tempfile = { workspace = true }
 linkme = { version = "0.3", optional = true }

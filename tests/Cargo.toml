@@ -11,6 +11,8 @@ version.workspace = true
 workspace = true
 
 [features]
+perf-mimalloc = ["dep:mimalloc"]
+perf-jemalloc = ["dep:tikv-jemallocator"]
 default = ["avm_debug"]
 # Allow optimized execution regressions to exercise release-only fast paths.
 avm_debug = ["ruffle_core/avm_debug", "ruffle_test_framework/avm_debug"]
@@ -27,6 +29,8 @@ jpegxr = ["ruffle_test_framework/jpegxr"]
 lzma = ["ruffle_test_framework/lzma"]
 
 [dependencies]
+mimalloc = { version = "0.1", optional = true }
+tikv-jemallocator = { version = "0.7", optional = true }
 ruffle_render_wgpu = { path = "../render/wgpu", optional = true }
 ruffle_fs_tests_runner = { path = "fs-tests-runner" }
 ruffle_test_framework = { path = "framework", default-features = false, features = ["clap"] }

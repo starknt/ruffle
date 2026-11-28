@@ -5,6 +5,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
+impl AssetScheduler {
+    fn shared_bytes_in_use(&self) -> usize {
+        self.inner.borrow().shared_bytes.load(Ordering::Relaxed)
+    }
+}
+
 struct Disk {
     size: usize,
     reads: AtomicUsize,
@@ -62,6 +68,7 @@ async fn two_large_fresh_hits_wait_for_body_handoff_or_cancellation() {
         )
     };
     let first = ready(fetch("first")).await.map_err(|e| e.error).unwrap();
+    assert!(first.allows_movie_cache());
     assert_eq!(first.buffered_body_len(), Some(disk.size));
     let address = disk.last_address.load(Ordering::SeqCst);
     let mut second = fetch("second");
@@ -141,16 +148,16 @@ async fn small_independent_disk_hits_have_credit_while_both_headers_are_held() {
     let (one, two) = ready(async { futures::join!(fetch("one"), fetch("two")) }).await;
     let one = one.map_err(|e| e.error).unwrap();
     let mut two = two.map_err(|e| e.error).unwrap();
-    assert_eq!(scheduler.inner.borrow().shared_bytes, 2 * disk.size);
+    assert_eq!(scheduler.shared_bytes_in_use(), 2 * disk.size);
     drop(one);
-    assert_eq!(scheduler.inner.borrow().shared_bytes, disk.size);
+    assert_eq!(scheduler.shared_bytes_in_use(), disk.size);
     let bytes = two.next_chunk().await.unwrap().unwrap();
     assert_eq!(bytes.len(), disk.size);
     assert_eq!(
         bytes.as_ptr() as usize,
         disk.last_address.load(Ordering::SeqCst)
     );
-    assert_eq!(scheduler.inner.borrow().shared_bytes, 0);
+    assert_eq!(scheduler.shared_bytes_in_use(), 0);
     assert_eq!(scheduler.disk_reads.available_permits(), 1);
 }
 
@@ -170,6 +177,111 @@ async fn empty_independent_disk_hit_returns_eof_on_first_read() {
     assert_eq!(response.buffered_body_len(), Some(0));
     assert!(response.next_chunk().await.unwrap().is_none());
     assert_eq!(scheduler.disk_reads.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn shared_download_remains_charged_until_the_final_consumer_drops_its_bytes() {
+    use ruffle_core::memory::{MemoryKind, MemoryManager};
+    let manager = MemoryManager::new(32 << 20);
+    let mut backend = new_test_backend(false);
+    let scheduler = backend.configure_buffered_assets(|_| true);
+    let disk = Disk::mount(&scheduler, 32);
+    let player = ruffle_core::PlayerBuilder::new()
+        .with_memory_manager(manager.clone())
+        .with_navigator(backend)
+        .build();
+    let fetch = || {
+        player.lock().unwrap().navigator().fetch_buffered(
+            Request::get("http://localhost/shared".into()),
+            FetchReason::LoadSwf,
+        )
+    };
+    let (a, b) = ready(async { futures::join!(fetch(), fetch()) }).await;
+    let a = a.map_err(|e| e.error).unwrap().body_bytes().await.unwrap();
+    let b = b.map_err(|e| e.error).unwrap().body_bytes().await.unwrap();
+    assert_eq!(a.as_ptr(), b.as_ptr());
+    assert_eq!(
+        a.as_ptr() as usize,
+        disk.last_address.load(Ordering::SeqCst)
+    );
+    let used = || {
+        manager.snapshot().players[0]
+            .active
+            .get(&MemoryKind::Network)
+            .copied()
+            .unwrap_or(0)
+    };
+    assert_eq!(used(), 32);
+    assert_eq!(scheduler.shared_bytes_in_use(), 32);
+    drop(a);
+    assert_eq!(used(), 32);
+    drop(b);
+    assert_eq!(used(), 0);
+    assert_eq!(scheduler.shared_bytes_in_use(), 0);
+}
+
+#[tokio::test]
+async fn direct_http_body_keeps_its_player_charge_until_consumed() {
+    use ruffle_core::memory::{MemoryKind, MemoryManager};
+    let manager = MemoryManager::new(32 << 20);
+    let scope = manager.player();
+    let mut backend = new_test_backend(false);
+    backend.set_memory_scope(&scope);
+    let (url, send, server) = serve(
+        "HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n".into(),
+        false,
+    )
+    .await;
+    let response = ready(backend.fetch(Request::get(url.into())))
+        .await
+        .map_err(|e| e.error)
+        .unwrap();
+    send.send(vec![7; 32]).unwrap();
+    let bytes = ready(response.body_bytes()).await.unwrap();
+    let used = || {
+        manager.snapshot().players[0]
+            .active
+            .get(&MemoryKind::Network)
+            .copied()
+            .unwrap_or(0)
+    };
+    assert_eq!(bytes.as_ref(), &[7; 32]);
+    assert!(used() >= 32);
+    drop(bytes);
+    assert_eq!(used(), 0);
+    ready(server).await.unwrap();
+}
+
+#[tokio::test]
+async fn high_pressure_cancels_unclaimed_preloads_and_keeps_foreground_reads_available() {
+    use ruffle_core::memory::{MemoryManager, PressureLevel};
+    let manager = MemoryManager::new(4096);
+    let scope = manager.player();
+    let mut backend = new_test_backend(false);
+    backend.set_memory_scope(&scope);
+    let scheduler = backend.configure_buffered_assets(|_| true);
+    Disk::mount(&scheduler, 32);
+    let preload = |path| {
+        scheduler.preload(
+            backend.client.as_ref().unwrap().as_ref().clone(),
+            backend.cookies.clone(),
+            Url::parse(&format!("http://localhost/{path}")).unwrap(),
+        )
+    };
+    let hint = preload("hint").unwrap();
+    manager.notify_pressure(PressureLevel::High);
+    assert!(preload("second").is_none());
+    assert!(scheduler.preloads.borrow().is_empty());
+    hint.await.unwrap();
+    let response = backend
+        .fetch_buffered(
+            Request::get("http://localhost/visible".into()),
+            FetchReason::LoadSwf,
+        )
+        .await
+        .map_err(|e| e.error)
+        .unwrap();
+    assert_eq!(response.body_bytes().await.unwrap().len(), 32);
 }
 
 // Flush real headers and let the test decide when the server supplies (or truncates) the body.
@@ -221,6 +333,10 @@ async fn validated_large_body_keeps_disk_credit_after_http_completes() {
     assert_eq!(response.status(), 200);
     assert_eq!(response.expected_length().unwrap(), Some(disk.size as u64));
     assert_eq!(response.buffered_body_len(), Some(disk.size));
+    assert!(
+        !response.allows_movie_cache(),
+        "account cache must not publish a shared FWS"
+    );
     assert_eq!(scheduler.stats().revalidated, 1);
     assert_eq!(scheduler.inner.borrow().active, 0);
     assert_eq!(scheduler.disk_reads.available_permits(), 0);

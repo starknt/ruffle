@@ -9,7 +9,6 @@ use ruffle_video::backend::VideoBackend;
 use ruffle_video::error::Error;
 use ruffle_video::frame::{EncodedFrame, FrameDependency};
 use ruffle_video_software::backend::SoftwareVideoBackend;
-use slotmap::SlotMap;
 
 use swf::{VideoCodec, VideoDeblocking};
 
@@ -26,7 +25,6 @@ enum ProxyOrStream {
 /// A video backend that falls back to the software backend for most codecs,
 /// except for H.264, for which it uses an external decoder.
 pub struct ExternalVideoBackend {
-    streams: SlotMap<VideoStreamHandle, ProxyOrStream>,
     #[cfg(feature = "openh264")]
     openh264_codec: Option<OpenH264Codec>,
     software: SoftwareVideoBackend,
@@ -52,7 +50,6 @@ impl ExternalVideoBackend {
     /// Create a backend without an H.264 decoder.
     pub fn new() -> Self {
         Self {
-            streams: SlotMap::with_key(),
             #[cfg(feature = "openh264")]
             openh264_codec: None,
             software: SoftwareVideoBackend::new(),
@@ -89,7 +86,7 @@ impl VideoBackend for ExternalVideoBackend {
             )
         };
 
-        Ok(self.streams.insert(proxy_or_stream))
+        Ok(VideoStreamHandle::new(proxy_or_stream))
     }
 
     fn configure_video_stream_decoder(
@@ -97,15 +94,12 @@ impl VideoBackend for ExternalVideoBackend {
         stream: VideoStreamHandle,
         configuration_data: &[u8],
     ) -> Result<(), Error> {
-        let stream = self
-            .streams
-            .get_mut(stream)
-            .ok_or(Error::VideoStreamIsNotRegistered)?;
+        let mut stream = stream.borrow_mut::<ProxyOrStream>()?;
 
-        match stream {
+        match &mut *stream {
             ProxyOrStream::Proxied(handle) => self
                 .software
-                .configure_video_stream_decoder(*handle, configuration_data),
+                .configure_video_stream_decoder(handle.clone(), configuration_data),
             ProxyOrStream::Owned(stream) => stream.decoder.configure_decoder(configuration_data),
         }
     }
@@ -115,15 +109,12 @@ impl VideoBackend for ExternalVideoBackend {
         stream: VideoStreamHandle,
         encoded_frame: EncodedFrame<'_>,
     ) -> Result<FrameDependency, Error> {
-        let stream = self
-            .streams
-            .get_mut(stream)
-            .ok_or(Error::VideoStreamIsNotRegistered)?;
+        let mut stream = stream.borrow_mut::<ProxyOrStream>()?;
 
-        match stream {
+        match &mut *stream {
             ProxyOrStream::Proxied(handle) => self
                 .software
-                .preload_video_stream_frame(*handle, encoded_frame),
+                .preload_video_stream_frame(handle.clone(), encoded_frame),
             ProxyOrStream::Owned(stream) => stream.decoder.preload_frame(encoded_frame),
         }
     }
@@ -134,15 +125,12 @@ impl VideoBackend for ExternalVideoBackend {
         encoded_frame: EncodedFrame<'_>,
         renderer: &mut dyn RenderBackend,
     ) -> Result<BitmapInfo, Error> {
-        let stream = self
-            .streams
-            .get_mut(stream)
-            .ok_or(Error::VideoStreamIsNotRegistered)?;
+        let mut stream = stream.borrow_mut::<ProxyOrStream>()?;
 
-        match stream {
+        match &mut *stream {
             ProxyOrStream::Proxied(handle) => {
                 self.software
-                    .decode_video_stream_frame(*handle, encoded_frame, renderer)
+                    .decode_video_stream_frame(handle.clone(), encoded_frame, renderer)
             }
             ProxyOrStream::Owned(stream) => stream.decoder.decode_frame(encoded_frame, |frame| {
                 let width = frame.width();

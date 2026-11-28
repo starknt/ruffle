@@ -4,12 +4,9 @@ use crate::error::Error;
 use crate::frame::{EncodedFrame, FrameDependency};
 use ruffle_render::backend::RenderBackend;
 use ruffle_render::bitmap::BitmapInfo;
-use slotmap::SlotMap;
 use swf::{VideoCodec, VideoDeblocking};
 
-pub struct NullVideoBackend {
-    streams: SlotMap<VideoStreamHandle, ()>,
-}
+pub struct NullVideoBackend;
 
 /// Implementation of video that does not decode any video.
 ///
@@ -21,9 +18,7 @@ pub struct NullVideoBackend {
 ///    unimplemented
 impl NullVideoBackend {
     pub fn new() -> Self {
-        Self {
-            streams: SlotMap::with_key(),
-        }
+        Self
     }
 }
 
@@ -41,7 +36,7 @@ impl VideoBackend for NullVideoBackend {
         _codec: VideoCodec,
         _filter: VideoDeblocking,
     ) -> Result<VideoStreamHandle, Error> {
-        Ok(self.streams.insert(()))
+        Ok(VideoStreamHandle::new(()))
     }
 
     fn configure_video_stream_decoder(

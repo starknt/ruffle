@@ -127,7 +127,7 @@ impl<'gc> SoundObject<'gc> {
         let sound_data = self.0.sound_data.borrow();
         match &*sound_data {
             SoundData::NotLoaded { .. } => None,
-            SoundData::Loaded { sound } => Some(*sound),
+            SoundData::Loaded { sound } => Some(sound.clone()),
         }
     }
 
@@ -160,7 +160,7 @@ impl<'gc> SoundObject<'gc> {
                 // We don't know the length yet, so return the `SoundChannel`
                 true
             }
-            SoundData::Loaded { sound } => play_queued(queued, *sound, activation.context),
+            SoundData::Loaded { sound } => play_queued(queued, sound.clone(), activation.context),
         }
     }
 
@@ -171,7 +171,7 @@ impl<'gc> SoundObject<'gc> {
         match &mut *sound_data {
             SoundData::NotLoaded { queued_plays } => {
                 for queued in std::mem::take(queued_plays) {
-                    play_queued(queued, sound, context);
+                    play_queued(queued, sound.clone(), context);
                 }
                 *sound_data = SoundData::Loaded { sound };
             }
@@ -273,7 +273,7 @@ fn play_queued<'gc>(
     sound: SoundHandle,
     context: &mut UpdateContext<'gc>,
 ) -> bool {
-    if let Some(duration) = context.audio.get_sound_duration(sound)
+    if let Some(duration) = context.audio.get_sound_duration(sound.clone())
         && queued.position > duration.as_millis()
     {
         tracing::error!(

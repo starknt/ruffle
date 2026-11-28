@@ -10,12 +10,16 @@ use ruffle_core::backend::navigator::{
     Bytes, ErrorResponse, FetchReason, OwnedFuture, SuccessResponse, get_encoding,
 };
 use ruffle_core::loader::Error;
+use ruffle_core::memory::{MemoryBuffer, MemoryKind, MemoryScope, PressureLevel};
 use ruffle_core::swf::Encoding;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     rc::{Rc, Weak},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Poll, Waker},
     time::{Duration, Instant},
 };
@@ -97,7 +101,7 @@ struct State {
     active: usize,
     origins: HashMap<String, usize>,
     waiting: Vec<Waiting>,
-    shared_bytes: usize,
+    shared_bytes: Arc<AtomicUsize>,
     seq: u64,
     stats: AssetStats,
 }
@@ -105,6 +109,7 @@ struct State {
 #[derive(Clone)]
 pub struct AssetScheduler {
     inner: Rc<RefCell<State>>,
+    memory: Rc<RefCell<MemoryScope>>,
     preloads: Rc<RefCell<HashMap<Url, Preload>>>,
     preload_slots: Arc<tokio::sync::Semaphore>,
     admissions: Arc<tokio::sync::Semaphore>,
@@ -118,9 +123,10 @@ pub struct AssetScheduler {
 }
 
 impl AssetScheduler {
-    pub(super) fn new(allow: fn(&Url) -> bool) -> Self {
+    pub(super) fn new(allow: fn(&Url) -> bool, memory: Rc<RefCell<MemoryScope>>) -> Self {
         Self {
             inner: Rc::default(),
+            memory,
             preloads: Rc::default(),
             preload_slots: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_PRELOADS)),
             admissions: Arc::new(tokio::sync::Semaphore::new(MAX_LOGICAL)),
@@ -189,6 +195,14 @@ impl AssetScheduler {
         if !self.cache_enabled() || !self.enabled() || !self.allows(&url) {
             return None;
         }
+        let weight = match self.memory.borrow().manager().pressure().level {
+            PressureLevel::Normal => 1,
+            PressureLevel::Moderate => 2,
+            PressureLevel::High | PressureLevel::Critical => {
+                self.clear_preloads();
+                return None;
+            }
+        };
         let mut tickets = self.preloads.borrow_mut();
         tickets.retain(|_, ticket| ticket.started.elapsed() < PRELOAD_LIFETIME);
         if tickets.contains_key(&url) || tickets.len() >= MAX_PRELOADS {
@@ -218,7 +232,7 @@ impl AssetScheduler {
                 }
             };
             let prepare = async {
-                let _slot = slots.acquire().await.ok()?;
+                let _slot = slots.acquire_many(weight).await.ok()?;
                 transfer.await.into_preload(&state).await
             };
             tokio::select! {
@@ -242,7 +256,11 @@ impl AssetScheduler {
             let preload = {
                 let mut tickets = this.preloads.borrow_mut();
                 tickets.retain(|_, ticket| ticket.started.elapsed() < PRELOAD_LIFETIME);
-                tickets.remove(&url)
+                let claimed = tickets.remove(&url);
+                if this.memory.borrow().manager().pressure().level >= PressureLevel::High {
+                    tickets.clear();
+                }
+                claimed
             };
             if let Some(ticket) = preload
                 && ticket.cookies == jar.snapshot(&url)
@@ -329,6 +347,7 @@ impl AssetScheduler {
         may_share: bool,
     ) -> LocalBoxFuture<'static, Outcome> {
         let state = self.inner.clone();
+        let memory = self.memory.borrow().clone();
         let vfs = self.vfs.borrow().clone();
         let private_vfs = self.account_vfs.borrow().clone();
         let disk_reads = self.disk_reads.clone();
@@ -348,7 +367,7 @@ impl AssetScheduler {
                         s.stats.cache_hits += 1;
                         s.stats.cache_bytes += hit.bytes.len() as u64;
                     }
-                    return Outcome::cached(&url, hit, slot, &state, may_share);
+                    return Outcome::cached(&url, hit, slot, &state, &memory, may_share, true);
                 }
                 state.borrow_mut().stats.cache_misses += 1;
             }
@@ -411,7 +430,7 @@ impl AssetScheduler {
                     st.stats.headers_ms += began.elapsed().as_millis() as u64;
                     drop(st);
                     permit.complete();
-                    return Outcome::cached(&url, hit, slot, &state, false);
+                    return Outcome::cached(&url, hit, slot, &state, &memory, false, false);
                 }
                 // A bad or evicted entity needs a second, unconditional network transfer.
                 state.borrow_mut().stats.transfers += 1;
@@ -421,7 +440,7 @@ impl AssetScheduler {
                 state.borrow_mut().stats.cache_misses += 1;
             }
             state.borrow_mut().stats.headers_ms += began.elapsed().as_millis() as u64;
-            let meta = Meta::from_http(&http, &url);
+            let mut meta = Meta::from_http(&http, &url);
             if !http.status().is_success() {
                 permit.complete();
                 return Outcome::HttpError(Failure::Http(
@@ -438,6 +457,7 @@ impl AssetScheduler {
                 && http.status() == reqwest::StatusCode::OK
                 && meta.url == url.as_str()
                 && public_headers(http.headers());
+            meta.allows_movie_cache = cacheable && anonymous && store.is_some();
             let tag = http
                 .headers()
                 .get(header::ETAG)
@@ -466,14 +486,15 @@ impl AssetScheduler {
             } else {
                 None
             };
-            let mut prefix = Vec::new();
+            let mut prefix = MemoryBuffer::new(&memory, MemoryKind::Network, Vec::new());
             let expected = http.content_length();
             if let Some(budget) = budget
-                && prefix.try_reserve_exact(budget.bytes).is_ok()
+                && let Some(buffer) =
+                    MemoryBuffer::try_with_capacity(&memory, MemoryKind::Network, budget.bytes)
             {
                 let began = Instant::now();
                 let size = budget.bytes;
-                let read = run_io(read_body(http, prefix, size))
+                let read = run_io(read_body(http, buffer, size))
                     .await
                     .map_err(|e| e.to_string())
                     .and_then(|r| r.map_err(|e| e.to_string()));
@@ -486,13 +507,16 @@ impl AssetScheduler {
                             prefix = data;
                         } else {
                             permit.complete();
-                            let data = Bytes::from(data);
+                            let data = AssetBytes::new(data);
                             let data = if let Some(write) = disk {
                                 write.save(data).await
                             } else {
                                 data
                             };
-                            return Outcome::Shared(meta, Rc::new(SharedBody { data, budget }));
+                            return Outcome::Shared(
+                                meta,
+                                Rc::new(SharedBody::new(data, budget, &state)),
+                            );
                         }
                     }
                     Err(message) => {
@@ -502,6 +526,7 @@ impl AssetScheduler {
                 }
             }
             Outcome::Single(RefCell::new(Some(Response {
+                allows_movie_cache: meta.allows_movie_cache,
                 url: meta.url,
                 loader_request: None,
                 text_encoding: meta.encoding,
@@ -716,36 +741,43 @@ impl Drop for TransferPermit {
 }
 
 struct Reservation {
-    state: Rc<RefCell<State>>,
+    used: Arc<AtomicUsize>,
     bytes: usize,
 }
 impl Reservation {
     fn new(state: &Rc<RefCell<State>>, bytes: usize) -> Option<Self> {
         let mut s = state.borrow_mut();
-        if bytes > MAX_SHARED - s.shared_bytes {
+        if bytes > MAX_SHARED - s.shared_bytes.load(Ordering::Relaxed) {
             return None;
         }
-        s.shared_bytes += bytes;
-        s.stats.peak_shared_bytes = s.stats.peak_shared_bytes.max(s.shared_bytes);
+        let used = s.shared_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        s.stats.peak_shared_bytes = s.stats.peak_shared_bytes.max(used);
         Some(Self {
-            state: state.clone(),
+            used: s.shared_bytes.clone(),
             bytes,
         })
     }
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.state.borrow_mut().shared_bytes -= self.bytes;
+        self.used.fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
 
 pub(super) struct SharedBody {
-    data: Bytes,
-    budget: Reservation,
+    data: AssetBytes,
+    state: Rc<RefCell<State>>,
 }
 impl SharedBody {
-    pub fn into_bytes(self: Rc<Self>) -> Bytes {
-        self.budget.state.borrow_mut().stats.delivered += 1;
+    fn new(mut data: AssetBytes, budget: Reservation, state: &Rc<RefCell<State>>) -> Self {
+        data.credit = Some(Arc::new(budget));
+        Self {
+            data,
+            state: state.clone(),
+        }
+    }
+    pub fn into_data(self: Rc<Self>) -> AssetBytes {
+        self.state.borrow_mut().stats.delivered += 1;
         match Rc::try_unwrap(self) {
             Ok(body) => body.data,
             Err(shared) => shared.data.clone(),
@@ -755,7 +787,48 @@ impl SharedBody {
         self.data.len()
     }
     pub fn reserved_bytes(&self) -> usize {
-        self.budget.bytes
+        self.data.credit.as_ref().map_or(0, |credit| credit.bytes)
+    }
+}
+
+/// Disk writers and joined readers can outlive the scheduler's response. The underlying allocation
+/// owns its charge across those handoffs. A sole Vec consumer can take the original allocation.
+#[derive(Clone)]
+pub(super) struct AssetBytes {
+    data: Arc<MemoryBuffer<u8>>,
+    credit: Option<Arc<Reservation>>,
+}
+impl AssetBytes {
+    pub(super) fn new(buffer: MemoryBuffer<u8>) -> Self {
+        Self {
+            data: Arc::new(buffer),
+            credit: None,
+        }
+    }
+}
+
+impl std::ops::Deref for AssetBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.data
+    }
+}
+impl AsRef<[u8]> for AssetBytes {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+impl From<AssetBytes> for Bytes {
+    fn from(value: AssetBytes) -> Self {
+        Self::from_owner(value)
+    }
+}
+impl From<AssetBytes> for Vec<u8> {
+    fn from(value: AssetBytes) -> Self {
+        match Arc::try_unwrap(value.data) {
+            Ok(buffer) => buffer.into_vec(),
+            Err(buffer) => buffer.to_vec(),
+        }
     }
 }
 struct DiskWrite {
@@ -767,7 +840,7 @@ struct DiskWrite {
     state: Rc<RefCell<State>>,
 }
 impl DiskWrite {
-    async fn save(self, data: Bytes) -> Bytes {
+    async fn save(self, data: AssetBytes) -> AssetBytes {
         if data.is_empty() || data.len() > 32 * 1024 * 1024 {
             return data;
         }
@@ -794,19 +867,19 @@ impl DiskWrite {
 pub(super) struct UnsharedBody {
     disk: Option<DiskWrite>,
     http: reqwest::Response,
-    prefix: Vec<u8>,
+    prefix: MemoryBuffer<u8>,
     pub expected: Option<u64>,
     permit: TransferPermit,
 }
 impl UnsharedBody {
-    pub async fn read(self) -> Result<Bytes, Error> {
+    pub async fn read(self) -> Result<AssetBytes, Error> {
         let state = self.permit.state.clone();
         let bytes = self.buffer().await?;
         state.borrow_mut().stats.delivered += 1;
         Ok(bytes)
     }
 
-    async fn buffer(self) -> Result<Bytes, Error> {
+    async fn buffer(self) -> Result<AssetBytes, Error> {
         let began = Instant::now();
         let prefix_bytes = self.prefix.len();
         let result = run_io(read_body(self.http, self.prefix, usize::MAX)).await;
@@ -819,7 +892,7 @@ impl UnsharedBody {
             state.stats.body_bytes += (data.len() - prefix_bytes) as u64;
             state.stats.body_ms += began.elapsed().as_millis() as u64;
         }
-        let data = Bytes::from(data);
+        let data = AssetBytes::new(data);
         let data = if let Some(write) = self.disk {
             write.save(data).await
         } else {
@@ -848,11 +921,11 @@ where
     tokio::task::unconstrained(task).await
 }
 
-async fn read_body(
+pub(super) async fn read_body(
     mut response: reqwest::Response,
-    mut data: Vec<u8>,
+    mut data: MemoryBuffer<u8>,
     limit: usize,
-) -> Result<(Vec<u8>, Option<reqwest::Response>), reqwest::Error> {
+) -> Result<(MemoryBuffer<u8>, Option<reqwest::Response>), reqwest::Error> {
     while let Some(chunk) = response.chunk().await? {
         data.extend_from_slice(&chunk);
         if data.len() > limit {
@@ -863,6 +936,7 @@ async fn read_body(
 }
 
 struct Meta {
+    allows_movie_cache: bool,
     url: String,
     status: u16,
     redirected: bool,
@@ -871,6 +945,7 @@ struct Meta {
 impl Meta {
     fn from_http(http: &reqwest::Response, original: &Url) -> Self {
         Self {
+            allows_movie_cache: false,
             url: http.url().to_string(),
             status: http.status().as_u16(),
             redirected: http.url() != original,
@@ -883,6 +958,7 @@ impl Meta {
     }
     fn response(&self, response_body: ResponseBody) -> Response {
         Response {
+            allows_movie_cache: self.allows_movie_cache,
             url: self.url.clone(),
             loader_request: None,
             status: self.status,
@@ -928,9 +1004,12 @@ impl Outcome {
         hit: CachedAsset,
         slot: tokio::sync::OwnedSemaphorePermit,
         state: &Rc<RefCell<State>>,
+        memory: &MemoryScope,
         may_share: bool,
+        allows_movie_cache: bool,
     ) -> Self {
         let meta = Meta {
+            allows_movie_cache,
             url: url.to_string(),
             status: 200,
             redirected: false,
@@ -939,11 +1018,11 @@ impl Outcome {
                 .as_deref()
                 .and_then(|e| Encoding::for_label(e.as_bytes())),
         };
-        let data = Bytes::from(hit.bytes);
+        let data = AssetBytes::new(MemoryBuffer::new(memory, MemoryKind::Network, hit.bytes));
         let body = if data.len() <= MAX_BODY
             && let Some(budget) = Reservation::new(state, data.len())
         {
-            let body = Rc::new(SharedBody { data, budget });
+            let body = Rc::new(SharedBody::new(data, budget, state));
             if may_share {
                 return Self::Shared(meta, body);
             }
@@ -975,10 +1054,8 @@ impl Outcome {
         if data.len() != size {
             return None;
         }
-        response.response_body = ResponseBody::Shared(Some(Rc::new(SharedBody {
-            data,
-            budget: reservation,
-        })));
+        response.response_body =
+            ResponseBody::Shared(Some(Rc::new(SharedBody::new(data, reservation, state))));
         Some(response)
     }
 

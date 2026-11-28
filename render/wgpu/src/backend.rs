@@ -112,6 +112,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     pub(super) active_frame: ActiveFrame,
     profiler: GpuProfiler,
     last_submission: Option<SubmissionIndex>,
+    shape_cache: crate::shape_residency::ShapeCache,
     bitmap_residency:
         Option<Arc<crate::bitmap_residency::BitmapResidency<crate::bitmap_recipe::BitmapRecipe>>>,
 }
@@ -403,6 +404,9 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             },
             pending_stage: None,
             owned_frames: std::env::var_os("RUFFLE_OWNED_FRAMES").as_deref() == Some("1".as_ref()),
+            shape_cache: crate::shape_residency::ShapeCache::for_device(
+                descriptors.runtime.generation(),
+            ),
             descriptors,
             viewport: ViewportDimensions {
                 width: target.width(),
@@ -481,6 +485,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             && let Some(mesh) = self.small_meshes.get(key)
         {
             self.descriptors.runtime.check_health()?;
+            mesh.vertex_buffer.lease().note_mesh_use(owner.symbol);
             return Ok(mesh);
         }
         let device = self.descriptors.device.with_owner(owner);
@@ -869,6 +874,17 @@ fn pack_shader_bytes(raw: Cow<'_, [u8]>, stride: usize, width: usize, channels: 
 }
 
 impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
+    fn allocator_snapshot(&self) -> Option<ruffle_memory::AllocatorSnapshot> {
+        let report = self.descriptors.device.raw().generate_allocator_report()?;
+        Some(ruffle_memory::AllocatorSnapshot {
+            allocated_bytes: report.total_allocated_bytes,
+            reserved_bytes: report.total_reserved_bytes,
+        })
+    }
+    fn memory_device(&self) -> Option<Arc<dyn ruffle_memory::DeviceMemory>> {
+        Some(self.descriptors.runtime.memory_device())
+    }
+
     fn decode_bitmap_symbol(
         &self,
         source: ruffle_render::bitmap::EncodedBitmap<'_>,
@@ -1003,6 +1019,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.descriptors.runtime.check_health()?;
         Ok(ShapeHandle(Arc::new(crate::shape_recipe::ShapeRecipe {
             static_definition: Default::default(),
+            shared_definition: Default::default(),
             owner: self
                 .descriptors
                 .runtime
@@ -1024,6 +1041,17 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     ) -> Result<ShapeHandle, crate::gpu_runtime::RenderFailure> {
         self.descriptors.runtime.check_health()?;
         if let Some(handle) = self.definition_meshes.get(definition, scale) {
+            if let Some(recipe) =
+                (&*handle.0 as &dyn Any).downcast_ref::<crate::shape_recipe::ShapeRecipe>()
+                && recipe.owner.symbol != ruffle_memory::SymbolId::current()
+            {
+                recipe.shared_definition.set(true);
+                if let Some(mesh) = recipe.mesh.get() {
+                    mesh.vertex_buffer
+                        .lease()
+                        .note_mesh_use(ruffle_memory::SymbolId::current());
+                }
+            }
             return Ok(handle);
         }
         let shape = DistilledShape::from(definition.as_ref());
@@ -1050,6 +1078,10 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     }
 
     fn prepare_frame(&mut self) -> Result<bool, crate::gpu_runtime::RenderFailure> {
+        while self.descriptors.runtime.pressure() >= ruffle_memory::PressureLevel::High
+            && self.shape_cache.evict_oldest()
+        {}
+
         self.descriptors.runtime.check_health()?;
         if self.stage_frame.is_none() {
             let _timer = ruffle_render::profile::native_time(
@@ -1156,6 +1188,13 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                 &self.active_frame.operations,
             )?,
         ))
+    }
+
+    fn retain_static_shape(&mut self, handle: ShapeHandle) -> ruffle_render::backend::CachedShape {
+        self.shape_cache.retain(handle)
+    }
+    fn trim_static_shapes(&mut self) {
+        self.shape_cache.clear();
     }
 
     fn cache_immutable_bitmap(&mut self, bitmap: &BitmapHandle) -> bool {

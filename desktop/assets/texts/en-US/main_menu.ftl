@@ -46,3 +46,5 @@ debug-menu-search-display-objects = Search Display Objects...
 
 view-menu = View
 view-menu-fullscreen = Full Screen
+
+debug-menu-memory = Memory

@@ -21,7 +21,6 @@ use crate::font::glyph::GlyphRef;
 use crate::prelude::*;
 use crate::string::WStr;
 use gc_arena::{Collect, Gc, Mutation};
-use ruffle_render::backend::RenderBackend;
 use std::hash::{Hash, Hasher};
 
 pub use swf::TextGridFit;
@@ -343,10 +342,10 @@ impl<'gc> Font<'gc> {
 
     pub fn from_swf_tag(
         gc_context: &Mutation<'gc>,
-        renderer: &mut dyn RenderBackend,
         tag: swf::Font,
         encoding: &'static swf::Encoding,
         font_type: FontType,
+        symbol: Option<ruffle_memory::SymbolId>,
     ) -> Font<'gc> {
         let mut code_point_to_glyph = fnv::FnvHashMap::default();
 
@@ -368,12 +367,7 @@ impl<'gc> Font<'gc> {
                 let character = char::from_u32(code as u32).unwrap_or(char::REPLACEMENT_CHARACTER);
                 code_point_to_glyph.insert(code, index);
 
-                let glyph = Glyph::from_swf(character, swf_glyph);
-
-                // Eager-load ASCII characters.
-                if code < 128 {
-                    glyph.glyph_render_data(renderer);
-                }
+                let glyph = Glyph::from_swf(character, swf_glyph, symbol);
 
                 glyph
             })

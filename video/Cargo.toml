@@ -13,7 +13,6 @@ workspace = true
 [dependencies]
 swf = { path = "../swf" }
 ruffle_render = { path = "../render" }
-slotmap = { workspace = true }
 thiserror = { workspace = true }
 
 [features]

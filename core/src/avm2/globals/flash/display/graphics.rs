@@ -1089,20 +1089,6 @@ pub fn draw_triangles<'gc>(
     Ok(Value::Undefined)
 }
 
-/// Like [`slice::as_chunks`], but returns `None` if the slice length
-/// is not a multiple of `N`.
-trait AsChunksExact<T> {
-    fn as_chunks_exact<const N: usize>(&self) -> Option<&[[T; N]]>;
-}
-
-impl<T> AsChunksExact<T> for [T] {
-    fn as_chunks_exact<const N: usize>(&self) -> Option<&[[T; N]]> {
-        let (chunks, remainder) = self.as_chunks::<N>();
-
-        remainder.is_empty().then_some(chunks)
-    }
-}
-
 /// Parsed and validated triangle geometry for `Graphics.drawTriangles`.
 ///
 /// # Invariants
@@ -1138,11 +1124,10 @@ impl TriangleData {
             .expect("vertices is not a Vector");
 
         let vertex_pairs = vertex_storage
-            .storage()
-            .as_chunks_exact::<2>()
+            .chunks::<2>()
             .ok_or_else(|| make_error_2004(activation, Error2004Type::ArgumentError))?;
 
-        if vertex_pairs.is_empty() {
+        if vertex_pairs.len() == 0 {
             return Ok(None);
         }
 
@@ -1152,24 +1137,21 @@ impl TriangleData {
                 .expect("indices is not a Vector");
 
             let index_triples = indices_storage
-                .storage()
-                .as_chunks_exact::<3>()
+                .chunks::<3>()
                 .ok_or_else(|| make_error_2004(activation, Error2004Type::ArgumentError))?;
 
-            if index_triples.is_empty() {
+            if index_triples.len() == 0 {
                 return Ok(None);
             }
 
             let vertices = vertex_pairs
-                .iter()
-                .map(|pair| make_point(pair))
+                .map(|pair| make_point(&pair))
                 .collect::<Box<_>>();
 
             let num_vertices = vertices.len();
 
             // `Vector.<int>` elements are always `Value::Integer`
             let indices: Box<_> = index_triples
-                .iter()
                 .map(|[i0, i1, i2]| [i0.as_u32(), i1.as_u32(), i2.as_u32()])
                 // Flash stops at the first out-of-bounds index.
                 .take_while(|tri| tri.iter().all(|&i| (i as usize) < num_vertices))
@@ -1181,15 +1163,13 @@ impl TriangleData {
 
             Ok(Some(Self::Indexed { vertices, indices }))
         } else {
-            let vertex_triples = vertex_pairs
-                .as_chunks_exact::<3>()
-                .ok_or_else(|| make_error_2004(activation, Error2004Type::ArgumentError))?;
-
-            let triangles = vertex_triples
-                .iter()
-                .map(|[p0, p1, p2]| [make_point(p0), make_point(p1), make_point(p2)])
-                .collect::<Box<_>>();
-
+            if !vertex_pairs.len().is_multiple_of(3) {
+                return Err(make_error_2004(activation, Error2004Type::ArgumentError));
+            }
+            let mut points = vertex_pairs.map(|pair| make_point(&pair));
+            let triangles = (0..points.len() / 3)
+                .map(|_| std::array::from_fn(|_| points.next().unwrap()))
+                .collect();
             Ok(Some(Self::Sequential { triangles }))
         }
     }

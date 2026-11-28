@@ -11,6 +11,7 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+memory-stats = "1.2"
 clap = { workspace = true }
 clap_complete = { workspace = true, optional = true }
 cpal = { workspace = true }

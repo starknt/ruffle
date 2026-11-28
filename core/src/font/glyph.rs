@@ -3,7 +3,7 @@ use crate::drawing::Drawing;
 use crate::font::FontAtlasGlyph;
 use crate::prelude::*;
 use ruffle_render::backend::null::NullBitmapSource;
-use ruffle_render::backend::{RenderBackend, ShapeHandle};
+use ruffle_render::backend::{CachedShape, RenderBackend, ShapeHandle};
 use ruffle_render::transform::Transform;
 use std::cell::{Ref, RefCell};
 
@@ -13,13 +13,13 @@ enum SwfGlyphOrShape {
     Shape {
         shape: swf::Shape,
         // Handle to registered shape, loaded lazily on first render of this glyph.
-        handle: Option<ShapeHandle>,
+        handle: Option<CachedShape>,
     },
     Poisoned,
 }
 
 impl SwfGlyphOrShape {
-    fn shape(&mut self) -> (&mut swf::Shape, &mut Option<ShapeHandle>) {
+    fn shape(&mut self) -> (&mut swf::Shape, &mut Option<CachedShape>) {
         if let Self::Glyph(_) = self
             && let Self::Glyph(glyph) = core::mem::replace(self, Self::Poisoned)
         {
@@ -54,7 +54,10 @@ impl GlyphRenderData {
 
 #[derive(Debug, Clone)]
 enum GlyphShape {
-    Swf(Box<RefCell<SwfGlyphOrShape>>),
+    Swf(
+        Box<RefCell<SwfGlyphOrShape>>,
+        Option<ruffle_memory::SymbolId>,
+    ),
     Drawing(Box<Drawing>),
     AtlasGlyph(FontAtlasGlyph),
     None,
@@ -63,7 +66,7 @@ enum GlyphShape {
 impl GlyphShape {
     pub fn hit_test(&self, point: Point<Twips>, local_matrix: &Matrix) -> bool {
         match self {
-            GlyphShape::Swf(glyph) => {
+            GlyphShape::Swf(glyph, _) => {
                 let mut glyph = glyph.borrow_mut();
                 let (shape, _) = glyph.shape();
                 shape.shape_bounds.contains(point)
@@ -80,19 +83,24 @@ impl GlyphShape {
 
     pub fn register(&self, renderer: &mut dyn RenderBackend) -> Option<GlyphRenderData> {
         match self {
-            GlyphShape::Swf(glyph) => {
+            GlyphShape::Swf(glyph, symbol) => {
                 let mut glyph = glyph.borrow_mut();
                 let (shape, handle) = glyph.shape();
-                if handle.is_none() {
-                    match renderer.register_shape((&*shape).into(), &NullBitmapSource) {
-                        Ok(new_handle) => *handle = Some(new_handle),
-                        Err(error) => {
-                            renderer.health().fail(error);
-                            return None;
-                        }
+                if let Some(resident) = handle.as_ref().and_then(CachedShape::get) {
+                    return Some(GlyphRenderData::Shape(resident));
+                }
+                match ruffle_memory::SymbolId::enter(*symbol, || {
+                    renderer.register_shape((&*shape).into(), &NullBitmapSource)
+                }) {
+                    Ok(new_handle) => {
+                        *handle = Some(renderer.retain_static_shape(new_handle.clone()));
+                        Some(GlyphRenderData::Shape(new_handle))
+                    }
+                    Err(error) => {
+                        renderer.health().fail(error);
+                        None
                     }
                 }
-                handle.clone().map(GlyphRenderData::from_shape)
             }
             GlyphShape::Drawing(drawing) => drawing
                 .register_or_replace(renderer)
@@ -141,10 +149,17 @@ impl Glyph {
         }
     }
 
-    pub fn from_swf(character: char, swf_glyph: swf::Glyph) -> Self {
+    pub fn from_swf(
+        character: char,
+        swf_glyph: swf::Glyph,
+        symbol: Option<ruffle_memory::SymbolId>,
+    ) -> Self {
         Self {
             advance: Twips::new(swf_glyph.advance.into()),
-            shape: GlyphShape::Swf(Box::new(RefCell::new(SwfGlyphOrShape::Glyph(swf_glyph)))),
+            shape: GlyphShape::Swf(
+                Box::new(RefCell::new(SwfGlyphOrShape::Glyph(swf_glyph))),
+                symbol,
+            ),
             character,
         }
     }
@@ -179,7 +194,7 @@ impl Glyph {
 
     pub fn rendered_at_baseline(&self) -> bool {
         match self.shape {
-            GlyphShape::Swf(_) => true,
+            GlyphShape::Swf(..) => true,
             GlyphShape::Drawing(_) => true,
             GlyphShape::AtlasGlyph(_) => false,
             GlyphShape::None => false,

@@ -1,3 +1,4 @@
+use ruffle_memory::{MemoryBuffer, MemoryKind, MemoryScope};
 // This module is heavily based on flashsv.rs from NihAV,
 // written by Kostya Shishkov, with permission.
 
@@ -39,9 +40,9 @@ pub struct ScreenVideoDecoder {
     block_w: usize,
     block_h: usize,
 
-    scratch: Vec<u8>,
+    scratch: MemoryBuffer<u8>,
 
-    last_frame: Vec<u8>,
+    last_frame: MemoryBuffer<u8>,
 }
 
 struct ByteReader<'a> {
@@ -86,8 +87,8 @@ impl ScreenVideoDecoder {
             h: 0,
             block_w: 0,
             block_h: 0,
-            scratch: vec![],
-            last_frame: vec![],
+            scratch: MemoryBuffer::new(&MemoryScope::current(), MemoryKind::Video, Vec::new()),
+            last_frame: MemoryBuffer::new(&MemoryScope::current(), MemoryKind::Video, Vec::new()),
         }
     }
 

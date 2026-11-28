@@ -42,3 +42,5 @@ debug-menu-open-domain-list = 显示域
 debug-menu-search-display-objects = 搜索显示对象...
 view-menu = 查看
 view-menu-fullscreen = 全屏
+
+debug-menu-memory = 内存

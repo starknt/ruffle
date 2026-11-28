@@ -206,6 +206,11 @@ impl Request {
 
 /// A response to a successful fetch request.
 pub trait SuccessResponse {
+    /// Whether this already-authorized body may also be stored as a persistent derived SWF.
+    fn allows_movie_cache(&self) -> bool {
+        false
+    }
+
     /// The final URL obtained after any redirects.
     fn url(&self) -> Cow<'_, str>;
 
@@ -249,6 +254,12 @@ pub trait SuccessResponse {
     /// Use one or the other.
     fn next_chunk(&mut self) -> OwnedFuture<Option<Vec<u8>>, Error>;
 
+    /// Keep a native transport's backing and memory credit alive through chunk delivery.
+    fn next_chunk_bytes(&mut self) -> OwnedFuture<Option<Bytes>, Error> {
+        let next = self.next_chunk();
+        Box::pin(async move { Ok(next.await?.map(Bytes::from)) })
+    }
+
     /// Upper bound when the response already owns its complete, immutable body.
     /// Movie loaders can share their memory allowance between these responses.
     fn buffered_body_len(&self) -> Option<usize> {
@@ -279,6 +290,9 @@ pub use super::tasks::OwnedFuture;
 
 /// The host interface for URL navigation, resource loading, and sockets.
 pub trait NavigatorBackend: Any {
+    /// Bind asynchronous response buffers to the player that owns this navigator.
+    fn set_memory_scope(&mut self, _scope: &ruffle_memory::MemoryScope) {}
+
     /// A root movie has been installed. File-backed hosts resolve relative requests against it.
     fn set_root_url(&mut self, _url: &str) {}
 

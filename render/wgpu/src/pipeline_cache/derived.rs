@@ -90,7 +90,7 @@ pub(super) fn write(file: &CacheFile, payload: &[u8], budget: u64) -> io::Result
             continue;
         }
         let meta = fs::symlink_metadata(&path)?;
-        if check_private_file(&meta).is_err() {
+        if check_private_file(&path, &meta).is_err() {
             continue;
         }
         used = used.saturating_add(meta.len());

@@ -184,7 +184,7 @@ impl Decoder for Mp3Decoder {
 }
 
 /// Returns the sample rate and length of the given MP3.
-pub fn mp3_metadata(data: &std::sync::Arc<[u8]>) -> Result<Mp3Metadata, Error> {
+pub fn mp3_metadata(data: &bytes::Bytes) -> Result<Mp3Metadata, Error> {
     let source =
         io::MediaSourceStream::new(Box::new(Cursor::new(data.clone())), Default::default());
     let reader = SymphoniaMpaReader::try_new(source, &Default::default())?;

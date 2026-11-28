@@ -1,4 +1,5 @@
 use crate::decoder::VideoDecoder;
+use ruffle_memory::{MemoryBuffer, MemoryKind, MemoryScope};
 use ruffle_render::bitmap::BitmapFormat;
 use ruffle_video::error::Error;
 
@@ -43,7 +44,7 @@ pub struct Vp6Decoder {
     bitreader: VP6BR,
     init_called: bool,
     last_frame: Option<NABufferRef<NAVideoBuffer<u8>>>,
-    scratch: Vec<u8>,
+    scratch: MemoryBuffer<u8>,
 }
 
 impl Vp6Decoder {
@@ -66,13 +67,13 @@ impl Vp6Decoder {
             bitreader: VP6BR::new(),
             init_called: false,
             last_frame: None,
-            scratch: Vec::new(),
+            scratch: MemoryBuffer::new(&MemoryScope::current(), MemoryKind::Video, Vec::new()),
         }
     }
 }
 
 /// Crop `data` to the requested size, and append the result to the `out` buffer.
-fn crop(out: &mut Vec<u8>, data: &[u8], width: usize, to_size: (u16, u16)) {
+fn crop(out: &mut MemoryBuffer<u8>, data: &[u8], width: usize, to_size: (u16, u16)) {
     debug_assert!(data.len().is_multiple_of(width));
     let height = data.len() / width;
 

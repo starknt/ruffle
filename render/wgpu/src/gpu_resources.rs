@@ -594,6 +594,7 @@ impl Device {
     }
     fn speculation_fits(&self) -> bool {
         self.runtime().check_health().is_ok()
+            && self.runtime().pressure() < ruffle_memory::PressureLevel::Moderate
             && self.runtime().stats().total_bytes.saturating_add(64 * 1024)
                 < self.runtime().config().soft_limit
             && self.runtime().stats().resources.saturating_add(8)
@@ -829,8 +830,11 @@ impl Device {
         let scheduler = self.runtime().scheduler();
         while self.runtime().stats().total_bytes.saturating_add(bytes)
             > self.runtime().config().soft_limit
+            || self.runtime().pressure() >= ruffle_memory::PressureLevel::High
         {
-            if !scheduler.evict_one(ReclaimClass::Idle) && !scheduler.evict_one(ReclaimClass::Cache)
+            if !scheduler.evict_one(ReclaimClass::Idle)
+                && !scheduler.evict_one(ReclaimClass::Cache)
+                && !crate::shape_residency::evict_for_device(self.runtime().generation())
             {
                 break;
             }
@@ -838,6 +842,7 @@ impl Device {
     }
     fn reclaim_and_drain(&self) -> Result<(), RenderFailure> {
         self.runtime().check_health()?;
+        while crate::shape_residency::evict_for_device(self.runtime().generation()) {}
         self.runtime().scheduler().reclaim();
         let deadline = Instant::now() + Duration::from_secs(2);
         // Wait through the oldest own submission first. Consumer completion on

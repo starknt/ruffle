@@ -67,6 +67,14 @@ impl From<FrameSubmission> for FrameOutcome {
 }
 
 pub trait RenderBackend: Any {
+    fn allocator_snapshot(&self) -> Option<ruffle_memory::AllocatorSnapshot> {
+        None
+    }
+
+    fn memory_device(&self) -> Option<Arc<dyn ruffle_memory::DeviceMemory>> {
+        None
+    }
+
     fn set_movie_pipeline_history(&mut self, _data: &[u8], _header: &swf::HeaderExt) {}
     fn decode_bitmap_symbol(
         &self,
@@ -210,6 +218,13 @@ pub trait RenderBackend: Any {
     /// Offer an immutable, reconstructible bitmap to the backend's residency
     /// cache. If accepted, the caller may keep only a weak handle and recreate
     /// it after eviction. Never offer mutable BitmapData or GPU-written targets.
+    /// Only definitions with a durable CPU source may use an evictable handle.
+    fn retain_static_shape(&mut self, handle: ShapeHandle) -> CachedShape {
+        CachedShape::Owned(handle)
+    }
+
+    fn trim_static_shapes(&mut self) {}
+
     fn cache_immutable_bitmap(&mut self, _bitmap: &BitmapHandle) -> bool {
         false
     }
@@ -928,6 +943,24 @@ pub enum Context3DCommand<'a> {
 
 #[derive(Clone, Debug)]
 pub struct ShapeHandle(pub Arc<dyn ShapeHandleImpl>);
+
+#[derive(Clone, Debug)]
+pub enum CachedShape {
+    Owned(ShapeHandle),
+    Managed(std::rc::Rc<dyn ShapeResidency>),
+}
+impl CachedShape {
+    pub fn get(&self) -> Option<ShapeHandle> {
+        match self {
+            Self::Owned(handle) => Some(handle.clone()),
+            Self::Managed(lease) => lease.get(),
+        }
+    }
+}
+
+pub trait ShapeResidency: Debug {
+    fn get(&self) -> Option<ShapeHandle>;
+}
 
 pub trait ShapeHandleImpl: Any + Debug {
     /// Conservative bytes pinned by a retained command. None forbids retention

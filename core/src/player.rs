@@ -354,6 +354,8 @@ impl PlayerSession {
 }
 
 pub struct Player {
+    gc_memory: ruffle_memory::MemoryLease,
+    last_external_bytes: u64,
     render_epoch: u64,
     snapshots: crate::display_object::snapshot::Cache,
     /// The version of the player we're emulating.
@@ -476,6 +478,7 @@ impl Player {
     where
         F: for<'gc> FnOnce(&'gc Mutation<'gc>, &'gc GcRootData<'gc>, &'gc Self) -> T,
     {
+        let scope = self.gc_memory.scope();
         let borrow = self.gc_arena.try_borrow().ok();
         let result = borrow.and_then(|arena| {
             arena.mutate(|mc, root| {
@@ -487,7 +490,7 @@ impl Player {
                 Some(unsafe {
                     let root = &*(root.deref() as *const _);
                     let this = &*(self as *const _);
-                    f(mc, root, this)
+                    scope.enter(|| f(mc, root, this))
                 })
             })
         });
@@ -500,6 +503,7 @@ impl Player {
         F: for<'gc> FnOnce(&'gc Mutation<'gc>, &'gc mut GcRootData<'gc>, &'gc mut Self) -> T,
     {
         // To allow passing a `&mut Self` to the user-provided function, we avoid borrowing directly from self.
+        let scope = self.gc_memory.scope().clone();
         let arena = Rc::clone(&self.gc_arena);
 
         // Do not borrow the arena mutably, to keep it accessible while inside a panic handler.
@@ -515,10 +519,12 @@ impl Player {
                 Some(unsafe {
                     let root = &mut *(root.deref_mut() as *mut _);
                     let this = &mut *(self as *mut _);
-                    f(mc, root, this)
+                    scope.enter(|| f(mc, root, this))
                 })
             })
         });
+        self.gc_memory
+            .resize(arena.borrow().metrics().total_gc_bytes() as u64);
         result.expect("arena already borrowed")
     }
 
@@ -1252,6 +1258,14 @@ impl Player {
 
     pub fn suspend_after_next_frame(&mut self) {
         self.set_run_state(RunState::Stepping);
+    }
+
+    pub fn memory_scope(&self) -> &ruffle_memory::MemoryScope {
+        self.gc_memory.scope()
+    }
+
+    pub fn memory_snapshot(&self) -> ruffle_memory::MemorySnapshot {
+        self.memory_scope().manager().snapshot()
     }
 
     pub fn gc_object_count(&self) -> usize {
@@ -2949,7 +2963,26 @@ impl Player {
                 arena.metrics().allocation_debt(),
             )
         });
-        arena.collect_debt();
+        let (external, pressure, emergency) = self.gc_memory.scope().gc_pressure();
+        let growth = external.saturating_sub(self.last_external_bytes);
+        self.last_external_bytes = external;
+        if emergency {
+            arena.finish_cycle();
+        } else {
+            // gc-arena expresses work in objects. Bound the extra debt per update so
+            // a single large external allocation does not turn an ordinary tick into a full GC.
+            let unit = if pressure.level >= ruffle_memory::PressureLevel::High {
+                1024
+            } else {
+                4096
+            };
+            arena
+                .metrics()
+                .adjust_debt((growth / unit).min(2048) as f64);
+            arena.collect_debt();
+        }
+        self.gc_memory
+            .resize(arena.metrics().total_gc_bytes() as u64);
         if let Some((started, phase_before, objects_before, debt_before)) = before {
             ruffle_render::profile::record_gc(ruffle_render::profile::GcSample {
                 nanos: started.elapsed().as_nanos() as u64,
@@ -3108,6 +3141,7 @@ impl Drop for Player {
 
 /// Player factory, which can be used to configure the aspects of a Ruffle player.
 pub struct PlayerBuilder {
+    memory_manager: ruffle_memory::MemoryManager,
     movie: Option<SwfMovieData>,
 
     // Backends
@@ -3164,6 +3198,7 @@ impl PlayerBuilder {
     pub fn new() -> Self {
         Self {
             movie: None,
+            memory_manager: ruffle_memory::MemoryManager::process().clone(),
 
             audio: None,
             log: None,
@@ -3211,6 +3246,11 @@ impl PlayerBuilder {
             #[cfg(feature = "default_font")]
             default_font: true,
         }
+    }
+
+    pub fn with_memory_manager(mut self, manager: ruffle_memory::MemoryManager) -> Self {
+        self.memory_manager = manager;
+        self
     }
 
     /// Configures the player to play an already-loaded movie.
@@ -3537,6 +3577,15 @@ impl PlayerBuilder {
         self,
         spawner: impl crate::backend::tasks::TaskSpawner + 'static,
     ) -> Arc<Mutex<Player>> {
+        let scope = self.memory_manager.player();
+        scope.enter(|| self.build_in_scope(spawner, &scope))
+    }
+
+    fn build_in_scope(
+        self,
+        spawner: impl crate::backend::tasks::TaskSpawner + 'static,
+        scope: &ruffle_memory::MemoryScope,
+    ) -> Arc<Mutex<Player>> {
         use crate::backend::*;
         use ruffle_video::null;
         let audio = self
@@ -3545,9 +3594,10 @@ impl PlayerBuilder {
         let log = self
             .log
             .unwrap_or_else(|| Box::new(log::NullLogBackend::new()));
-        let navigator = self
+        let mut navigator = self
             .navigator
             .unwrap_or_else(|| Box::new(navigator::FileNavigator::default()));
+        navigator.set_memory_scope(scope);
         let renderer = self.renderer.unwrap_or_else(|| {
             Box::new(NullRenderer::new(ViewportDimensions {
                 width: self.viewport_width,
@@ -3555,6 +3605,9 @@ impl PlayerBuilder {
                 scale_factor: self.viewport_scale_factor,
             }))
         });
+        if let Some(device) = renderer.memory_device() {
+            self.memory_manager.register_device(device);
+        }
         let storage = self
             .storage
             .unwrap_or_else(|| Box::new(storage::MemoryStorageBackend::new()));
@@ -3576,6 +3629,8 @@ impl PlayerBuilder {
         let forced_frame_rate = self.frame_rate.is_some();
         let player = Arc::new_cyclic(|self_ref| {
             Mutex::new(Player {
+                gc_memory: scope.track(ruffle_memory::MemoryKind::GcHeap, 0),
+                last_external_bytes: 0,
                 render_epoch: 0,
                 snapshots: Default::default(),
                 // Backends

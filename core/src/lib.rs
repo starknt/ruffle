@@ -68,6 +68,7 @@ pub use player::{
     Player, PlayerBuilder, PlayerMode, PlayerRuntime, PlayerSession, StaticCallstack,
 };
 pub use ruffle_common::duration::FloatDuration;
+pub use ruffle_memory as memory;
 pub use ruffle_render::backend::FrameOutcome;
 pub use ruffle_render::backend::ViewportDimensions;
 pub use swf;

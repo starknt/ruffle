@@ -263,8 +263,26 @@ impl<'gc> HasStringContext<'gc> for UpdateContext<'gc> {
 
 /// Convenience methods for controlling audio.
 impl<'gc> UpdateContext<'gc> {
-    pub fn spawn_future(&mut self, task: crate::backend::tasks::PlayerTask) {
-        self.load_manager.spawn_root_task(self.task_spawner, task);
+    /// Full export is explicit, so enumerating owners and querying the driver stays off the frame path.
+    pub fn memory_report(&self) -> serde_json::Value {
+        let scope = ruffle_memory::MemoryScope::current();
+        let manager = scope.manager();
+        let movies: Vec<_> = self
+            .library
+            .known_movies(self.gc())
+            .map(
+                |movie| serde_json::json!({"movieId":movie.movie_id(), "bytes":movie.data().len()}),
+            )
+            .collect();
+        serde_json::json!({"playerId":scope.id(), "memory":manager.snapshot(), "movies":movies,
+            "gpuResources":manager.device_resources(), "playerDeviceAllocator":self.renderer.allocator_snapshot()})
+    }
+
+    pub fn spawn_future(&mut self, mut task: crate::backend::tasks::PlayerTask) {
+        let scope = ruffle_memory::MemoryScope::current();
+        let scoped = futures::future::poll_fn(move |cx| scope.enter(|| task.as_mut().poll(cx)));
+        self.load_manager
+            .spawn_root_task(self.task_spawner, Box::pin(scoped));
     }
 
     pub(crate) fn in_wall_clock_method(&self) -> bool {

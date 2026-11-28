@@ -2,6 +2,7 @@ use crate::decoder::VideoDecoder;
 use h263_rs::parser::H263Reader;
 use h263_rs::{DecoderOption, H263State, PictureOption, PictureTypeCode};
 use h263_rs_deblock::deblock::{QUANT_TO_STRENGTH, deblock};
+use ruffle_memory::{MemoryBuffer, MemoryKind, MemoryScope};
 use ruffle_render::bitmap::BitmapFormat;
 use ruffle_video::error::Error;
 use ruffle_video::frame::{DecodedFrame, EncodedFrame, FrameDependency};
@@ -32,7 +33,7 @@ impl From<H263Error> for Error {
 pub struct H263Decoder {
     state: H263State,
     deblock: VideoDeblocking,
-    scratch: Vec<u8>,
+    scratch: MemoryBuffer<u8>,
 }
 
 impl H263Decoder {
@@ -40,7 +41,7 @@ impl H263Decoder {
         Self {
             state: H263State::new(DecoderOption::SORENSON_SPARK_BITSTREAM),
             deblock,
-            scratch: Vec::new(),
+            scratch: MemoryBuffer::new(&MemoryScope::current(), MemoryKind::Video, Vec::new()),
         }
     }
 }

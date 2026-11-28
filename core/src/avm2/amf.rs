@@ -453,20 +453,23 @@ pub fn deserialize_value_impl<'gc>(
             let obj = VectorObject::from_vector(empty_storage, activation);
             object_map.insert(*id, obj.into());
 
-            let new_values = vec
-                .iter()
-                .map(|v| {
-                    deserialize_value_impl(activation, v, object_map).map(|value| {
-                        // There's no Vector.<void>: convert any
-                        // Undefined items in the Vector to Null.
-                        if matches!(value, Value::Undefined) {
-                            Value::Null
-                        } else {
-                            value
-                        }
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let element_type = class.inner_class_definition();
+            let mut new_values = Vec::with_capacity(vec.len());
+            for child in vec {
+                let value = deserialize_value_impl(activation, child, object_map)?;
+                // Coercion may execute ActionScript. Do it before borrowing vector storage.
+                let value = if element_type.is_builtin_int()
+                    || element_type.is_builtin_uint()
+                    || element_type.is_builtin_number()
+                {
+                    value.coerce_to_type(activation, element_type)?
+                } else if matches!(value, Value::Undefined) {
+                    Value::Null
+                } else {
+                    value
+                };
+                new_values.push(value);
+            }
 
             // Swap in the actual values
             obj.storage_mut(activation.gc()).replace_storage(new_values);
@@ -542,4 +545,36 @@ pub fn deserialize_lso<'gc>(
     }
 
     Ok(obj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amf_vector_alias_uses_the_vector_element_coercion() {
+        let bytes = include_bytes!("../../../tests/tests/swfs/native_perf/cache_soak/child.swf");
+        let movie =
+            crate::tag_utils::SwfMovieData::from_data(bytes, "file:///root.swf".into(), None, None)
+                .unwrap();
+        let player = crate::PlayerBuilder::new().with_movie(movie).build();
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                let mut activation = Activation::from_nothing(context);
+                let name = AvmString::new_utf8(activation.gc(), "Count");
+                let class = activation.avm2().classes().int;
+                activation.avm2().register_class_alias(name, class);
+                let values = vec![Rc::new(AmfValue::String("42".into()))];
+                let input = AmfValue::VectorObject(ObjectId(1), values, "Count".into(), false);
+                let vector = deserialize_value(&mut activation, &input)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .as_vector_object()
+                    .unwrap();
+                assert_eq!(vector.storage().get_optional(0).unwrap().as_i32(), 42);
+            });
+    }
 }

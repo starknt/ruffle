@@ -14,7 +14,6 @@ workspace = true
 ruffle_render = { path = "../../render" }
 ruffle_video = { path = ".." }
 swf = { path = "../../swf" }
-slotmap = { workspace = true }
 tracing = { workspace = true }
 ruffle_video_software = { path = "../software" }
 thiserror = { workspace = true }

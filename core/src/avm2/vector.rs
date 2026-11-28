@@ -8,7 +8,8 @@ use crate::avm2::value::Value;
 use gc_arena::Collect;
 use std::cmp::{max, min};
 use std::ops::RangeBounds;
-use std::slice::SliceIndex;
+mod elements;
+use elements::Elements;
 
 /// The vector storage portion of a vector object.
 ///
@@ -23,7 +24,7 @@ use std::slice::SliceIndex;
 #[collect(no_drop)]
 pub struct VectorStorage<'gc> {
     /// The storage for vector values.
-    storage: Vec<Value<'gc>>,
+    storage: Elements<'gc>,
 
     /// Whether or not the array length is fixed.
     is_fixed: bool,
@@ -41,7 +42,8 @@ pub struct VectorStorage<'gc> {
 
 impl<'gc> VectorStorage<'gc> {
     pub fn new(length: usize, is_fixed: bool, value_type: Option<Class<'gc>>) -> Self {
-        let storage = Vec::new();
+        ruffle_memory::MemoryScope::sample_layout("vectorLengthAtCreation", length);
+        let storage = Elements::new(value_type);
 
         let mut self_vec = VectorStorage {
             storage,
@@ -70,11 +72,9 @@ impl<'gc> VectorStorage<'gc> {
         is_fixed: bool,
         value_type: Option<Class<'gc>>,
     ) -> Self {
-        VectorStorage {
-            storage,
-            is_fixed,
-            value_type,
-        }
+        let mut vector = Self::new(0, is_fixed, value_type);
+        vector.replace_storage(storage);
+        vector
     }
 
     pub fn is_fixed(&self) -> bool {
@@ -161,7 +161,7 @@ impl<'gc> VectorStorage<'gc> {
 
     /// Retrieve a value from the vector or `None` for out-of-bounds.
     pub fn get_optional(&self, index: usize) -> Option<Value<'gc>> {
-        self.storage.get(index).cloned()
+        self.storage.get(index)
     }
 
     /// Store a value into the vector.
@@ -183,8 +183,8 @@ impl<'gc> VectorStorage<'gc> {
             self.storage.resize(pos + 1, self.default());
         }
 
-        if let Some(v) = self.storage.get_mut(pos) {
-            *v = value;
+        if pos < self.length() {
+            self.storage.set(pos, value);
             Ok(())
         } else {
             Err(make_error_1125(activation, pos as f64, self.length()))
@@ -258,7 +258,7 @@ impl<'gc> VectorStorage<'gc> {
     ) -> Result<Value<'gc>, Error<'gc>> {
         self.check_fixed(activation)?;
 
-        if !self.storage.is_empty() {
+        if self.storage.len() > 0 {
             Ok(self.storage.remove(0))
         } else if let Some(value_type) = self.value_type() {
             if value_type.is_builtin_numeric() {
@@ -338,14 +338,14 @@ impl<'gc> VectorStorage<'gc> {
         &'a self,
     ) -> impl DoubleEndedIterator<Item = Value<'gc>> + ExactSizeIterator<Item = Value<'gc>> + 'a
     {
-        self.storage.iter().cloned()
+        (0..self.length()).map(|i| self.storage.get(i).unwrap())
     }
 
     /// Replace this vector's storage with new values.
     ///
     /// See also [`Self::replace_storage_with_iter`] to avoid unnecessarily collecting to a Vec.
     pub fn replace_storage(&mut self, new_storage: Vec<Value<'gc>>) {
-        self.storage = new_storage;
+        self.storage.replace(new_storage);
     }
 
     /// Replace the contents of the vector's storage with the contents of an iterator, reusing the existing allocation if possible.
@@ -353,8 +353,7 @@ impl<'gc> VectorStorage<'gc> {
     where
         I: IntoIterator<Item = Value<'gc>>,
     {
-        self.storage.clear();
-        self.storage.extend(iter);
+        self.storage.replace_iter(iter);
     }
 
     pub fn splice<R>(
@@ -363,13 +362,18 @@ impl<'gc> VectorStorage<'gc> {
         replace_with: Vec<Value<'gc>>,
     ) -> Result<Vec<Value<'gc>>, Error<'gc>>
     where
-        R: Clone + SliceIndex<[Value<'gc>], Output = [Value<'gc>]> + RangeBounds<usize>,
+        R: RangeBounds<usize>,
     {
         // NOTE: no fixed check here for bug compatibility
-        Ok(self.storage.splice(range, replace_with).collect())
+        Ok(self.storage.splice(range, replace_with))
     }
 
-    pub fn storage(&self) -> &Vec<Value<'gc>> {
-        &self.storage
+    pub fn chunks<const N: usize>(
+        &self,
+    ) -> Option<impl ExactSizeIterator<Item = [Value<'gc>; N]> + '_> {
+        self.length().is_multiple_of(N).then(|| {
+            (0..self.length() / N)
+                .map(|i| std::array::from_fn(|offset| self.storage.get(i * N + offset).unwrap()))
+        })
     }
 }

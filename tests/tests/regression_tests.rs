@@ -179,7 +179,14 @@ fn trial_for_test(
     let trial = Trial::test(test.name.clone(), move || {
         #[cfg(feature = "imgtests")]
         let _scope = ruffle_render_wgpu::profile::enter(None);
-        let mut runner = test.create_test_runner(env.as_ref())?;
+        // Each fixture represents a separate Flash session with its own deterministic clock.
+        // An unrelated parallel fixture must not consume its file/decode admission window.
+        let memory = ruffle_core::memory::MemoryManager::new(
+            ruffle_core::memory::MemoryManager::process().budget_bytes(),
+        );
+        let mut runner = memory
+            .shared()
+            .enter(|| test.create_test_runner(env.as_ref()))?;
 
         loop {
             match runner.tick()? {

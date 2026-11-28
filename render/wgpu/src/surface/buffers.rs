@@ -135,7 +135,7 @@ impl ChunkBufferBuilder {
         }
     }
 
-    pub(super) fn into_instance_bytes(self) -> Option<Box<[u8]>> {
+    pub(super) fn into_instance_bytes(self) -> Option<ruffle_memory::MemoryBuffer<u8>> {
         (self.vertices.len() == 0).then(|| self.transforms.into_storage())
     }
     pub(super) fn remaining_instances(&self, limits: &wgpu::Limits) -> u32 {

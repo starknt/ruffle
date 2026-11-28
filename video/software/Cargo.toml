@@ -11,10 +11,10 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+ruffle_memory = { path = "../../memory" }
 ruffle_render = { path = "../../render" }
 ruffle_video = { path = ".." }
 swf = { path = "../../swf" }
-slotmap = { workspace = true }
 thiserror = { workspace = true }
 flate2 = { workspace = true }
 log = { workspace = true }

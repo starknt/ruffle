@@ -2,6 +2,16 @@ use std::borrow::Cow;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+#[test]
+fn owned_bitmap_clone_shares_storage_until_first_pixel_write() {
+    let mut first = super::Pixels::owned(vec![super::Color::from(0xff123456); 16]);
+    let other = first.clone();
+    assert_eq!(first.as_ptr(), other.as_ptr());
+    first[0] = super::Color::from(0xffabcdef);
+    assert_ne!(first.as_ptr(), other.as_ptr());
+    assert_eq!(u32::from(other[0]), 0xff123456);
+}
+
 use ruffle_render::backend::{
     BitmapCacheEntry, RenderBackend, ShapeHandle, ShapeHandleImpl, ViewportDimensions,
 };
@@ -282,18 +292,23 @@ use crate::character::CompressedBitmap;
 use std::{borrow::Cow as Borrowed, io::Write, rc::Rc};
 
 fn source() -> Rc<SymbolImage> {
+    source_with_id(1)
+}
+
+fn source_with_id(id: u16) -> Rc<SymbolImage> {
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&[255, 12, 34, 56]).unwrap();
-    Rc::new(SymbolImage::new(CompressedBitmap::Lossless(
-        swf::DefineBitsLossless {
+    Rc::new(SymbolImage::new(
+        None,
+        CompressedBitmap::Lossless(swf::DefineBitsLossless {
             version: 2,
-            id: 1,
+            id,
             format: swf::BitmapFormat::Rgb32,
             width: 1,
             height: 1,
             data: Borrowed::Owned(encoder.finish().unwrap()),
-        },
-    )))
+        }),
+    ))
 }
 pub(crate) fn renderer(managed: bool) -> TestRenderer {
     TestRenderer {
@@ -833,4 +848,20 @@ fn actionscript_pixel_words_have_native_bgra_byte_order() {
     let color = crate::bitmap::bitmap_data::Color::bgra_u32(0x80563412);
     assert_eq!(bytemuck::bytes_of(&color), &[0x12, 0x34, 0x56, 0x80]);
     assert_eq!(color.to_bgra_u32(), 0x80563412);
+}
+
+#[test]
+fn independent_symbols_share_compressed_bytes_and_clones_share_decoded_pixels() {
+    let left = source();
+    let right = source_with_id(2);
+    let address = |s: &SymbolImage| match s.data.encoded() {
+        ruffle_render::bitmap::EncodedBitmap::Lossless(tag) => tag.data.as_ptr(),
+        _ => unreachable!(),
+    };
+    assert_eq!(address(&left), address(&right));
+    let a = Pixels::symbol(left.clone());
+    let mut b = Pixels::symbol(left);
+    assert_eq!(a.as_ptr(), b.as_ptr());
+    b[0] = 0xff003355.into();
+    assert_ne!(a.as_ptr(), b.as_ptr());
 }

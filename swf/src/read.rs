@@ -130,7 +130,19 @@ pub fn decompress_swf<'a, R: Read + 'a>(mut input: R) -> Result<SwfBuf> {
         log::warn!("SWF length doesn't match header, may be corrupt");
     }
 
-    let mut reader = Reader::new(&data, version);
+    let (header, offset) = read_movie_header(&data, version, compression, uncompressed_len)?;
+    data.drain(..offset);
+    Ok(SwfBuf { header, data })
+}
+
+/// Parse the movie header and metadata directly from a decompressed body, including a mapped FWS.
+pub fn read_movie_header(
+    data: &[u8],
+    version: u8,
+    compression: Compression,
+    uncompressed_len: u32,
+) -> Result<(HeaderExt, usize)> {
+    let mut reader = Reader::new(data, version);
     let stage_size = reader.read_rectangle()?;
     let frame_rate = reader.read_fixed8()?;
     let num_frames = reader.read_u16()?;
@@ -142,12 +154,6 @@ pub fn decompress_swf<'a, R: Read + 'a>(mut input: R) -> Result<SwfBuf> {
         num_frames,
     };
     let offset = reader.as_slice().as_ptr() as usize - data.as_ptr() as usize;
-    // Remove the header.
-    // As an alternative we could return the entire original buffer with header length,
-    // but that's a nontrivial API change, probably not worth the effort.
-    data.drain(..offset);
-    let mut reader = Reader::new(&data, version);
-
     // Parse the first two tags, searching for the FileAttributes and SetBackgroundColor tags.
     // This metadata is useful, so we want to return it along with the header.
     // In SWF8+, FileAttributes should be the first tag in the SWF.
@@ -172,15 +178,15 @@ pub fn decompress_swf<'a, R: Read + 'a>(mut input: R) -> Result<SwfBuf> {
         tag = reader.read_tag();
     }
 
-    Ok(SwfBuf {
-        header: HeaderExt {
+    Ok((
+        HeaderExt {
             header,
             file_attributes,
             background_color,
             uncompressed_len: uncompressed_len as i32,
         },
-        data,
-    })
+        offset,
+    ))
 }
 
 #[cfg(feature = "flate2")]

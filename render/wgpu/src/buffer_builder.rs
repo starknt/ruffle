@@ -1,15 +1,16 @@
 use bytemuck::{AnyBitPattern, NoUninit};
+use ruffle_memory::{MemoryBuffer, MemoryKind, MemoryScope};
 use std::ops::Range;
 
 pub struct BufferBuilder {
-    inner: Vec<u8>,
+    inner: MemoryBuffer<u8>,
     align_mask: usize,
     limit: u64,
     scratch: Option<ScratchPool>,
 }
 
 #[derive(Clone, Default)]
-pub struct ScratchPool(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+pub struct ScratchPool(std::sync::Arc<std::sync::Mutex<Vec<MemoryBuffer<u8>>>>);
 impl Drop for BufferBuilder {
     fn drop(&mut self) {
         if let Some(pool) = &self.scratch {
@@ -20,10 +21,11 @@ impl Drop for BufferBuilder {
             let capacity = self.inner.capacity();
             if capacity != 0
                 && buffers.len() < 8
-                && capacity.saturating_add(buffers.iter().map(Vec::capacity).sum::<usize>())
+                && capacity
+                    .saturating_add(buffers.iter().map(MemoryBuffer::capacity).sum::<usize>())
                     <= 2 * 1024 * 1024
             {
-                let mut bytes = std::mem::take(&mut self.inner);
+                let mut bytes = self.inner.take();
                 bytes.clear();
                 buffers.push(bytes);
             }
@@ -37,7 +39,11 @@ pub struct BufferFull;
 impl BufferBuilder {
     pub fn new(limits: &wgpu::Limits, alignment: u32) -> Self {
         Self {
-            inner: Vec::new(),
+            inner: MemoryBuffer::new(
+                &MemoryScope::current(),
+                MemoryKind::FrameScratch,
+                Vec::new(),
+            ),
             scratch: None,
             align_mask: if alignment > 0 {
                 assert!(alignment.is_power_of_two());
@@ -51,12 +57,14 @@ impl BufferBuilder {
 
     pub fn with_scratch(limits: &wgpu::Limits, alignment: u32, scratch: ScratchPool) -> Self {
         let mut builder = Self::new(limits, alignment);
-        builder.inner = scratch
+        if let Some(buffer) = scratch
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop()
-            .unwrap_or_default();
+        {
+            builder.inner = buffer;
+        }
         builder.scratch = Some(scratch);
         builder
     }
@@ -138,8 +146,10 @@ impl BufferBuilder {
         Ok(())
     }
 
-    pub fn into_storage(mut self) -> Box<[u8]> {
-        std::mem::take(&mut self.inner).into_boxed_slice()
+    pub fn into_storage(mut self) -> MemoryBuffer<u8> {
+        let mut bytes = self.inner.take();
+        bytes.shrink_to_fit();
+        bytes
     }
     pub fn len(&self) -> usize {
         self.inner.len()
@@ -149,6 +159,33 @@ impl BufferBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scratch_is_charged_while_reused_or_owned_by_a_prepared_draw() {
+        use ruffle_memory::{MemoryKind, MemoryManager};
+        let manager = MemoryManager::new(4096);
+        let player = manager.player();
+        let cache = ScratchPool::default();
+        let used = || manager.snapshot().active_bytes;
+        let mut builder = player
+            .enter(|| BufferBuilder::with_scratch(&wgpu::Limits::default(), 0, cache.clone()));
+        builder.add(&[23u8; 512]).unwrap();
+        assert_eq!(used(), 512);
+        drop(builder);
+        assert_eq!(used(), 512);
+        let mut builder = player
+            .enter(|| BufferBuilder::with_scratch(&wgpu::Limits::default(), 0, cache.clone()));
+        builder.add(&[19u8; 256]).unwrap();
+        let draw = builder.into_storage();
+        drop(cache);
+        assert_eq!(
+            manager.snapshot().players[0].active[&MemoryKind::FrameScratch],
+            used()
+        );
+        assert!(used() >= draw.len() as u64);
+        drop(draw);
+        assert_eq!(used(), 0);
+    }
+
     #[test]
     fn chunk_scratch_reuses_storage_without_reusing_contents_and_caps_retention() {
         let scratch = ScratchPool::default();
@@ -173,6 +210,6 @@ mod tests {
         drop(builders);
         let buffers = scratch.0.lock().unwrap();
         assert!(buffers.len() <= 8);
-        assert!(buffers.iter().map(Vec::capacity).sum::<usize>() <= 2 * 1024 * 1024);
+        assert!(buffers.iter().map(MemoryBuffer::capacity).sum::<usize>() <= 2 * 1024 * 1024);
     }
 }

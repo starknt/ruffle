@@ -1,6 +1,12 @@
 use super::*;
 use crate::player::PlayerBuilder;
 
+fn fixture_player() -> PlayerBuilder {
+    // A poll in this fixture must not wait for unrelated tests to return file-read permits.
+    let budget = ruffle_memory::MemoryManager::process().budget_bytes();
+    PlayerBuilder::new().with_memory_manager(ruffle_memory::MemoryManager::new(budget))
+}
+
 fn movie_bytes() -> Vec<u8> {
     let mut bytes = Vec::new();
     swf::write_swf(
@@ -25,7 +31,7 @@ fn external_loader_image_uploads_its_actual_read_only_when_drawn() {
     for version in 1..=2 {
         let renderer = crate::bitmap::symbol_pixels::tests::renderer(false);
         let uploads = renderer.loader_uploads.clone();
-        let mut session = PlayerBuilder::new()
+        let mut session = fixture_player()
             .with_movie(movie.clone())
             .with_renderer(renderer)
             .build();
@@ -74,7 +80,7 @@ fn headless_session_fetches_sibling_resources_from_the_installed_root() {
         .join("../tests/tests/swfs/avm1/asnew/test.swf")
         .canonicalize()
         .unwrap();
-    let mut session = PlayerBuilder::new().build();
+    let mut session = fixture_player().build();
     session.lock().unwrap().fetch_root_movie(
         Url::from_file_path(&file).unwrap().into(),
         vec![],
@@ -103,7 +109,7 @@ fn headless_session_fetches_sibling_resources_from_the_installed_root() {
 fn a_replaced_root_load_cannot_deliver_metadata_or_install_its_movie() {
     use std::cell::RefCell;
     use std::rc::Rc;
-    let session = PlayerBuilder::new().build_session();
+    let session = fixture_player().build_session();
     let player = session.player();
     let seen = Rc::new(RefCell::new(Vec::new()));
     let request = |name: &'static str| {
@@ -131,7 +137,7 @@ fn a_replaced_root_load_cannot_deliver_metadata_or_install_its_movie() {
 
 #[test]
 fn metadata_callback_can_replace_the_root_before_installation() {
-    let mut session = PlayerBuilder::new().build_session();
+    let mut session = fixture_player().build_session();
     let player = session.player().clone();
     let newer = player.clone();
     let swfs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/tests/swfs/avm1");
@@ -178,7 +184,7 @@ fn root_fixture(name: &str) -> String {
 fn file_session(url: &str) -> crate::PlayerSession {
     let mut movie = SwfMovieData::empty(8, None);
     movie.set_url(url.into());
-    PlayerBuilder::new().with_movie(movie).build()
+    fixture_player().with_movie(movie).build()
 }
 
 fn avm1_root_request(player: &crate::PlayerSession, url: String) -> OwnedFuture<(), Error> {
@@ -276,7 +282,7 @@ fn prepared_movie_is_installed_without_reparsing_transport_bytes() {
     )
     .unwrap();
     let expected = prepared.data().to_vec();
-    let player = PlayerBuilder::new()
+    let player = fixture_player()
         .with_movie(SwfMovieData::empty(8, None))
         .build();
     player.lock().unwrap().mutate_with_update_context(|uc| {
@@ -316,7 +322,7 @@ fn prepared_movie_is_installed_without_reparsing_transport_bytes() {
 
 #[test]
 fn stale_load_bytes_parse_error_does_not_fail_a_new_loader_generation() {
-    let player = PlayerBuilder::new()
+    let player = fixture_player()
         .with_movie(SwfMovieData::empty(8, None))
         .build();
     player.lock().unwrap().mutate_with_update_context(|uc| {
@@ -547,7 +553,7 @@ fn child_replacement_and_close_during_local_load_bytes_only_commit_the_replaceme
         None,
     )
     .unwrap();
-    let mut session = PlayerBuilder::new()
+    let mut session = fixture_player()
         .with_movie(movie)
         .with_renderer(renderer)
         .with_log(trace.clone())
@@ -590,7 +596,7 @@ fn closing_a_remote_load_bytes_retires_both_superseded_preparations() {
         None,
     )
     .unwrap();
-    let mut session = PlayerBuilder::new()
+    let mut session = fixture_player()
         .with_movie(movie)
         .with_log(trace.clone())
         .build();

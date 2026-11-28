@@ -57,7 +57,8 @@ pub struct VideoData<'gc> {
     source: Lock<VideoSource<'gc>>,
 
     /// The decoder stream that this video source is associated to.
-    stream: Cell<VideoStream>,
+    #[collect(require_static)]
+    stream: RefCell<VideoStream>,
 
     /// AVM representation of this video player.
     object: Lock<Option<AvmObject<'gc>>>,
@@ -82,7 +83,7 @@ pub struct VideoData<'gc> {
 }
 
 /// An optionally-instantiated video stream.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum VideoStream {
     /// An uninstantiated video stream.
     ///
@@ -149,7 +150,7 @@ impl<'gc> Video<'gc> {
                 base: Default::default(),
                 avm1_text_field_bindings: RefLock::new(Vec::new()),
                 source,
-                stream: Cell::new(VideoStream::Uninstantiated(0)),
+                stream: RefCell::new(VideoStream::Uninstantiated(0)),
                 object: Lock::new(None),
                 keyframes: RefCell::new(BTreeSet::new()),
                 movie,
@@ -172,7 +173,7 @@ impl<'gc> Video<'gc> {
                 base: Default::default(),
                 avm1_text_field_bindings: RefLock::new(Vec::new()),
                 source: Lock::new(VideoSource::Unconnected),
-                stream: Cell::new(VideoStream::Uninstantiated(0)),
+                stream: RefCell::new(VideoStream::Uninstantiated(0)),
                 object: Lock::new(object),
                 keyframes: RefCell::new(BTreeSet::new()),
                 movie,
@@ -205,7 +206,8 @@ impl<'gc> Video<'gc> {
     /// Existing video state related to the old video stream will be dropped.
     pub fn attach_netstream(self, context: &mut UpdateContext<'gc>, stream: NetStream<'gc>) {
         self.set_source(context, VideoSource::NetStream { stream });
-        self.0.stream.set(VideoStream::Uninstantiated(0));
+        self.0.decoded_frame.take();
+        self.0.stream.replace(VideoStream::Uninstantiated(0));
         self.0.keyframes.replace(BTreeSet::new());
     }
 
@@ -243,8 +245,8 @@ impl<'gc> Video<'gc> {
     /// `seek` is only called when processing `PlaceObject` tags involving this
     /// Video. It is a no-op for Videos that are connected to a `NetStream`.
     pub fn seek(self, context: &mut UpdateContext<'gc>, mut frame_id: u32) {
-        if let VideoStream::Uninstantiated(_) = self.0.stream.get() {
-            self.0.stream.set(VideoStream::Uninstantiated(frame_id));
+        if matches!(*self.0.stream.borrow(), VideoStream::Uninstantiated(_)) {
+            self.0.stream.replace(VideoStream::Uninstantiated(frame_id));
             return;
         };
 
@@ -309,7 +311,7 @@ impl<'gc> Video<'gc> {
     /// valid, hence the fact that it's not `pub`. To do a seek that accounts
     /// for keyframes, see `Video.seek`.
     fn seek_internal(self, context: &mut UpdateContext<'gc>, frame_id: u32) {
-        let stream = if let VideoStream::Instantiated(stream) = self.0.stream.get() {
+        let stream = if let VideoStream::Instantiated(stream) = self.0.stream.borrow().clone() {
             stream
         } else {
             tracing::error!("Attempted to seek uninstantiated video stream.");
@@ -392,7 +394,7 @@ impl<'gc> TDisplayObject<'gc> for Video<'gc> {
 
                     for (frame_id, (frame_start, frame_end)) in swf_source.frames.borrow().iter() {
                         let dep = context.video.preload_video_stream_frame(
-                            stream,
+                            stream.clone(),
                             EncodedFrame {
                                 codec: streamdef.codec,
                                 data: &movie.data()[*frame_start..*frame_end],
@@ -418,15 +420,16 @@ impl<'gc> TDisplayObject<'gc> for Video<'gc> {
             VideoSource::Unconnected { .. } => return,
         };
 
-        let starting_seek = if let VideoStream::Uninstantiated(seek_to) = self.0.stream.get() {
-            seek_to
-        } else {
-            tracing::warn!("Reinstantiating already-instantiated video stream!");
-            0
-        };
+        let starting_seek =
+            if let VideoStream::Uninstantiated(seek_to) = self.0.stream.borrow().clone() {
+                seek_to
+            } else {
+                tracing::warn!("Reinstantiating already-instantiated video stream!");
+                0
+            };
 
         if let Some(stream) = stream {
-            self.0.stream.set(VideoStream::Instantiated(stream));
+            self.0.stream.replace(VideoStream::Instantiated(stream));
         }
         self.0.keyframes.replace(keyframes);
 

@@ -277,8 +277,11 @@ impl<'gc> LoadManager<'gc> {
         }
     }
 
-    /// Native hosts with a private writable data directory can retain excess
-    /// loadBytes snapshots there, including on Android's application sandbox.
+    pub fn set_movie_cache_directory(&mut self, directory: &std::path::Path, budget: u64) {
+        self.movie_budgets.cache =
+            ruffle_common::tag_utils::MovieCache::open_with_budget(directory, budget).ok();
+    }
+
     pub fn set_snapshot_directory(&mut self, directory: std::path::PathBuf) {
         self.movie_budgets.set_snapshot_directory(directory);
     }
@@ -852,12 +855,12 @@ fn generation_is_current(current: u64, expected: u64) -> bool {
 
 async fn wait_for_full_response(
     response: OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>,
-) -> Result<(Vec<u8>, String, u16, bool), ErrorResponse> {
+) -> Result<(bytes::Bytes, String, u16, bool), ErrorResponse> {
     let response = response.await?;
     let url = response.url().to_string();
     let status = response.status();
     let redirected = response.redirected();
-    let body = response.body().await;
+    let body = response.body_bytes().await;
 
     match body {
         Ok(body) => Ok((body, url, status, redirected)),
@@ -1618,7 +1621,7 @@ pub fn load_form_into_object<'gc>(
     uc.resources.run_read(registration, async move {
         let response = fetch.await.map_err(|e| e.error)?;
         let response_encoding = response.text_encoding();
-        let body = response.body().await?;
+        let body = response.body_bytes().await?;
 
         // Fire the load handler.
         read.deliver(|uc| {
@@ -1869,7 +1872,7 @@ pub fn load_data_into_url_loader<'gc>(
             let mut activation = Avm2Activation::from_nothing(uc);
 
             fn set_data<'a, 'gc: 'a>(
-                body: Vec<u8>,
+                body: bytes::Bytes,
                 activation: &mut Avm2Activation<'a, 'gc>,
                 target: Avm2Object<'gc>,
             ) {
@@ -1891,7 +1894,7 @@ pub fn load_data_into_url_loader<'gc>(
                     .expect("The dataFormat field is typed String");
 
                 let data_object = if &data_format == b"binary" {
-                    let storage = ByteArrayStorage::from_vec(activation.context, body);
+                    let storage = ByteArrayStorage::from_vec(activation.context, body.into());
                     let bytearray = ByteArrayObject::from_storage(activation.context, storage);
 
                     Some(bytearray.into())
@@ -1979,7 +1982,7 @@ pub fn load_data_into_url_loader<'gc>(
                     // Testing with Flash shoes that the 'data' property is cleared
                     // when an error occurs
 
-                    set_data(Vec::new(), &mut activation, target);
+                    set_data(bytes::Bytes::new(), &mut activation, target);
 
                     let (status_code, redirected) =
                         if let Error::HttpNotOk(_, status_code, redirected, _) = response.error {
@@ -2051,7 +2054,7 @@ pub fn load_sound_avm1_blocking<'gc>(
 fn load_sound_avm1_data<'gc>(
     uc: &mut UpdateContext<'gc>,
     sound_object: ObjectHandle,
-    response: Result<(Vec<u8>, String, u16, bool), ErrorResponse>,
+    response: Result<(bytes::Bytes, String, u16, bool), ErrorResponse>,
 ) -> Result<(), Error> {
     let sound_object = sound_object.fetch(uc);
 
@@ -2073,7 +2076,7 @@ fn load_sound_avm1_data<'gc>(
         .map_err(|e| e.error)
         .and_then(|(body, _, _, _)| {
             let handle = activation.context.audio.register_mp3(&body)?;
-            sound.set_sound(&mut activation, sound_object, Some(handle));
+            sound.set_sound(&mut activation, sound_object, Some(handle.clone()));
             sound.set_duration(Some(0));
             sound.load_id3(&mut activation, sound_object, &body)?;
             if external.read_cancelled() {
@@ -2162,7 +2165,7 @@ pub fn load_sound_avm2<'gc>(
                         return Ok(());
                     }
 
-                    sound.read_and_call_id3_event(&mut activation, body.as_slice());
+                    sound.read_and_call_id3_event(&mut activation, &body);
                     if read.cancelled() {
                         return Ok(());
                     }
@@ -2222,13 +2225,13 @@ pub fn load_netstream<'gc>(
                 })?;
 
                 while !read.cancelled() {
-                    let chunk = response.next_chunk().await;
+                    let chunk = response.next_chunk_bytes().await;
                     let is_end = !matches!(chunk, Ok(Some(_)));
                     read.deliver(|uc| {
                         let stream = stream.fetch(uc);
 
                         match chunk {
-                            Ok(Some(mut data)) => stream.load_buffer(uc, &mut data),
+                            Ok(Some(data)) => stream.load_buffer(uc, &data),
                             Ok(None) => stream.finish_buffer(),
                             Err(err) => stream.report_error(err),
                         }
@@ -2557,7 +2560,7 @@ impl<'gc> MovieLoader<'gc> {
                     pixels.width,
                     pixels.height,
                     pixels.transparency,
-                    pixels.colors,
+                    pixels.colors.into_vec(),
                     pixels.loader_request,
                 );
 

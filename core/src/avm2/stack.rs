@@ -5,9 +5,11 @@ use crate::avm2::value::Value;
 
 use gc_arena::collect::Trace;
 use gc_arena::{Collect, Gc, Mutation};
-use std::cell::Cell;
+use ruffle_memory::{MemoryBuffer, MemoryKind, MemoryScope};
+use std::cell::{Cell, OnceCell};
 
-const PREALLOCATED_STACK_SIZE: usize = 200000;
+const INITIAL_STACK_SIZE: usize = 4096;
+const MAX_STACK_SIZE: usize = 200000;
 
 /// The global, preallocated value stack. This has little use directly due to
 /// the way AVM2 works; to do anything with it, an StackFrame must be
@@ -22,7 +24,8 @@ pub struct Stack<'gc>(Gc<'gc, StackData<'gc>>);
 
 struct StackData<'gc> {
     /// Stack data
-    stack: Box<[Cell<Value<'gc>>]>,
+    stack: MemoryBuffer<Cell<Value<'gc>>>,
+    overflow: OnceCell<MemoryBuffer<Cell<Value<'gc>>>>,
 
     /// The number of values currently stored on the stack
     stack_pointer: Cell<usize>,
@@ -30,17 +33,22 @@ struct StackData<'gc> {
 
 impl<'gc> Stack<'gc> {
     pub fn new(mc: &Mutation<'gc>) -> Self {
-        let stack = (0..PREALLOCATED_STACK_SIZE)
-            .map(|_| Cell::new(Value::Undefined))
-            .collect::<Box<[_]>>();
-
         Stack(Gc::new(
             mc,
             StackData {
-                stack,
+                stack: Self::allocate(INITIAL_STACK_SIZE),
+                overflow: OnceCell::new(),
                 stack_pointer: Cell::new(0),
             },
         ))
+    }
+
+    fn allocate(count: usize) -> MemoryBuffer<Cell<Value<'gc>>> {
+        MemoryBuffer::new(
+            &MemoryScope::current(),
+            MemoryKind::AvmStack,
+            vec![Cell::new(Value::Undefined); count],
+        )
     }
 
     /// Returns a slice of stack data for the specified method
@@ -59,10 +67,17 @@ impl<'gc> Stack<'gc> {
     /// properly disposed of by using the `dispose_stack_frame` method.
     pub fn get_frame(&self, frame_size: usize) -> StackFrame<'_, 'gc> {
         // Create the stack frame
-        let stack_data = &self.0.stack;
         let stack_pointer = &self.0.stack_pointer;
 
-        let subslice = &stack_data[stack_pointer.get()..stack_pointer.get() + frame_size];
+        let end = stack_pointer.get() + frame_size;
+        let stack_data = if end <= INITIAL_STACK_SIZE {
+            &self.0.stack
+        } else {
+            self.0
+                .overflow
+                .get_or_init(|| Self::allocate(MAX_STACK_SIZE))
+        };
+        let subslice = &stack_data[stack_pointer.get()..end];
 
         stack_pointer.set(stack_pointer.get() + frame_size);
 
@@ -183,5 +198,28 @@ impl<'a, 'gc> StackFrame<'a, 'gc> {
         self.stack_pointer = Cell::new(0);
 
         new_frame
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn frames_across_the_initial_stack_keep_their_values_and_clear_on_reuse() {
+        gc_arena::arena::rootless_mutate(|mc| {
+            let stack = Stack::new(mc);
+            let outer = stack.get_frame(INITIAL_STACK_SIZE - 2);
+            outer.push(42.into());
+            let deep = stack.get_frame(8);
+            deep.push(73.into());
+            assert_eq!(outer.peek(0).as_i32(), 42);
+            assert_eq!(deep.pop().as_i32(), 73);
+            stack.dispose_stack_frame(deep);
+            let next = stack.get_frame(8);
+            assert!(matches!(next.value_at(0), Value::Undefined));
+            stack.dispose_stack_frame(next);
+            assert_eq!(outer.pop().as_i32(), 42);
+            stack.dispose_stack_frame(outer);
+        });
     }
 }

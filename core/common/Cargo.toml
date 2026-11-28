@@ -11,6 +11,7 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+ruffle_memory = { path = "../../memory" }
 hashbrown = { workspace = true }
 fnv = { workspace = true }
 gc-arena = { workspace = true }

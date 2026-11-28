@@ -1,6 +1,15 @@
 //! Offline native frame service benchmark. Captures and trace comparison belong
 //! to the regression runner; this runner measures GPU-completed work, not FPS.
 #![recursion_limit = "256"]
+// Cargo's all-features builds select mimalloc. Isolated allocator comparisons
+// enable one feature per binary and record the effective choice in the session.
+#[cfg(feature = "perf-mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(all(feature = "perf-jemalloc", not(feature = "perf-mimalloc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use ruffle_render::profile::{self, NativePhase, RenderMetrics};
@@ -113,6 +122,12 @@ struct Opt {
     /// Memory-soak checkpoints are deliberately unavailable in throughput runs.
     #[arg(long, requires = "pace_fps", value_parser = clap::value_parser!(u32).range(1..))]
     reclaim_every: Option<u32>,
+    /// Require this many child movies to finish loading, drawing and unloading in the memory_soak fixture.
+    #[arg(long, conflicts_with_all = ["reclaim_every", "profile_off"], value_parser = clap::value_parser!(u32).range(1..))]
+    soak_cycles: Option<u32>,
+    /// Elapsed measurement time required independently of the confirmed cycle count.
+    #[arg(long, requires = "soak_cycles")]
+    min_seconds: Option<u64>,
     /// Measure instrumentation-disabled overhead. Optimizations stay enabled.
     #[arg(long)]
     profile_off: bool,
@@ -156,6 +171,7 @@ struct PerfEnvironment {
     descriptors: Arc<Descriptors>,
     compile: bool,
     profiling: bool,
+    soak: bool,
 }
 impl Environment for PerfEnvironment {
     fn is_render_supported(&self, _: &RenderOptions) -> bool {
@@ -173,8 +189,12 @@ impl Environment for PerfEnvironment {
         width: u32,
         height: u32,
     ) -> Option<(Box<dyn RenderInterface>, Box<dyn RenderBackend>)> {
-        let target =
-            TextureTarget::new_without_readback(&self.descriptors.device, (width, height)).ok()?;
+        let target = if self.soak {
+            TextureTarget::new(&self.descriptors.device, (width, height))
+        } else {
+            TextureTarget::new_without_readback(&self.descriptors.device, (width, height))
+        }
+        .ok()?;
         let renderer =
             WgpuRenderBackend::with_options(self.descriptors.clone(), target, self.profiling)
                 .ok()?;
@@ -265,8 +285,62 @@ fn allocator_stats(device: &wgpu::Device) -> serde_json::Value {
         json!({"allocatedBytes":report.total_allocated_bytes,"reservedBytes":report.total_reserved_bytes}))
 }
 
+#[derive(Default)]
+struct CompletedCycles {
+    pending: Option<(u32, bool, bool)>, // sequence, measured, pixels observed
+    sequence: u32,
+    confirmed: u32,
+}
+impl CompletedCycles {
+    fn observe(
+        &mut self,
+        trace: &str,
+        measured: bool,
+        mut pixel: impl FnMut() -> Result<[u8; 4]>,
+    ) -> Result<Option<u32>> {
+        let mut checkpoint = None;
+        for line in trace.lines() {
+            if let Some(n) = line.strip_prefix("memory-loaded ") {
+                let n: u32 = n.parse()?;
+                ensure!(
+                    self.pending.is_none() && n == self.sequence + 1,
+                    "out-of-order load {n}"
+                );
+                self.sequence = n;
+                self.pending = Some((n, measured, false));
+            } else if let Some(n) = line.strip_prefix("memory-unloaded ") {
+                let n: u32 = n.parse()?;
+                let (expected, count, drawn) =
+                    self.pending.take().context("unload without load")?;
+                ensure!(
+                    expected == n && drawn,
+                    "cycle {n} unloaded before its pixels were observed"
+                );
+                ensure!(
+                    pixel()?[..3] == [32, 32, 32],
+                    "child pixels survived unload {n}"
+                );
+                if count {
+                    self.confirmed += 1;
+                    checkpoint = Some(n);
+                }
+            } else {
+                anyhow::bail!("unexpected soak trace {line}");
+            }
+        }
+        if let Some((_, _, drawn @ false)) = &mut self.pending {
+            *drawn = pixel()?[..3] == [0x33, 0x99, 0x66];
+        }
+        Ok(checkpoint)
+    }
+}
+
 fn main() -> Result<()> {
     let opt = Opt::parse();
+    ensure!(
+        opt.soak_cycles.is_none() || opt.case == "memory_soak",
+        "confirmed cycles require the memory_soak fixture"
+    );
     let total = validate_frames(opt.warmup, opt.frames)?;
     let manifest = Manifest::parse(&fs::read_to_string(&opt.manifest)?)?;
     let case = manifest
@@ -299,6 +373,7 @@ fn main() -> Result<()> {
         descriptors: Arc::new(Descriptors::new(instance, adapter, device, queue)?),
         compile: opt.compile,
         profiling: !opt.profile_off,
+        soak: opt.soak_cycles.is_some(),
     };
     let path = opt
         .manifest
@@ -344,7 +419,7 @@ fn main() -> Result<()> {
         let viewport = renderer.viewport_dimensions();
         json!({"quality":renderer.quality().to_string(), "samples":renderer.sample_count(),
             "viewport":[viewport.width,viewport.height], "scaleFactor":viewport.scale_factor,
-            "readback":false,"inFlightLimit":2,"debugAssertions":cfg!(debug_assertions),"avmDebug":cfg!(feature="avm_debug"),
+            "readback":environment.soak,"inFlightLimit":2,"debugAssertions":cfg!(debug_assertions),"avmDebug":cfg!(feature="avm_debug"),
             "timestampPeriod":environment.descriptors.queue.get_timestamp_period(),
             "deviceFeatures":format!("{:?}", environment.descriptors.device.features())})
     };
@@ -360,23 +435,34 @@ fn main() -> Result<()> {
         "{}",
         json!({"event":"session", "schemaVersion":2, "case":case.name,
         "backend":format!("{:?}", info.backend), "device":info.name, "driver":info.driver_info,
-        "warmup":opt.warmup, "frames":opt.frames, "inFlightLimit":2, "readback":false, "paceFps":opt.pace_fps,
+        "warmup":opt.warmup, "frames":opt.frames, "inFlightLimit":2, "readback":environment.soak, "paceFps":opt.pace_fps,
+        "allocator":if cfg!(feature = "perf-mimalloc") { "mimalloc" } else if cfg!(feature = "perf-jemalloc") { "jemalloc" } else { "system" },
         "profilingEnabled":!opt.profile_off, "runId":run_id, "settings":settings,
-        "reclaimEvery":opt.reclaim_every,
+        "reclaimEvery":opt.reclaim_every, "requiredCycles":opt.soak_cycles, "minimumSeconds":opt.min_seconds,
         "workloadSha256":workload_digest(&path)?})
     )?;
     let mut inflight = VecDeque::new();
     let mut measured_start = None;
     let mut descriptor_baseline = HashSet::new();
     let mut previous = metrics.snapshot();
+    let memory_manager = runner
+        .player()
+        .lock()
+        .unwrap()
+        .memory_scope()
+        .manager()
+        .clone();
+    memory_manager.sample_rss(resident_memory().map(|r| r.0));
     let mut last_rss = Instant::now();
     let mut frame = 0;
     let pace_start = Instant::now();
+    let timeout = Duration::from_secs(3600)
+        + opt.pace_fps.map_or(Duration::ZERO, |fps| {
+            Duration::from_secs_f64(f64::from(total) / f64::from(fps))
+        });
+    let mut soak = CompletedCycles::default();
     while frame < opt.warmup + opt.frames {
-        ensure!(
-            setup.elapsed() < Duration::from_secs(3600),
-            "workload timeout"
-        );
+        ensure!(setup.elapsed() < timeout, "workload timeout");
         if inflight.len() >= 2 {
             wait(&environment.descriptors, inflight.pop_front())?;
         }
@@ -444,13 +530,41 @@ fn main() -> Result<()> {
         renderer.collect_gpu_samples();
         drop(player);
         let current = metrics.snapshot();
-        if frame >= opt.warmup {
-            let rss = (last_rss.elapsed() >= Duration::from_millis(100))
-                .then(|| {
-                    last_rss = Instant::now();
-                    resident_memory()
-                })
-                .flatten();
+        let rss = if last_rss.elapsed() >= Duration::from_millis(100) {
+            last_rss = Instant::now();
+            let sample = resident_memory();
+            memory_manager.sample_rss(sample.map(|r| r.0));
+            sample
+        } else {
+            None
+        };
+        if environment.soak {
+            let mut player = runner.player().lock().unwrap();
+            let trace = runner.take_trace_output();
+            let measured = frame >= opt.warmup;
+            let elapsed =
+                measured_start.map_or(0.0, |start: Instant| start.elapsed().as_secs_f64());
+            let checkpoint = soak.observe(&trace, measured, || {
+                let renderer =
+                    <dyn Any>::downcast_ref::<WgpuRenderBackend<TextureTarget>>(player.renderer())
+                        .unwrap();
+                let image = renderer.capture_frame()?.context("missing soak readback")?;
+                Ok(image.get_pixel(8, 8).0)
+            })?;
+            if let Some(cycle) = checkpoint {
+                let movies = player.mutate_with_update_context(|ctx| ctx.library.movie_count());
+                write_record(
+                    &mut output,
+                    &json!({
+                        "event":"postUnload", "cycle":cycle, "confirmedCycles":soak.confirmed,
+                        "elapsedSeconds":elapsed, "frame":frame, "memory":player.memory_snapshot(),
+                        "movies":movies, "gcObjects":player.gc_object_count(), "allocator":allocator_stats(&environment.descriptors.device)
+                    }),
+                )?;
+                output.flush()?;
+            }
+        }
+        if frame >= opt.warmup && !environment.soak {
             write_record(
                 &mut output,
                 &FrameRecord {
@@ -479,7 +593,7 @@ fn main() -> Result<()> {
             )?;
         }
         for sample in metrics.take_gpu_samples() {
-            if measured_start.is_some() {
+            if measured_start.is_some() && !environment.soak {
                 write_gpu_record(&mut output, &sample)?;
             }
         }
@@ -542,6 +656,18 @@ fn main() -> Result<()> {
     for sample in metrics.take_gpu_samples() {
         write_gpu_record(&mut output, &sample)?;
     }
+    let memory_after_drain = player.memory_snapshot();
+    if let Some(minimum) = opt.soak_cycles {
+        ensure!(
+            soak.confirmed >= minimum,
+            "confirmed {} cycles, expected {minimum}",
+            soak.confirmed
+        );
+        ensure!(
+            Duration::from_nanos(completed_ns) >= Duration::from_secs(opt.min_seconds.unwrap_or(0)),
+            "elapsed soak duration too short"
+        );
+    }
     let resources_after_drain = environment.descriptors.runtime.diagnostic_snapshot();
     let allocator_after_drain = allocator_stats(&environment.descriptors.device);
     drop(player);
@@ -580,7 +706,7 @@ fn main() -> Result<()> {
         "{}",
         json!({"event":"summary","frames":opt.frames,"completedNs":completed_ns,
         "peakRssBytes":memory.map(|r|r.1),"rssBytes":memory.map(|r|r.0),
-        "droppedGpuSamples":metrics.snapshot().dropped_gpu_samples,
+        "droppedGpuSamples":metrics.snapshot().dropped_gpu_samples, "confirmedCycles":soak.confirmed, "memoryAfterDrain":memory_after_drain,
         "resourcesAfterDrain":resources_after_drain, "allocatorAfterDrain":allocator_after_drain,
         "resourcesAfterUnload":environment.descriptors.runtime.diagnostic_snapshot(),
         "allocatorAfterUnload":allocator_stats(&environment.descriptors.device),

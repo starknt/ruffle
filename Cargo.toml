@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "memory",
     "core",
     "core/macros",
     "core/build_playerglobal",
@@ -35,7 +36,7 @@ members = [
     "tools/fuzzer",
     "tools/stub-report",
 ]
-exclude = ["render/wgpu/vendor/wgpu-hal"]
+exclude = ["render/wgpu/vendor/wgpu-hal", "vendor/gc-arena"]
 default-members = ["desktop"]
 resolver = "2"
 
@@ -66,7 +67,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 clap_complete = "4.6"
 cpal = "0.16.0"
 anyhow = "1.0"
-gc-arena = { version = "0.7.0", features = ["enum-map", "hashbrown", "indexmap", "slotmap", "smallvec"] }
+gc-arena = { path = "vendor/gc-arena", version = "0.7.0", features = ["enum-map", "hashbrown", "indexmap", "slotmap", "smallvec"] }
 slotmap = "1.1.1"
 async-channel = "2.5.0"
 crossbeam-channel = "0.5"

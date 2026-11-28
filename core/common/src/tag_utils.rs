@@ -2,6 +2,7 @@ use crate::sandbox::SandboxType;
 
 use gc_arena::barrier::unlock;
 use gc_arena::{Collect, Gc, GcWeak, Lock, Mutation};
+use ruffle_memory::{ContentId, MemoryKind, MemoryLease, MemoryScope};
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -11,7 +12,9 @@ use url::Url;
 
 pub type SwfStream<'a> = swf::read::Reader<'a>;
 
+mod cache;
 mod lifetime;
+pub use cache::MovieCache;
 
 /// A shared pointer to a `SwfMovieData`.
 #[derive(Clone, Collect, Copy, Debug)]
@@ -55,6 +58,16 @@ impl<'gc> SwfMovie<'gc> {
 
     pub fn as_ptr(self) -> *const SwfMovieData {
         &self.0.data
+    }
+
+    pub fn movie_id(self) -> u64 {
+        self.0.lifetime.id
+    }
+    pub fn symbol_id(self, character_id: u16) -> ruffle_memory::SymbolId {
+        ruffle_memory::SymbolId {
+            movie_id: self.movie_id(),
+            character_id,
+        }
     }
 
     pub fn record_lifetime(self, action: &'static str) {
@@ -107,32 +120,58 @@ impl<'gc> SwfMovieWeak<'gc> {
 #[derive(Debug)]
 struct Mapping {
     file: std::fs::File,
+    offset: u64,
     view: memmap2::Mmap,
+    _charge: MemoryLease,
 }
 // The unlinked temporary file is private. Nothing writes to it after construction.
 // Both the read-only source and private VM mappings retain the file content.
 impl Mapping {
-    fn new(bytes: &[u8]) -> std::io::Result<Self> {
+    fn new(bytes: &[u8], scope: &MemoryScope) -> std::io::Result<Self> {
         use std::io::Write;
         let mut file = tempfile::tempfile()?;
         file.write_all(bytes)?;
         let view = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(Self { file, view })
+        let charge = scope.track(MemoryKind::MappedFile, view.len() as u64);
+        Ok(Self {
+            file,
+            offset: 0,
+            view,
+            _charge: charge,
+        })
     }
 }
-#[derive(Clone, Debug, Collect)]
+#[derive(Debug, Collect)]
 #[collect(require_static)]
 pub struct MovieBytes {
     file: Vec<u8>,
     tags_offset: usize,
     mapping: Option<Arc<Mapping>>,
+    charge: MemoryLease,
+}
+impl Clone for MovieBytes {
+    fn clone(&self) -> Self {
+        let file = self.file.clone();
+        let charge = self
+            .charge
+            .scope()
+            .track(MemoryKind::MovieBytes, file.capacity() as u64);
+        Self {
+            file,
+            tags_offset: self.tags_offset,
+            mapping: self.mapping.clone(),
+            charge,
+        }
+    }
 }
 impl From<Vec<u8>> for MovieBytes {
     fn from(file: Vec<u8>) -> Self {
+        let charge = MemoryScope::current().track(MemoryKind::MovieBytes, file.capacity() as u64);
         Self {
             file,
             tags_offset: 0,
             mapping: None,
+            charge,
         }
     }
 }
@@ -158,32 +197,47 @@ impl MovieBytes {
     }
     fn share_pages(&mut self) {
         if self.file.len() >= 64 * 1024
-            && let Ok(m) = Mapping::new(&self.file)
+            && let Ok(m) = Mapping::new(&self.file, self.charge.scope())
         {
             self.mapping = Some(Arc::new(m));
             self.file = Vec::new();
+            self.charge.resize(0);
         }
     }
     pub fn private_pages(&self) -> Option<PrivatePages> {
         if let Some(m) = &self.mapping {
-            return unsafe { memmap2::MmapOptions::new().map_copy(&m.file) }
-                .ok()
-                .map(PrivatePages);
+            return unsafe {
+                memmap2::MmapOptions::new()
+                    .offset(m.offset)
+                    .map_copy(&m.file)
+            }
+            .ok()
+            .map(|pages| {
+                let charge =
+                    MemoryScope::current().track(MemoryKind::MappedFile, pages.len() as u64);
+                PrivatePages {
+                    pages,
+                    _charge: charge,
+                }
+            });
         }
         None
     }
 }
 #[derive(Debug)]
-pub struct PrivatePages(memmap2::MmapMut);
+pub struct PrivatePages {
+    pages: memmap2::MmapMut,
+    _charge: MemoryLease,
+}
 impl std::ops::Deref for PrivatePages {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        &self.0
+        &self.pages
     }
 }
 impl std::ops::DerefMut for PrivatePages {
     fn deref_mut(&mut self) -> &mut [u8] {
-        &mut self.0
+        &mut self.pages
     }
 }
 
@@ -351,7 +405,25 @@ impl SwfMovieData {
     ) -> Result<Self, swf::error::Error> {
         let compressed_len = swf_data.len();
         let swf_buf = swf::read::decompress_swf(swf_data)?;
-        let encoding = swf::SwfStr::encoding_for_version(swf_buf.header.version());
+        Ok(Self::from_backing(
+            swf_buf.header,
+            Arc::new(swf_buf.data.into()),
+            url,
+            loader_url,
+            load_bytes_info,
+            compressed_len,
+        ))
+    }
+
+    fn from_backing(
+        header: HeaderExt,
+        data: Arc<MovieBytes>,
+        url: String,
+        loader_url: Option<String>,
+        load_bytes_info: Option<LoadBytesInfo>,
+        compressed_len: usize,
+    ) -> Self {
+        let encoding = swf::SwfStr::encoding_for_version(header.version());
 
         // The loader SWF has full control over the tags of a SWF loaded using
         // `Loader.loadBytes`, so if we were to use the sandbox type declared in
@@ -360,11 +432,11 @@ impl SwfMovieData {
         // a child SWF with different sandboxing.
         let sandbox_type = load_bytes_info
             .map(|i| i.loader_sandbox_type)
-            .unwrap_or_else(|| SandboxType::infer(url.as_str(), &swf_buf.header));
+            .unwrap_or_else(|| SandboxType::infer(url.as_str(), &header));
 
         let mut movie = Self {
-            header: swf_buf.header,
-            data: Arc::new(swf_buf.data.into()),
+            header,
+            data,
             url,
             loader_url,
             parameters: Vec::new(),
@@ -376,7 +448,7 @@ impl SwfMovieData {
             sandbox_type,
         };
         movie.append_parameters_from_url();
-        Ok(movie)
+        movie
     }
 
     /// Construct a movie based on a loaded image (JPEG, GIF or PNG).
@@ -448,14 +520,25 @@ impl SwfMovieData {
             return self;
         };
         prefix[4..8].copy_from_slice(&length.to_le_bytes());
-        let storage = Arc::make_mut(&mut self.data);
-        let n = storage.file.len();
-        storage.file.reserve_exact(offset);
-        storage.file.resize(total, 0);
-        storage.file.copy_within(0..n, offset);
-        storage.file[..offset].copy_from_slice(&prefix);
-        storage.tags_offset = offset;
-        storage.share_pages();
+        let manager = self.data.charge.scope().manager().clone();
+        let files = manager.resources::<MovieBytes>();
+        let key = ContentId::from_parts(&[&prefix, self.data()]);
+        self.data = files.intern(key, || {
+            let storage = Arc::make_mut(&mut self.data);
+            let n = storage.file.len();
+            storage.file.reserve_exact(offset);
+            storage.file.resize(total, 0);
+            storage.file.copy_within(0..n, offset);
+            storage.file[..offset].copy_from_slice(&prefix);
+            storage.tags_offset = offset;
+            // Transfer the same backing from the loading player to shared ownership.
+            storage.charge.resize(0);
+            storage.charge = manager
+                .shared()
+                .track(MemoryKind::MovieBytes, storage.file.capacity() as u64);
+            storage.share_pages();
+            self.data.clone()
+        });
         self
     }
     pub fn shared_file(&self) -> Option<Arc<MovieBytes>> {

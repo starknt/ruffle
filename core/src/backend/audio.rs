@@ -10,7 +10,7 @@ use crate::{
 use gc_arena::Collect;
 pub use ruffle_common::buffer::Substream;
 use ruffle_common::duration::FloatDuration;
-use slotmap::{Key, SlotMap, new_key_type};
+use slotmap::{Key, new_key_type};
 
 #[cfg(feature = "audio")]
 pub mod decoders;
@@ -40,9 +40,27 @@ use std::time::Duration;
 use thiserror::Error;
 
 new_key_type! {
-    pub struct SoundHandle;
     pub struct SoundInstanceHandle;
 }
+
+/// The script object, movie symbol and playing instance share the backend definition.
+#[derive(Clone, Debug, Collect)]
+#[collect(require_static)]
+pub struct SoundHandle(std::sync::Arc<dyn Any + Send + Sync>);
+impl SoundHandle {
+    pub fn new<T: Any + Send + Sync>(definition: T) -> Self {
+        Self(std::sync::Arc::new(definition))
+    }
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+}
+impl PartialEq for SoundHandle {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for SoundHandle {}
 
 pub type DecodeError = decoders::Error;
 
@@ -162,7 +180,7 @@ pub trait AudioBackend: Any {
     fn get_sound_size(&self, sound: SoundHandle) -> Option<u32>;
 
     /// Get the sound format that a given sound was added with.
-    fn get_sound_format(&self, sound: SoundHandle) -> Option<&swf::SoundFormat>;
+    fn get_sound_format<'s>(&self, sound: &'s SoundHandle) -> Option<&'s swf::SoundFormat>;
 
     /// Set the volume transform for a sound instance.
     fn set_sound_transform(&mut self, instance: SoundInstanceHandle, transform: SoundTransform);
@@ -222,16 +240,12 @@ struct NullSound {
 
 /// Audio backend that ignores all audio.
 pub struct NullAudioBackend {
-    sounds: SlotMap<SoundHandle, NullSound>,
     volume: f32,
 }
 
 impl NullAudioBackend {
     pub fn new() -> NullAudioBackend {
-        NullAudioBackend {
-            sounds: SlotMap::with_key(),
-            volume: 1.0,
-        }
+        NullAudioBackend { volume: 1.0 }
     }
 }
 
@@ -251,7 +265,7 @@ impl AudioBackend for NullAudioBackend {
         let sample_rate: f64 = sound.format.sample_rate.into();
         let duration = FloatDuration::from_millis(num_sample_frames * 1000.0 / sample_rate);
 
-        Ok(self.sounds.insert(NullSound {
+        Ok(SoundHandle::new(NullSound {
             duration,
             size: data.len() as u32,
             format: sound.format.clone(),
@@ -259,7 +273,7 @@ impl AudioBackend for NullAudioBackend {
     }
 
     fn register_mp3(&mut self, _data: &[u8]) -> Result<SoundHandle, DecodeError> {
-        Ok(self.sounds.insert(NullSound {
+        Ok(SoundHandle::new(NullSound {
             size: 0,
             duration: FloatDuration::ZERO,
             format: swf::SoundFormat {
@@ -302,22 +316,22 @@ impl AudioBackend for NullAudioBackend {
         Some(0.0)
     }
     fn get_sound_duration(&self, sound: SoundHandle) -> Option<FloatDuration> {
-        if let Some(sound) = self.sounds.get(sound) {
+        if let Some(sound) = sound.downcast_ref::<NullSound>() {
             Some(sound.duration)
         } else {
             None
         }
     }
     fn get_sound_size(&self, sound: SoundHandle) -> Option<u32> {
-        if let Some(sound) = self.sounds.get(sound) {
+        if let Some(sound) = sound.downcast_ref::<NullSound>() {
             Some(sound.size)
         } else {
             None
         }
     }
 
-    fn get_sound_format(&self, sound: SoundHandle) -> Option<&swf::SoundFormat> {
-        self.sounds.get(sound).map(|s| &s.format)
+    fn get_sound_format<'s>(&self, sound: &'s SoundHandle) -> Option<&'s swf::SoundFormat> {
+        sound.downcast_ref::<NullSound>().map(|s| &s.format)
     }
 
     fn set_sound_transform(&mut self, _instance: SoundInstanceHandle, _transform: SoundTransform) {}
@@ -415,7 +429,8 @@ impl<'gc> AudioManager<'gc> {
                 // Sound ended.
                 let duration = sound
                     .sound
-                    .and_then(|sound| context.audio.get_sound_duration(sound))
+                    .as_ref()
+                    .and_then(|sound| context.audio.get_sound_duration(sound.clone()))
                     .unwrap_or_default();
                 if let Some(object) = sound.avm1_object {
                     if let NativeObject::Sound(sound) = object.native() {
@@ -468,7 +483,7 @@ impl<'gc> AudioManager<'gc> {
     ) -> Option<SoundInstanceHandle> {
         if self.sounds.len() < Self::MAX_SOUNDS {
             let handle = audio
-                .start_sound(sound, settings)
+                .start_sound(sound.clone(), settings)
                 .map_err(|e| tracing::warn!("Cannot start sound: {e}"))
                 .ok()?;
             let mut instance = SoundInstance {
@@ -522,7 +537,7 @@ impl<'gc> AudioManager<'gc> {
 
     pub fn stop_sounds_with_handle(&mut self, audio: &mut dyn AudioBackend, sound: SoundHandle) {
         self.sounds.retain(move |other| {
-            if other.sound == Some(sound) {
+            if other.sound.as_ref() == Some(&sound) {
                 audio.stop_sound(other.instance);
                 false
             } else {
@@ -588,7 +603,9 @@ impl<'gc> AudioManager<'gc> {
     }
 
     pub fn is_sound_playing_with_handle(&self, sound: SoundHandle) -> bool {
-        self.sounds.iter().any(|other| other.sound == Some(sound))
+        self.sounds
+            .iter()
+            .any(|other| other.sound.as_ref() == Some(&sound))
     }
 
     pub fn start_stream(
@@ -744,7 +761,7 @@ impl<'gc> AudioManager<'gc> {
         let mut changed = false;
 
         for other in &mut self.sounds {
-            if other.sound == Some(sound) {
+            if other.sound.as_ref() == Some(&sound) {
                 other.transform = sound_transform;
                 changed = true;
             }
@@ -820,7 +837,7 @@ impl<'gc> AudioManager<'gc> {
 
                 // "Start" sounds only play if an instance of the same sound is not already playing.
                 SoundEvent::Start => {
-                    if !context.is_sound_playing_with_handle(handle) {
+                    if !context.is_sound_playing_with_handle(handle.clone()) {
                         let _ = context.start_sound(
                             handle,
                             sound_info,

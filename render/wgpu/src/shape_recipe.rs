@@ -26,6 +26,7 @@ impl BitmapSource for FrozenBitmapSource {
 #[derive(Debug)]
 pub struct ShapeRecipe {
     pub static_definition: std::cell::Cell<bool>,
+    pub shared_definition: std::cell::Cell<bool>,
     pub owner: ResourceOwner,
     pub device_generation: u64,
     pub mesh: OnceCell<Arc<Mesh>>,
@@ -55,6 +56,9 @@ impl ShapeRecipe {
             })?
             .id;
         let mesh = backend.register_prepared_shape(prepared, id, &self.bitmaps, self.owner)?;
+        if self.shared_definition.get() {
+            mesh.vertex_buffer.lease().note_mesh_use(None);
+        }
         let _ = self.mesh.set(mesh);
         self.geometry.borrow_mut().take();
         Ok(())

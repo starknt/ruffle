@@ -162,6 +162,10 @@ impl MenuBar {
                                 player.debug_ui().queue_message(DebugMessage::ShowKnownMovies);
                             }
                         }
+                        if Button::new(text(locale, "debug-menu-memory")).ui(ui).clicked() {
+                            ui.close();
+                            if let Some(player) = &mut player { player.debug_ui().queue_message(DebugMessage::ShowMemory); }
+                        }
                         if Button::new(text(locale, "debug-menu-open-domain-list")).ui(ui).clicked() {
                             ui.close();
                             if let Some(player) = &mut player {

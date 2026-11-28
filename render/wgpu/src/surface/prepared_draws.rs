@@ -63,7 +63,7 @@ impl Draw {
 }
 
 pub(super) struct Group {
-    pub instances: Box<[u8]>,
+    pub instances: ruffle_memory::MemoryBuffer<u8>,
     pub draws: Box<[Draw]>,
 }
 pub(super) struct PreparedDraws {

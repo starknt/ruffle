@@ -426,12 +426,10 @@ pub fn get_shader_args<'gc>(
                                 input_channels,
                             )?
                         } else if let Some(vector) = input.as_vector_storage() {
-                            let values: &[Value<'gc>] = vector.storage().as_ref();
-
                             make_float_texture(
                                 activation,
                                 name,
-                                values,
+                                &*vector,
                                 width,
                                 height,
                                 input_channels,
@@ -469,14 +467,15 @@ impl PixelSource for &[f32] {
     }
 }
 
-impl<'gc> PixelSource for &[Value<'gc>] {
+impl PixelSource for &crate::avm2::vector::VectorStorage<'_> {
     fn collect<const N: usize>(&self, num_pixels: usize) -> Option<Vec<[f32; N]>> {
-        let (chunks, _) = self.as_chunks::<N>();
+        if num_pixels > self.length() / N {
+            return None;
+        }
+        let mut values = self.iter();
         Some(
-            chunks
-                .get(..num_pixels)?
-                .iter()
-                .map(|vals| vals.map(|val| val.as_f64() as f32))
+            (0..num_pixels)
+                .map(|_| std::array::from_fn(|_| values.next().unwrap().as_f64() as f32))
                 .collect(),
         )
     }

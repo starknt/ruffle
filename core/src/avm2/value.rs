@@ -2018,3 +2018,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod compact_experiment;

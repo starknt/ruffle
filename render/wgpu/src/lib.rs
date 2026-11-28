@@ -56,6 +56,7 @@ mod render_snapshot;
 pub use render_snapshot::FramePacket;
 mod resource_scheduler;
 mod shape_recipe;
+mod shape_residency;
 pub mod target;
 mod transfers;
 pub use ruffle_render::profile;

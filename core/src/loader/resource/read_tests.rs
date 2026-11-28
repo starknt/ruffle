@@ -57,7 +57,7 @@ fn replacing_the_root_retires_buffered_stream_playback() {
     session.lock().unwrap().mutate_with_update_context(|uc| {
         let stream = NetStream::new_avm2(uc.gc());
         stream.play(uc, None);
-        stream.load_buffer(uc, &mut vec![1, 2, 3]);
+        stream.load_buffer(uc, &[1, 2, 3]);
         stream.finish_buffer();
         uc.replace_root_movie(SwfMovieData::empty(10, None));
         assert!(!uc.stream_manager.is_active());

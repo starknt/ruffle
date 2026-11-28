@@ -11,6 +11,7 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+ruffle_memory = { path = "../memory" }
 crossbeam-channel.workspace = true
 tracy-client = { version = "0.18", optional = true, default-features = false, features = ["demangle"] }
 ruffle_wstr = { path = "../wstr" }
