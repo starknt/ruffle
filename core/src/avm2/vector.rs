@@ -42,7 +42,6 @@ pub struct VectorStorage<'gc> {
 
 impl<'gc> VectorStorage<'gc> {
     pub fn new(length: usize, is_fixed: bool, value_type: Option<Class<'gc>>) -> Self {
-        ruffle_memory::MemoryScope::sample_layout("vectorLengthAtCreation", length);
         let storage = Elements::new(value_type);
 
         let mut self_vec = VectorStorage {
@@ -87,6 +86,10 @@ impl<'gc> VectorStorage<'gc> {
 
     pub fn length(&self) -> usize {
         self.storage.len()
+    }
+
+    pub(super) fn record_initial_length(&self) {
+        ruffle_memory::MemoryScope::sample_layout("vectorLengthAtCreation", self.length());
     }
 
     pub fn reserve_exact(&mut self, length: usize) {
@@ -375,5 +378,75 @@ impl<'gc> VectorStorage<'gc> {
             (0..self.length() / N)
                 .map(|i| std::array::from_fn(|offset| self.storage.get(i * N + offset).unwrap()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::avm2::amf::deserialize_value;
+    use crate::string::AvmString;
+    use flash_lso::types::{ObjectId, Value as AmfValue};
+    use ruffle_memory::MemoryManager;
+    use std::rc::Rc;
+
+    #[test]
+    fn vector_layout_samples_initialized_lengths() {
+        // Sampling is opt-in and cached for the life of a process.
+        if std::env::var_os("RUFFLE_MEMORY_LAYOUT").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env("RUFFLE_MEMORY_LAYOUT", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let manager = MemoryManager::new(64 << 20);
+        let player = crate::PlayerBuilder::new()
+            .with_memory_manager(manager.clone())
+            .build();
+        let bins = || {
+            manager.snapshot().players[0]
+                .layout_samples
+                .get("vectorLengthAtCreation")
+                .copied()
+                .unwrap_or_default()
+        };
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                let mut activation = Activation::from_nothing(context);
+                let uint = activation.avm2().class_defs().uint;
+                let generic = activation.avm2().classes().generic_vector;
+                let class = generic.parametrize(&mut activation, Some(uint));
+                let name = AvmString::new_utf8(activation.gc(), "SampledObject");
+                let object = activation.avm2().classes().object;
+                activation.avm2().register_class_alias(name, object);
+                let before = bins();
+                // One sample per 64 creations. Exercise the AS constructor, a native
+                // vector with existing storage, and AMF's initially empty reference.
+                for _ in 0..64 {
+                    class.construct(&mut activation, &[65.into()]).unwrap();
+                }
+                let ints = AmfValue::VectorUInt(vec![42; 3], false);
+                for _ in 0..64 {
+                    deserialize_value(&mut activation, &ints).unwrap();
+                }
+                let objects = AmfValue::VectorObject(
+                    ObjectId(1),
+                    vec![Rc::new(AmfValue::Null); 7],
+                    "SampledObject".into(),
+                    false,
+                );
+                for _ in 0..64 {
+                    deserialize_value(&mut activation, &objects).unwrap();
+                }
+                let after = bins();
+                let observed = std::array::from_fn(|i| after[i] - before[i]);
+                assert_eq!(observed, [0, 0, 1, 1, 0, 1]);
+            });
     }
 }

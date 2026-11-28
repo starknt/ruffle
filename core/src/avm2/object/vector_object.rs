@@ -71,6 +71,14 @@ impl<'gc> VectorObject<'gc> {
         vector: VectorStorage<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> VectorObject<'gc> {
+        vector.record_initial_length();
+        Self::allocate_with_storage(vector, activation)
+    }
+
+    pub(in crate::avm2) fn allocate_with_storage(
+        vector: VectorStorage<'gc>,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> VectorObject<'gc> {
         let value_type = vector.value_type();
         let vector_class = activation.avm2().classes().generic_vector;
 

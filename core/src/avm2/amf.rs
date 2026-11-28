@@ -450,7 +450,7 @@ pub fn deserialize_value_impl<'gc>(
             // Create an empty vector, as it has to exist in the map before reading children, in case they reference it
             let empty_storage =
                 VectorStorage::new(0, *is_fixed, Some(class.inner_class_definition()));
-            let obj = VectorObject::from_vector(empty_storage, activation);
+            let obj = VectorObject::allocate_with_storage(empty_storage, activation);
             object_map.insert(*id, obj.into());
 
             let element_type = class.inner_class_definition();
@@ -471,8 +471,9 @@ pub fn deserialize_value_impl<'gc>(
                 new_values.push(value);
             }
 
-            // Swap in the actual values
-            obj.storage_mut(activation.gc()).replace_storage(new_values);
+            let mut storage = obj.storage_mut(activation.gc());
+            storage.replace_storage(new_values);
+            storage.record_initial_length();
 
             obj.into()
         }

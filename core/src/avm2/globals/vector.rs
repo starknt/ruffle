@@ -39,6 +39,7 @@ pub fn instance_init<'gc>(
 
         vector.resize(length, activation)?;
         vector.set_is_fixed(is_fixed);
+        vector.record_initial_length();
     }
 
     Ok(Value::Undefined)
