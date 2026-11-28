@@ -283,6 +283,10 @@ impl Pixels {
         )))
     }
 
+    pub fn has_view(&self) -> bool {
+        self.view.is_some()
+    }
+
     pub fn release_view(&mut self) {
         self.view = None;
     }

@@ -361,15 +361,26 @@ impl<'gc> LoaderInfoObject<'gc> {
             }
             loader.remove_child(context, child);
             if !child.is_on_stage(context) {
-                let mut detached = vec![child];
-                while let Some(object) = detached.pop() {
-                    if let Some(bitmap) = object.as_bitmap() {
-                        bitmap.bitmap_data().release_display_texture(context);
-                    } else if let Some(container) = object.as_container() {
-                        detached.extend(container.iter_render_list());
-                    }
-                }
+                for_each_detached_bitmap(child, |data| data.release_display_texture(context));
             }
+        }
+    }
+}
+
+fn for_each_detached_bitmap<'gc>(
+    root: DisplayObject<'gc>,
+    mut visit: impl FnMut(crate::bitmap::bitmap_data::BitmapData<'gc>),
+) {
+    let mut seen = fnv::FnvHashSet::default();
+    let mut detached = vec![root];
+    while let Some(object) = detached.pop() {
+        if let Some(bitmap) = object.as_bitmap() {
+            let data = bitmap.bitmap_data();
+            if seen.insert(data.as_ptr()) {
+                visit(data);
+            }
+        } else if let Some(container) = object.as_container() {
+            detached.extend(container.iter_render_list());
         }
     }
 }

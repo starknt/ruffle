@@ -416,6 +416,10 @@ impl<'gc> BitmapData<'gc> {
         self.0.is_point_in_bounds(x, y)
     }
 
+    pub(crate) fn as_ptr(self) -> *const () {
+        self.0.as_ptr()
+    }
+
     pub fn ptr_eq(&self, other: BitmapData<'gc>) -> bool {
         self.0.ptr_eq(other.0)
     }
@@ -1008,20 +1012,25 @@ mod wrapper {
 
         pub fn release_display_texture(&self, context: &crate::context::UpdateContext<'gc>) {
             use crate::display_object::TDisplayObject;
-            let mut data = self.0.borrow_mut(context.gc());
-            if !data.handle_exported
-                && data.validity.gpu.is_empty()
-                && data.validity.pending.is_none()
-                && data.validity.failure.is_none()
-                && !data
-                    .display_objects
-                    .iter()
-                    .filter_map(|object| object.upgrade(context.gc()))
-                    .any(|object| object.is_on_stage(context))
             {
-                data.bitmap_handle = None;
-                data.pixels.release_view();
+                let data = self.0.borrow();
+                if (data.bitmap_handle.is_none() && !data.pixels.has_view())
+                    || data.handle_exported
+                    || !data.validity.gpu.is_empty()
+                    || data.validity.pending.is_some()
+                    || data.validity.failure.is_some()
+                    || data
+                        .display_objects
+                        .iter()
+                        .filter_map(|object| object.upgrade(context.gc()))
+                        .any(|object| object.is_on_stage(context))
+                {
+                    return;
+                }
             }
+            let mut data = self.0.borrow_mut(context.gc());
+            data.bitmap_handle = None;
+            data.pixels.release_view();
         }
 
         pub fn can_read(&self, read_area: PixelRegion) -> bool {
@@ -1050,6 +1059,10 @@ mod wrapper {
 
         pub fn is_point_in_bounds(&self, x: i32, y: i32) -> bool {
             x >= 0 && x < self.width() as i32 && y >= 0 && y < self.height() as i32
+        }
+
+        pub(super) fn as_ptr(self) -> *const () {
+            Gc::as_ptr(self.0).cast()
         }
 
         pub fn ptr_eq(&self, other: BitmapRawDataWrapper<'gc>) -> bool {
